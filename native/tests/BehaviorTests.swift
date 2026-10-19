@@ -70,6 +70,28 @@ struct BehaviorTests {
         store.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [])
         try check(navigation.unavailability(in: store) != nil && navigation.confirm(in: store) == nil, "A stale job cannot be confirmed")
         store.snapshot = original
+        var measured = queued
+        measured.canStart = false
+        measured.resources = JobResources(prediction: ResourcePrediction(memoryBytes: 2_147_483_648,
+            cpuCores: 2, durationSeconds: nil, samples: 3, confidence: "low", source: "family"),
+            observed: ResourceObservation(memoryBytes: 1_073_741_824, peakMemoryBytes: 1_610_612_736,
+                cpuSeconds: 20, cpuCores: 1.5, durationSeconds: 15, samples: 5, complete: false),
+            decision: ResourceDecision(allowed: false, reason: "Waiting for memory headroom"))
+        let decoded = try JSONDecoder().decode(QueueJob.self, from: JSONEncoder().encode(measured))
+        try check(decoded.resources == measured.resources && decoded.resources?.prediction.summary.contains("low confidence") == true,
+                  "Native resource predictions retain worktree family confidence")
+        let expectedPeak = "peak 1\(Locale.current.decimalSeparator ?? ".")5 GiB"
+        try check(decoded.resources?.observed?.summary.contains("Memory 1 GiB") == true &&
+                  decoded.resources?.observed?.summary.contains(expectedPeak) == true,
+                  "Native observations show current and peak memory with the current locale")
+        try check(decoded.canStart == false && !decoded.permitsStart,
+                  "Native decoding preserves explicit start denial")
+        store.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [measured])
+        navigation.request(.start, job: queued)
+        try check(navigation.unavailability(in: store) != nil && navigation.confirm(in: store) == nil,
+                  "Start confirmation rechecks explicit permission")
+        store.snapshot = original
+        navigation.decline()
         let passwords: [(String, Bool)] = [("", false), ("abc", false), ("word", true), ("2468", true),
             ("simple", true), (String(repeating: "a", count: 72), true),
             (String(repeating: "a", count: 73), false), (String(repeating: "é", count: 36), true),

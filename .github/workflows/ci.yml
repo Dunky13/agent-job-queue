@@ -77,6 +77,10 @@ jobs:
       - run: python -m pip install --require-hashes -r remote/requirements.lock
       - name: Core unit tests
         run: python -m unittest discover -s tests -p test_agent_heavy.py -v
+      - name: Resource sampling and admission tests
+        run: python -m unittest discover -s tests -p 'test_resource*.py' -v
+      - name: Worktree identity and learning tests
+        run: python -m unittest discover -s tests -p test_job_profiles.py -v
       - name: Agent instruction integration tests
         run: python -m unittest discover -s tests -p test_agent_integration.py -v
       - name: Isolated real-daemon acceptance tests

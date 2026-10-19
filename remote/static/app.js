@@ -1,7 +1,7 @@
-import { snapshotSchema, csrfSchema, resultSchema, errorSchema, logSchema, waiting, running, eligible } from "./schema.mjs";
+import { snapshotSchema, csrfSchema, resultSchema, errorSchema, logSchema, schedulingModeSchema, waiting, running, eligible } from "./schema.mjs";
 
 const byId = (id) => document.getElementById(id);
-const state = { snapshot: null, lastSuccess: 0, error: "", busy: false, readController: null, generation: 0, timer: null, staleTimer: null, selected: null, confirmation: null, logController: null, logJob: null, listKey: "", detailKey: "", renderKey: "", limitDirty: false };
+const state = { snapshot: null, lastSuccess: 0, error: "", busy: false, readController: null, generation: 0, timer: null, staleTimer: null, selected: null, confirmation: null, logController: null, logJob: null, listKey: "", detailKey: "", renderKey: "", limitDirty: false, modeDirty: false };
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const POLL_MS = 5000;
 const STALE_MS = 20000;
@@ -12,6 +12,12 @@ const readable = (value) => value.replaceAll("_", " ").replace(/^./, (letter) =>
 const jobStatus = (job) => job.exitCode !== null && job.exitCode !== 0 ? `Failed (${job.exitCode})` : readable(job.state);
 const when = (value) => value ? dateFormat.format(new Date(value)) : "—";
 const errorMessage = (error) => error instanceof Error ? error.message : "The request could not be completed.";
+const modeLabel = (mode) => ({ fixed: "Fixed", shadow: "Learn only", adaptive: "Adaptive" })[mode];
+const modeInput = () => document.querySelector('input[name="mode"]:checked');
+const bytes = (value) => `${(value / 1073741824).toLocaleString(undefined, { maximumFractionDigits: 2 })} GiB`;
+const cores = (value) => `${value.toLocaleString(undefined, { maximumFractionDigits: 1 })} CPU cores`;
+const predictionText = (prediction) => `Estimate ${bytes(prediction.memoryBytes)} · ${cores(prediction.cpuCores)} · ${prediction.confidence} confidence (${prediction.samples} runs, ${prediction.source})`;
+const observedText = (observed) => `Memory ${bytes(observed.memoryBytes)} · peak ${bytes(observed.peakMemoryBytes)} · ${cores(observed.cpuCores)}${observed.complete ? "" : observed.samples ? " · partial sample coverage" : " · collecting"}`;
 
 async function request(path, schema, options = {}) {
   const controller = new AbortController();
@@ -46,6 +52,9 @@ function remember(snapshot) {
   state.staleTimer = setTimeout(render, STALE_MS + 1);
   state.error = "";
   if (!state.limitDirty) byId("limit").value = String(snapshot.queue.limit);
+  if (!state.modeDirty) {
+    for (const input of document.querySelectorAll('input[name="mode"]')) input.checked = input.value === snapshot.scheduler?.mode;
+  }
   if (state.confirmation && !eligible(snapshot.jobs.find((job) => job.id === state.confirmation.id), state.confirmation.action)) {
     state.confirmation = null;
     announce("That job has changed. The queue has been updated.");
@@ -80,7 +89,7 @@ async function refresh({ manual = false } = {}) {
   }
 }
 
-async function mutate(action, id = null, limit = null) {
+async function mutate(action, id = null, value = null) {
   if (actionsDisabled()) return;
   // Reserve the action before any await. Polls never discard or compete with a click.
   state.busy = true;
@@ -92,19 +101,21 @@ async function mutate(action, id = null, limit = null) {
   render();
   try {
     remember(await request("/api/status", snapshotSchema));
-    if (action !== "limit" && !eligible(state.snapshot.jobs.find((job) => job.id === id), action)) {
+    if (!["limit", "scheduling"].includes(action) && !eligible(state.snapshot.jobs.find((job) => job.id === id), action)) {
       throw new Error("That job has changed. Check its current state before trying again.");
     }
     const { token } = await request("/api/csrf", csrfSchema);
-    const path = action === "limit" ? "/api/limit" : `/api/jobs/${id}/${action}`;
-    const body = action === "limit" ? { limit } : {};
+    if (action === "scheduling" && !state.snapshot.scheduler) throw new Error("Scheduling controls are unavailable. Update the queue controller.");
+    const path = ["limit", "scheduling"].includes(action) ? `/api/${action}` : `/api/jobs/${id}/${action}`;
+    const body = action === "limit" ? { limit: value } : action === "scheduling" ? { mode: value } : {};
     await request(path, resultSchema, {
       method: "POST", headers: { "Content-Type": "application/json", "X-CSRFToken": token }, body: JSON.stringify(body),
     });
     state.confirmation = null;
     if (action === "limit") state.limitDirty = false;
+    if (action === "scheduling") state.modeDirty = false;
     remember(await request("/api/status", snapshotSchema));
-    announce(action === "limit" ? `Parallel limit set to ${limit}.` : action === "start" ? `Job #${id} was requested to start now.` : action === "cancel" ? `Job #${id} was cancelled.` : `Job #${id} was moved ${action === "next" ? "to the front" : "to the end"}.`);
+    announce(action === "limit" ? `Parallel limit set to ${value}.` : action === "scheduling" ? `Scheduling set to ${modeLabel(value)}.` : action === "start" ? `Job #${id} was requested to start now.` : action === "cancel" ? `Job #${id} was cancelled.` : `Job #${id} was moved ${action === "next" ? "to the front" : "to the end"}.`);
   } catch (error) {
     state.error = errorMessage(error);
   } finally {
@@ -146,6 +157,11 @@ function renderJob(job) {
   li.append(element("p", "job-context", [`#${job.id}`, job.project, job.branch].filter(Boolean).join(" · ")));
   if (waiting(job) && job.queuePosition) li.append(element("p", "job-context", `Position ${job.queuePosition} · Priority ${job.priority}`));
   if (job.phase && job.phase.toLowerCase().replaceAll("_", " ") !== job.state.toLowerCase().replaceAll("_", " ")) li.append(element("p", "job-phase", readable(job.phase)));
+  if (job.resources) {
+    li.append(element("p", "job-context", predictionText(job.resources.prediction)));
+    if (job.resources.observed) li.append(element("p", "job-context", observedText(job.resources.observed)));
+    if (waiting(job) && job.resources.decision) li.append(element("p", "job-phase", job.resources.decision.reason));
+  }
   const actions = element("div", "job-actions");
   if (job.canStart && waiting(job)) actions.append(actionButton("Start now", job, "start"));
   if (job.canReorder && waiting(job)) {
@@ -167,9 +183,11 @@ function render() {
   const disabled = actionsDisabled();
   // Response timestamps change on every poll. Only rendered data and interaction
   // state should invalidate the view, preserving focus, selection and scroll.
-  const renderKey = JSON.stringify({ queue: state.snapshot?.queue, jobs: state.snapshot?.jobs,
+  const schedulerContent = state.snapshot?.scheduler && { ...state.snapshot.scheduler, updatedAt: null,
+    host: state.snapshot.scheduler.host && { ...state.snapshot.scheduler.host, sampledAt: 0 } };
+  const renderKey = JSON.stringify({ queue: state.snapshot?.queue, jobs: state.snapshot?.jobs, scheduler: schedulerContent,
     disabled, error: state.error, busy: state.busy, selected: state.selected,
-    confirmation: state.confirmation, limit: byId("limit").value });
+    confirmation: state.confirmation, limit: byId("limit").value, mode: modeInput()?.value });
   if (renderKey === state.renderKey) return;
   state.renderKey = renderKey;
   byId("error").hidden = !state.error;
@@ -177,10 +195,14 @@ function render() {
   byId("refresh").disabled = state.busy;
   byId("limit").disabled = disabled;
   byId("apply-limit").disabled = disabled || Number(byId("limit").value) === state.snapshot?.queue.limit;
+  byId("scheduling-modes").disabled = disabled || !state.snapshot?.scheduler;
+  byId("apply-scheduling").disabled = disabled || !state.snapshot?.scheduler || !modeInput() || modeInput().value === state.snapshot.scheduler.mode;
   byId("connection").className = `connection ${stale() ? "stale" : "live"}`;
   byId("connection-text").textContent = state.busy ? "Updating queue…" : !state.snapshot ? state.error ? "Disconnected" : "Connecting to your Mac…" : stale() ? `Offline · Last updated ${dateFormat.format(new Date(state.lastSuccess))}` : "Connected · Updates every 5 seconds";
   if (!state.snapshot) return;
-  const { queue, jobs } = state.snapshot;
+  const { queue, jobs, scheduler } = state.snapshot;
+  byId("scheduler-status").textContent = scheduler ? `${modeLabel(scheduler.mode)} · ${scheduler.available ? "Resource monitoring active" : "Resource monitoring unavailable"}${scheduler.reason ? ` · ${scheduler.reason}` : ""}` : "Resource monitoring unavailable. Update the queue controller to enable scheduling controls.";
+  byId("host-status").textContent = scheduler?.host ? `Memory pressure ${scheduler.host.memoryPressure} · ${bytes(scheduler.host.availableMemoryBytes)} available of ${bytes(scheduler.host.totalMemoryBytes)} · CPU ${scheduler.host.cpuBusyCores.toFixed(1)}/${scheduler.host.cpuCores} cores · swap ${bytes(scheduler.host.swapUsedBytes)}${scheduler.host.complete === false ? " · Collecting rates" : ""}` : "Host measurements unavailable.";
   byId("running-count").textContent = String(queue.running);
   byId("waiting-count").textContent = String(queue.waiting);
   byId("limit-count").textContent = String(queue.limit);
@@ -219,7 +241,7 @@ function renderConfirmation() {
   const job = state.snapshot.jobs.find((item) => item.id === confirmation.id);
   const start = confirmation.action === "start";
   byId("confirmation-title").textContent = `${start ? "Start" : "Cancel"} ${job ? jobName(job) : `job #${confirmation.id}`}?`;
-  byId("confirmation-copy").textContent = start ? `Run this job now alongside ${state.snapshot.queue.running} active job${state.snapshot.queue.running === 1 ? "" : "s"}, without changing the parallel limit. This can increase memory pressure.` : "This stops the selected job and its owned child processes. Its output remains available.";
+  byId("confirmation-copy").textContent = start ? `Run this job now alongside ${state.snapshot.queue.running} active job${state.snapshot.queue.running === 1 ? "" : "s"}, bypassing the parallel limit and adaptive resource checks. This can increase memory pressure.` : "This stops the selected job and its owned child processes. Its output remains available.";
   byId("confirm-action").textContent = state.busy ? "Updating…" : start ? "Start in parallel" : "Cancel job";
   byId("confirm-action").className = start ? "" : "destructive";
   byId("confirm-action").disabled = actionsDisabled() || !eligible(job, confirmation.action);
@@ -255,6 +277,15 @@ function renderDetail() {
   document.title = `${jobName(job)} | Agent Queue`;
   const rows = [["Project", job.project || "—"], ["Branch", job.branch || "—"], ["Directory", job.directory || "—"], ["Executable", job.executable || "—"], ["Phase", readable(job.phase || job.state)], ["Submitted", when(job.submittedAt)], ["Started", when(job.startedAt)], ["Finished", when(job.finishedAt)]];
   if (job.exitCode !== null) rows.push(["Exit code", String(job.exitCode)]);
+  if (job.resources) {
+    rows.push(["Prediction", predictionText(job.resources.prediction)]);
+    if (job.resources.prediction.durationSeconds !== null) rows.push(["Expected duration", `${Math.round(job.resources.prediction.durationSeconds)} seconds`]);
+    if (job.resources.observed) {
+      rows.push(["Measured usage", observedText(job.resources.observed)]);
+      rows.push(["CPU cost", `${job.resources.observed.cpuSeconds.toFixed(1)} CPU-seconds over ${job.resources.observed.durationSeconds.toFixed(1)} seconds (${job.resources.observed.samples} samples)`]);
+    } else rows.push(["Measured usage", "No measurements available."]);
+    if (job.resources.decision) rows.push(["Admission", job.resources.decision.reason]);
+  } else rows.push(["Resources", "No measurements or predictions available."]);
   byId("detail-metadata").replaceChildren(...rows.flatMap(([label, value]) => [element("dt", "", label), element("dd", "", value)]));
 }
 
@@ -294,6 +325,12 @@ byId("limit-form").addEventListener("submit", (event) => {
   event.preventDefault();
   const limit = Number(byId("limit").value);
   if (Number.isInteger(limit) && limit >= 1 && limit <= 8) void mutate("limit", null, limit);
+});
+for (const input of document.querySelectorAll('input[name="mode"]')) input.addEventListener("change", () => { state.modeDirty = true; render(); });
+byId("scheduling-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const mode = schedulingModeSchema.safeParse(modeInput()?.value);
+  if (mode.success) void mutate("scheduling", null, mode.data);
 });
 byId("confirm-action").addEventListener("click", () => {
   if (state.confirmation) void mutate(state.confirmation.action, state.confirmation.id);

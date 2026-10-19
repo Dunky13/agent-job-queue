@@ -121,3 +121,64 @@ test("limit, queue order and confirmed cancellation call only their selected con
   await expect(page.locator("#running-count")).toHaveText("0");
   expect(await queueFixture.events()).toEqual([["limit", "2"], ["next", "103"], ["cancel", "101"]]);
 });
+
+const scheduler = { mode: "shadow", available: true, reason: "Learning resource profiles", updatedAt: "2026-10-19T10:00:00Z",
+  host: { sampledAt: 1792404000, totalMemoryBytes: 17179869184, availableMemoryBytes: 4294967296,
+    cpuCores: 8, cpuBusyCores: 2.5, memoryPressure: "warning", swapUsedBytes: 1073741824,
+    swapInBytesPerSecond: 0, swapOutBytesPerSecond: 0, diskFreeBytes: 21474836480, machine: "arm64", complete: false } };
+const resources = { prediction: { memoryBytes: 2147483648, cpuCores: 2, durationSeconds: 60,
+  samples: 3, confidence: "low", source: "family" }, observed: { memoryBytes: 1073741824,
+  peakMemoryBytes: 1610612736, cpuSeconds: 20, cpuCores: 1.5, durationSeconds: 15,
+  samples: 5, complete: false }, decision: { allowed: false, reason: "Waiting for memory headroom" } };
+
+test("missing telemetry remains unavailable and disables mode changes", async ({ page }) => {
+  await openQueue(page);
+  await expect(page.locator("#scheduler-status")).toContainText("Resource monitoring unavailable");
+  await expect(page.locator("#host-status")).toHaveText("Host measurements unavailable.");
+  await expect(page.getByRole("radio", { name: "Adaptive", exact: true })).toBeDisabled();
+});
+
+test("resource telemetry, admission reasons and mode controls work on mobile and desktop", async ({ page, queueFixture }) => {
+  await queueFixture.update({ scheduler, resources });
+  await page.clock.install();
+  await openQueue(page);
+  await expect(page.locator("#scheduler-status")).toContainText("Learn only");
+  await expect(page.locator("#host-status")).toContainText("Memory pressure warning");
+  await expect(page.locator("#host-status")).toContainText("Collecting rates");
+  await expect(page.locator("#waiting-jobs")).toContainText("low confidence (3 runs, family)");
+  await expect(page.locator("#waiting-jobs")).toContainText("peak 1.5 GiB");
+  await expect(page.locator("#waiting-jobs")).toContainText("Waiting for memory headroom");
+  await page.getByRole("radio", { name: "Adaptive", exact: true }).check();
+  await page.evaluate(() => {
+    window.fixtureTelemetryMutations = [];
+    window.fixtureTelemetryObserver = new MutationObserver((records) => window.fixtureTelemetryMutations.push(...records.map((record) => record.type)));
+    window.fixtureTelemetryObserver.observe(document.body, { attributes: true, childList: true, characterData: true, subtree: true });
+  });
+  await queueFixture.update({ scheduler: { ...scheduler, updatedAt: "2026-10-19T10:00:05Z", host: { ...scheduler.host, sampledAt: scheduler.host.sampledAt + 5 } } });
+  await backgroundPoll(page);
+  expect(await page.evaluate(() => window.fixtureTelemetryMutations)).toEqual([]);
+  await expect(page.getByRole("radio", { name: "Adaptive", exact: true })).toBeChecked();
+  await page.getByRole("button", { name: "Set mode", exact: true }).click();
+  await expect(page.locator("#scheduler-status")).toContainText("Adaptive");
+  expect(await queueFixture.events()).toEqual([["scheduling", "adaptive"]]);
+  for (const width of [375, 390, 1280]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  }
+  await page.locator('[data-focus-key="102-details"]').click();
+  await expect(page.locator("#detail-metadata")).toContainText("20.0 CPU-seconds");
+  await expect(page.locator("#detail-metadata")).toContainText("Waiting for memory headroom");
+});
+
+test("unavailable sampler permits fixed and learning while rejecting adaptive honestly", async ({ page, queueFixture }) => {
+  await queueFixture.update({ scheduler: { ...scheduler, mode: "fixed", available: false, reason: "Sampling failed", host: null } });
+  await openQueue(page);
+  await expect(page.locator("#scheduler-status")).toContainText("Sampling failed");
+  await page.getByRole("radio", { name: "Learn only", exact: true }).check();
+  await page.getByRole("button", { name: "Set mode", exact: true }).click();
+  await expect(page.locator("#scheduler-status")).toContainText("Learn only");
+  await page.getByRole("radio", { name: "Adaptive", exact: true }).check();
+  await page.getByRole("button", { name: "Set mode", exact: true }).click();
+  await expect(page.locator("#error")).toContainText("Resource sampler unavailable");
+  await expect(page.locator("#scheduler-status")).toContainText("Learn only");
+});

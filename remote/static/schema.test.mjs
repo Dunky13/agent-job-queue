@@ -10,9 +10,29 @@ const job = {
   canCancel: true, phase: "Queued",
 };
 const snapshot = { updatedAt: "2026-10-18T19:44:39.127731+00:00", queue: { status: "running", limit: 1, running: 0, waiting: 1, legacyOccupied: false }, jobs: [job] };
+const host = { sampledAt: 1792340000, totalMemoryBytes: 17179869184, availableMemoryBytes: 4294967296,
+  cpuCores: 8, cpuBusyCores: 2.5, memoryPressure: "normal", swapUsedBytes: 1073741824,
+  swapInBytesPerSecond: 0, swapOutBytesPerSecond: 0, diskFreeBytes: 21474836480, machine: "arm64", complete: false };
+const resources = { prediction: { memoryBytes: 2147483648, cpuCores: 2, durationSeconds: 60,
+  samples: 3, confidence: "low", source: "family" }, observed: { memoryBytes: 1073741824,
+  peakMemoryBytes: 1610612736, cpuSeconds: 20, cpuCores: 1.5, durationSeconds: 15,
+  samples: 5, complete: false }, decision: { allowed: false, reason: "Waiting for memory headroom" } };
 
 test("accepts the real queue timestamp precision and explicit nullable lifecycle fields", () => {
   assert.deepEqual(snapshotSchema.parse(snapshot), snapshot);
+});
+test("accepts optional scheduler telemetry and typed job resources without inventing missing values", () => {
+  assert.equal(snapshotSchema.parse(snapshot).scheduler, undefined);
+  assert.equal(snapshotSchema.parse(snapshot).jobs[0].resources, undefined);
+  const value = { ...snapshot, scheduler: { mode: "shadow", available: true, reason: "Learning",
+    updatedAt: snapshot.updatedAt, host }, jobs: [{ ...job, resources }] };
+  assert.deepEqual(snapshotSchema.parse(value), value);
+  assert.equal(snapshotSchema.safeParse({ ...value, scheduler: { ...value.scheduler, mode: "auto" } }).success, false);
+  assert.equal(snapshotSchema.safeParse({ ...value, scheduler: { ...value.scheduler, host: { ...host, availableMemoryBytes: -1 } } }).success, false);
+  assert.equal(snapshotSchema.safeParse({ ...value, jobs: [{ ...job, resources: { ...resources, prediction: { ...resources.prediction, confidence: "certain" } } }] }).success, false);
+  assert.equal(snapshotSchema.safeParse({ ...value, jobs: [{ ...job, resources: { ...resources, observed: { ...resources.observed, cpuSeconds: -1 } } }] }).success, false);
+  const unavailable = { ...snapshot, scheduler: { mode: "adaptive", available: false, reason: "Sampling failed", updatedAt: null, host: null } };
+  assert.deepEqual(snapshotSchema.parse(unavailable), unavailable);
 });
 test("rejects missing permissions, invalid limits, malformed timestamps, and duplicate IDs", () => {
   assert.equal(snapshotSchema.safeParse({ ...snapshot, queue: { ...snapshot.queue, limit: 9 } }).success, false);

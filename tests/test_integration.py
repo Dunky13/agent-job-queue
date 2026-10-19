@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -197,6 +198,56 @@ while not pathlib.Path(sys.argv[2]).exists():
 
     def task_state(self, task_id):
         return json.loads(self.pueue("status", "--json").stdout)["tasks"][str(task_id)]["status"]
+
+    @contextlib.contextmanager
+    def resource_controller(self, *, pressure="normal"):
+        """Real daemon and ownership, deterministic resource demand, no host load."""
+        host_file = self.root / "resource-host.json"
+        host_file.write_text(json.dumps({"memoryPressure": pressure}))
+        script = self.root / "resource-controller.py"
+        script.write_text('''import json,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+import agent_heavy,resource_scheduler
+class Sampler:
+ def __init__(self): self.groups={}
+ def host(self):
+  return dict(sampledAt=time.time(),totalMemoryBytes=16*1024**3,availableMemoryBytes=12*1024**3,
+   cpuCores=12,cpuBusyCores=.2,memoryPressure="normal",swapUsedBytes=0,
+   swapInBytesPerSecond=0.,swapOutBytesPerSecond=0.,diskFreeBytes=100*1024**3,
+   machine="acceptance-machine",complete=True,**{}) | json.loads(Path(sys.argv[2]).read_text())
+ def group(self,pgid,expected_members):
+  count=self.groups.get(pgid,0);self.groups[pgid]=count+1
+  return dict(memoryBytes=64*1024**2,cpuSeconds=count*.1,cpuCores=.05,
+   processCount=len(expected_members),complete=count>0,baseline=count==0)
+ def forget_group(self,pgid): self.groups.pop(pgid,None)
+resource_scheduler.serve(agent_heavy.Gate(),sampler=Sampler())
+''')
+        log = (self.root / "resource-controller.log").open("w+")
+        controller = subprocess.Popen([PYTHON, str(script), str(MODULE.parent), str(host_file)],
+                                      env=self.env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            until(lambda: json.loads(self.control("status", "--json").stdout)["scheduler"]["available"])
+            yield host_file, controller
+        finally:
+            controller.terminate()
+            controller.wait(timeout=8)
+            for task_id, task in json.loads(self.pueue("status", "--json").stdout)["tasks"].items():
+                if "Done" not in task["status"]:
+                    self.control("cancel", task_id)
+            self.control("scheduling", "fixed")
+            log.close()
+
+    def seed_resource_profile(self):
+        from job_profiles import ProfileStore, identify_workload
+        environment = dict(self.env, AGENT_HEAVY_PROFILE="adaptive-acceptance")
+        workload = identify_workload([PYTHON, "-c", "pass"], str(Path.cwd()), environment)
+        with ProfileStore(self.state) as store:
+            for number in range(5):
+                store.record(f"acceptance-{time.time_ns()}-{number}", workload, "acceptance-machine",
+                             {"memoryBytes": 256 * 1024 ** 2, "cpuSeconds": .1,
+                              "cpuCores": .2, "durationSeconds": 1}, complete=True, exit_code=0)
+        return environment
 
     def test_01_cwd_environment_arguments_and_exact_failure(self):
         work = self.root / "working directory"
@@ -555,6 +606,93 @@ print('PREVIOUS-CHILD-GONE')
             self.control("limit", limit, expected=125)
         snapshot = json.loads(self.control("status", "--json").stdout)
         self.assertEqual(snapshot["queue"]["limit"], 1)
+
+    def test_21_adaptive_admission_overlaps_known_jobs_and_respects_lowered_cap(self):
+        environment = self.seed_resource_profile()
+        with self.resource_controller():
+            self.control("limit", 2)
+            self.control("scheduling", "adaptive")
+            started = [self.root / f"adaptive-{index}.started" for index in range(3)]
+            release = [self.root / f"adaptive-{index}.release" for index in range(3)]
+            code = "import pathlib,sys,time;pathlib.Path(sys.argv[1]).touch()\nwhile not pathlib.Path(sys.argv[2]).exists():time.sleep(.05)"
+            first = self.launch(code, started[0], release[0], env=environment)
+            self.queued_id(first)
+            until(started[0].exists)
+            second = self.launch(code, started[1], release[1], env=environment)
+            self.queued_id(second)
+            until(started[1].exists)
+            self.control("limit", 1)
+            third = self.launch(code, started[2], release[2], env=environment)
+            third_id = self.queued_id(third)
+            until(lambda: "Stashed" in self.task_state(third_id))
+            release[0].touch()
+            self.finish(first)
+            self.assertFalse(started[2].exists())
+            release[1].touch()
+            self.finish(second)
+            until(started[2].exists)
+            release[2].touch()
+            self.finish(third)
+
+    def test_22_pressure_holds_jobs_and_recovers_without_changing_limit(self):
+        with self.resource_controller(pressure="warning") as (host_file, _controller):
+            self.control("scheduling", "adaptive")
+            started = self.root / "adaptive-pressure.started"
+            client = self.launch("import pathlib,sys;pathlib.Path(sys.argv[1]).touch()", started)
+            task_id = self.queued_id(client)
+            until(lambda: "Stashed" in self.task_state(task_id))
+            status = json.loads(self.control("status", "--json").stdout)
+            self.assertEqual(status["queue"]["limit"], 1)
+            self.assertFalse(started.exists())
+            temporary = host_file.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"memoryPressure": "normal"}))
+            temporary.replace(host_file)
+            until(started.exists, timeout=25)
+            self.finish(client)
+
+    def test_23_controller_loss_holds_new_jobs_and_manual_start_is_explicit(self):
+        with self.resource_controller() as (_host_file, controller):
+            self.control("scheduling", "adaptive")
+            controller.terminate()
+            controller.wait(timeout=8)
+            started = self.root / "adaptive-manual.started"
+            client = self.launch("import pathlib,sys;pathlib.Path(sys.argv[1]).touch()", started)
+            task_id = self.queued_id(client)
+            self.assertIn("Stashed", self.task_state(task_id))
+            self.assertFalse(started.exists())
+            self.control("start", task_id)
+            until(started.exists)
+            self.finish(client)
+
+    def test_24_shadow_never_controls_and_adaptive_migrates_existing_jobs(self):
+        with self.resource_controller(pressure="critical"):
+            self.control("scheduling", "shadow")
+            until(lambda: json.loads(self.control("status", "--json").stdout)["scheduler"]["available"])
+            client = self.launch("print('SHADOW')")
+            out, _err = self.finish(client)
+            self.assertEqual(out, "SHADOW\n")
+            blocker, _blocker_id, blocker_started, blocker_release = self.holding("migration-blocker")
+            until(blocker_started.exists)
+            started = self.root / "adaptive-migration.started"
+            client = self.launch("import pathlib,sys;pathlib.Path(sys.argv[1]).touch()", started)
+            task_id = self.queued_id(client)
+            self.pueue("pause", "--wait")
+            receipt = json.loads((self.state / "receipts" / f"{task_id}.json").read_text())
+            workload_path = self.state / "workloads" / f"{receipt['token']}.json"
+            workload_path.unlink()
+            self.control("scheduling", "adaptive")
+            until(workload_path.exists)
+            self.assertIn("Stashed", self.task_state(task_id))
+            self.assertFalse(started.exists())
+            # Returning to fixed scheduling releases managed jobs through Pueue,
+            # while preserving its deliberately paused queue state.
+            self.control("scheduling", "fixed")
+            self.assertIn("Queued", self.task_state(task_id))
+            blocker_release.touch()
+            self.finish(blocker)
+            self.pueue("start")
+            until(started.exists)
+            self.finish(client)
 
     def test_99_daemon_crash_pauses_queue_until_owned_work_is_reconciled(self):
         started = self.root / "crash.started"

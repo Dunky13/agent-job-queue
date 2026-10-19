@@ -21,6 +21,9 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+import resource_scheduler
+from job_profiles import ProfileError
+
 TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 MODULE = str(Path(__file__).resolve())
 OVERRIDES = ("AGENT_HEAVY_CONFIG", "AGENT_HEAVY_STATE", "AGENT_HEAVY_LEGACY_SLOT", "AGENT_HEAVY_PUEUE")
@@ -66,7 +69,8 @@ class Gate:
         return executable
 
     def prepare(self):
-        for directory in (self.state, self.jobs, self.receipts, self.cancelled, self.metadata):
+        for directory in (self.state, self.jobs, self.receipts, self.cancelled, self.metadata,
+                          self.state / "workloads", self.state / "resource-runs"):
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             info = directory.lstat()
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
@@ -329,6 +333,8 @@ def run(gate: Gate, argv: list[str], label: str | None = None) -> int:
     payload = gate.payload_path(token)
     description = make_description(gate, argv, os.getcwd(), label)
     cache_description(gate, token, description)
+    from job_profiles import identify_workload
+    write_private(gate.state / "workloads" / f"{token}.json", identify_workload(argv, os.getcwd(), dict(os.environ)))
     forwarded = {key: value for key, value in os.environ.items() if not key.startswith(("AGENT_HEAVY_", "PUEUE_"))}
     content = {"argv": argv, "cwd": os.getcwd(), "env": forwarded, "token": token, "label": description["title"], "explicit_label": label is not None}
     write_private(payload, content)
@@ -339,14 +345,17 @@ def run(gate: Gate, argv: list[str], label: str | None = None) -> int:
             try:
                 # add persists Queued state; Pueue 4.0.4 enqueue does not save it.
                 # The helper waits for the acknowledged identity before execution.
-                added = gate.pueue("add", "--escape", "--print-task-id", "--label", description["title"], "--",
-                                   "exec", sys.executable, MODULE, "execute", token)
-                if not added.stdout.strip().isdigit():
-                    raise GateError("Pueue did not acknowledge a numeric task ID")
-                task_id = int(added.stdout.strip())
-                content["task_id"] = task_id
-                write_private(payload, content)
-                write_private(gate.receipt_path(task_id), {"task_id": task_id, "token": token})
+                with private_lock(gate, "scheduling.lock"):
+                    managed = resource_scheduler.settings(gate)["mode"] == "adaptive"
+                    options = ["--stashed"] if managed else []
+                    added = gate.pueue("add", *options, "--escape", "--print-task-id", "--label", description["title"], "--",
+                                       "exec", sys.executable, MODULE, "execute", token)
+                    if not added.stdout.strip().isdigit():
+                        raise GateError("Pueue did not acknowledge a numeric task ID")
+                    task_id = int(added.stdout.strip())
+                    content.update(task_id=task_id, resource_managed=managed)
+                    write_private(payload, content)
+                    write_private(gate.receipt_path(task_id), {"task_id": task_id, "token": token})
                 print(f"agent-heavy: job {task_id} queued", file=sys.stderr, flush=True)
             finally:
                 signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
@@ -416,6 +425,8 @@ def execute(gate: Gate, token: str) -> int:
         raise GateError("Cannot establish the helper process birth identity")
     marker = {"task_id": task_id, "token": token, "pgid": pgid, "pid": os.getpid(),
               "boot_uuid": boot_identity(), "initial_members": initial, "members": initial}
+    if content.get("resource_managed"):
+        marker["resourceManaged"] = True
     with helper_interrupts() as cancelled:
         while True:
             if cancelled[0]:
@@ -622,6 +633,14 @@ def lease_capacity(gate: Gate) -> int:
 def acquire_lease(gate: Gate, marker: dict, capacity: int = 1) -> bool:
     """Join our shared lease, or wait behind an external/old singleton owner."""
     with private_lock(gate), publication_signals():
+        count = 0
+        if gate.slot.exists():
+            manifest = shared_manifest(gate)
+            if manifest is None:
+                return False
+            count = len(list((gate.slot / "agent-heavy-jobs").iterdir()))
+        if not resource_scheduler.permit(gate, marker, count):
+            return False
         try:
             gate.slot.mkdir(mode=0o700)
         except FileExistsError:
@@ -873,6 +892,7 @@ def describe_task(gate: Gate, task: dict, state_name: str) -> dict:
 def status_data(gate: Gate) -> dict:
     gate.prepare()
     snapshot = gate.snapshot()
+    scheduling = resource_scheduler.view(gate)
     jobs = []
     entries = list(snapshot["tasks"].items())
     recent_done = sorted((entry for entry in entries if task_status(entry[1])[0] == "Done"),
@@ -883,7 +903,14 @@ def status_data(gate: Gate) -> dict:
         name, details = task_status(task)
         state_name = name.lower()
         receipt = gate.receipt(task_id)
+        token = command_token(task)
+        resources = scheduling["jobs"].get(token)
+        owned_waiting = name == "Stashed" and token is not None
+        if owned_waiting:
+            state_name = "queued"
         phase = "Waiting for shared validation slot" if name == "Running" and receipt is not None and "pgid" not in receipt else name
+        if (owned_waiting or name == "Queued") and scheduling["mode"] == "adaptive":
+            phase = ((resources or {}).get("decision") or {}).get("reason", "Waiting for resource admission")
         if name == "Done" and receipt is not None:
             phase = "Finishing cleanup"
         priority = task.get("priority", 0)
@@ -894,8 +921,9 @@ def status_data(gate: Gate) -> dict:
                      "startedAt": details.get("start"), "finishedAt": details.get("end"),
                      "exitCode": result_code(details.get("result")) if name == "Done" else None,
                      "logPath": str(gate.state / "pueue/task_logs" / f"{task_id}.log"),
-                     "canReorder": name == "Queued", "canStart": name == "Queued", "canCancel": name in ("Queued", "Stashed", "Running", "Paused"),
-                     "phase": phase})
+                     "canReorder": name == "Queued" or owned_waiting, "canStart": name == "Queued" or owned_waiting,
+                     "canCancel": name in ("Queued", "Stashed", "Running", "Paused"), "phase": phase,
+                     **({"resources": resources} if resources is not None else {})})
     active = sorted((job for job in jobs if job["state"] in ("running", "paused")), key=lambda job: job["id"])
     waiting = sorted((job for job in jobs if job["state"] not in ("running", "paused", "done")), key=lambda job: (-job["priority"], job["id"]))
     queued = [job for job in waiting if job["state"] == "queued"]
@@ -906,7 +934,8 @@ def status_data(gate: Gate) -> dict:
     return {"updatedAt": datetime.now(UTC).isoformat(),
             "queue": {"status": str(group.get("status", "unknown")).lower(), "limit": group.get("parallel_tasks", 1),
                       "running": len(active), "waiting": len(waiting), "legacyOccupied": legacy_occupied(gate)},
-            "jobs": [*active, *waiting, *done]}
+            "jobs": [*active, *waiting, *done],
+            "scheduler": {key: scheduling[key] for key in ("mode", "available", "reason", "updatedAt", "host")}}
 
 
 def status(gate: Gate, as_json: bool = False):
@@ -916,6 +945,7 @@ def status(gate: Gate, as_json: bool = False):
         return
     queue = data["queue"]
     print(f"Queue {queue['status']}: {queue['running']} running, {queue['waiting']} waiting; limit {queue['limit']}")
+    print(f"Scheduling {data['scheduler']['mode']}: {data['scheduler']['reason']}")
     for job in data["jobs"]:
         context = f"{job['project']} / {job['branch']}" if job["branch"] else job["project"]
         suffix = f"; exit={job['exitCode']}" if job["exitCode"] is not None else ""
@@ -981,33 +1011,29 @@ def set_limit(gate: Gate, limit: int):
     gate.prepare()
     with control_budget(gate), private_lock(gate, "settings.lock"):
         gate.pueue("parallel", str(limit), "--group", "default")
-        # Pueue 4.0.4 parallel changes memory only. An empty control group
-        # provides a supported save barrier without touching job states/IDs.
-        barrier = f"agent-heavy-save-{uuid.uuid4().hex}"
-        added = False
-        try:
-            gate.pueue("group", "add", barrier, "--parallel", "1")
-            added = True
-        except GateError as error:
-            raise GateError(f"Limit {limit} may be active but its save barrier failed; inspect memory and persisted settings") from error
-        finally:
-            if added:
-                try:
-                    gate.pueue("group", "remove", barrier)
-                except GateError as error:
-                    raise GateError(f"Limit {limit} may be active; temporary save group {barrier} could not be removed") from error
+        save_barrier(gate)
         current = gate.snapshot().get("groups", {}).get("default", {}).get("parallel_tasks")
         if current != limit or persisted_limit(gate) != limit:
             raise GateError(f"Limit {limit} could not be verified in memory and persisted state; inspect queue settings")
 
 
+def save_barrier(gate: Gate):
+    # Pueue 4.0.4 parallel/enqueue changes are not saved immediately. A supported
+    # group mutation persists them without editing daemon state on disk.
+    barrier = f"agent-heavy-save-{uuid.uuid4().hex}"
+    gate.pueue("group", "add", barrier, "--parallel", "1")
+    gate.pueue("group", "remove", barrier)
+
+
 def start_job(gate: Gate, task_id: int):
     if task_id < 0:
         raise GateError("Task ID must be nonnegative")
-    with control_budget(gate):
+    with control_budget(gate), private_lock(gate, "scheduling.lock"):
         task = gate.task(task_id)
-        if task_status(task)[0] != "Queued" or command_token(task) is None:
+        token = command_token(task)
+        if task_status(task)[0] not in ("Queued", "Stashed") or token is None:
             raise GateError(f"Only a queued agent-heavy job can be started; inspect job {task_id}")
+        resource_scheduler.manual_grant(gate, task_id, token)
         gate.pueue("start", str(task_id))
         name, _ = task_status(gate.task(task_id))
         if name not in ("Running", "Done"):
@@ -1043,9 +1069,10 @@ def reorder(gate: Gate, task_id: int, action: str, priority: int | None = None) 
     snapshot = gate.snapshot()
     task = snapshot["tasks"].get(str(task_id))
     name, _ = task_status(task)
-    if name != "Queued":
+    if name not in ("Queued", "Stashed"):
         raise GateError(f"Only queued jobs can be reordered; job {task_id} is {name.lower()}")
-    priorities = [candidate.get("priority", 0) for candidate in snapshot["tasks"].values() if task_status(candidate)[0] == "Queued"]
+    priorities = [candidate.get("priority", 0) for candidate in snapshot["tasks"].values()
+                  if task_status(candidate)[0] in ("Queued", "Stashed")]
     if not all(type(value) is int for value in priorities):
         raise GateError("Pueue returned an invalid queue priority")
     if action == "next":
@@ -1091,6 +1118,10 @@ def main(argv: list[str] | None = None) -> int:
     limit_parser.add_argument("count", type=int)
     start_parser = subparsers.add_parser("start", help="start one queued job now, bypassing the parallel limit")
     start_parser.add_argument("task_id", type=int)
+    scheduling_parser = subparsers.add_parser("scheduling", help="choose fixed, shadow, or adaptive resource admission")
+    scheduling_parser.add_argument("mode", choices=resource_scheduler.MODES)
+    controller_parser = subparsers.add_parser("scheduler", help="run the independent resource controller")
+    controller_parser.add_argument("--once", action="store_true", help="sample and reconcile once")
     agents_parser = subparsers.add_parser("agents", help="manage optional coding-agent queue instructions")
     agents_parser.add_argument("operation", choices=("status", "install", "remove"))
     agents_parser.add_argument("--runner", choices=("codex", "claude"))
@@ -1133,11 +1164,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "start":
             start_job(gate, args.task_id)
             print(f"agent-heavy: job {args.task_id} started now")
+        elif args.action == "scheduling":
+            resource_scheduler.set_mode(gate, args.mode)
+            print(f"agent-heavy: scheduling mode {args.mode} saved")
+        elif args.action == "scheduler":
+            resource_scheduler.serve(gate, once=args.once)
         return 0
-    except (GateError, OSError, ValueError, KeyError) as error:
+    except (GateError, ProfileError, resource_scheduler.SchedulingError, OSError, ValueError, KeyError) as error:
         print(f"agent-heavy: {error}", file=sys.stderr)
         return 125
 
 
 if __name__ == "__main__":
+    sys.modules["agent_heavy"] = sys.modules[__name__]
     sys.exit(main())

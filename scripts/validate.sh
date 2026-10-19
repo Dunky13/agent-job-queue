@@ -8,6 +8,8 @@ export PATH="$root/.venv/bin:$PATH"
 export AGENT_QUEUE_TEST_PYTHON="$root/.venv/bin/python"
 bash scripts/lint.sh
 python -m unittest discover -s tests -p test_agent_heavy.py -v
+python -m unittest discover -s tests -p 'test_resource*.py' -v
+python -m unittest discover -s tests -p test_job_profiles.py -v
 python -m unittest discover -s tests -p test_agent_integration.py -v
 python -m unittest discover -s tests -p test_integration.py -v
 python -m unittest discover -s remote/tests -p test_remote.py -v

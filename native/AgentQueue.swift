@@ -7,9 +7,10 @@ struct QueueSnapshot: Codable, Sendable {
     let updatedAt: String
     let queue: QueueSummary
     let jobs: [QueueJob]
+    var scheduler: QueueScheduler? = nil
 
     func hasSameContent(as other: QueueSnapshot) -> Bool {
-        queue == other.queue && jobs == other.jobs
+        queue == other.queue && jobs == other.jobs && scheduler == other.scheduler
     }
 }
 
@@ -19,6 +20,90 @@ struct QueueSummary: Codable, Sendable, Equatable {
     let running: Int
     let waiting: Int
     let legacyOccupied: Bool
+}
+
+enum SchedulingMode: String, Codable, CaseIterable, Sendable {
+    case fixed, shadow, adaptive
+    var label: String {
+        switch self { case .fixed: "Fixed"; case .shadow: "Learn only"; case .adaptive: "Adaptive" }
+    }
+}
+
+struct QueueScheduler: Codable, Sendable, Equatable {
+    let mode: SchedulingMode
+    let available: Bool
+    let reason: String
+    let updatedAt: String?
+    let host: HostResources?
+    var summary: String { "\(mode.label) · Resource monitoring \(available ? "active" : "unavailable")" }
+    static func == (lhs: QueueScheduler, rhs: QueueScheduler) -> Bool {
+        // Acquisition timestamps alone do not change the rendered dashboard.
+        lhs.mode == rhs.mode && lhs.available == rhs.available && lhs.reason == rhs.reason && lhs.host == rhs.host
+    }
+}
+
+struct HostResources: Codable, Sendable, Equatable {
+    let sampledAt: Double
+    let totalMemoryBytes: Int64
+    let availableMemoryBytes: Int64
+    let cpuCores: Int
+    let cpuBusyCores: Double
+    let memoryPressure: String
+    let swapUsedBytes: Int64
+    let swapInBytesPerSecond: Double
+    let swapOutBytesPerSecond: Double
+    let diskFreeBytes: Int64
+    let machine: String
+    var complete: Bool? = nil
+    static func == (lhs: HostResources, rhs: HostResources) -> Bool {
+        lhs.totalMemoryBytes == rhs.totalMemoryBytes && lhs.availableMemoryBytes == rhs.availableMemoryBytes &&
+        lhs.cpuCores == rhs.cpuCores && lhs.cpuBusyCores == rhs.cpuBusyCores && lhs.memoryPressure == rhs.memoryPressure &&
+        lhs.swapUsedBytes == rhs.swapUsedBytes && lhs.swapInBytesPerSecond == rhs.swapInBytesPerSecond &&
+        lhs.swapOutBytesPerSecond == rhs.swapOutBytesPerSecond && lhs.diskFreeBytes == rhs.diskFreeBytes &&
+        lhs.machine == rhs.machine && lhs.complete == rhs.complete
+    }
+    var summary: String {
+        "Memory pressure \(memoryPressure) · \(resourceBytes(availableMemoryBytes)) available · CPU \(cpuBusyCores.formatted(.number.precision(.fractionLength(1))))/\(cpuCores) cores\(complete == false ? " · Collecting rates" : "")"
+    }
+}
+
+struct ResourcePrediction: Codable, Sendable, Equatable {
+    let memoryBytes: Int64
+    let cpuCores: Double
+    let durationSeconds: Double?
+    let samples: Int
+    let confidence: String
+    let source: String
+    var summary: String {
+        "Estimate \(resourceBytes(memoryBytes)) · \(resourceCores(cpuCores)) · \(confidence) confidence (\(samples) runs, \(source))"
+    }
+}
+
+struct ResourceObservation: Codable, Sendable, Equatable {
+    let memoryBytes: Int64
+    let peakMemoryBytes: Int64
+    let cpuSeconds: Double
+    let cpuCores: Double
+    let durationSeconds: Double
+    let samples: Int
+    let complete: Bool
+    var summary: String {
+        "Memory \(resourceBytes(memoryBytes)) · peak \(resourceBytes(peakMemoryBytes)) · \(resourceCores(cpuCores))\(complete ? "" : samples > 0 ? " · partial sample coverage" : " · collecting")"
+    }
+}
+
+struct ResourceDecision: Codable, Sendable, Equatable { let allowed: Bool; let reason: String }
+struct JobResources: Codable, Sendable, Equatable {
+    let prediction: ResourcePrediction
+    let observed: ResourceObservation?
+    let decision: ResourceDecision?
+}
+
+func resourceBytes(_ value: Int64) -> String {
+    "\((Double(value) / 1_073_741_824).formatted(.number.precision(.fractionLength(0...2)))) GiB"
+}
+func resourceCores(_ value: Double) -> String {
+    "\(value.formatted(.number.precision(.fractionLength(0...1)))) CPU cores"
 }
 
 struct QueueJob: Codable, Identifiable, Sendable, Equatable {
@@ -39,10 +124,13 @@ struct QueueJob: Codable, Identifiable, Sendable, Equatable {
     let canReorder: Bool
     let canCancel: Bool
     let phase: String
+    var canStart: Bool? = nil
+    var resources: JobResources? = nil
 
     var name: String { title.isEmpty ? executable : title }
     var isWaiting: Bool { state == "queued" || state == "waiting" }
     var isRunning: Bool { state == "running" || state == "starting" || state == "cancelling" }
+    var permitsStart: Bool { isWaiting && (canStart ?? canReorder) }
     var distinctPhase: String? {
         let display = phase.replacingOccurrences(of: "_", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -177,6 +265,7 @@ final class QueueStore: ObservableObject {
     private var visibleSurfaces = 0
     private var pollTask: Task<Void, Never>?
     private let statusLoader: @Sendable () async throws -> Data
+    private let command: @Sendable ([String]) async throws -> Data
     private var refreshInFlight = false
     private var refreshRequested = false
     private var mutationRevision = 0
@@ -185,8 +274,9 @@ final class QueueStore: ObservableObject {
 
     init(statusLoader: @escaping @Sendable () async throws -> Data = {
         try await QueueClient.run(["status", "--json"])
-    }) {
+    }, command: @escaping @Sendable ([String]) async throws -> Data = { try await QueueClient.run($0) }) {
         self.statusLoader = statusLoader
+        self.command = command
         let args = CommandLine.arguments
         if let index = args.firstIndex(of: "--fixture"), args.indices.contains(index + 1) {
             fixtureMode = true
@@ -268,7 +358,7 @@ final class QueueStore: ObservableObject {
     @discardableResult
     func dispatch(_ action: String, job: QueueJob) -> Task<Void, Never>? {
         guard !actionsDisabled, ["next", "last", "cancel", "start"].contains(action) else { return nil }
-        guard action == "cancel" ? job.canCancel : job.canReorder else { return nil }
+        guard action == "cancel" ? job.canCancel : action == "start" ? job.permitsStart : job.isWaiting && job.canReorder else { return nil }
         // Reserve before scheduling asynchronous I/O so polling and other windows
         // cannot silently consume the user's confirmed action between these steps.
         isMutating = true
@@ -285,7 +375,7 @@ final class QueueStore: ObservableObject {
             return
         }
         do {
-            _ = try await QueueClient.run([action, String(job.id)])
+            _ = try await command([action, String(job.id)])
             switch action {
             case "next": notice = "Job #\(job.id) will run next."
             case "last": notice = "Job #\(job.id) moved to the end."
@@ -313,7 +403,7 @@ final class QueueStore: ObservableObject {
 
     private func completeLimit(_ limit: Int) async {
         do {
-            _ = try await QueueClient.run(["limit", String(limit)])
+            _ = try await command(["limit", String(limit)])
             notice = "Parallel job limit changed to \(limit)."
             error = nil
         } catch {
@@ -323,6 +413,27 @@ final class QueueStore: ObservableObject {
         }
         isMutating = false
         await refresh()
+    }
+
+    @discardableResult
+    func dispatchScheduling(_ mode: SchedulingMode) -> Task<Void, Never>? {
+        guard !fixtureMode, !actionsDisabled, let scheduler = snapshot?.scheduler, scheduler.mode != mode else { return nil }
+        isMutating = true
+        mutationRevision += 1
+        notice = nil
+        return Task {
+            do {
+                _ = try await command(["scheduling", mode.rawValue])
+                notice = "Scheduling changed to \(mode.label)."
+                error = nil
+            } catch {
+                self.error = error.localizedDescription
+                isMutating = false
+                return
+            }
+            isMutating = false
+            await refresh()
+        }
     }
 }
 
@@ -560,8 +671,8 @@ final class QueueNavigation: ObservableObject {
         }
         switch confirmation.action {
         case .start:
-            guard current.isWaiting && current.canReorder else {
-                return "This job is no longer waiting. It cannot be started again."
+            guard current.permitsStart else {
+                return "This job cannot be started from its current state. Return to the queue to see its latest status."
             }
         case .cancel:
             guard current.canCancel else {
@@ -588,6 +699,7 @@ struct QueuePanel: View {
     var fullWindow = false
     @StateObject private var navigation: QueueNavigation
     @State private var draftLimit = "1"
+    @State private var draftMode = SchedulingMode.fixed
 
     init(store: QueueStore, fullWindow: Bool = false, navigation: QueueNavigation = QueueNavigation()) {
         self.store = store
@@ -638,10 +750,14 @@ struct QueuePanel: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             draftLimit = String(store.snapshot?.queue.limit ?? 1)
+            draftMode = store.snapshot?.scheduler?.mode ?? .fixed
             store.appear(fullWindow: fullWindow)
         }
         .onChange(of: store.snapshot?.queue.limit) { _, value in
             if let value { draftLimit = String(value) }
+        }
+        .onChange(of: store.snapshot?.scheduler?.mode) { _, value in
+            if let value { draftMode = value }
         }
         .onDisappear { store.disappear(fullWindow: fullWindow) }
     }
@@ -687,6 +803,24 @@ struct QueuePanel: View {
                 Spacer(minLength: 0)
             }.disabled(store.fixtureMode || store.isMutating || store.snapshot == nil || store.error != nil)
             Text("Choose 1 to 8 jobs. Lowering the limit lets active jobs finish.").font(.caption2).foregroundStyle(.secondary)
+            if let scheduler = store.snapshot?.scheduler {
+                HStack(spacing: 8) {
+                    Picker("Scheduling", selection: $draftMode) {
+                        ForEach(SchedulingMode.allCases, id: \.self) { mode in Text(mode.label).tag(mode) }
+                    }.pickerStyle(.menu)
+                    Button("Set mode") { store.dispatchScheduling(draftMode) }
+                        .disabled(store.actionsDisabled || scheduler.mode == draftMode)
+                }.disabled(store.fixtureMode || store.actionsDisabled)
+                Text("Adaptive fits jobs within your parallel limit. Learn only records predictions. Running jobs are never stopped automatically.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text(scheduler.summary).font(.caption2).foregroundStyle(.secondary)
+                if !scheduler.reason.isEmpty { Text(scheduler.reason).font(.caption2).foregroundStyle(.secondary) }
+                Text(scheduler.host?.summary ?? "Host measurements unavailable.")
+                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Resource monitoring unavailable. Update the queue controller to enable scheduling controls.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
         }.padding(18)
     }
 
@@ -760,23 +894,38 @@ struct QueuePanel: View {
                     Text(phase)
                         .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
                 }
-                if job.canReorder {
+                if let resources = job.resources {
+                    Text(resources.prediction.summary).font(.caption2).foregroundStyle(.secondary)
+                    if let observed = resources.observed { Text(observed.summary).font(.caption2).foregroundStyle(.secondary) }
+                    if job.isWaiting, let decision = resources.decision {
+                        Text(decision.reason).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                if job.canReorder || job.permitsStart {
                     HStack(spacing: 8) {
+                        if job.canReorder {
                         Button("Run next", systemImage: "arrow.up.to.line") { store.dispatch("next", job: job) }
                             .help("Run job #\(job.id) after the current job finishes")
                         Button("Move to end", systemImage: "arrow.down.to.line") { store.dispatch("last", job: job) }
+                        }
+                        if job.permitsStart {
                         Button("Start now", systemImage: "play.fill") { navigation.request(.start, job: job) }
-                            .help("Start this job outside the parallel limit")
+                            .help("Bypass the parallel limit and adaptive resource checks")
+                        }
                     }.font(.caption).buttonStyle(.borderless).disabled(store.actionsDisabled)
                 }
             }
             Menu {
                 Button("View details and output", systemImage: "doc.text") { navigation.show(job) }
-                if job.canReorder {
+                if job.canReorder || job.permitsStart {
                     Divider()
+                    if job.canReorder {
                     Button("Run next", systemImage: "arrow.up.to.line") { store.dispatch("next", job: job) }.disabled(store.actionsDisabled)
                     Button("Move to end", systemImage: "arrow.down.to.line") { store.dispatch("last", job: job) }.disabled(store.actionsDisabled)
+                    }
+                    if job.permitsStart {
                     Button("Start now…", systemImage: "play.fill") { navigation.request(.start, job: job) }.disabled(store.actionsDisabled)
+                    }
                 }
                 if job.canCancel {
                     Divider()
@@ -941,7 +1090,7 @@ struct JobConfirmationPanel: View {
     private var declineLabel: String { action == .start ? "Keep waiting" : "Keep job" }
     private var explanation: String {
         if action == .start {
-            return "This starts the job outside the parallel limit and may increase CPU and memory pressure. Other queued jobs keep their order."
+            return "This bypasses the parallel limit and adaptive resource checks and may increase CPU and memory pressure. Other queued jobs keep their order."
         }
         return job.isRunning || job.state == "paused"
             ? "This stops the running command and its managed child processes. Work already written to disk remains."
@@ -1027,6 +1176,15 @@ struct JobDetail: View {
                 if let value = job.submittedAt { detail("Submitted", formatted(value)) }
                 if let value = job.startedAt { detail("Started", formatted(value)) }
                 if let value = job.finishedAt { detail("Finished", formatted(value)) }
+                if let resources = job.resources {
+                    detail("Prediction", resources.prediction.summary)
+                    if let duration = resources.prediction.durationSeconds { detail("Expected duration", "\(Int(duration.rounded())) seconds") }
+                    detail("Measured usage", resources.observed?.summary ?? "No measurements available.")
+                    if let observed = resources.observed {
+                        detail("CPU cost", "\(observed.cpuSeconds.formatted(.number.precision(.fractionLength(1)))) CPU-seconds over \(observed.durationSeconds.formatted(.number.precision(.fractionLength(1)))) seconds (\(observed.samples) samples)")
+                    }
+                    if let decision = resources.decision { detail("Admission", decision.reason) }
+                } else { detail("Resources", "No measurements or predictions available.") }
             }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
             }.frame(maxHeight: 200)
             Divider()

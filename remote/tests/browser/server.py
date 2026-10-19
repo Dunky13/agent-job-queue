@@ -29,6 +29,7 @@ class FakeQueue:
             self.events = []
             self.offline = False
             self.limit = 1
+            self.scheduler = None
             self.jobs = [self.job(101, "running", "Build app"),
                          self.job(102, "queued", "Run browser tests"),
                          self.job(103, "queued", "Typecheck client")]
@@ -51,14 +52,22 @@ class FakeQueue:
             if self.offline:
                 raise BackendError("Fixture queue is offline")
             if arguments == ["status", "--json"]:
-                return {"updatedAt": datetime.now(timezone.utc).isoformat(),
+                snapshot = {"updatedAt": datetime.now(timezone.utc).isoformat(),
                         "queue": {"status": "running", "limit": self.limit,
                                   "running": sum(job["state"] == "running" for job in self.jobs),
                                   "waiting": sum(job["state"] == "queued" for job in self.jobs),
                                   "legacyOccupied": False}, "jobs": copy.deepcopy(self.jobs)}
+                if self.scheduler is not None:
+                    snapshot["scheduler"] = copy.deepcopy(self.scheduler)
+                return snapshot
             self.events.append(arguments)
             if arguments[0] == "limit":
                 self.limit = int(arguments[1])
+                return {"ok": True}
+            if arguments[0] == "scheduling":
+                if arguments[1] == "adaptive" and not self.scheduler["available"]:
+                    raise BackendError("Resource sampler unavailable")
+                self.scheduler["mode"] = arguments[1]
                 return {"ok": True}
             job = next(job for job in self.jobs if job["id"] == int(arguments[1]))
             if arguments[0] == "start":
@@ -114,6 +123,10 @@ def main():
                     queue.offline = values["offline"]
                 if "title" in values:
                     queue.jobs[1]["title"] = values["title"]
+                if "scheduler" in values:
+                    queue.scheduler = values["scheduler"]
+                if "resources" in values:
+                    queue.jobs[1]["resources"] = values["resources"]
             return jsonify(ok=True)
 
         origin = f"http://127.0.0.1:{listener.effective_port}"

@@ -25,7 +25,8 @@ class InstallerTests(unittest.TestCase):
         self.payload = self.base / "payload"
         self.source = self.payload / "source"
         self.source.mkdir(parents=True)
-        for name in ("agent_heavy.py", "agent_integration.py", "install-remote.sh"):
+        for name in ("agent_heavy.py", "agent_integration.py", "resource_monitor.py", "job_profiles.py",
+                     "resource_scheduler.py", "install-remote.sh"):
             shutil.copy2(ROOT / name, self.source / name)
         shutil.copytree(ROOT / "bin", self.source / "bin")
         shutil.copytree(ROOT / "remote", self.source / "remote", ignore=shutil.ignore_patterns(".venv", "__pycache__"))
@@ -85,6 +86,10 @@ fi''')
         self.assertIn("/usr/local/bin", service["EnvironmentVariables"]["PATH"])
         self.assertTrue((self.home / "Applications/Agent Queue.app/Contents/MacOS/AgentQueue").exists())
         self.assertTrue((self.home / ".local/bin/agent-heavy").stat().st_mode & 0o100)
+        controller = plistlib.loads((self.home / "Library/LaunchAgents/io.went.agent-resources.plist").read_bytes())
+        self.assertEqual(controller["ProgramArguments"][-1], "scheduler")
+        self.assertTrue(controller["KeepAlive"])
+        self.assertTrue((self.home / ".local/share/agent-heavy/resource_scheduler.py").is_file())
         self.assertFalse((self.home / ".config/agent-heavy/remote.json").exists())
         calls = self.calls.read_text()
         self.assertIn("launchctl <bootstrap>", calls)
