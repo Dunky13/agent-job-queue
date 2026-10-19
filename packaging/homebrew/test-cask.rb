@@ -31,7 +31,13 @@ if ARGV[1]
 end
 cask = Cask::CaskLoader.load(cask_path)
 installer = cask.artifacts.find { |artifact| artifact.is_a?(Cask::Artifact::Installer) }
-raise "An automated non-root installer is required" if installer.nil? || installer.manual_install || installer.requires_sudo?
+details = installer&.to_h
+arguments = details&.fetch(:args, nil)
+# Manual installers omit :args. Require the declared false value rather than
+# relying on newer Homebrew methods or treating a missing privilege flag as safe.
+unless arguments.is_a?(Hash) && arguments[:sudo] == false
+  raise "An automated non-root installer is required"
+end
 
 binaries = cask.artifacts.select { |artifact| artifact.is_a?(Cask::Artifact::Binary) }
 raise "Both CLI binaries are required" unless binaries.map { |artifact| artifact.source.basename.to_s }.sort == %w[agent-heavy agent-remote]
@@ -44,7 +50,7 @@ if ARGV[1]
 
   FileUtils.mkdir_p(cask.staged_path/"Agent Job Queue Installer.app/Contents/Resources")
   FileUtils.cp_r(fixture/"payload", cask.staged_path/"Agent Job Queue Installer.app/Contents/Resources/payload")
-  installer.install_phase
+  installer.install_phase(command: SystemCommand)
 end
 puts JSON.generate({ version: cask.version.to_s, sha256: cask.sha256.to_s, url: cask.url.to_s,
                      dependencies: cask.depends_on.to_h, installer: installer.to_h,

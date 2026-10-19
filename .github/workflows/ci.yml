@@ -122,6 +122,8 @@ jobs:
             --archive "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" \
             --version "$(cat VERSION)" --tag "build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" \
             --commit "$GITHUB_SHA" --build "$GITHUB_RUN_NUMBER" --output dist
+      - name: Record Homebrew version used for packaging validation
+        run: brew --version
       - name: Verify Homebrew manifest and actual automated installer artifact
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'

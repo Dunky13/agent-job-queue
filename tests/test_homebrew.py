@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -54,6 +55,44 @@ class HomebrewTests(unittest.TestCase):
         self.assertNotIn("zap ", cask)
         self.assertIn('depends_on formula: "pueue"', cask)
         self.assertIn('binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/bin/agent-heavy"', cask)
+
+    def test_existing_release_workflow_compares_assets_without_mutation(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        marker = 'python3 - "$existing" "$GITHUB_SHA" <<\'PY\'\n'
+        self.assertEqual(workflow.count(marker), 1, "Expected the actual existing-release comparison block")
+        remaining = workflow.split(marker, 1)[1]
+        self.assertIn("\n          PY\n", remaining)
+        script = textwrap.dedent(remaining.split("\n          PY\n", 1)[0]) + "\n"
+        self.assertLess(len(script), 8_192)
+        commit = "1" * 40
+        for scenario in ("matching", "different-target", "changed-bytes", "missing-asset"):
+            with self.subTest(scenario=scenario):
+                root = self.root / scenario
+                local = root / "dist"
+                existing = root / "existing"
+                local.mkdir(parents=True)
+                existing.mkdir()
+                for name, content in (("installer.zip", b"installer bytes"), ("manifest.json", b'{"version": 1}')):
+                    (local / name).write_bytes(content)
+                    (existing / name).write_bytes(content)
+                target = "2" * 40 if scenario == "different-target" else commit
+                (existing / "release.json").write_text(json.dumps({"targetCommitish": target}))
+                if scenario == "changed-bytes":
+                    (existing / "installer.zip").write_bytes(b"different installer bytes")
+                if scenario == "missing-asset":
+                    (existing / "manifest.json").unlink()
+                before = {str(path.relative_to(root)): path.read_bytes()
+                          for path in root.rglob("*") if path.is_file()}
+                result = subprocess.run([sys.executable, "-", str(existing), commit], input=script,
+                                        cwd=root, capture_output=True, text=True, timeout=5, check=False)
+                if scenario == "matching":
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("no overwrite performed", result.stdout)
+                else:
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                after = {str(path.relative_to(root)): path.read_bytes()
+                         for path in root.rglob("*") if path.is_file()}
+                self.assertEqual(after, before, "Release comparison must never change either asset set")
 
     def test_manifest_rejects_untrusted_fields_and_code_or_path_injection(self):
         invalid = [("repository", "Other/project"), ("url", "https://untrusted.example/package"),
@@ -108,7 +147,30 @@ class HomebrewTests(unittest.TestCase):
             api.assert_called_once()
             publish.assert_not_called()
 
+    def test_real_homebrew_helper_rejects_root_and_manual_installers(self):
+        brew = shutil.which("brew", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin")
+        self.assertIsNotNone(brew)
+        environment = {**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_DEVELOPER": "1"}
+        original = renderer.render_cask(self.manifest)
+        start = original.index("  installer script:")
+        end = original.index("\n\n  binary", start)
+        for body in (original.replace("sudo:       false", "sudo:       true"),
+                     original[:start] + '  installer manual: "Interactive Installer.app"' + original[end:]):
+            with self.subTest(installer="root" if "sudo:       true" in body else "manual"):
+                cask = self.root / "agent-job-queue.rb"
+                cask.write_text(body)
+                result = subprocess.run([brew, "ruby", str(PACKAGING / "test-cask.rb"), str(cask)],
+                                        env=environment, capture_output=True, text=True, timeout=30, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("An automated non-root installer is required", result.stderr)
+
     def test_real_homebrew_dsl_runs_automated_install_in_private_fixture(self):
+        self._probe_install()
+
+    def test_older_homebrew_api_runs_same_automated_install_without_privilege_method(self):
+        self._probe_install(older_api=True)
+
+    def _probe_install(self, *, older_api=False):
         brew = shutil.which("brew", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin")
         self.assertIsNotNone(brew, "Homebrew packaging checks require Homebrew on macOS")
         fixture = test_installer.InstallerTests(methodName="runTest")
@@ -122,8 +184,23 @@ class HomebrewTests(unittest.TestCase):
         cask = self.root / "agent-job-queue.rb"
         cask.write_text(renderer.render_cask(self.manifest))
         environment = {**fixture.environment, "HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_DEVELOPER": "1"}
-        result = subprocess.run([brew, "ruby", str(PACKAGING / "test-cask.rb"), str(cask), str(fixture.base)],
-                                env=environment, capture_output=True, text=True, timeout=45, check=False)
+        invocation = [brew, "ruby"]
+        if older_api:
+            shim = self.root / "older-homebrew.rb"
+            shim.write_text(
+                'require "cask/cask_loader"\nrequire "cask/artifact/installer"\n'
+                'Cask::Artifact::Installer.class_eval { undef_method :requires_sudo? if method_defined?(:requires_sudo?) }\n'
+                'raise "Privilege method still exposed" if Cask::Artifact::Installer.method_defined?(:requires_sudo?)\n'
+                'compatibility = Module.new do\n'
+                '  def install_phase(command: nil, **options)\n'
+                '    raise "Explicit command required by older API" if command.nil?\n'
+                '    super(command: command, **options)\n'
+                '  end\nend\n'
+                'Cask::Artifact::Installer.prepend(compatibility)\nload ARGV.shift\n'
+            )
+            invocation.append(str(shim))
+        invocation.extend([str(PACKAGING / "test-cask.rb"), str(cask), str(fixture.base)])
+        result = subprocess.run(invocation, env=environment, capture_output=True, text=True, timeout=45, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((fixture.home / "Applications/Agent Queue.app/Contents/MacOS/AgentQueue").exists())
         self.assertTrue((fixture.home / ".local/bin/agent-heavy").exists())

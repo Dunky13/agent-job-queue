@@ -12,7 +12,7 @@ The initial signed import is on main. GitHub reports its signature verified. Mai
 
 The complete bootstrap CI passed. The first main run then exposed a real Darwin process-lifecycle race in the crash acceptance test. Its aggregate gate failed and correctly withheld publication. [Failing main run](https://github.com/Dunky13/agent-job-queue/actions/runs/39216528279).
 
-PR 1 repairs that race and synchronizes the native refresh fixture explicitly. All hosted validation passed on b70ee5d, including both macOS architectures, web tests, and the universal installer. The later README screenshots and Homebrew additions need validation on their updated head. Owner merge approval remains before the first main installer release. This document records the repair's delivery state; query GitHub for the current result.
+PR 1 repairs that race and synchronizes the native refresh fixture explicitly. All hosted validation passed on b70ee5d, including both macOS architectures, web tests, and the universal installer. On 8aaa52e, both macOS suites, lint, web tests, and commit policy passed; the installer check exposed an older Homebrew helper API. The helper now validates declared installer arguments and supplies the command runner explicitly, with compatibility and rejection tests. Validation of the updated repair head is still required. Owner merge approval remains before the first main installer release. This document records the repair's delivery state; query GitHub for the current result.
 
 ## Diagnosis and repair
 
@@ -34,6 +34,8 @@ The public Homebrew tap is Dunky13/homebrew-agent-job-queue, with a signed initi
 
 Review identified a stale-checkout race in tap refresh. The updater now requires the live branch to match the checked-out commit before comparing current build metadata, then uses that same commit for GitHub expected-head publication. A deterministic regression rejects a branch advanced since checkout. Source publication compares existing release targets and every expected asset; it refuses missing or different immutable assets instead of overwriting them.
 
+The hosted Homebrew failure was reproduced by removing the newer privilege-inspection method in a separate Ruby process. The repair requires an explicit sudo:false value from the stable artifact metadata, rejects manual or privileged installers, and passes SystemCommand explicitly for older Homebrew installation APIs. Tests exercise the real installer with both API contracts. CI records the Homebrew version used for packaging validation.
+
 ## Validation evidence
 
 - The full local repair run passed core tests, 22 real-daemon acceptance/environment tests, 18 real HTTPS/API tests, five schema tests, six browser tests, native regression checks, and 11 installer tests.
@@ -44,6 +46,7 @@ Review identified a stale-checkout race in tap refresh. The updater now requires
 - All seven Homebrew tests passed, including the real installed Homebrew DSL and automatic installer artifact against owned temporary HOME, Caskroom, and tool fixtures. The private app, wrappers, and queue login entry were created without enabling remote credentials. Independent review also ran these tests and reported no further actionable issue.
 - The final queued packaging batch passed complete lint, rebuilt the universal ZIP and DMG, passed all 11 installer tests, verified signatures and both architectures, and loaded a cask rendered from that actual ZIP through the real Homebrew DSL. Graphify structural data was refreshed locally.
 - All three README screenshots were visually inspected. The native capture verified confirmation navigation with inert actions. The phone viewport had no console errors or horizontal overflow; its preview was stopped. Unsafe preview bind addresses were rejected before server startup.
+- After the hosted API repair, all 10 Homebrew tests passed. Added cases run the actual installer with the older API contract, reject manual and privileged installers, and execute the workflow release-comparison block against matching, changed, missing, and wrong-target assets without modifying either asset set. Scoped independent review reported no actionable finding.
 - Public source-release publication, the first tap metadata update, and installation from the published cask remain unexecuted pending owner merge approval and the first successful main release.
 - Physical Android certificate installation, an off-site VPN connection, and Apple notarization are outside this repair's validation. The installer is ad hoc signed.
 
