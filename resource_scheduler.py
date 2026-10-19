@@ -215,11 +215,12 @@ def decision(host: dict, prediction: dict, active: list[dict], limit: int) -> tu
     cpu_budget = max(1.0, host["cpuCores"] * 0.8)
     cpu_growth = sum(max(0.0, min(cpu_budget, job["prediction"]["cpuCores"]) - job["observed"]["cpuCores"])
                      for job in active)
-    if active:
-        if host["cpuBusyCores"] + cpu_growth + min(cpu_budget, prediction["cpuCores"]) > cpu_budget:
-            return False, "Waiting for predicted CPU headroom"
-    elif host["cpuBusyCores"] > host["cpuCores"] * 0.6:
+    if not active and host["cpuBusyCores"] > host["cpuCores"] * 0.6:
         return False, "Waiting for background CPU activity to settle"
+    if prediction["cpuCores"] > cpu_budget:
+        return False, "Predicted CPU demand exceeds this machine's budget; reduce workers or inspect Start now"
+    if host["cpuBusyCores"] + cpu_growth + prediction["cpuCores"] > cpu_budget:
+        return False, "Waiting for predicted CPU headroom"
     return True, "Predicted resource demand fits the current headroom"
 
 
@@ -390,6 +391,19 @@ class Controller:
                 if run:
                     if not observed_here:
                         run["complete"] = False
+                    from resource_monitor import MAX_SAMPLE_INTERVAL
+                    try:
+                        end_date = datetime.fromisoformat(details["end"].replace("Z", "+00:00"))
+                        if end_date.utcoffset() is None:
+                            raise ValueError("Execution end requires an offset")
+                        ended = end_date.timestamp()
+                    except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+                        ended = None
+                    observed_at = run.get("sampledAt", run["started"] + run["durationSeconds"])
+                    if ended is None or not 0 <= ended - observed_at <= MAX_SAMPLE_INTERVAL or ended > time.time():
+                        run["complete"] = False
+                    if ended is not None and run["started"] <= ended <= time.time():
+                        run["durationSeconds"] = max(run["durationSeconds"], ended - run["started"])
                     metrics = {"memoryBytes": run["peakMemoryBytes"], "cpuSeconds": run["cpuSeconds"],
                                "cpuCores": run["peakCpuCores"], "durationSeconds": run["durationSeconds"],
                                "sampledAt": run.get("sampledAt", run["started"] + run["durationSeconds"])}

@@ -61,6 +61,15 @@ class DecisionTests(unittest.TestCase):
         running["prediction"]["cpuCores"] = 5.0
         self.assertFalse(scheduler.decision(sample, prediction(cpuCores=2.0), [running], 2)[0])
 
+    def test_first_job_still_reserves_predicted_cpu_above_background_usage(self):
+        allowed, reason = scheduler.decision(host(cpuBusyCores=4.0), prediction(cpuCores=6.0), [], 2)
+        self.assertFalse(allowed)
+        self.assertIn("CPU headroom", reason)
+        self.assertTrue(scheduler.decision(host(cpuBusyCores=1.0), prediction(cpuCores=5.0), [], 2)[0])
+        allowed, reason = scheduler.decision(host(), prediction(cpuCores=8.0), [], 2)
+        self.assertFalse(allowed)
+        self.assertIn("machine's budget", reason)
+
     def test_memory_pressure_warning_and_critical_hold_admission(self):
         for pressure in ("warning", "critical"):
             with self.subTest(pressure=pressure):
@@ -255,7 +264,8 @@ class SchedulerFixture(unittest.TestCase):
 
     def finish(self, task_id=1, controller=None):
         (self.gate.receipts / f"{task_id}.json").unlink(missing_ok=True)
-        self.gate.data["tasks"][str(task_id)]["status"] = {"Done": {"result": "Success"}}
+        self.gate.data["tasks"][str(task_id)]["status"] = {"Done": {
+            "result": "Success", "end": datetime.fromtimestamp(self.clock_mock.return_value, UTC).isoformat()}}
         (controller or self.controller).tick()
 
 
@@ -385,6 +395,32 @@ class PermitTests(SchedulerFixture):
 
 
 class ControllerTests(SchedulerFixture):
+    def test_job_finishing_inside_observation_gap_cannot_supply_complete_training(self):
+        token = self.add_job(1, state="Running", owned=True)
+        marker = self.gate.receipt(1)
+        self.controller.sample_run(1, token, marker, host(), prediction())
+        for seconds in (2, 4):
+            self.clock_mock.return_value = NOW + seconds
+            self.controller.sample_run(1, token, marker, host(), prediction())
+        self.clock_mock.return_value = NOW + 123
+        self.sampler.host_sample = host(sampledAt=NOW + 123, complete=False)
+        self.finish()
+        self.assertFalse(self.store.records[0]["complete"])
+        self.assertEqual(self.store.records[0]["metrics"]["durationSeconds"], 123)
+        self.assertEqual(self.store.records[0]["metrics"]["sampledAt"], NOW + 4)
+
+    def test_timely_terminal_tail_retains_actual_duration_and_can_learn(self):
+        token = self.add_job(1, state="Running", owned=True)
+        marker = self.gate.receipt(1)
+        self.controller.sample_run(1, token, marker, host(), prediction())
+        for seconds in (2, 4):
+            self.clock_mock.return_value = NOW + seconds
+            self.controller.sample_run(1, token, marker, host(), prediction())
+        self.clock_mock.return_value = NOW + 5
+        self.finish()
+        self.assertTrue(self.store.records[0]["complete"])
+        self.assertEqual(self.store.records[0]["metrics"]["durationSeconds"], 5)
+
     def test_late_first_observation_preserves_duration_but_censors_unseen_prefix(self):
         token = self.add_job(1, state="Running", owned=True)
         marker = self.gate.receipt(1)
@@ -593,10 +629,7 @@ class ControllerTests(SchedulerFixture):
         self.assertTrue(second["observed"]["complete"])
         self.clock_mock.return_value += 2
         self.controller.sample_run(1, token, marker, host(), prediction())
-        for path in self.gate.receipts.glob("*.json"):
-            path.unlink()
-        self.gate.data["tasks"]["1"]["status"] = {"Done": {"result": "Success"}}
-        self.controller.tick()
+        self.finish()
         self.assertTrue(self.store.records[0]["complete"])
         self.assertEqual(self.store.records[0]["metrics"]["durationSeconds"], 4)
 
