@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import Foundation
 import Darwin
+import Combine
 
 struct QueueSnapshot: Codable, Sendable {
     let updatedAt: String
@@ -280,7 +281,7 @@ final class QueueStore: ObservableObject {
     @Published var isRefreshing = false
     @Published var isMutating = false
     @Published var notice: String?
-    private var visibleSurfaces = 0
+    private(set) var visibleSurfaces = 0
     private var pollTask: Task<Void, Never>?
     private let statusLoader: @Sendable () async throws -> Data
     private let command: @Sendable ([String]) async throws -> Data
@@ -315,12 +316,6 @@ final class QueueStore: ObservableObject {
     }
     var recent: [QueueJob] { Array((snapshot?.jobs.filter { !$0.isRunning && !$0.isWaiting } ?? []).prefix(12)) }
     var actionsDisabled: Bool { (fixtureMode && fixtureRecorder == nil) || isRefreshing || isMutating || error != nil }
-    var badge: String {
-        guard let queue = snapshot?.queue else { return "" }
-        if queue.running == 0 && queue.waiting == 0 { return "" }
-        return "\(queue.running) · \(queue.waiting)"
-    }
-
     func start() {
         guard !fixtureMode, pollTask == nil else { return }
         pollTask = Task { [weak self] in
@@ -595,6 +590,19 @@ final class RemoteAccessStore: ObservableObject {
     static var integrationWindow: NSWindow?
     static var updatesWindow: NSWindow?
     static var learningWindow: NSWindow?
+    static var menuBarController: QueueMenuBarController?
+
+    static func perform(_ action: QueueAppAction) {
+        menuBarController?.closePopover()
+        switch action {
+        case .openWindow: showWindow()
+        case .learnedWorkloads: showLearningWindow()
+        case .updates: showUpdatesWindow()
+        case .integration: showIntegrationWindow()
+        case .remoteAccess: showRemoteWindow()
+        case .quit: NSApp.terminate(nil)
+        }
+    }
 
     static func showLearningWindow(profileID: String? = nil) {
         if let learningWindow {
@@ -702,6 +710,239 @@ final class RemoteAccessStore: ObservableObject {
     }
 }
 
+enum QueueAppAction: Int, CaseIterable, Identifiable {
+    case openWindow, learnedWorkloads, updates, integration, remoteAccess, quit
+    var id: Int { rawValue }
+    static let settings: [Self] = [.learnedWorkloads, .updates, .integration, .remoteAccess]
+    static let quitExplanation = "Quitting this app leaves jobs running."
+
+    var title: String {
+        switch self {
+        case .openWindow: "Open window"
+        case .learnedWorkloads: "Learned workloads…"
+        case .updates: "About and updates…"
+        case .integration: "Agent integration…"
+        case .remoteAccess: "Remote access settings…"
+        case .quit: "Quit Agent Queue"
+        }
+    }
+    var symbol: String {
+        switch self {
+        case .openWindow: "arrow.up.left.and.arrow.down.right"
+        case .learnedWorkloads: "chart.bar.doc.horizontal"
+        case .updates: "info.circle"
+        case .integration: "terminal"
+        case .remoteAccess: "network"
+        case .quit: "power"
+        }
+    }
+}
+
+enum QueueStatusActivation: Equatable {
+    case primaryClick, doubleClick, contextMenu, accessible
+
+    static func from(_ event: NSEvent?) -> Self {
+        guard let event else { return .accessible }
+        switch event.type {
+        case .rightMouseDown, .rightMouseUp: return .contextMenu
+        case .leftMouseDown, .leftMouseUp:
+            if event.modifierFlags.contains(.control) { return .contextMenu }
+            return event.clickCount > 1 ? .doubleClick : .primaryClick
+        default:
+            // clickCount raises an Objective-C exception for keyboard and other events.
+            return .accessible
+        }
+    }
+}
+
+struct QueueStatusPresentation {
+    let title: String
+    let accessibilityLabel: String
+    init(snapshot: QueueSnapshot?, error: String?) {
+        let running = snapshot?.queue.running ?? 0
+        let waiting = snapshot?.queue.waiting ?? 0
+        title = error != nil ? "!" : (running == 0 && waiting == 0 ? "" : "\(running) · \(waiting)")
+        accessibilityLabel = "Agent Queue, \(running) running, \(waiting) waiting" + (error == nil ? "" : ", queue unavailable")
+    }
+}
+
+@MainActor
+final class QueueMenuBarController: NSObject, NSPopoverDelegate {
+    let statusItem: NSStatusItem
+    let popover = NSPopover()
+    let menu = NSMenu()
+    private var observation: AnyCancellable?
+    private var deactivationObservation: AnyCancellable?
+    private var menuTrackingObservations: [AnyCancellable] = []
+    private var menuTrackingDepth = 0
+    private var eventMonitor: Any?
+    var isMonitoringEvents: Bool { eventMonitor != nil }
+    private var isTornDown = false
+    private let store: QueueStore
+    private var registeredVisibleSurface = false
+    private let perform: @MainActor (QueueAppAction) -> Void
+
+    init(store: QueueStore, perform: @escaping @MainActor (QueueAppAction) -> Void = AppRuntime.perform) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        self.store = store
+        self.perform = perform
+        super.init()
+        // Transient popovers consume Control-clicks on the status button while
+        // shown. Own dismissal so every status-button gesture remains available.
+        popover.behavior = .applicationDefined
+        popover.delegate = self
+        popover.contentSize = NSSize(width: 500, height: 650)
+        popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, tracksVisibility: false))
+        if let button = statusItem.button {
+            button.image = NSImage(systemSymbolName: "square.stack.3d.up", accessibilityDescription: nil)
+            button.image?.isTemplate = true
+            button.imagePosition = .imageLeading
+            button.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+            button.target = self
+            button.action = #selector(activateStatusItem(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.setAccessibilityIdentifier("agent-queue-status-item")
+        }
+        buildMenu()
+        observation = store.$snapshot.combineLatest(store.$error).sink { [weak self] snapshot, error in
+            let presentation = QueueStatusPresentation(snapshot: snapshot, error: error)
+            self?.statusItem.button?.title = presentation.title
+            self?.statusItem.button?.setAccessibilityLabel(presentation.accessibilityLabel)
+            self?.statusItem.button?.toolTip = presentation.accessibilityLabel
+        }
+        deactivationObservation = NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
+            .sink { [weak self] _ in self?.closePopover() }
+        menuTrackingObservations = [
+            NotificationCenter.default.publisher(for: NSMenu.didBeginTrackingNotification)
+                .sink { [weak self] _ in self?.menuTrackingDepth += 1 },
+            NotificationCenter.default.publisher(for: NSMenu.didEndTrackingNotification)
+                .sink { [weak self] _ in
+                    guard let self else { return }
+                    self.menuTrackingDepth = max(0, self.menuTrackingDepth - 1)
+                }
+        ]
+    }
+
+    private func buildMenu() {
+        menu.autoenablesItems = false
+        for action in QueueAppAction.allCases {
+            if action == .learnedWorkloads { menu.addItem(.separator()) }
+            if action == .quit {
+                menu.addItem(.separator())
+                let explanation = NSMenuItem(title: QueueAppAction.quitExplanation, action: nil, keyEquivalent: "")
+                explanation.isEnabled = false
+                menu.addItem(explanation)
+                menu.addItem(.separator())
+            }
+            let item = NSMenuItem(title: action.title, action: #selector(selectMenuAction(_:)),
+                                  keyEquivalent: action == .quit ? "q" : "")
+            item.target = self
+            item.tag = action.rawValue
+            item.image = NSImage(systemSymbolName: action.symbol, accessibilityDescription: nil)
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func activateStatusItem(_ sender: NSStatusBarButton) {
+        activate(.from(NSApp.currentEvent))
+    }
+
+    func activate(_ activation: QueueStatusActivation) {
+        guard !isTornDown else { return }
+        switch activation {
+        case .primaryClick, .accessible: togglePopover()
+        case .doubleClick: performAction(.openWindow)
+        case .contextMenu: showContextMenu()
+        }
+    }
+
+    private func handleLocalEvent(type: NSEvent.EventType, keyCode: UInt16, windowNumber: Int) -> Bool {
+        // Native and SwiftUI menus may track in separate windows. Let their
+        // selection/dismissal finish without destroying the originating popover.
+        guard menuTrackingDepth == 0 else { return false }
+        if type == .keyDown {
+            if keyCode == 53 && popover.isShown { closePopover(); return true }
+        } else if windowNumber != statusItem.button?.window?.windowNumber {
+            if popover.isShown && windowNumber != popover.contentViewController?.view.window?.windowNumber { closePopover() }
+        }
+        return false
+    }
+
+    private func startMonitoringEvents() {
+        guard eventMonitor == nil else { return }
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]) { [weak self] event in
+            let type = event.type
+            let keyCode = type == .keyDown ? event.keyCode : 0
+            let windowNumber = event.windowNumber
+            let suppress = MainActor.assumeIsolated {
+                self?.handleLocalEvent(type: type, keyCode: keyCode, windowNumber: windowNumber) ?? false
+            }
+            return suppress ? nil : event
+        }
+    }
+
+    private func stopMonitoringEvents() {
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
+    }
+
+    @objc private func selectMenuAction(_ sender: NSMenuItem) {
+        guard let action = QueueAppAction(rawValue: sender.tag) else { return }
+        performAction(action)
+    }
+
+    private func performAction(_ action: QueueAppAction) {
+        closePopover()
+        perform(action)
+    }
+
+    private func togglePopover() {
+        if popover.isShown { closePopover(); return }
+        guard let button = statusItem.button else { return }
+        NSApp.activate()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
+    private func showContextMenu() {
+        closePopover()
+        guard let button = statusItem.button else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: button.bounds.minX, y: button.bounds.minY), in: button)
+    }
+
+    func closePopover() {
+        popover.performClose(nil)
+        releaseVisibleSurface()
+    }
+
+    func popoverWillShow(_ notification: Notification) {
+        guard !registeredVisibleSurface else { return }
+        registeredVisibleSurface = true
+        startMonitoringEvents()
+        store.appear(fullWindow: false)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        if !popover.isShown { releaseVisibleSurface() }
+    }
+
+    private func releaseVisibleSurface() {
+        stopMonitoringEvents()
+        guard registeredVisibleSurface else { return }
+        registeredVisibleSurface = false
+        store.disappear(fullWindow: false)
+    }
+
+    func tearDown() {
+        guard !isTornDown else { return }
+        isTornDown = true
+        closePopover()
+        observation = nil
+        deactivationObservation = nil
+        menuTrackingObservations = []
+        NSStatusBar.system.removeStatusItem(statusItem)
+    }
+}
+
 @MainActor
 final class FixtureDispatchRecorder {
     private(set) var actions: [RecordedQueueAction] = []
@@ -767,13 +1008,15 @@ final class QueueNavigation: ObservableObject {
 struct QueuePanel: View {
     @ObservedObject var store: QueueStore
     var fullWindow = false
+    var tracksVisibility = true
     @StateObject private var navigation: QueueNavigation
     @State private var draftLimit = "1"
     @State private var draftMode = SchedulingMode.fixed
 
-    init(store: QueueStore, fullWindow: Bool = false, navigation: QueueNavigation = QueueNavigation()) {
+    init(store: QueueStore, fullWindow: Bool = false, tracksVisibility: Bool = true, navigation: QueueNavigation = QueueNavigation()) {
         self.store = store
         self.fullWindow = fullWindow
+        self.tracksVisibility = tracksVisibility
         _navigation = StateObject(wrappedValue: navigation)
     }
 
@@ -821,7 +1064,7 @@ struct QueuePanel: View {
         .onAppear {
             draftLimit = String(store.snapshot?.queue.limit ?? 1)
             draftMode = store.snapshot?.scheduler?.mode ?? .fixed
-            store.appear(fullWindow: fullWindow)
+            if tracksVisibility { store.appear(fullWindow: fullWindow) }
         }
         .onChange(of: store.snapshot?.queue.limit) { _, value in
             if let value { draftLimit = String(value) }
@@ -829,7 +1072,7 @@ struct QueuePanel: View {
         .onChange(of: store.snapshot?.scheduler?.mode) { _, value in
             if let value { draftMode = value }
         }
-        .onDisappear { store.disappear(fullWindow: fullWindow) }
+        .onDisappear { if tracksVisibility { store.disappear(fullWindow: fullWindow) } }
     }
 
     private func applyLimit() {
@@ -1021,16 +1264,15 @@ struct QueuePanel: View {
                 else if let updated = store.lastRefreshed { Text("Updated \(updated.formatted(date: .omitted, time: .shortened))") }
                 else { Text("Connecting…") }
                 Spacer()
-                if !fullWindow { Button("Open window", systemImage: "arrow.up.left.and.arrow.down.right") { AppRuntime.showWindow() }.buttonStyle(.borderless) }
+                if !fullWindow { Button(QueueAppAction.openWindow.title, systemImage: QueueAppAction.openWindow.symbol) { AppRuntime.perform(.openWindow) }.buttonStyle(.borderless) }
                 Menu {
-                    Button("Learned workloads…", systemImage: "chart.bar.doc.horizontal") { AppRuntime.showLearningWindow() }
-                    Button("About and updates…", systemImage: "info.circle") { AppRuntime.showUpdatesWindow() }
-                    Button("Agent integration…", systemImage: "terminal") { AppRuntime.showIntegrationWindow() }
-                    Button("Remote access settings…", systemImage: "network") { AppRuntime.showRemoteWindow() }
+                    ForEach(QueueAppAction.settings) { action in
+                        Button(action.title, systemImage: action.symbol) { AppRuntime.perform(action) }
+                    }
                     Divider()
-                    Text("Quitting this app leaves jobs running.")
+                    Text(QueueAppAction.quitExplanation)
                     Divider()
-                    Button("Quit Agent Queue", systemImage: "power") { NSApp.terminate(nil) }.keyboardShortcut("q")
+                    Button(QueueAppAction.quit.title, systemImage: QueueAppAction.quit.symbol) { AppRuntime.perform(.quit) }.keyboardShortcut("q")
                 } label: { Image(systemName: "gearshape") }.menuStyle(.borderlessButton).fixedSize().help("Application options").accessibilityLabel("Application options")
             }.font(.caption).foregroundStyle(.secondary)
         }.padding(.horizontal, 18).padding(.vertical, 12)
@@ -1314,6 +1556,8 @@ struct JobDetail: View {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.mainMenu = makeMainMenu()
+        AppRuntime.menuBarController = QueueMenuBarController(store: AppRuntime.store)
         AppRuntime.store.start()
         let arguments = CommandLine.arguments
         if let index = arguments.firstIndex(of: "--snapshot"), arguments.indices.contains(index + 1) {
@@ -1450,6 +1694,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 UserDefaults.standard.set(true, forKey: AgentOnboarding.offeredKey)
             }
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        AppRuntime.menuBarController?.tearDown()
+        AppRuntime.menuBarController = nil
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    @objc private func selectApplicationAction(_ sender: NSMenuItem) {
+        guard let action = QueueAppAction(rawValue: sender.tag) else { return }
+        AppRuntime.perform(action)
+    }
+
+    func makeMainMenu() -> NSMenu {
+        let main = NSMenu()
+        func submenu(_ title: String) -> NSMenu {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            let menu = NSMenu(title: title)
+            item.submenu = menu
+            main.addItem(item)
+            return menu
+        }
+        func applicationItem(_ action: QueueAppAction, key: String = "") -> NSMenuItem {
+            let item = NSMenuItem(title: action.title, action: #selector(selectApplicationAction(_:)), keyEquivalent: key)
+            item.target = self
+            item.tag = action.rawValue
+            return item
+        }
+        let application = submenu("Agent Queue")
+        application.addItem(applicationItem(.updates))
+        application.addItem(.separator())
+        let services = NSMenu(title: "Services")
+        let servicesItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+        servicesItem.submenu = services
+        application.addItem(servicesItem)
+        NSApp.servicesMenu = services
+        application.addItem(.separator())
+        application.addItem(withTitle: "Hide Agent Queue", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let hideOthers = application.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        application.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        application.addItem(.separator())
+        application.addItem(applicationItem(.quit, key: "q"))
+        let file = submenu("File")
+        file.addItem(applicationItem(.openWindow))
+        file.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        let edit = submenu("Edit")
+        edit.addItem(withTitle: "Undo", action: NSSelectorFromString("undo:"), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "Redo", action: NSSelectorFromString("redo:"), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let window = submenu("Window")
+        window.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        window.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        window.addItem(.separator())
+        window.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+        NSApp.windowsMenu = window
+        return main
     }
 
     private func verifyPasswordValidation() -> PasswordValidationVerification {
@@ -1681,19 +1988,12 @@ struct ConfirmationVerification: Encodable {
 }
 
 @main
-struct AgentQueueApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var store = AppRuntime.store
-
-    var body: some Scene {
-        MenuBarExtra {
-            QueuePanel(store: store)
-        } label: {
-            Label {
-                if store.error != nil { Text("!") }
-                else if !store.badge.isEmpty { Text(store.badge).monospacedDigit() }
-            } icon: { Image(systemName: "square.stack.3d.up") }
-            .accessibilityLabel("Agent Queue, \(store.snapshot?.queue.running ?? 0) running, \(store.snapshot?.queue.waiting ?? 0) waiting")
-        }.menuBarExtraStyle(.window)
+struct AgentQueueApp {
+    @MainActor static func main() {
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        withExtendedLifetime(delegate) { application.run() }
     }
 }

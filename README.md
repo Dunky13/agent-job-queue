@@ -130,6 +130,8 @@ Pueue owns submitted jobs independently of the calling terminal and menu app. Cl
 
 The menu-bar app provides project and branch labels, queue positions, elapsed time, results, job details, and bounded log tails. Background checks leave unchanged content in place. Details and confirmations stay within the queue panel.
 
+Click the menu-bar icon to open the queue popover. Right-click or Control-click it for **Open window**, learned workloads, About and updates, agent integration, remote access settings, and Quit. Double-click the icon to open or focus the main queue window. The same settings remain available in the popover's gear menu.
+
 Use the app or CLI to change future scheduling:
 
 ```sh
