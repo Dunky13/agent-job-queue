@@ -1,0 +1,69 @@
+{
+  "updatedAt": "2026-10-19T08:00:34+00:00",
+  "queue": {
+    "status": "running",
+    "limit": 1,
+    "running": 1,
+    "waiting": 2,
+    "legacyOccupied": false
+  },
+  "jobs": [
+    {
+      "id": 101,
+      "state": "running",
+      "title": "Build API and run unit tests",
+      "project": "example-api",
+      "branch": "feature/search",
+      "directory": "/example/example-api",
+      "executable": "go",
+      "priority": 0,
+      "queuePosition": null,
+      "submittedAt": "2026-10-19T07:58:04+00:00",
+      "startedAt": "2026-10-19T07:59:00+00:00",
+      "finishedAt": null,
+      "exitCode": null,
+      "logPath": "",
+      "canReorder": false,
+      "canCancel": true,
+      "phase": "Running"
+    },
+    {
+      "id": 102,
+      "state": "queued",
+      "title": "Run browser tests",
+      "project": "example-web",
+      "branch": "fix/login",
+      "directory": "/example/example-web",
+      "executable": "npm",
+      "priority": 0,
+      "queuePosition": 1,
+      "submittedAt": "2026-10-19T07:58:04+00:00",
+      "startedAt": null,
+      "finishedAt": null,
+      "exitCode": null,
+      "logPath": "",
+      "canReorder": true,
+      "canCancel": true,
+      "phase": "Queued"
+    },
+    {
+      "id": 103,
+      "state": "queued",
+      "title": "Typecheck client",
+      "project": "example-client",
+      "branch": "feature/dashboard",
+      "directory": "/example/example-client",
+      "executable": "npm",
+      "priority": 0,
+      "queuePosition": 2,
+      "submittedAt": "2026-10-19T07:58:04+00:00",
+      "startedAt": null,
+      "finishedAt": null,
+      "exitCode": null,
+      "logPath": "",
+      "canReorder": true,
+      "canCancel": true,
+      "phase": "Queued"
+    }
+  ]
+}

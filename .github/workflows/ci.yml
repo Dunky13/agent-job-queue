@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: ['**']
+    branches: [main, bootstrap]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -116,6 +116,19 @@ jobs:
           python-version: '3.12'
       - name: Build macOS 15+ universal installer app
         run: scripts/build-installer.sh
+      - name: Generate immutable release manifest and Homebrew cask
+        run: |
+          python packaging/homebrew/render_cask.py \
+            --archive "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" \
+            --version "$(cat VERSION)" --tag "build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" \
+            --commit "$GITHUB_SHA" --build "$GITHUB_RUN_NUMBER" --output dist
+      - name: Record Homebrew version used for packaging validation
+        run: brew --version
+      - name: Verify Homebrew manifest and actual automated installer artifact
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_DEVELOPER: '1'
+        run: python -m unittest discover -s tests -p test_homebrew.py -v
       - name: Install daemon for isolated installer smoke test
         run: brew install pueue
         env:
@@ -171,10 +184,32 @@ jobs:
         run: |
           tag="build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            existing=$(mktemp -d)
+            trap 'rm -rf "$existing"' EXIT
+            gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json targetCommitish > "$existing/release.json"
+            for asset in dist/*; do
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "${asset##*/}" --dir "$existing"
+            done
+            python3 - "$existing" "$GITHUB_SHA" <<'PY'
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+          existing = Path(sys.argv[1])
+          if json.loads((existing / 'release.json').read_text())['targetCommitish'] != sys.argv[2]:
+              sys.exit('Existing immutable release has a different target commit')
+          for asset in Path('dist').iterdir():
+              with asset.open('rb') as handle:
+                  expected = hashlib.file_digest(handle, 'sha256').hexdigest()
+              with (existing / asset.name).open('rb') as handle:
+                  actual = hashlib.file_digest(handle, 'sha256').hexdigest()
+              if actual != expected:
+                  sys.exit('Existing immutable release differs: ' + asset.name)
+          print('Existing release target and all assets match; no overwrite performed.')
+          PY
           else
             gh release create "$tag" dist/* \
               --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "Main build ${GITHUB_RUN_NUMBER}" --prerelease \
-              --notes "Automated installer from validated main commit ${GITHUB_SHA}. Includes Apple Silicon and Intel executables."
+              --notes "Automated installer from validated main commit ${GITHUB_SHA}. Includes Apple Silicon and Intel executables plus checksum-pinned Homebrew metadata."
           fi

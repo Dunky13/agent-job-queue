@@ -1,0 +1,32 @@
+Copy render_cask.py, refresh.py, test-cask.rb, LICENSE and .github/workflows/refresh.yml
+into the dedicated Dunky13/homebrew-agent-job-queue repository. Use a signed,
+DCO-signed-off initial commit on its default branch named tap. Do not copy SEED.txt.
+The app source repository's protected main branch remains independent.
+
+The refresh workflow reads only the known public app repository. It selects the
+highest numbered published build with a strict JSON manifest, downloads the known
+installer asset, verifies its SHA256, regenerates Ruby using the trusted local
+template, checks it through the real Homebrew DSL, and only then creates a signed
+GitHub API commit on tap. It never evaluates released Ruby. No PAT is needed.
+The GitHub Actions token is scoped to contents:write in this dedicated repository.
+The returned commit is checked for a Verified signature and matching author DCO.
+Expected-head compare-and-swap and current-build checks prevent stale updates.
+
+Scheduled refresh runs every 15 minutes; GitHub may delay scheduled workflows.
+Owners can run Refresh generated tap manually after a source release. Until the
+first validated main release publishes metadata, refresh succeeds without a Cask.
+Do not advertise the install command as usable until that first refresh succeeds.
+
+After publication the fully qualified command selects/trusts only this cask:
+  brew install --cask dunky13/agent-job-queue/agent-job-queue
+Homebrew 7 explicitly trusts a fully qualified item on install; no whole-tap trust
+or quarantine bypass is required. The downloaded build is ad hoc signed and is
+not notarized, so macOS may require normal user approval before opening the app.
+
+Install is automatic: Homebrew prepares dependencies, the vendor installer sets
+up private support/services and opens the menu app, and Homebrew links both CLI
+commands. Uninstall removes its command links, menu app and menu login plist.
+Shared per-user backend, independent queue daemon, operator commands, jobs,
+credentials and enabled remote access are retained, including on brew upgrade.
+Disable remote access in settings before uninstall if its listener should stop.
+No destructive zap action is supplied.

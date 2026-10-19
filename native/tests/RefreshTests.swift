@@ -4,12 +4,36 @@ import Combine
 actor StatusFixture {
     var data: Data
     var fails = false
+    private var shouldHoldNextRead = false
+    private var heldRead: CheckedContinuation<Void, Never>?
+    private var readWaiter: CheckedContinuation<Void, Never>?
     init(_ data: Data) { self.data = data }
     func set(_ data: Data, fails: Bool = false) { self.data = data; self.fails = fails }
+    func holdNextRead() {
+        precondition(!shouldHoldNextRead && heldRead == nil && readWaiter == nil)
+        shouldHoldNextRead = true
+    }
+    func waitUntilReadHeld() async {
+        if heldRead != nil { return }
+        precondition(shouldHoldNextRead && readWaiter == nil)
+        await withCheckedContinuation { readWaiter = $0 }
+    }
+    func releaseRead() {
+        guard let continuation = heldRead else { preconditionFailure("No read is held") }
+        heldRead = nil
+        continuation.resume()
+    }
     func load() async throws -> Data {
         let captured = data
         let failed = fails
-        try await Task.sleep(for: .milliseconds(50))
+        if shouldHoldNextRead {
+            shouldHoldNextRead = false
+            await withCheckedContinuation {
+                heldRead = $0
+                readWaiter?.resume()
+                readWaiter = nil
+            }
+        }
         if failed { throw ClientError.message("Fixture disconnected") }
         return captured
     }
@@ -32,10 +56,12 @@ struct RefreshTests {
         var publishes = 0
         let subscription = store.objectWillChange.sink { publishes += 1 }
         await fixture.set(try snapshot("2026-10-18T10:00:02Z"))
+        await fixture.holdNextRead()
         let quiet = Task { await store.refresh() }
-        try await Task.sleep(for: .milliseconds(10))
+        await fixture.waitUntilReadHeld()
         // Capture every failure before throwing so the pre-fix run explains both causes.
         let controlsStable = !store.actionsDisabled && !store.isRefreshing
+        await fixture.releaseRead()
         await quiet.value
         let unchangedWasSilent = publishes == 0
         FileHandle.standardOutput.write(Data("\(controlsStable ? "PASS" : "FAIL") background polling leaves controls enabled\n".utf8))
@@ -52,12 +78,16 @@ struct RefreshTests {
         try check(store.error == nil && !store.actionsDisabled, "unchanged recovery re-enables actions")
         // A slow poll that began before a mutation must not overwrite its newer state.
         await fixture.set(try snapshot("2026-10-18T10:00:10Z", limit: 1))
+        await fixture.holdNextRead()
         let oldRead = Task { await store.refresh() }
-        try await Task.sleep(for: .milliseconds(10))
+        await fixture.waitUntilReadHeld()
         store.isMutating = true
+        await fixture.releaseRead()
         await oldRead.value
         try check(store.snapshot?.queue.limit == 2, "in-flight read cannot overwrite a mutation")
         store.isMutating = false
+        await store.refresh()
+        try check(store.snapshot?.queue.limit == 1, "refresh resumes after mutation")
         subscription.cancel()
     }
 }
