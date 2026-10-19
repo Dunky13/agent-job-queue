@@ -23,10 +23,24 @@
       <section id="queue-view">
         <div class="summary" aria-label="Queue overview"><div><strong id="running-count">—</strong><span>running</span></div><div><strong id="waiting-count">—</strong><span>waiting</span></div><div><strong id="limit-count">—</strong><span>parallel limit</span></div></div>
         <section class="settings">
-          <form id="limit-form">
+          <form id="limit-form" action="/api/limit" method="post">
             <div><label for="limit">Parallel jobs</label><p id="limit-hint">Lowering the limit lets active jobs finish.</p></div>
             <div class="limit-controls"><select id="limit" name="limit" aria-describedby="limit-hint" disabled><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option></select><button id="apply-limit" type="submit" disabled>Apply</button></div>
           </form>
+          <form id="scheduling-form" action="/api/scheduling" method="post">
+            <fieldset id="scheduling-modes" aria-describedby="scheduling-hint" disabled>
+              <legend>Scheduling</legend>
+              <div class="mode-options">
+                <label><input type="radio" name="mode" value="fixed"> Fixed</label>
+                <label><input type="radio" name="mode" value="shadow"> Learn only</label>
+                <label><input type="radio" name="mode" value="adaptive"> Adaptive</label>
+              </div>
+              <p id="scheduling-hint">Adaptive fits jobs within your parallel limit. Learn only records predictions. Running jobs are never stopped automatically.</p>
+            </fieldset>
+            <button id="apply-scheduling" type="submit" disabled>Set mode</button>
+          </form>
+          <p id="scheduler-status">Resource monitoring unavailable.</p>
+          <p id="host-status"></p>
         </section>
         <p id="queue-notice" class="notice" hidden></p>
         <section id="confirmation" class="confirmation" aria-labelledby="confirmation-title" hidden>

@@ -105,6 +105,30 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(result.json["truncated"])
         self.assertEqual(self.calls, [["status", "--json"]])
 
+    def test_scheduling_modes_require_csrf_and_strict_allowlist(self):
+        result = self.client.post("/api/scheduling", base_url=self.origin, json={"mode": "adaptive"}, headers={"Origin": self.origin})
+        self.assertEqual(result.status_code, 400)
+        for value in ({"mode": "auto"}, {"mode": True}, {"mode": []}, {"mode": "fixed", "command": "run"}, {}, []):
+            with self.subTest(value=value):
+                result = self.client.post("/api/scheduling", base_url=self.origin, json=value, headers=self.headers)
+                self.assertEqual(result.status_code, 400)
+        self.assertEqual(self.calls, [])
+        for mode in ("fixed", "shadow", "adaptive"):
+            result = self.client.post("/api/scheduling", base_url=self.origin, json={"mode": mode}, headers=self.headers)
+            self.assertEqual(result.json, {"ok": True})
+        self.assertEqual(self.calls, [["scheduling", mode] for mode in ("fixed", "shadow", "adaptive")])
+
+    def test_scheduling_propagates_controller_failure_without_success(self):
+        def unavailable(_arguments):
+            raise server.BackendError("Resource sampler unavailable")
+        app = server.create_app({"hosts": ["queue.local"], "port": 8743, "secret_key": "fixture" * 8}, unavailable, test_mode=True)
+        client = app.test_client()
+        token = client.get("/api/csrf", base_url=self.origin).json["token"]
+        result = client.post("/api/scheduling", base_url=self.origin, json={"mode": "adaptive"},
+                             headers={**self.headers, "X-CSRFToken": token})
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(result.json, {"error": "Resource sampler unavailable"})
+
     def test_static_asset_routes_and_mime_types(self):
         (self.root / "vendor").mkdir()
         for name in ("app.css", "app.js", "vendor/module.js"):

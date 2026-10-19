@@ -22,7 +22,8 @@ for bundle, executable in ((app, 'Installer'), (payload / 'Agent Queue.app', 'Ag
     assert info['LSMinimumSystemVersion'] == '15.0'
     architectures = subprocess.check_output(['xcrun', 'lipo', '-archs', str(bundle / 'Contents/MacOS' / executable)], text=True).split()
     assert set(architectures) == {'arm64', 'x86_64'}, architectures
-for name in ('agent_heavy.py', 'agent_integration.py', 'remote/control.py', 'remote/server.py', 'remote/requirements.txt', 'remote/requirements.lock',
+for name in ('agent_heavy.py', 'agent_integration.py', 'resource_monitor.py', 'job_profiles.py', 'resource_scheduler.py',
+             'remote/control.py', 'remote/server.py', 'remote/requirements.txt', 'remote/requirements.lock',
              'remote/static/index.html', 'remote/static/vendor/zod.mjs', 'bin/agent-heavy', 'bin/agent-remote',
              'scripts/install-user.sh', 'scripts/migrate-installation.py', 'LICENSE', 'VERSION'):
     assert (payload / 'source' / name).is_file(), name

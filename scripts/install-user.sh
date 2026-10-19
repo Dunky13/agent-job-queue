@@ -66,6 +66,9 @@ printf 'Installing application support files...\n'
 # Copy only the public payload. Runtime state, credentials and the existing venv stay private.
 cp "$payload/source/agent_heavy.py" "$root/agent_heavy.py"
 cp "$payload/source/agent_integration.py" "$root/agent_integration.py"
+for module in resource_monitor.py job_profiles.py resource_scheduler.py; do
+  cp "$payload/source/$module" "$root/$module"
+done
 mkdir -p "$root/remote/static" "$root/bin" "$root/scripts"
 cp "$payload/source/remote/control.py" "$payload/source/remote/server.py" "$payload/source/remote/requirements.txt" "$payload/source/remote/requirements.lock" "$root/remote/"
 cp -R "$payload/source/remote/static/." "$root/remote/static/"
@@ -123,6 +126,18 @@ if not queue_plist.exists():
         'ThrottleInterval': 10, 'Umask': 0o077, 'WorkingDirectory': str(state),
     }))
     queue_plist.chmod(0o600)
+controller_plist = launch / 'io.went.agent-resources.plist'
+if not controller_plist.exists():
+    controller_plist.write_bytes(plistlib.dumps({
+        'Label': 'io.went.agent-resources',
+        'ProgramArguments': [str(root / '.venv/bin/python'), str(root / 'agent_heavy.py'), 'scheduler'],
+        'EnvironmentVariables': {'HOME': str(home), 'PATH': '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+                                 **{key: os.environ[key] for key in ('AGENT_HEAVY_PUEUE', 'AGENT_HEAVY_LEGACY_SLOT') if key in os.environ}},
+        'KeepAlive': True, 'RunAtLoad': True, 'ThrottleInterval': 10, 'Umask': 0o077,
+        'StandardErrorPath': str(state / 'resources.log'), 'StandardOutPath': str(state / 'resources.log'),
+        'WorkingDirectory': str(state),
+    }))
+    controller_plist.chmod(0o600)
 app = home / 'Applications/Agent Queue.app'
 menu_plist = launch / 'io.went.agent-queue.plist'
 menu_plist.write_bytes(plistlib.dumps({'Label': 'io.went.agent-queue',
@@ -144,6 +159,9 @@ for _attempt in {1..30}; do
   sleep 1
 done
 [[ "$ready" == 1 ]] || { echo 'The queue daemon did not become ready. Inspect the private daemon log.' >&2; exit 1; }
+if ! launchctl print "gui/$(id -u)/io.went.agent-resources" >/dev/null 2>&1; then
+  launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.went.agent-resources.plist"
+fi
 if [[ "$fresh_config" == 1 ]]; then
   "$pueue_tool" --config "$config/pueue.yml" --color never parallel 1 --group default
 fi

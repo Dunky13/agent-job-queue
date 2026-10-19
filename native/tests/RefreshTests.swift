@@ -4,6 +4,7 @@ import Combine
 actor StatusFixture {
     var data: Data
     var fails = false
+    var commands: [[String]] = []
     private var shouldHoldNextRead = false
     private var heldRead: CheckedContinuation<Void, Never>?
     private var readWaiter: CheckedContinuation<Void, Never>?
@@ -22,6 +23,17 @@ actor StatusFixture {
         guard let continuation = heldRead else { preconditionFailure("No read is held") }
         heldRead = nil
         continuation.resume()
+    }
+    func command(_ arguments: [String]) throws -> Data {
+        commands.append(arguments)
+        var snapshot = try JSONDecoder().decode(QueueSnapshot.self, from: data)
+        guard arguments.count == 2, arguments[0] == "scheduling", let mode = SchedulingMode(rawValue: arguments[1]),
+              let scheduler = snapshot.scheduler else { throw ClientError.message("Invalid fixture command") }
+        if mode == .adaptive && !scheduler.available { throw ClientError.message("Resource sampler unavailable") }
+        snapshot.scheduler = QueueScheduler(mode: mode, available: scheduler.available,
+            reason: scheduler.reason, updatedAt: scheduler.updatedAt, host: scheduler.host)
+        data = try JSONEncoder().encode(snapshot)
+        return Data("{}".utf8)
     }
     func load() async throws -> Data {
         let captured = data
@@ -89,5 +101,48 @@ struct RefreshTests {
         await store.refresh()
         try check(store.snapshot?.queue.limit == 1, "refresh resumes after mutation")
         subscription.cancel()
+
+        var telemetry = try JSONDecoder().decode(QueueSnapshot.self, from: snapshot("2026-10-19T10:00:00Z"))
+        try check(telemetry.scheduler == nil, "Older status without telemetry decodes as unavailable")
+        telemetry.scheduler = QueueScheduler(mode: .fixed, available: true, reason: "Learning", updatedAt: nil,
+            host: HostResources(sampledAt: 1792404000, totalMemoryBytes: 17_179_869_184,
+                availableMemoryBytes: 4_294_967_296, cpuCores: 8, cpuBusyCores: 2.5,
+                memoryPressure: "warning", swapUsedBytes: 1_073_741_824, swapInBytesPerSecond: 0,
+                swapOutBytesPerSecond: 0, diskFreeBytes: 21_474_836_480, machine: "arm64", complete: false))
+        let schedulingFixture = StatusFixture(try JSONEncoder().encode(telemetry))
+        let scheduling = QueueStore(statusLoader: { try await schedulingFixture.load() },
+            command: { try await schedulingFixture.command($0) })
+        await scheduling.refresh()
+        try check(scheduling.snapshot?.scheduler?.host?.summary.contains("Collecting rates") == true,
+                  "Cold telemetry explicitly collects rates")
+        var telemetryPublishes = 0
+        let telemetrySubscription = scheduling.objectWillChange.sink { telemetryPublishes += 1 }
+        telemetry.scheduler = QueueScheduler(mode: .fixed, available: true, reason: "Learning",
+            updatedAt: "2026-10-19T10:00:01Z", host: telemetry.scheduler?.host)
+        await schedulingFixture.set(try JSONEncoder().encode(telemetry))
+        await scheduling.refresh()
+        try check(telemetryPublishes == 0, "Scheduler acquisition timestamp alone does not republish unchanged data")
+        telemetrySubscription.cancel()
+        let change = scheduling.dispatchScheduling(.adaptive)
+        try check(change != nil && scheduling.isMutating && scheduling.dispatchScheduling(.shadow) == nil,
+                  "Scheduling mutation reserves before I/O and rejects duplicate changes")
+        await change?.value
+        let commands = await schedulingFixture.commands
+        try check(commands == [["scheduling", "adaptive"]] && scheduling.snapshot?.scheduler?.mode == .adaptive,
+                  "Scheduling dispatch uses allowlisted mode and refreshes actual status")
+        telemetry.scheduler = QueueScheduler(mode: .fixed, available: false, reason: "Sampling failed", updatedAt: nil, host: nil)
+        await schedulingFixture.set(try JSONEncoder().encode(telemetry))
+        await scheduling.refresh()
+        await scheduling.dispatchScheduling(.shadow)?.value
+        try check(scheduling.snapshot?.scheduler?.mode == .shadow, "Learning mode remains available without sampler")
+        await scheduling.dispatchScheduling(.adaptive)?.value
+        try check(scheduling.error?.contains("Resource sampler unavailable") == true && scheduling.snapshot?.scheduler?.mode == .shadow,
+                  "Unavailable adaptive mode reports failure and preserves confirmed mode")
+        let olderData = try snapshot("2026-10-19T10:00:01Z")
+        let unsupported = QueueStore(statusLoader: { olderData }, command: { _ in
+            throw ClientError.message("Unsupported controller must never mutate")
+        })
+        await unsupported.refresh()
+        try check(unsupported.dispatchScheduling(.adaptive) == nil, "Older controller cannot receive unsupported scheduling mutation")
     }
 }

@@ -106,6 +106,15 @@ def create_app(settings: dict, runner=None, *, test_mode: bool = False) -> Flask
         run(["limit", str(value["limit"])])
         return jsonify(ok=True)
 
+    @app.post("/api/scheduling")
+    def scheduling():
+        value = request.get_json()
+        if not isinstance(value, dict) or set(value) != {"mode"} or not isinstance(value["mode"], str) \
+                or value["mode"] not in {"fixed", "shadow", "adaptive"}:
+            return jsonify(error="Scheduling mode must be fixed, shadow, or adaptive"), 400
+        run(["scheduling", value["mode"]])
+        return jsonify(ok=True)
+
     @app.post("/api/jobs/<int:task_id>/<action>")
     def job_action(task_id, action):
         if action not in {"next", "last", "start", "cancel"} or task_id > 2**63 - 1:
