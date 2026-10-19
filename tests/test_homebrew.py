@@ -183,12 +183,19 @@ class HomebrewTests(unittest.TestCase):
         fixture_environment.chmod(0o600)
         cask = self.root / "agent-job-queue.rb"
         cask.write_text(renderer.render_cask(self.manifest))
-        environment = {**fixture.environment, "HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_DEVELOPER": "1"}
+        # This fixture evaluates a local cask and stubs dependency installation.
+        # A fresh HOME must not trigger a live Homebrew package-index download.
+        environment = {**fixture.environment, "HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_DEVELOPER": "1",
+                       "HOMEBREW_NO_INSTALL_FROM_API": "1"}
         invocation = [brew, "ruby"]
         if older_api:
             shim = self.root / "older-homebrew.rb"
             shim.write_text(
                 'require "cask/cask_loader"\nrequire "cask/artifact/installer"\n'
+                'Homebrew::API.singleton_class.prepend(Module.new do\n'
+                '  def fetch_json_api_file(*)\n'
+                '    raise "Local installer fixture must not fetch the package index"\n'
+                '  end\nend)\n'
                 'Cask::Artifact::Installer.class_eval { undef_method :requires_sudo? if method_defined?(:requires_sudo?) }\n'
                 'raise "Privilege method still exposed" if Cask::Artifact::Installer.method_defined?(:requires_sudo?)\n'
                 'compatibility = Module.new do\n'

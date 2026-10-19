@@ -25,7 +25,7 @@ class InstallerTests(unittest.TestCase):
         self.payload = self.base / "payload"
         self.source = self.payload / "source"
         self.source.mkdir(parents=True)
-        for name in ("agent_heavy.py", "install-remote.sh"):
+        for name in ("agent_heavy.py", "agent_integration.py", "install-remote.sh"):
             shutil.copy2(ROOT / name, self.source / name)
         shutil.copytree(ROOT / "bin", self.source / "bin")
         shutil.copytree(ROOT / "remote", self.source / "remote", ignore=shutil.ignore_patterns(".venv", "__pycache__"))
@@ -117,6 +117,23 @@ fi''')
         self.assertNotIn("<bootout>", calls)
         self.assertNotIn("<parallel>", calls)
         self.assertNotIn("<kill>", calls)
+
+    def test_installed_agent_integration_is_opt_in_and_uses_shipped_module(self):
+        environment = {**self.environment, "HOME": str(self.home.resolve()),
+                       "CODEX_HOME": str((self.home / ".codex").resolve()),
+                       "CLAUDE_CONFIG_DIR": str((self.home / ".claude").resolve())}
+        self.assertEqual(self.install().returncode, 0)
+        self.assertFalse((self.home / ".codex").exists())
+        self.assertFalse((self.home / ".claude").exists())
+        wrapper = self.home / ".local/bin/agent-heavy"
+        command = [str(wrapper), "agents", "install", "--runner", "codex", "--json"]
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(result.stdout)
+        self.assertTrue(state["runners"][0]["configured"])
+        self.assertFalse(state["runners"][1]["configured"])
+        self.assertIn("Agent Job Queue", (self.home / ".codex/AGENTS.md").read_text())
+        self.assertFalse((self.home / ".claude").exists())
 
     def test_explicit_operator_overrides_survive_daemon_environment(self):
         self.environment["AGENT_HEAVY_PUEUE"] = str(self.tools / "pueue")

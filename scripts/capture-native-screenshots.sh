@@ -29,3 +29,5 @@ ARCHS=$(uname -m) "$root/native/build.sh" "$temporary/AgentQueue"
   --snapshot "$temporary/confirmation.png" --snapshot-menu --snapshot-confirmation start \
   --verify-confirmation-navigation "$temporary/navigation.json"
 cp "$temporary/confirmation.png" "$output/mac-start-now.png"
+"$temporary/AgentQueue" --fixture "$temporary/fixture.json" \
+  --snapshot "$output/agent-integration.png" --snapshot-agent-integration

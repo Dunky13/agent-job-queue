@@ -17,6 +17,7 @@ Activate the virtual environment for these commands:
 source .venv/bin/activate
 bash scripts/lint.sh
 python -m unittest discover -s tests -p test_agent_heavy.py -v
+python -m unittest discover -s tests -p test_agent_integration.py -v
 python -m unittest discover -s tests -p test_integration.py -v
 python -m unittest discover -s remote/tests -p test_remote.py -v
 npm run test:web
@@ -29,7 +30,7 @@ scripts/test-installer.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-univers
 
 Apply your shared queue policy to resource-intensive local batches. Hosted CI has its own isolated runners. Do not submit the queue wrapper inside an already queued batch.
 
-Core and HTTPS acceptance tests launch their own temporary daemons, state directories, child processes, ports, and test-only credentials. Browser tests use simulated jobs. Installer tests use stub tools and an isolated user directory. They must never operate on your active queue. Native tests are headless and check the actual store and navigation handlers.
+Core and HTTPS acceptance tests launch their own temporary daemons, state directories, child processes, ports, and test-only credentials. Browser tests use simulated jobs. Installer and agent-integration tests use isolated user directories. They must never operate on your active queue or real agent instructions. Native tests are headless and check the actual store and navigation handlers, including opt-in integration, duplicate-save protection, partial failures, and onboarding state.
 
 Use `AGENT_QUEUE_TEST_PYTHON` to select a Python interpreter with the remote dependencies for browser tests. Playwright runs one Chromium worker and does not retry failures.
 

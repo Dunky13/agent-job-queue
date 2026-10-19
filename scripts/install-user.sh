@@ -15,7 +15,7 @@ if [[ ${AGENT_QUEUE_INSTALL_TEST_MODE:-} == 1 ]]; then
 else
   [[ $(uname -s) == Darwin ]] || { echo 'Agent Job Queue requires macOS.' >&2; exit 1; }
 fi
-[[ -d "$payload/Agent Queue.app" && -f "$payload/source/agent_heavy.py" && -f "$payload/source/remote/requirements.txt" ]] || {
+[[ -d "$payload/Agent Queue.app" && -f "$payload/source/agent_heavy.py" && -f "$payload/source/agent_integration.py" && -f "$payload/source/remote/requirements.txt" ]] || {
   echo 'Incomplete installer payload.' >&2; exit 1;
 }
 brew_tool=$(command -v brew || true)
@@ -65,6 +65,7 @@ pueue_tool=$(command -v pueue)
 printf 'Installing application support files...\n'
 # Copy only the public payload. Runtime state, credentials and the existing venv stay private.
 cp "$payload/source/agent_heavy.py" "$root/agent_heavy.py"
+cp "$payload/source/agent_integration.py" "$root/agent_integration.py"
 mkdir -p "$root/remote/static" "$root/bin" "$root/scripts"
 cp "$payload/source/remote/control.py" "$payload/source/remote/server.py" "$payload/source/remote/requirements.txt" "$payload/source/remote/requirements.lock" "$root/remote/"
 cp -R "$payload/source/remote/static/." "$root/remote/static/"

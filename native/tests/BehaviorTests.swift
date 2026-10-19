@@ -1,5 +1,42 @@
 import Foundation
 
+actor IntegrationFixture {
+    var configured: Set<String> = []
+    var calls: [[String]] = []
+    var failClaude = false
+    private var held: CheckedContinuation<Void, Never>?
+    private var started: CheckedContinuation<Void, Never>?
+    private var shouldHold = false
+
+    func holdNextMutation() { shouldHold = true }
+    func waitForMutation() async {
+        if held != nil { return }
+        await withCheckedContinuation { started = $0 }
+    }
+    func releaseMutation() { held?.resume(); held = nil }
+    func failSecondRunner() { failClaude = true }
+    func load(_ arguments: [String]) async throws -> Data {
+        calls.append(arguments)
+        if arguments[1] != "status" {
+            if shouldHold {
+                shouldHold = false
+                await withCheckedContinuation {
+                    held = $0
+                    started?.resume()
+                    started = nil
+                }
+            }
+            let id = arguments[3]
+            if id == "claude" && failClaude { throw ClientError.message("Instruction file is read-only") }
+            if arguments[1] == "install" { configured.insert(id) } else { configured.remove(id) }
+        }
+        return try JSONEncoder().encode(AgentIntegrationSnapshot(runners: [
+            AgentRunnerConfiguration(id: "codex", name: "Codex", path: "~/.codex/AGENTS.md", configured: configured.contains("codex"), error: nil),
+            AgentRunnerConfiguration(id: "claude", name: "Claude Code", path: "~/.claude/CLAUDE.md", configured: configured.contains("claude"), error: nil)
+        ], instruction: "Shared queue instructions"))
+    }
+}
+
 @main
 struct BehaviorTests {
     @MainActor static func main() async throws {
@@ -42,5 +79,46 @@ struct BehaviorTests {
         }
         let remote = RemoteAccessStore(fixtureMode: true)
         try check(remote.fixtureMode && !remote.configure(password: "word", enable: true), "Fixture cannot change actual remote credentials")
+
+        let suite = "agent-queue-onboarding-test-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { throw ClientError.message("No isolated defaults") }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        try check(AgentOnboarding.shouldOffer(defaults: defaults, fixtureMode: false), "New users receive integration setup")
+        try check(!AgentOnboarding.shouldOffer(defaults: defaults, fixtureMode: true), "Fixtures never trigger real onboarding")
+        defaults.set(true, forKey: AgentOnboarding.offeredKey)
+        try check(!AgentOnboarding.shouldOffer(defaults: defaults, fixtureMode: false), "Dismissed onboarding stays dismissed")
+
+        let integrationFixture = IntegrationFixture()
+        let integration = AgentIntegrationStore(command: { try await integrationFixture.load($0) })
+        await integration.refresh()
+        try check(integration.selected.isEmpty && !integration.canSave, "Integration starts with no runners selected")
+        integration.select("codex", enabled: true)
+        await integrationFixture.holdNextMutation()
+        let saving = integration.save()
+        await integrationFixture.waitForMutation()
+        try check(integration.isBusy && integration.save() == nil, "Duplicate saves are rejected before I/O")
+        integration.select("claude", enabled: true)
+        try check(!integration.selected.contains("claude"), "Selection is stable while saving")
+        await integrationFixture.releaseMutation()
+        await saving?.value
+        let calls = await integrationFixture.calls
+        try check(calls == [["agents", "status", "--json"], ["agents", "install", "--runner", "codex", "--json"]], "Only the selected runner is configured")
+        try check(integration.snapshot?.runners.first?.configured == true && !integration.hasChanges && integration.notice != nil, "Saved configuration is reflected")
+        integration.select("codex", enabled: false)
+        await integration.save()?.value
+        try check(integration.snapshot?.runners.first?.configured == false, "Deselecting a runner removes its managed section")
+
+        integration.select("codex", enabled: true)
+        integration.select("claude", enabled: true)
+        await integrationFixture.failSecondRunner()
+        await integration.save()?.value
+        try check(integration.error != nil && integration.notice == nil && !integration.isBusy, "Partial failure is explained without a success notice")
+        try check(integration.snapshot?.runners.first?.configured == true && integration.snapshot?.runners.last?.configured == false, "Partial failure reconciles actual per-runner state")
+        let preview = AgentIntegrationStore(fixtureMode: true, command: { _ in
+            throw ClientError.message("Preview must not dispatch")
+        })
+        preview.select("codex", enabled: true)
+        await preview.refresh()
+        try check(preview.save() == nil && preview.error == nil, "Preview never dispatches instruction changes")
     }
 }

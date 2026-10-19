@@ -18,7 +18,7 @@ for architecture in arm64 x86_64; do
     -framework SwiftUI -framework AppKit "$root/native/Installer.swift" -o "$work/Installer-$architecture"
 done
 xcrun lipo -create "$work/Installer-arm64" "$work/Installer-x86_64" -output "$installer/Contents/MacOS/Installer"
-cp "$root/agent_heavy.py" "$root/install-remote.sh" "$payload/source/"
+cp "$root/agent_heavy.py" "$root/agent_integration.py" "$root/install-remote.sh" "$payload/source/"
 cp "$root/remote/control.py" "$root/remote/server.py" "$root/remote/requirements.txt" "$root/remote/requirements.lock" "$payload/source/remote/"
 cp -R "$root/remote/static" "$payload/source/remote/"
 cp "$root/scripts/install-user.sh" "$root/scripts/migrate-installation.py" "$payload/source/scripts/"
