@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f5f5f7">
+  <title>Agent Queue</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to queue</a>
+  <div class="shell">
+    <header class="app-header">
+      <div class="brand"><span class="app-symbol" aria-hidden="true">▱</span><div><p class="eyebrow">YOUR MAC</p><h1>Agent Queue</h1></div></div>
+      <button type="button" id="refresh" class="quiet-button">Refresh</button>
+    </header>
+    <main id="content" tabindex="-1">
+      <div id="connection" class="connection"><span class="connection-dot" aria-hidden="true"></span><span id="connection-text">Connecting to your Mac…</span></div>
+      <div id="error" class="notice error" role="alert" hidden></div>
+      <p id="announcement" class="visually-hidden" role="status" aria-live="polite"></p>
+      <section id="queue-view">
+        <div class="summary" aria-label="Queue overview"><div><strong id="running-count">—</strong><span>running</span></div><div><strong id="waiting-count">—</strong><span>waiting</span></div><div><strong id="limit-count">—</strong><span>parallel limit</span></div></div>
+        <section class="settings">
+          <form id="limit-form">
+            <div><label for="limit">Parallel jobs</label><p id="limit-hint">Lowering the limit lets active jobs finish.</p></div>
+            <div class="limit-controls"><select id="limit" name="limit" aria-describedby="limit-hint" disabled><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5</option><option value="6">6</option><option value="7">7</option><option value="8">8</option></select><button id="apply-limit" type="submit" disabled>Apply</button></div>
+          </form>
+        </section>
+        <p id="queue-notice" class="notice" hidden></p>
+        <section id="confirmation" class="confirmation" aria-labelledby="confirmation-title" hidden>
+          <h2 id="confirmation-title" tabindex="-1"></h2><p id="confirmation-copy"></p>
+          <div class="button-row"><button id="confirm-action" type="button"></button><button id="dismiss-confirmation" type="button" class="quiet-button">Keep waiting</button></div>
+        </section>
+        <section class="job-section"><div class="section-title"><h2>Running</h2><span id="running-label"></span></div><ul id="running-jobs" class="job-list" role="list"><li class="empty">Loading your queue…</li></ul></section>
+        <section class="job-section"><div class="section-title"><h2>Up next</h2><span id="waiting-label"></span></div><ul id="waiting-jobs" class="job-list" role="list"><li class="empty">Loading your queue…</li></ul></section>
+        <details class="recent-section"><summary>Recent jobs <span id="recent-count"></span></summary><ul id="recent-jobs" class="job-list" role="list"></ul></details>
+      </section>
+      <section id="detail-view" hidden>
+        <button id="back" type="button" class="back-button">‹ Queue</button>
+        <h2 id="detail-title" tabindex="-1"></h2><p id="detail-status" class="detail-status"></p>
+        <dl id="detail-metadata" class="metadata"></dl>
+        <div class="section-title output-heading"><div><h3>Output</h3><p id="log-size">Latest 64 KB</p></div><button id="refresh-log" type="button" class="quiet-button">Refresh output</button></div>
+        <p id="log-error" class="notice error" role="alert" hidden></p><pre id="log-output" tabindex="0" aria-label="Job output">Loading output…</pre>
+      </section>
+    </main>
+    <footer><span>Private access · Wi-Fi &amp; VPN</span><span>Your Mac needs to stay awake.</span></footer>
+  </div>
+</body>
+</html>

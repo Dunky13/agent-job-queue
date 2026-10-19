@@ -1,0 +1,21 @@
+{
+  "name": "agent-job-queue",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "lint:web": "eslint remote/static/app.js remote/static/schema.mjs remote/static/schema.test.mjs remote/tests/browser playwright.config.mjs eslint.config.mjs --max-warnings 0",
+    "test:web": "node --test remote/static/schema.test.mjs",
+    "test:browser": "playwright test"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.64.1",
+    "eslint": "10.13.0",
+    "globals": "17.13.0"
+  }
+}

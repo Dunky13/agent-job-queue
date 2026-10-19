@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+root="${HOME:?}/.local/share/agent-heavy"
+exec "$root/.venv/bin/python" "$root/remote/control.py" "$@"

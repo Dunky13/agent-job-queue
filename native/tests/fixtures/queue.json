@@ -1,0 +1,50 @@
+{
+  "updatedAt": "2026-10-18T10:00:00Z",
+  "queue": {
+    "status": "running",
+    "limit": 1,
+    "running": 1,
+    "waiting": 1,
+    "legacyOccupied": false
+  },
+  "jobs": [
+    {
+      "id": 1,
+      "state": "queued",
+      "title": "Fixture validation",
+      "project": "Example",
+      "branch": "main",
+      "directory": "/example/project",
+      "executable": "python3",
+      "priority": 0,
+      "queuePosition": 1,
+      "submittedAt": "2026-10-18T10:00:00Z",
+      "startedAt": null,
+      "finishedAt": null,
+      "exitCode": null,
+      "logPath": "",
+      "canReorder": true,
+      "canCancel": true,
+      "phase": "Queued"
+    },
+    {
+      "id": 2,
+      "state": "running",
+      "title": "Fixture validation",
+      "project": "Example",
+      "branch": "main",
+      "directory": "/example/project",
+      "executable": "python3",
+      "priority": 0,
+      "queuePosition": null,
+      "submittedAt": "2026-10-18T10:00:00Z",
+      "startedAt": null,
+      "finishedAt": null,
+      "exitCode": null,
+      "logPath": "",
+      "canReorder": false,
+      "canCancel": true,
+      "phase": "Running"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+while read -r _local_ref local_sha remote_ref remote_sha; do
+    case "$local_sha" in
+        0000000000000000000000000000000000000000) continue ;;
+    esac
+    case "$remote_ref" in
+        refs/heads/*)
+            python3 scripts/check-commits.py --base "$remote_sha" --head "$local_sha" --verify-local
+            ;;
+    esac
+done

@@ -1,0 +1,111 @@
+# Agent Job Queue
+
+[![CI](https://github.com/Dunky13/agent-job-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/Dunky13/agent-job-queue/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Run many coding agents while sharing a limited number of heavy local job slots. Agents can read, reason, and edit concurrently. Builds, test suites, type checks, and other expensive commands wait their turn.
+
+The macOS menu-bar app shows what is running, what is waiting, and which project and branch each job belongs to. An optional private web dashboard works from a phone over home Wi-Fi or a VPN.
+
+## Download and install
+
+1. Use macOS 15 or later on an Apple Silicon or Intel Mac. Install [Homebrew](https://brew.sh/) first.
+2. Download the installer ZIP or DMG from [Releases](https://github.com/Dunky13/agent-job-queue/releases). Every successful push to `main` publishes a new prerelease build with SHA-256 checksums. CI runs also retain the installer as an artifact for 30 days.
+3. Open **Agent Job Queue Installer.app**, then choose **Install**. The installer displays progress and dependency errors in its window.
+4. The app appears in your menu bar. Add your local bin directory to your shell's `PATH` to use `agent-heavy` by name.
+
+The installer includes prebuilt universal executables, so Xcode is not required. Homebrew supplies Pueue, Caddy, uv, and Python 3.12; the installer needs an internet connection to install missing dependencies and the locked Python environment. It installs into your user account without `sudo`.
+
+The installer and app are ad hoc signed. Apple Developer ID signing and notarization are not configured, so macOS may require approval in Privacy & Security before opening a downloaded build. Installer checksums identify the downloaded bytes; they do not replace Apple notarization.
+
+Upgrades preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. Only the menu-bar UI is replaced. Existing dependencies are not upgraded by the installer.
+
+## Queue heavy commands
+
+```sh
+agent-heavy run --label "Build and unit tests" -- npm run build
+agent-heavy -- npm run typecheck
+agent-heavy -- go test -p 2 ./...
+```
+
+Commands run in their original working directory with their literal arguments and environment. The wrapper waits, streams output, and returns the command's exit status. Several repositories, worktrees, terminals, and agents share the same queue.
+
+Queue resource-intensive parallel work. Small serial compilations, focused tests, source inspection, and editing can run directly. Keep persistent development servers and watch modes outside the queue and account for their memory separately. Do not nest queue wrappers. Jobs are noninteractive and receive EOF on stdin; pass scripts as files or arguments.
+
+Add this rule to your agents' shared instructions:
+
+```text
+Run resource-intensive builds, broad tests, type checks, browser suites, and
+expensive generators through agent-heavy -- <command> [arguments...].
+Use the same shared queue across repositories and worktrees. Keep each tool's
+internal worker count conservative. Run small focused checks directly.
+```
+
+Pueue owns submitted jobs independently of the calling terminal and menu app. Closing the UI does not stop jobs. Abruptly losing a submitter leaves its accepted job visible until it finishes or is explicitly cancelled.
+
+## View and manage jobs
+
+The menu-bar app provides project and branch labels, queue positions, elapsed time, results, job details, and bounded log tails. Background checks leave unchanged content in place. Details and confirmations stay within the queue panel.
+
+Use the app or CLI to change future scheduling:
+
+```sh
+agent-heavy status
+agent-heavy status --json
+agent-heavy limit 2
+agent-heavy next 17
+agent-heavy last 17
+agent-heavy start 17
+agent-heavy cancel 17
+```
+
+Replace `17` with a real job ID. The default parallel limit is one, adjustable from one through eight. Lowering the limit lets active jobs finish and holds future jobs. **Start now** starts one selected job alongside active work without changing the limit. Cancellation targets that job's positively identified owned processes.
+
+The queue limits how many wrapped commands can run. A command may still create many workers or use substantial memory, so configure worker limits within your build and test tools too. There is no host memory quota, and persistent agent processes are not controlled by this queue.
+
+## Phone access
+
+Remote access starts off. In the menu-bar gear menu, open **Remote access**, set a password of at least four characters, and choose **Save password and enable**. A short word or PIN works, with no character-mix requirement. The username is `agent`.
+
+The settings window displays the HTTPS address and certificate sharing controls:
+
+1. Transfer the public `root.crt` certificate to your phone.
+2. On Android, install it as a **CA certificate** in the system's certificate settings. Settings names vary by device; search for "CA certificate". This certificate is for HTTPS.
+3. Open the displayed address in your browser and sign in. Away from home, connect a VPN that routes to the Mac's home LAN. The Mac must be awake and logged in.
+
+The dashboard shows the queue, details and logs, and supports reordering, concurrency changes, starting, and cancelling jobs. Connection failures preserve the last data and disable mutations until a successful refresh. No router forwarding or public hosting is configured.
+
+Caddy provides HTTPS and Basic authentication. Only a bcrypt hash is stored. Flask-WTF handles CSRF checks, and Waitress serves a private Unix-socket API with a fixed queue-control allowlist. Disabling access stops only the remote service. Quitting the menu app leaves an enabled remote service running independently. A failed stop remains visible as **Needs attention**.
+
+## Local data and service operation
+
+The installation uses these intentional per-user locations:
+
+| Purpose | Location |
+| --- | --- |
+| App | `~/Applications/Agent Queue.app` |
+| CLI commands | `~/.local/bin/agent-heavy`, `~/.local/bin/agent-remote` |
+| Runtime source and Python environment | `~/.local/share/agent-heavy/` |
+| Private configuration | `~/.config/agent-heavy/` |
+| Private jobs, receipts, logs and daemon state | `~/.local/state/agent-heavy/` |
+| Login services | `~/Library/LaunchAgents/io.went.agent-*.plist` |
+
+The dedicated Pueue daemon uses a private Unix socket. Existing default Pueue installations are not reused. The queue fails closed when its daemon, state, or process ownership cannot be verified. Do not clear a lock or kill a process to bypass an unknown owner.
+
+`agent-remote status --json` reports the remote service. `agent-remote disable` stops it. Passwords are passed privately through the native settings form, not command-line arguments.
+
+For an optional migration bridge, `AGENT_HEAVY_LEGACY_SLOT` selects an existing external lease directory; otherwise the queue uses its private execution lease. `AGENT_HEAVY_CONFIG` and `AGENT_HEAVY_STATE` select alternative queue configuration and state. `AGENT_HEAVY_PUEUE` and `AGENT_REMOTE_CADDY` can select absolute executable paths. Set overrides consistently for both submitters and the daemon environment.
+
+## Development and CI
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local commands and the [workflow](.github/workflows/ci.yml) for exact hosted checks.
+
+Pull requests run Python and JavaScript lint, shell and workflow checks, core unit tests, isolated Pueue acceptance tests, real Caddy HTTPS/API tests, browser regression tests, native Swift regression tests, and universal installer verification. macOS behavior is tested on Apple Silicon and Intel runners. All validation jobs feed one required `ci-required` check; a failure, cancellation, or skipped required job fails that check.
+
+`main` requires a pull request, current passing checks, resolved review conversations, and verified commit signatures. Force pushes and deletion are blocked, including for administrators. Commits also require an author-matching DCO sign-off. The initial repository import bootstraps the branch; later changes use pull requests.
+
+Only a successful `main` workflow can publish an installer. Pull request code receives read-only repository permissions. Actions are pinned to immutable commit SHAs, npm dependencies use a lockfile, and runtime Python dependencies are hash locked.
+
+## License
+
+[MIT](LICENSE). See [third-party notices](THIRD-PARTY-NOTICES.md) for bundled Zod and separately installed dependencies.
