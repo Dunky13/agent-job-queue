@@ -439,10 +439,11 @@ class ProfileStore:
             floors = connection.execute("SELECT memory,cpu FROM floors WHERE machine IN (?, '*')", (machine,)).fetchall()
         successes = [row for row in runs if row["success"]]
         samples = len(successes)
+        recent_successes = sum(row["sampled"] >= now - 30 * DAY for row in successes)
         # A censored/failed observation is only a lower bound. It cannot replace
         # the family prior with its small observed prefix. Require repeat exact
         # successes before dropping sibling upper evidence and uncertainty.
-        borrowing = bool(exact) and samples < 5 and any(row["variant"] != variant for row in envelopes)
+        borrowing = bool(exact) and recent_successes < 5 and any(row["variant"] != variant for row in envelopes)
         use_exact = bool(exact) and not borrowing
         selected = envelopes if borrowing else exact or envelopes
         source = "variant" if use_exact else "family" if envelopes else "prior"
@@ -458,15 +459,17 @@ class ProfileStore:
         age_factor = max(0.75, 1 - max(0, age - 30 * DAY) / (240 * DAY))
         memory = max(row["memory"] for row in selected) * margin * age_factor
         cpu = max(row["cpu"] for row in selected) * margin * age_factor
-        if not use_exact or samples < 5 or age > 30 * DAY:
+        # Envelope timestamps include censored peaks. Only recent successful
+        # runs can establish that an exact variant is still inexpensive.
+        if not use_exact or recent_successes < 5:
             memory = max(memory, memory_floor)
             cpu = max(cpu, cpu_floor)
         else:
             memory = max(memory, 64 * 1024 ** 2, *[row["memory"] for row in floors])
             cpu = max(cpu, 0.1, *[row["cpu"] for row in floors])
         durations = [row["duration"] for row in selected if row["duration"] > 0]
-        confidence = ("high" if use_exact and samples >= 12 and age <= 30 * DAY
-                      else "medium" if use_exact and samples >= 5 else "low")
+        confidence = ("high" if use_exact and recent_successes >= 12
+                      else "medium" if use_exact and recent_successes >= 5 else "low")
         if age > 30 * DAY or (runs and not max(runs, key=lambda row: row["sampled"])["success"]):
             confidence = "low"
         return {"memoryBytes": math.ceil(memory), "cpuCores": round(cpu, 3),
@@ -500,7 +503,8 @@ class ProfileStore:
             connection.execute("""INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(token) DO UPDATE SET
                 memory=MAX(memory,excluded.memory),cpu=MAX(cpu,excluded.cpu),
                 cpu_seconds=MAX(cpu_seconds,excluded.cpu_seconds),duration=MAX(duration,excluded.duration),
-                sampled=MAX(sampled,excluded.sampled),success=MAX(success,excluded.success)""",
+                sampled=CASE WHEN success=1 AND excluded.success=0 THEN sampled
+                    ELSE MAX(sampled,excluded.sampled) END,success=MAX(success,excluded.success)""",
                                (token, family, variant, context, machine, memory, cpu, cpu_seconds, duration, sampled, success))
             connection.execute("""INSERT INTO envelopes VALUES (?,?,?,?,?,?,?)
                 ON CONFLICT(machine,family,variant) DO UPDATE SET memory=MAX(memory,excluded.memory),

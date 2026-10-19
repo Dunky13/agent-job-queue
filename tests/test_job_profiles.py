@@ -307,6 +307,36 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertGreaterEqual(aged["memoryBytes"], 3 * profiles.GIB)
         self.assertEqual(aged["samples"], 0)
 
+    def test_failed_prefix_cannot_refresh_stale_successes_or_drop_family_evidence(self):
+        old = time.time() - 60 * profiles.DAY
+        for index in range(12):
+            self.record(index, metrics={"sampledAt": old})
+        stale = self.prediction()
+        self.assertGreaterEqual(stale["memoryBytes"], profiles.GIB)
+        for token, complete, code in (("partial", False, None), ("failed", True, 1), (0, False, None)):
+            self.record(token, memory=64 * 1024 ** 2, cpu=0.1, duration=1, complete=complete, code=code)
+            estimate = self.prediction()
+            self.assertGreaterEqual(estimate["memoryBytes"], stale["memoryBytes"])
+            self.assertGreaterEqual(estimate["cpuCores"], stale["cpuCores"])
+            self.assertEqual((estimate["samples"], estimate["confidence"]), (12, "low"))
+        for index in range(4):
+            self.record("fresh-" + str(index))
+        self.assertGreaterEqual(self.prediction()["memoryBytes"], profiles.GIB)
+        self.record("fresh-4")
+        self.assertLess(self.prediction()["memoryBytes"], profiles.GIB)
+        self.assertEqual(self.prediction()["confidence"], "medium")
+
+        changed = {**self.identity, "variant": "d" * 64}
+        for index in range(12):
+            self.record("old-variant-" + str(index), identity=changed, metrics={"sampledAt": old})
+        borrowed = self.prediction(changed)
+        self.record("partial-variant", identity=changed, memory=64 * 1024 ** 2, cpu=0.1,
+                    duration=1, complete=False, code=None)
+        estimate = self.prediction(changed)
+        self.assertEqual((estimate["source"], estimate["confidence"]), ("family", "low"))
+        for field in ("memoryBytes", "cpuCores", "durationSeconds"):
+            self.assertGreaterEqual(estimate[field], borrowed[field])
+
     def test_retention_is_bounded_and_preserves_old_upper_evidence(self):
         self.record("old-large", memory=8 * profiles.GIB)
         with patch.object(profiles, "MAX_RUNS", 3), patch.object(profiles, "MAX_ENVELOPES", 2):
