@@ -221,6 +221,164 @@ class PasswordTests(unittest.TestCase):
                     control.configure(paths, {"password": password})
 
 
+class ShutdownRaceTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="ar-stop-", dir="/tmp")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        environment = patch.dict(os.environ, {"AGENT_REMOTE_TEST_MODE": "1", "AGENT_REMOTE_STATE": str(self.root / "state"),
+                                              "AGENT_REMOTE_CONFIG": str(self.root / "config.json")})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.paths = control.Paths()
+        self.paths.prepare()
+
+    def waiting_process(self):
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True)
+
+        def cleanup():
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=3)
+
+        self.addCleanup(cleanup)
+        return child
+
+    def child_record(self, child):
+        token = "a" * 32
+        path = control.child_path(self.paths, token, "caddy")
+        record = {**control.process_record(child.pid), "generation": token, "role": "caddy",
+                  "boot_uuid": control.boot_identity(), "ack": False}
+        control.save_private(path, record)
+        return path
+
+    def test_pre_ack_child_departure_before_group_lookup_completes_shutdown(self):
+        child = self.waiting_process()
+        path = self.child_record(child)
+        getpgid = os.getpgid
+
+        def departed_group(pid):
+            self.assertEqual(pid, child.pid)
+            # The unacknowledged wrapper can exit after noticing its dead supervisor.
+            # Force that departure after the birth check and before the real group lookup.
+            child.communicate(input=b"x", timeout=3)
+            return getpgid(pid)
+
+        with patch.object(control.os, "getpgid", side_effect=departed_group) as group, \
+                patch.object(control.os, "killpg") as signal_group:
+            control.stop_owned_service(self.paths)
+        group.assert_called_once_with(child.pid)
+        signal_group.assert_not_called()
+        self.assertFalse(path.exists())
+        self.assertFalse(self.paths.error.exists())
+        self.assertFalse(control.unresolved_children(self.paths))
+
+    def test_child_ownership_mismatch_still_blocks_shutdown(self):
+        child = self.waiting_process()
+        path = self.child_record(child)
+        with patch.object(control.os, "getpgid", return_value=child.pid + 1), \
+                patch.object(control.os, "killpg") as signal_group, \
+                self.assertRaisesRegex(control.RemoteError, "group identity could not be verified"):
+            control.stop_owned_service(self.paths)
+        signal_group.assert_not_called()
+        self.assertTrue(path.exists())
+        self.assertIsNone(child.poll())
+        self.assertIn("group identity could not be verified", control.load_private(self.paths.error)["error"])
+
+    def test_child_group_lookup_permission_failure_stays_visible(self):
+        child = self.waiting_process()
+        path = self.child_record(child)
+        with patch.object(control.os, "getpgid", side_effect=PermissionError("fixture group access denied")), \
+                patch.object(control.os, "killpg") as signal_group, \
+                self.assertRaisesRegex(control.RemoteError, "fixture group access denied"):
+            control.stop_owned_service(self.paths)
+        signal_group.assert_not_called()
+        self.assertTrue(path.exists())
+        self.assertIsNone(child.poll())
+        self.assertIn("fixture group access denied", control.load_private(self.paths.error)["error"])
+
+    def test_supervisor_departure_before_term_signal_is_already_stopped(self):
+        child = self.waiting_process()
+        control.save_private(self.paths.pid, {"boot_uuid": control.boot_identity(),
+                                             "supervisor": control.process_record(child.pid)})
+        kill = os.kill
+
+        def departed_signal(pid, signum):
+            self.assertEqual((pid, signum), (child.pid, signal.SIGTERM))
+            child.communicate(input=b"x", timeout=3)
+            return kill(pid, signum)
+
+        with patch.object(control.os, "kill", side_effect=departed_signal) as signal_process:
+            control.stop_supervisor(self.paths)
+        signal_process.assert_called_once_with(child.pid, signal.SIGTERM)
+
+    def test_supervisor_departure_before_kill_signal_is_already_stopped(self):
+        child = self.waiting_process()
+        control.save_private(self.paths.pid, {"boot_uuid": control.boot_identity(),
+                                             "supervisor": control.process_record(child.pid)})
+        kill = os.kill
+
+        def departed_signal(pid, signum):
+            self.assertEqual(pid, child.pid)
+            if signum == signal.SIGTERM:
+                return  # Hold the fixture alive until the existing escalation deadline.
+            self.assertEqual(signum, signal.SIGKILL)
+            child.communicate(input=b"x", timeout=3)
+            return kill(pid, signum)
+
+        with patch.object(control.os, "kill", side_effect=departed_signal) as signal_process, \
+                patch.object(control.time, "monotonic", side_effect=(0, 4)):
+            control.stop_supervisor(self.paths)
+        self.assertEqual(signal_process.call_args_list,
+                         [((child.pid, signal.SIGTERM),), ((child.pid, signal.SIGKILL),)])
+
+    def test_supervisor_permission_failure_is_not_treated_as_departure(self):
+        child = self.waiting_process()
+        control.save_private(self.paths.pid, {"boot_uuid": control.boot_identity(),
+                                             "supervisor": control.process_record(child.pid)})
+        with patch.object(control.os, "kill", side_effect=PermissionError("fixture signal access denied")), \
+                self.assertRaisesRegex(PermissionError, "fixture signal access denied"):
+            control.stop_supervisor(self.paths)
+        self.assertIsNone(child.poll())
+
+    def test_supervisor_birth_mismatch_never_signals_the_process(self):
+        child = self.waiting_process()
+        control.save_private(self.paths.pid, {"boot_uuid": control.boot_identity(),
+                                             "supervisor": {"pid": child.pid, "birth": "a different process"}})
+        with patch.object(control.os, "kill") as signal_process:
+            control.stop_supervisor(self.paths)
+        signal_process.assert_not_called()
+        self.assertIsNone(child.poll())
+
+    def test_test_service_stop_accepts_supervisor_departure_before_term(self):
+        child = self.waiting_process()
+        control.save_private(self.paths.pid, {"boot_uuid": control.boot_identity(),
+                                             "supervisor": control.process_record(child.pid)})
+        kill = os.kill
+
+        def departed_signal(pid, signum):
+            self.assertEqual((pid, signum), (child.pid, signal.SIGTERM))
+            child.communicate(input=b"x", timeout=3)
+            return kill(pid, signum)
+
+        with patch.object(control.os, "kill", side_effect=departed_signal) as signal_process:
+            control.service_action(self.paths, "stop")
+        signal_process.assert_called_once_with(child.pid, signal.SIGTERM)
+        self.assertEqual(child.returncode, 0)
+
+    def test_test_service_stop_keeps_signal_permission_failure_visible(self):
+        child = self.waiting_process()
+        control.save_private(self.paths.pid, {"boot_uuid": control.boot_identity(),
+                                             "supervisor": control.process_record(child.pid)})
+        with patch.object(control.os, "kill", side_effect=PermissionError("fixture service signal access denied")) \
+                as signal_process, self.assertRaisesRegex(PermissionError, "fixture service signal access denied"):
+            control.service_action(self.paths, "stop")
+        signal_process.assert_called_once_with(child.pid, signal.SIGTERM)
+        self.assertIsNone(child.poll())
+
+
 class GatewayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -345,10 +503,12 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(json.load(self.opener(self.password).open(self.url + "api/csrf", timeout=5)).keys(), {"token"})
 
     def test_05_sigkill_before_gateway_ack_never_publishes_untracked_listener(self):
-        self.assertEqual(self.cli("disable").returncode, 0)
+        result = self.cli("disable")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.process.communicate(timeout=3)
         self.assertFalse(self.port_open())
-        self.assertEqual(self.cli("enable").returncode, 0)
+        result = self.cli("enable")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         gate = self.root / "hold-caddy-ack"
         self.restart({**self.env, "AGENT_REMOTE_TEST_ACK_GATE": str(gate)})
         deadline = time.monotonic() + 8
@@ -363,12 +523,14 @@ class GatewayTests(unittest.TestCase):
         self.assertFalse(self.port_open())
         self.process.send_signal(signal.SIGKILL)
         self.process.communicate(timeout=3)
-        self.assertEqual(self.cli("disable").returncode, 0)
+        result = self.cli("disable")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         gate.touch()
         time.sleep(0.2)
         self.assertFalse(self.port_open())
         self.assertFalse(list((self.state / "children").glob("*.json")))
-        self.assertEqual(self.cli("enable").returncode, 0)
+        result = self.cli("enable")
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.restart()
         self.wait_ready()
 

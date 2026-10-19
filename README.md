@@ -40,6 +40,8 @@ The tap becomes installable after the first validated `main` installer release i
 brew upgrade --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
+Each successfully published main installer triggers and verifies its Homebrew delivery. Scheduled reconciliation provides recovery. Maintainer setup, failure handling and trusted tap tooling synchronization are documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
+
 Uninstalling the cask removes the menu app and Homebrew command links. It preserves the queue daemon, running jobs, private backend, data, credentials, and any enabled remote service. Disable remote access in settings or with `agent-remote disable` first if you want it stopped.
 
 ### Installer app

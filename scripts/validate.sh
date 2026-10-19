@@ -13,6 +13,8 @@ python -m unittest discover -s tests -p test_job_profiles.py -v
 python -m unittest discover -s tests -p 'test_learning*.py' -v
 python -m unittest discover -s tests -p test_release_metadata.py -v
 python -m unittest discover -s tests -p test_updates.py -v
+python -m unittest discover -s tests -p 'test_homebrew_*.py' -v
+python -m unittest discover -s packaging/homebrew -p test_refresh.py -v
 python -m unittest discover -s tests -p test_agent_integration.py -v
 python -m unittest discover -s tests -p test_integration.py -v
 python -m unittest discover -s remote/tests -p test_remote.py -v

@@ -1,4 +1,4 @@
-Copy render_cask.py, refresh.py, test-cask.rb, LICENSE and .github/workflows/refresh.yml
+Copy render_cask.py, refresh.py, test-cask.rb, test_refresh.py, LICENSE and .github/workflows/refresh.yml
 into the dedicated Dunky13/homebrew-agent-job-queue repository. Use a signed,
 DCO-signed-off initial commit on its default branch named tap. Do not copy SEED.txt.
 Also copy release_metadata.py from the app repository root beside render_cask.py;
@@ -14,10 +14,23 @@ The GitHub Actions token is scoped to contents:write in this dedicated repositor
 The returned commit is checked for a Verified signature and matching author DCO.
 Expected-head compare-and-swap and current-build checks prevent stale updates.
 
-Scheduled refresh runs every 15 minutes; GitHub may delay scheduled workflows.
-Owners can run Refresh generated tap manually after a source release. Until the
-first validated main release publishes metadata, refresh succeeds without a Cask.
-Do not advertise the install command as usable until that first refresh succeeds.
+The source release workflow dispatches expected_tag and expected_commit through
+a GitHub App with Actions write access to the tap only, waits for the exact run,
+and independently verifies the resulting signed cask commit. Configure its
+Client ID variable and private-key secret using docs/homebrew-delivery.md in the
+source repository. Missing credentials fail delivery explicitly.
+
+Scheduled refresh runs every 15 minutes as recovery; GitHub may delay or drop it.
+Owners can run Refresh generated tap manually after a source release. A missing
+published release or inconsistent current cask fails visibly. Exact current
+metadata is revalidated before no-op. Newer published descendants may supersede
+older requests; downgrades and conflicting identities are rejected.
+
+PRs targeting tap run read-only refresh regressions, separately from publication.
+Keep all copied trusted helpers and release_metadata.py byte-identical to the
+reviewed source revision. The source delivery job checks parity before dispatch,
+so merge a companion tooling PR before the corresponding source PR. Do not
+advertise installation until a first validated refresh has published a cask.
 
 After publication the fully qualified command selects/trusts only this cask:
   brew install --cask dunky13/agent-job-queue/agent-job-queue

@@ -346,7 +346,7 @@ def service_action(paths: Paths, action: str):
                 if record.get("boot_uuid") == boot_identity() and supervisor.get("pid") != os.getpid() \
                         and supervisor.get("birth") and birth(supervisor.get("pid")) == supervisor["birth"]:
                     os.kill(supervisor["pid"], signal.SIGTERM)
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 pass
         return
     domain = f"gui/{os.getuid()}"
@@ -408,11 +408,12 @@ def reconcile_children(paths: Paths, token: str | None = None):
             for signum, timeout in ((signal.SIGTERM, 2), (signal.SIGKILL, 2)):
                 if birth(record["pid"]) != record["birth"]:
                     break
-                if record["pid"] == os.getpid() or os.getpgid(record["pid"]) != record["pid"]:
-                    raise RemoteError("Owned service group identity could not be verified")
                 try:
+                    if record["pid"] == os.getpid() or os.getpgid(record["pid"]) != record["pid"]:
+                        raise RemoteError("Owned service group identity could not be verified")
                     os.killpg(record["pid"], signum)
                 except ProcessLookupError:
+                    # A child can exit after the birth check, including before acknowledgement.
                     break
                 deadline = time.monotonic() + timeout
                 while birth(record["pid"]) == record["birth"] and time.monotonic() < deadline:
@@ -448,14 +449,20 @@ def stop_supervisor(paths: Paths):
             and birth(supervisor.get("pid")) == supervisor["birth"]:
         if supervisor["pid"] == os.getpid():
             raise RemoteError("Refusing to stop the current control process")
-        os.kill(supervisor["pid"], signal.SIGTERM)
+        try:
+            os.kill(supervisor["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            return
     while supervisor.get("birth") and birth(supervisor.get("pid")) == supervisor["birth"] and time.monotonic() < deadline:
         time.sleep(0.05)
     if record and record.get("boot_uuid") == boot_identity() and supervisor.get("birth") \
             and birth(supervisor.get("pid")) == supervisor["birth"]:
         if supervisor["pid"] == os.getpid():
             raise RemoteError("Refusing to stop the current control process")
-        os.kill(supervisor["pid"], signal.SIGKILL)
+        try:
+            os.kill(supervisor["pid"], signal.SIGKILL)
+        except ProcessLookupError:
+            return
 
 
 def stop_owned_service(paths: Paths):

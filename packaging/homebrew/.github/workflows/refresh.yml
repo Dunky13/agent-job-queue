@@ -4,17 +4,45 @@ on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
+    inputs:
+      expected_tag:
+        description: Published app release tag (supply with expected_commit)
+        type: string
+        required: false
+        default: ''
+      expected_commit:
+        description: Full published app commit (supply with expected_tag)
+        type: string
+        required: false
+        default: ''
+  pull_request:
+    branches: [tap]
 
 permissions:
   contents: read
 
-concurrency:
-  group: refresh-generated-tap
-  cancel-in-progress: false
-
 jobs:
+  validate:
+    concurrency:
+      group: tap-validation-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    if: github.repository == 'Dunky13/homebrew-agent-job-queue' && github.event_name == 'pull_request' && github.base_ref == 'tap'
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Validate refresh, release identity and publication boundaries
+        run: python -m unittest discover -p test_refresh.py -v
   refresh:
-    if: github.repository == 'Dunky13/homebrew-agent-job-queue' && github.ref == 'refs/heads/tap'
+    concurrency:
+      group: refresh-generated-tap
+      cancel-in-progress: false
+    if: github.repository == 'Dunky13/homebrew-agent-job-queue' && github.ref == 'refs/heads/tap' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: macos-15
     timeout-minutes: 10
     permissions:
@@ -22,6 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: tap
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -31,4 +60,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_DEVELOPER: '1'
-        run: python refresh.py --publish
+          EXPECTED_TAG: ${{ inputs.expected_tag }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: python refresh.py --publish --expected-tag "$EXPECTED_TAG" --expected-commit "$EXPECTED_COMMIT"
