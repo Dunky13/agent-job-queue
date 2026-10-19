@@ -502,13 +502,59 @@ def process_group_members(pgid: int) -> list[dict]:
 
 
 def group_exists(pgid: int) -> bool:
+    """Whether a group still has potentially running members.
+
+    Darwin's killpg filters zombies and returns EPERM when none are signalable.
+    Distinguish that exited-group state from a live inaccessible group without
+    ever sending a nonzero signal to establish existence.
+    """
     try:
         os.killpg(pgid, 0)
         return True
     except ProcessLookupError:
         return False
     except PermissionError as error:
+        if sys.platform == "darwin":
+            initial = process_group_states(pgid)
+            if not any(not state.startswith("Z") for _, _, state in initial):
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    return False
+                except PermissionError:
+                    # Empty or changing listings are not proof of a dead group.
+                    if initial:
+                        if process_group_states(pgid) == initial:
+                            return False
+                        # Reaping can remove a positively observed zombie
+                        # between snapshots. Only kernel absence settles that.
+                        try:
+                            os.killpg(pgid, 0)
+                        except ProcessLookupError:
+                            return False
+                        except PermissionError:
+                            pass
+                else:
+                    return True
         raise GateError("Cannot verify the owned process group; retaining its lock") from error
+
+
+def process_group_states(pgid: int) -> list[tuple[int, str, str]]:
+    output = identity_command(["/bin/ps", "-axo", "pid=,pgid=,stat=,lstart="])
+    observer_seen = False
+    members = []
+    for line in output.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) != 4 or not fields[0].isdigit() or not fields[1].isdigit():
+            raise GateError("Invalid process state listing; shared slot retained")
+        pid, group = int(fields[0]), int(fields[1])
+        if pid == os.getpid() and group == os.getpgrp() and not fields[2].startswith("Z"):
+            observer_seen = True
+        if group == pgid:
+            members.append((pid, fields[3].strip(), fields[2]))
+    if not observer_seen:
+        raise GateError("Incomplete process state listing; shared slot retained")
+    return sorted(members)
 
 
 @contextlib.contextmanager
@@ -664,6 +710,12 @@ def cleanup(gate: Gate, task_id: int):
         try:
             os.killpg(pgid, sig)
         except ProcessLookupError:
+            break
+        except PermissionError as error:
+            # The verified group can exit between identity check and signal.
+            # Do not retry a signal when it still exists or cannot be verified.
+            if group_exists(pgid):
+                raise GateError("Cannot signal the owned process group; retaining its lock") from error
             break
         deadline = time.monotonic() + timeout
         while group_exists(pgid) and time.monotonic() < deadline:

@@ -2,6 +2,7 @@ import importlib.util
 import json
 import os
 import signal
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -520,6 +521,102 @@ class GateTests(unittest.TestCase):
             gate_module.cleanup(self.gate, 3)
         kill.assert_not_called()
         self.assertTrue(self.gate.slot.exists())
+
+    def test_darwin_eperm_for_zombie_group_is_confirmed_without_signalling(self):
+        listing = f"{os.getpid()} {os.getpgrp()} S observer-birth\n12345 987654 Z target-birth\n"
+        with patch.object(os, "killpg", side_effect=PermissionError) as probe, \
+                patch.object(gate_module, "identity_command", return_value=listing) as inspect:
+            self.assertFalse(gate_module.group_exists(987654))
+        self.assertEqual(probe.call_args_list, [call(987654, 0), call(987654, 0)])
+        self.assertEqual(inspect.call_count, 2)
+
+    def test_darwin_eperm_empty_group_requires_kernel_disappearance_confirmation(self):
+        listing = f"{os.getpid()} {os.getpgrp()} S observer-birth\n"
+        with patch.object(os, "killpg", side_effect=[PermissionError, ProcessLookupError]), \
+                patch.object(gate_module, "identity_command", return_value=listing) as inspect:
+            self.assertFalse(gate_module.group_exists(987654))
+        self.assertEqual(inspect.call_count, 1)
+        with patch.object(os, "killpg", side_effect=PermissionError), \
+                patch.object(gate_module, "identity_command", return_value=listing), \
+                self.assertRaises(gate_module.GateError):
+            gate_module.group_exists(987654)
+
+    def test_zombie_reaped_between_observations_requires_final_kernel_absence(self):
+        observer = f"{os.getpid()} {os.getpgrp()} S observer-birth\n"
+        zombie = observer + "12345 987654 Z target-birth\n"
+        with patch.object(os, "killpg", side_effect=[PermissionError, PermissionError, ProcessLookupError]) as probe, \
+                patch.object(gate_module, "identity_command", side_effect=[zombie, observer]):
+            self.assertFalse(gate_module.group_exists(987654))
+        self.assertEqual(probe.call_args_list, [call(987654, 0)] * 3)
+
+    def test_eperm_with_live_or_newly_live_member_retains_lease_without_signalling(self):
+        observer = f"{os.getpid()} {os.getpgrp()} S observer-birth\n"
+        zombie = observer + "12345 987654 Z target-birth\n"
+        live = observer + "12345 987654 S target-birth\n"
+        changed = observer + "12345 987654 Z changed-birth\n"
+        for observations in ([live], [zombie, live], [zombie, observer], [zombie, changed]):
+            with self.subTest(observations=observations), \
+                    patch.object(os, "killpg", side_effect=PermissionError) as probe, \
+                    patch.object(gate_module, "identity_command", side_effect=observations), \
+                    self.assertRaises(gate_module.GateError):
+                gate_module.group_exists(987654)
+            self.assertTrue(all(arguments == call(987654, 0) for arguments in probe.call_args_list))
+            self.assertLessEqual(probe.call_count, 3)
+
+    def test_eperm_with_incomplete_or_failed_listing_retains_lease(self):
+        observer = f"{os.getpid()} {os.getpgrp()} S observer-birth\n"
+        for listing in ("", "12345 987654 Z target-birth\n", observer + "malformed\n"):
+            with self.subTest(listing=listing), patch.object(os, "killpg", side_effect=PermissionError), \
+                    patch.object(gate_module, "identity_command", return_value=listing), \
+                    self.assertRaises(gate_module.GateError):
+                gate_module.group_exists(987654)
+        with patch.object(os, "killpg", side_effect=PermissionError), \
+                patch.object(gate_module, "identity_command", side_effect=gate_module.GateError("Cannot inspect")), \
+                self.assertRaises(gate_module.GateError):
+            gate_module.group_exists(987654)
+
+    def test_owned_group_exiting_between_identity_check_and_signal_releases_lease(self):
+        self.marker()
+        with patch.object(gate_module, "verify_group_identity", return_value=True), \
+                patch.object(os, "killpg", side_effect=PermissionError) as send, \
+                patch.object(gate_module, "group_exists", return_value=False):
+            gate_module.cleanup(self.gate, 3)
+        send.assert_called_once_with(987654, signal.SIGTERM)
+        self.assertFalse(self.gate.slot.exists())
+        self.assertFalse(self.gate.receipt_path(3).exists())
+
+    def test_live_group_rejecting_signal_retains_lease_without_signal_retry(self):
+        self.marker()
+        with patch.object(gate_module, "verify_group_identity", return_value=True), \
+                patch.object(os, "killpg", side_effect=PermissionError) as send, \
+                patch.object(gate_module, "group_exists", return_value=True), \
+                self.assertRaises(gate_module.GateError):
+            gate_module.cleanup(self.gate, 3)
+        send.assert_called_once_with(987654, signal.SIGTERM)
+        self.assertTrue(self.gate.slot.exists())
+        self.assertTrue(self.gate.receipt_path(3).exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin zombie-group signal semantics")
+    def test_real_owned_unreaped_zombie_is_not_a_live_group(self):
+        # Keep the owned child unreaped until Darwin's EPERM is observed.
+        pid = os.fork()
+        if pid == 0:
+            os.setsid()
+            os._exit(0)
+        try:
+            deadline = gate_module.time.monotonic() + 2
+            while gate_module.time.monotonic() < deadline:
+                listing = gate_module.identity_command(["/bin/ps", "-p", str(pid), "-o", "stat="])
+                if listing.strip().startswith("Z"):
+                    break
+                gate_module.time.sleep(0.01)
+            else:
+                self.fail("Owned child did not become an unreaped zombie")
+            with self.assertRaises(PermissionError):
+                os.killpg(pid, 0)
+            self.assertFalse(gate_module.group_exists(pid))
+        finally:
+            os.waitpid(pid, 0)
 
     def test_reused_pid_with_different_birth_is_not_signalled(self):
         self.marker()
