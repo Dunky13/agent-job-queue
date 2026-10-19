@@ -1091,7 +1091,19 @@ def main(argv: list[str] | None = None) -> int:
     limit_parser.add_argument("count", type=int)
     start_parser = subparsers.add_parser("start", help="start one queued job now, bypassing the parallel limit")
     start_parser.add_argument("task_id", type=int)
+    agents_parser = subparsers.add_parser("agents", help="manage optional coding-agent queue instructions")
+    agents_parser.add_argument("operation", choices=("status", "install", "remove"))
+    agents_parser.add_argument("--runner", choices=("codex", "claude"))
+    agents_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(arguments)
+    if args.action == "agents":
+        import agent_integration
+        options = [args.operation]
+        if args.runner:
+            options.extend(["--runner", args.runner])
+        if args.json:
+            options.append("--json")
+        return agent_integration.main(options)
     try:
         gate = Gate()
         if args.action == "run":

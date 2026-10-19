@@ -53,6 +53,32 @@ The installer and app are ad hoc signed. Apple Developer ID signing and notariza
 
 Upgrades preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. Only the menu-bar UI is replaced. Existing dependencies are not upgraded by the installer.
 
+## Connect your coding agents
+
+On first launch, **Agent integration** offers to add queue instructions for **Codex** and **Claude Code**. Select the runners you use, review the instructions, then choose **Save instructions**. Start new agent sessions afterward. You can skip setup and reopen it from the queue's gear menu at any time, including after a Homebrew installation.
+
+<details>
+<summary>Preview agent integration setup</summary>
+
+![Agent integration setup offering Codex and Claude Code with no runners selected](docs/screenshots/agent-integration.png)
+
+</details>
+
+Setup shows each instruction file and whether this app has configured it. It preserves existing text, adds its own marked section, and makes a private backup before changing an existing file. Deselecting a runner removes only that section. Existing custom rules and shared imports remain in place; the status describes this app's section only.
+
+The command line supports the same actions:
+
+```sh
+agent-heavy agents status
+agent-heavy agents install --runner codex
+agent-heavy agents install --runner claude
+agent-heavy agents remove --runner codex
+```
+
+Codex uses its global `AGENTS.md`, or its existing nonempty `AGENTS.override.md` when that takes precedence. Claude Code uses its user `CLAUDE.md`. The CLI honors `CODEX_HOME` and `CLAUDE_CONFIG_DIR`; run it from the runner's shell when using a custom profile. The app shows the paths visible in its own environment. See the official [Codex instruction discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md) and [Claude Code memory](https://code.claude.com/docs/en/memory) documentation.
+
+These instructions guide agents; they do not intercept commands or enforce queue usage. Other runners can use the shared rule below. Installation and upgrades do not change agent instructions until you explicitly save your selections.
+
 ## Queue heavy commands
 
 ```sh
@@ -65,7 +91,7 @@ Commands run in their original working directory with their literal arguments an
 
 Queue resource-intensive parallel work. Small serial compilations, focused tests, source inspection, and editing can run directly. Keep persistent development servers and watch modes outside the queue and account for their memory separately. Do not nest queue wrappers. Jobs are noninteractive and receive EOF on stdin; pass scripts as files or arguments.
 
-Add this rule to your agents' shared instructions:
+For other runners, add this rule to their shared instructions:
 
 ```text
 Run resource-intensive builds, broad tests, type checks, browser suites, and

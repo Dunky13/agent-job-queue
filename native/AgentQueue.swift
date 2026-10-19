@@ -458,8 +458,31 @@ final class RemoteAccessStore: ObservableObject {
 @MainActor enum AppRuntime {
     static let store = QueueStore()
     static let remoteStore = RemoteAccessStore(fixtureMode: store.fixtureMode)
+    static let integrationStore = AgentIntegrationStore(fixtureMode: store.fixtureMode)
     static var queueWindow: NSWindow?
     static var remoteWindow: NSWindow?
+    static var integrationWindow: NSWindow?
+
+    static func showIntegrationWindow() {
+        if let integrationWindow {
+            integrationWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate()
+            Task { await integrationStore.refresh() }
+            return
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 720),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = "Agent Integration"
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 520, height: 540)
+        window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: integrationStore) {
+            AppRuntime.integrationWindow?.close()
+        })
+        integrationWindow = window
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
 
     static func showWindow() {
         if let queueWindow { queueWindow.makeKeyAndOrderFront(nil); NSApp.activate(); return }
@@ -776,6 +799,7 @@ struct QueuePanel: View {
                 Spacer()
                 if !fullWindow { Button("Open window", systemImage: "arrow.up.left.and.arrow.down.right") { AppRuntime.showWindow() }.buttonStyle(.borderless) }
                 Menu {
+                    Button("Agent integration…", systemImage: "terminal") { AppRuntime.showIntegrationWindow() }
                     Button("Remote access settings…", systemImage: "network") { AppRuntime.showRemoteWindow() }
                     Divider()
                     Text("Quitting this app leaves jobs running.")
@@ -1096,6 +1120,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     window.setContentSize(NSSize(width: 580, height: 780))
                     window.center()
                 }
+                if arguments.contains("--snapshot-agent-integration") {
+                    window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: AppRuntime.integrationStore) {})
+                    window.minSize = NSSize(width: 520, height: 540)
+                    window.setContentSize(NSSize(width: 600, height: 720))
+                    window.center()
+                }
             }
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(500))
@@ -1156,7 +1186,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } catch { self.diagnostic("Snapshot failed: \(error.localizedDescription)"); exit(EXIT_FAILURE) }
                 NSApp.terminate(nil)
             }
-        } else if arguments.contains("--open-window") { AppRuntime.showWindow() }
+        } else {
+            if arguments.contains("--open-window") { AppRuntime.showWindow() }
+            if AgentOnboarding.shouldOffer(defaults: .standard, fixtureMode: AppRuntime.store.fixtureMode) {
+                AppRuntime.showIntegrationWindow()
+                UserDefaults.standard.set(true, forKey: AgentOnboarding.offeredKey)
+            }
+        }
     }
 
     private func verifyPasswordValidation() -> PasswordValidationVerification {
