@@ -212,8 +212,14 @@ jobs:
           print('Existing release target and all assets match; no overwrite performed.')
           PY
           else
+            notes=$(mktemp)
+            trap 'rm -f "$notes"' EXIT
+            printf '%s\n\n%s\n\n%s\n' \
+              "Automated installer from validated main commit ${GITHUB_SHA}. Includes Apple Silicon and Intel executables plus checksum-pinned Homebrew metadata." \
+              '**macOS approval required:** This build is ad hoc signed and is not notarized. Gatekeeper can block the installer or menu app; Homebrew does not change that.' \
+              'After an opening attempt, use System Settings > Privacy & Security > Open Anyway for the named Agent Job Queue app, if offered. Keep Gatekeeper and quarantine enabled. See https://support.apple.com/102445 for Apple instructions.' > "$notes"
             gh release create "$tag" dist/* \
               --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "Main build ${GITHUB_RUN_NUMBER}" --prerelease \
-              --notes "Automated installer from validated main commit ${GITHUB_SHA}. Includes Apple Silicon and Intel executables plus checksum-pinned Homebrew metadata."
+              --notes-file "$notes"
           fi

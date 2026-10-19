@@ -35,6 +35,10 @@ agent-heavy agents install --runner claude
 agent-heavy agents remove --runner codex
 ```
 
+## Installer verification follow-up
+
+The published build-10-ca5ff4b ZIP matched its checksum and passed strict deep code-signature integrity verification, while spctl rejected it for execution. It is ad hoc signed with no Developer ID or notarization. This does not attribute the reported generic popup to Agent Queue: local logs around its timestamp did not identify its source. The README now explains Apple's per-app Privacy & Security approval flow for the named Agent Queue installer or menu app. Future release notes state the same limitation prominently. No Gatekeeper or quarantine setting was changed, no signing boundary was bypassed, and no paid-account signing was configured.
+
 ## Source references
 
 - [Codex instruction discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md)

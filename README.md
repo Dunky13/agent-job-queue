@@ -53,6 +53,20 @@ The installer and app are ad hoc signed. Apple Developer ID signing and notariza
 
 Upgrades preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. Only the menu-bar UI is replaced. Existing dependencies are not upgraded by the installer.
 
+### If macOS blocks opening the app
+
+Current releases are **not notarized**. Passing the package's code-signature integrity check does not mean Gatekeeper will accept it. macOS can block the installer or the installed menu app; Homebrew does not provide Apple notarization.
+
+For a downloaded Agent Job Queue app that you trust, use Apple's per-app approval flow:
+
+1. Dismiss the blocked-app dialog, then open **System Settings → Privacy & Security**.
+2. Find the entry naming **Agent Job Queue Installer** or **Agent Queue**, then choose **Open Anyway** and confirm **Open**. This option appears after an attempt to open the blocked app, when allowed by your Mac's policy.
+3. Reopen the installer and choose **Install**. If the menu app is separately blocked afterward, approve its own named entry the same way.
+
+Use the app name in Privacy & Security to identify a generic verification popup before approving anything. If no matching entry appears, the popup's source is still unknown. Managed Macs can restrict these choices. See [Apple's opening instructions](https://support.apple.com/102445).
+
+Developer ID signing and notarization require an Apple Developer Program membership and are not configured for this project. Keep Gatekeeper and quarantine enabled; the app does not remove them during installation.
+
 ## Connect your coding agents
 
 On first launch, **Agent integration** offers to add queue instructions for **Codex** and **Claude Code**. Select the runners you use, review the instructions, then choose **Save instructions**. Start new agent sessions afterward. You can skip setup and reopen it from the queue's gear menu at any time, including after a Homebrew installation.
