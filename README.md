@@ -7,7 +7,40 @@ Run many coding agents while sharing a limited number of heavy local job slots. 
 
 The macOS menu-bar app shows what is running, what is waiting, and which project and branch each job belongs to. An optional private web dashboard works from a phone over home Wi-Fi or a VPN.
 
+| Mac menu-bar queue | Phone dashboard |
+| --- | --- |
+| [![Mac queue showing running and waiting jobs, project labels, and the parallel job limit](docs/screenshots/mac-queue.png)](docs/screenshots/mac-queue.png) | [![Phone dashboard showing the queue and controls to start or reorder jobs](docs/screenshots/phone-queue.png)](docs/screenshots/phone-queue.png) |
+
+Screenshots use sample jobs. The Mac image uses the app's safe preview mode.
+
+<details>
+<summary>Start a waiting job in parallel</summary>
+
+![Native confirmation for starting a waiting job outside the parallel limit](docs/screenshots/mac-start-now.png)
+
+</details>
+
 ## Download and install
+
+### Homebrew
+
+On macOS 15 or later, install the app and CLI through the project's [Homebrew tap](https://github.com/Dunky13/homebrew-agent-job-queue):
+
+```sh
+brew install --cask dunky13/agent-job-queue/agent-job-queue
+```
+
+Homebrew installs the dependencies, sets up your private queue, and opens the menu-bar app. Both `agent-heavy` and `agent-remote` are linked into Homebrew's bin directory. No Xcode or manual installer window is needed.
+
+The tap becomes installable after the first validated `main` installer release is published. It tracks published builds, so updates can use:
+
+```sh
+brew upgrade --cask dunky13/agent-job-queue/agent-job-queue
+```
+
+Uninstalling the cask removes the menu app and Homebrew command links. It preserves the queue daemon, running jobs, private backend, data, credentials, and any enabled remote service. Disable remote access in settings or with `agent-remote disable` first if you want it stopped.
+
+### Installer app
 
 1. Use macOS 15 or later on an Apple Silicon or Intel Mac. Install [Homebrew](https://brew.sh/) first.
 2. Download the installer ZIP or DMG from [Releases](https://github.com/Dunky13/agent-job-queue/releases). Every successful push to `main` publishes a new prerelease build with SHA-256 checksums. CI runs also retain the installer as an artifact for 30 days.

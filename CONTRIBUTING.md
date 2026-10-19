@@ -33,6 +33,19 @@ Core and HTTPS acceptance tests launch their own temporary daemons, state direct
 
 Use `AGENT_QUEUE_TEST_PYTHON` to select a Python interpreter with the remote dependencies for browser tests. Playwright runs one Chromium worker and does not retry failures.
 
+## README screenshots
+
+Use artificial jobs when capturing documentation. Never capture your real queue, logs, passwords, or certificate settings.
+
+```sh
+scripts/capture-native-screenshots.sh
+python scripts/preview-screenshots.py
+```
+
+The first command builds the native app for the current Mac, captures its queue and start confirmation, and verifies confirmation navigation using an inert action recorder. It needs a logged-in graphical macOS session. The fixture is [native-fixture.json](docs/screenshots/native-fixture.json), and timestamps are shifted at capture time to keep elapsed labels readable.
+
+The second command serves the actual dashboard with simulated jobs at the printed ephemeral URL. Pass `--bind` with your current private LAN IPv4 address to preview it on another device. Resize the browser to 390 by 844 CSS pixels and capture the viewport as `docs/screenshots/phone-queue.png`. Stop the preview with Ctrl+C afterward. This preview cannot call the installed queue or load its settings.
+
 When changing runtime Python dependencies, update the exact constraints in `remote/requirements.txt`, then regenerate the hash lock:
 
 ```sh
