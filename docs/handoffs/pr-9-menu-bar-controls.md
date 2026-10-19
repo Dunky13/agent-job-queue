@@ -40,6 +40,14 @@ Tests and previews use artificial jobs and private fixture state. They must not 
 
 ## Delivery boundary
 
-The target is a reviewed, signed and DCO-signed-off pull request against `main`. Human merge approval, main installer publication, Homebrew delivery and operator installation are separate steps. Native compatibility remains macOS 15 or later on Apple Silicon and Intel.
+PR 9 merged after human approval as `def1ca52e9a3d145b390007c1539cf061091745c`. Its tree is identical to reviewed head `a62e7d226fdfc66dd5c148811289e89fd3245916` (`b2926b156488717c200541f6513b4b5636be682a`), and GitHub verifies its cryptographic signature.
+
+Main [CI run 39295113610](https://github.com/Dunky13/agent-job-queue/actions/runs/39295113610) failed the commit-policy check: GitHub selected `Marc Went <Dunky13@users.noreply.github.com>` as the squash author, but the merge message only signed off `Marc Went <marc@went.io>`. The merge command omitted the documented `--author-email` flag. Publication correctly remains blocked; merging the feature did not publish a new installer or update Homebrew.
+
+The recovery change records this incident without changing application, installer, workflow, or commit-policy code. A subsequent reviewed, signed and author-matching DCO commit on `main` can rebuild the feature through the normal validation, installer publication and Homebrew delivery pipeline. The original commit and failed run remain unchanged; this is not retroactive DCO repair. Do not rewrite `main`, bypass protection, weaken the checker, or manually publish the failed run's artifacts.
+
+For the recovery squash, follow [the existing squash author instructions](../../CONTRIBUTING.md#squash-author-and-sign-off): explicitly pass `--author-email` matching the final `Signed-off-by` trailer, pin the reviewed head, then independently verify the resulting author, trailer and signature. The installed `gh pr merge` command supports this flag. Verify successful main CI, the immutable release's source commit and installer checksum, and the tap's signed commit, manifest and cask before calling delivery complete.
+
+The recovery PR still needs its own human merge approval. Installer publication, verified Homebrew delivery and operator installation remain separate outcomes. Nothing has been installed as part of this work. Native compatibility remains macOS 15 or later on Apple Silicon and Intel; the graphical verification limits above still apply.
 
 This handoff also has a complete standalone [HTML version](pr-9-menu-bar-controls.html).
