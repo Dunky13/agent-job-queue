@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PR 9: menu-bar shortcuts</title><style>:root{color-scheme:light dark;font:16px/1.65 system-ui,sans-serif}body{margin:0;background:light-dark(#f4f5f7,#17191d);color:light-dark(#24272e,#e4e7ed)}main{max-width:850px;margin:32px auto;padding:32px;background:light-dark(#fff,#22252b);border-radius:16px}h1{font-size:clamp(1.65rem,4vw,2.2rem);line-height:1.2}h2{font-size:1.2rem;margin-top:2rem}a{color:light-dark(#175bb7,#95bfff)}code,pre{font-family:ui-monospace,monospace;overflow-wrap:anywhere}code{font-size:.9em}pre{padding:16px;border-radius:8px;background:light-dark(#edf0f5,#14161a);overflow:auto}li{margin-block:10px}@media(max-width:600px){main{margin:0;padding:20px;border-radius:0}}</style><main>
+<h1>PR 9: menu-bar shortcuts</h1>
+<p><a href="https://github.com/Dunky13/agent-job-queue/pull/9">PR 9</a> implements the request: &quot;Let&#x27;s add a right click settings menu on the menubar icon. Include open window as option, and add double click to open window as well&quot;.</p>
+<h2>Behavior</h2>
+<ul>
+<li>A primary click toggles the existing queue popover.</li>
+<li>Right-click or Control-click opens a native menu with <strong>Open window</strong>, <strong>Learned workloads</strong>, <strong>About and updates</strong>, <strong>Agent integration</strong>, <strong>Remote access settings</strong>, and <strong>Quit Agent Queue</strong>. The existing explanation that quitting leaves jobs running remains visible.</li>
+<li>A primary double-click opens or focuses the existing main queue window and closes the popover.</li>
+<li>The gear menu and the icon menu use the same application actions and settings labels.</li>
+<li>Keyboard and accessibility activation opens the popover directly. Mouse-only event properties are never read for other event types.</li>
+</ul>
+<h2>Implementation</h2>
+<p>The previous icon was owned by SwiftUI&#x27;s <code>MenuBarExtra</code>, with no right-click or double-click routing. Public AppKit status-item and popover APIs now own those interactions; the popover keeps the existing SwiftUI queue panel and stores. The queue badge, error state, window reuse, onboarding and independent daemon remain part of the existing application behavior.</p>
+<p>A primary click opens the popover immediately. A second click switches to the main window. Dismissal uses an application-local event monitor and application focus notifications, so icon clicks remain available while the popover is open. Menu tracking keeps the footer and job menus usable.</p>
+<p>The application retains standard editing, window and Quit shortcuts through owned AppKit menus. Closing its last window leaves the menu-bar app running.</p>
+<h2>Validation</h2>
+<ul>
+<li>The graphical fixture executed 32 successful checks against the real AppKit status button, popover, menus and production window handlers. It covers immediate single clicks, double-click sequences from closed and open popovers, singleton window reopening and restoration, both menu gestures while open, child-menu selection, Escape, outside-click dismissal, badges and accessibility, and monitor teardown. Events are synthetic AppKit events; fixture animations are disabled.</li>
+<li>Three global keyboard-dispatch checks (Select All, Undo, and Close Window) were explicitly skipped because macOS declined foreground activation of the fixture. Standard menu selectors/key equivalents and the owned editor&#x27;s first responder were checked. The report records each skip, and <code>--require-foreground</code> makes unavailable foreground checks fail.</li>
+<li>Fixture testing reproduced two intermediate implementation regressions: a transient popover consumed Control-click, and a retained hosting view left the hidden popover counted as visible. Owned event dismissal fixes the first; explicit popover lifecycle accounting fixes the second. Repeated measured visibility cycles now return from zero to one to zero, and closed popovers retain no input monitor.</li>
+<li>Final queued validation passed all four native suites, the warnings-as-errors universal build for <code>arm64</code> and <code>x86_64</code>, ShellCheck, Bash syntax, public-source boundaries and diff checks. The actual application entry point rendered the fixture queue window and popover-size queue. Four confirmation/navigation scenarios preserved the visible surface, dispatched exactly the confirmed inert actions, and rejected stale or duplicate requests. Native screenshots were inspected locally.</li>
+<li>Standards/Spec review and exact-head hosted CI are recorded on the pull request separately from local verification. Cross-provider review is unavailable under the current operator policy.</li>
+</ul>
+<p>Run the documented native suite and portable build in the configured development environment, through the operator&#x27;s shared heavy-command queue:</p>
+<pre><code>bash scripts/test-native.sh
+native/build.sh build/AgentQueue
+bash native/tests/run-menu-bar-ui-tests.sh build/menu-bar-verification.json</code></pre>
+<p>The graphical runner requires a logged-in macOS session. Add <code>--require-foreground</code> to require the three foreground dispatch checks.</p>
+<p>Tests and previews use artificial jobs and private fixture state. They must not dispatch work, alter real credentials or agent instructions, replace the installed app, or stop the live queue.</p>
+<h2>Delivery boundary</h2>
+<p>The target is a reviewed, signed and DCO-signed-off pull request against <code>main</code>. Human merge approval, main installer publication, Homebrew delivery and operator installation are separate steps. Native compatibility remains macOS 15 or later on Apple Silicon and Intel.</p>
+<p>This handoff also has a complete standalone <a href="pr-9-menu-bar-controls.html">HTML version</a>.</p>
+</main></html>

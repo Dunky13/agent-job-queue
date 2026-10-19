@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 actor IntegrationFixture {
     var configured: Set<String> = []
@@ -44,6 +45,7 @@ struct BehaviorTests {
             FileHandle.standardOutput.write(Data("\(value ? "PASS" : "FAIL") \(name)\n".utf8))
             if !value { throw ClientError.message(name) }
         }
+        try checkMenuBarBehavior(check)
         let store = QueueStore()
         guard store.fixtureMode, let recorder = store.fixtureRecorder,
               let queued = store.waiting.first, let original = store.snapshot else {
@@ -142,5 +144,42 @@ struct BehaviorTests {
         preview.select("codex", enabled: true)
         await preview.refresh()
         try check(preview.save() == nil && preview.error == nil, "Preview never dispatches instruction changes")
+    }
+
+    @MainActor private static func checkMenuBarBehavior(_ check: (Bool, String) throws -> Void) throws {
+        func mouse(_ type: NSEvent.EventType, count: Int = 1,
+                   modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
+            guard let event = NSEvent.mouseEvent(with: type, location: .zero, modifierFlags: modifiers,
+                timestamp: 0, windowNumber: 0, context: nil, eventNumber: 0, clickCount: count, pressure: 0) else {
+                throw ClientError.message("Could not create fixture mouse event")
+            }
+            return event
+        }
+        try check(QueueStatusActivation.from(try mouse(.leftMouseUp)) == .primaryClick,
+                  "Primary mouse activation keeps the queue popover")
+        try check(QueueStatusActivation.from(try mouse(.leftMouseUp, count: 2)) == .doubleClick,
+                  "Primary double-click opens the queue window")
+        try check(QueueStatusActivation.from(try mouse(.rightMouseUp)) == .contextMenu,
+                  "Secondary click opens the context menu")
+        try check(QueueStatusActivation.from(try mouse(.leftMouseUp, count: 2, modifiers: .control)) == .contextMenu,
+                  "Control-click takes precedence over double-click")
+        let key = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+            windowNumber: 0, context: nil, characters: " ", charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49)
+        try check(key != nil && QueueStatusActivation.from(key) == .accessible && QueueStatusActivation.from(nil) == .accessible,
+                  "Keyboard and accessibility activation never inspect mouse clickCount")
+
+        try check(QueueAppAction.allCases == [.openWindow] + QueueAppAction.settings + [.quit],
+                  "Context menu and footer share all application actions in order")
+        try check(QueueAppAction.settings.map(\.title) == ["Learned workloads…", "About and updates…", "Agent integration…", "Remote access settings…"]
+            && QueueAppAction.quitExplanation == "Quitting this app leaves jobs running.",
+                  "Application actions retain existing settings and background-job explanation")
+        let summary = QueueSummary(status: "running", limit: 1, running: 2, waiting: 3, legacyOccupied: false)
+        let snapshot = QueueSnapshot(updatedAt: "fixture", queue: summary, jobs: [])
+        let presentation = QueueStatusPresentation(snapshot: snapshot, error: nil)
+        try check(presentation.title == "2 · 3" && presentation.accessibilityLabel == "Agent Queue, 2 running, 3 waiting",
+                  "Status item preserves running and waiting counts and accessibility")
+        try check(QueueStatusPresentation(snapshot: snapshot, error: "Fixture error").title == "!"
+            && QueueStatusPresentation(snapshot: nil, error: nil).title.isEmpty,
+                  "Status item preserves the error and idle badge states")
     }
 }

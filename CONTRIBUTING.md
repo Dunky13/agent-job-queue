@@ -37,6 +37,15 @@ Apply your shared queue policy to resource-intensive local batches. Hosted CI ha
 
 Core and HTTPS acceptance tests launch their own temporary daemons, state directories, child processes, ports, and test-only credentials. Browser tests use simulated jobs. Installer and agent-integration tests use isolated user directories. They must never operate on your active queue or real agent instructions. Native tests are headless and check the actual store and navigation handlers, including opt-in integration, duplicate-save protection, partial failures, and onboarding state.
 
+For menu-bar gestures, use a logged-in graphical macOS session:
+
+```sh
+mkdir -p build
+bash native/tests/run-menu-bar-ui-tests.sh build/menu-bar-verification.json
+```
+
+The runner builds a private fixture app with a unique identity and sends synthetic AppKit events through the real status button, menus and window handlers. It records explicit `skippedChecks` when macOS declines foreground activation for global keyboard dispatch. Add `--require-foreground` to fail on those unavailable checks. Its bounded launcher checks the JSON result and cleans up only its own temporary app; it leaves the installed queue app and clipboard intact.
+
 Use `AGENT_QUEUE_TEST_PYTHON` to select a Python interpreter with the remote dependencies for browser tests. Playwright runs one Chromium worker and does not retry failures.
 
 ## README screenshots
