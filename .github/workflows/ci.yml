@@ -25,6 +25,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify pre-push PR-range and fail-closed behavior
+        run: python3 -m unittest discover -s tests -p test_git_hooks.py -v
       - name: Check DCO and verified signatures
         env:
           GH_TOKEN: ${{ github.token }}

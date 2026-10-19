@@ -10,11 +10,11 @@ GitHub authored the squash commit as Marc Went <Dunky13@users.noreply.github.com
 
 ## Repair
 
-This follow-up adds a maintainer squash checklist and instructions for setting the final author email and matching DCO trailer together. Its signed commit includes sign-offs for both observed public identities of the same maintainer, so either of those squash author selections retains a matching trailer. No DCO, signature, validation, publication, or branch-protection check changes.
+This follow-up adds a maintainer squash checklist and instructions for setting the final author email and matching DCO trailer together. Its signed commits include sign-offs for both observed public identities of the same maintainer, so either of those squash author selections retains a matching trailer. The pre-push hook also now checks the documented full PR range from origin/main, including previously pushed PR commits. Its previous new-branch path checked all history and incorrectly included the already-remote merge commit. Fresh repositories still check their initial history, and unexpected Git lookup, signature, or DCO failures still block pushes. The exact commit checker and main protection remain enforced.
 
 ## Evidence
 
-The failure was checked in the actual main commit metadata and commit-policy job log. The exact author-matching checker still rejects the original squash commit. Contributor instructions use installed GitHub CLI flags verified through gh pr merge --help. This is a documentation-only change; source-boundary and diff checks are sufficient locally, and hosted required checks must pass before merge.
+Both failures were observed directly: the main commit-policy job rejected the squash identity, and an actual new-branch push incorrectly included that existing main commit in its range. The exact author-matching checker still rejects the original squash commit and accepts the new PR range. Seven isolated hook regression tests passed, covering new and existing PR branches, bootstrap fallback, lookup and commit-resolution failures, checker failure, and deletion/nonbranch handling. Ruff, ShellCheck, workflow lint, source-boundary and diff checks passed. Contributor instructions use installed GitHub CLI flags verified through gh pr merge --help. Hosted required checks must pass before merge.
 
 ## Remaining work
 

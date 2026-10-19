@@ -60,7 +60,7 @@ Commit with configured cryptographic signing enabled and a DCO sign-off:
 git commit -s -m "fix(queue): describe the change"
 ```
 
-The pre-push hook checks every commit being introduced. GitHub checks DCO and its verified-signature record, and protects `main` with the aggregate required check. Open a pull request; direct pushes, force pushes, and admin bypasses are not part of the delivery process. Preserve sign-offs in the final squash commit message.
+The pre-push hook checks the full PR range from `origin/main` to the pushed head, including previously pushed PR commits. Fetch `origin/main` before pushing to keep that baseline current. A fresh repository without that reference checks the initial history or commits since the existing remote branch. GitHub checks DCO and its verified-signature record, and protects `main` with the aggregate required check. Open a pull request; direct pushes, force pushes, and admin bypasses are not part of the delivery process. Preserve sign-offs in the final squash commit message.
 
 ## Squash author and sign-off
 
