@@ -5,29 +5,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
+import sys
 from pathlib import Path
 
-REPOSITORY = "Dunky13/agent-job-queue"
-FIELDS = {"schemaVersion", "repository", "tag", "commit", "version", "build", "asset", "sha256"}
+# In this source tree the validator is at the repository root. In the dedicated
+# tap it is copied beside this script, so normal sibling imports remain valid.
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
-
-def validate_manifest(data: object) -> dict:
-    if not isinstance(data, dict) or set(data) != FIELDS:
-        raise ValueError("Unexpected Homebrew manifest fields")
-    if type(data["schemaVersion"]) is not int or data["schemaVersion"] != 1 or data["repository"] != REPOSITORY:
-        raise ValueError("Unsupported Homebrew manifest source")
-    if type(data["build"]) is not int or not 1 <= data["build"] <= 999_999_999:
-        raise ValueError("Invalid build number")
-    for field, pattern in (("version", r"[0-9]+\.[0-9]+\.[0-9]+(?:[.-][A-Za-z0-9.-]+)?"),
-                           ("commit", r"[0-9a-f]{40}"), ("sha256", r"[0-9a-f]{64}")):
-        if not isinstance(data[field], str) or not re.fullmatch(pattern, data[field]):
-            raise ValueError(f"Invalid {field}")
-    if data["tag"] != f"build-{data['build']}-{data['commit'][:7]}":
-        raise ValueError("Release tag does not match the build and commit")
-    if data["asset"] != f"Agent-Job-Queue-Installer-{data['version']}-universal.zip":
-        raise ValueError("Unexpected installer asset")
-    return data
+from release_metadata import FIELDS as FIELDS, REPOSITORY as REPOSITORY, validate_manifest as validate_manifest
 
 
 def render_cask(data: object) -> str:

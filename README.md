@@ -69,6 +69,12 @@ Use the app name in Privacy & Security to identify a generic verification popup 
 
 Developer ID signing and notarization require an Apple Developer Program membership and are not configured for this project. The manual installer does not remove quarantine. The cask's exception applies only to its own staged files; Gatekeeper remains enabled system-wide.
 
+## Version and updates
+
+Choose **About and updates** from the queue's gear menu to see the running app and installed controller versions. **Check for updates** finds published builds, including builds with the same version number. **Download and open installer** verifies the selected build and opens the existing installer; choose **Install** there to finish. Running and queued jobs remain with the independent daemon.
+
+Legacy and local builds are labelled untracked and can explicitly choose a published installer. The updater does not install automatically. It preserves Gatekeeper policy and refuses tracked downgrades. CLI equivalents and verification details are in [Installed version and updates](docs/updates.md).
+
 ## Connect your coding agents
 
 On first launch, **Agent integration** offers to add queue instructions for **Codex** and **Claude Code**. Select the runners you use, review the instructions, then choose **Save instructions**. Start new agent sessions afterward. You can skip setup and reopen it from the queue's gear menu at any time, including after a Homebrew installation.
@@ -161,6 +167,8 @@ AGENT_HEAVY_PROFILE=project-validation agent-heavy -- bash scripts/validate.sh
 ```
 
 Use the same explicit profile only for related workloads. Their meaningful arguments and settings still distinguish variants. Do not put credentials in profile names. History stores opaque identities and numeric observations, with bounded retention; raw environment and command contents are not copied into the history database.
+
+Choose **Learned workloads** in the app's gear menu or phone navigation to inspect measured peaks, variants, confidence and recent runs. Rename profiles, share learning between similar job families, separate a family, set minimum RAM/CPU reservations, or reset obsolete measurements. Saved corrections affect future estimates without stopping active jobs. The CLI exposes the same controls through `agent-heavy profiles`; see [Inspect and correct workload learning](docs/learning.md) for details.
 
 Measurements are sampled estimates, not enforced CPU or memory quotas. Workers and peaks entirely between samples can be missed. Failed, cancelled, interrupted and incompletely observed runs cannot establish that a workload is cheap, while their observed peaks still raise conservative estimates. Adaptive mode does not suspend or terminate jobs, control unrelated apps, or rewrite tool flags. See [the scheduling contract](docs/adaptive-scheduling.md) for learning, ownership and recovery details.
 

@@ -1091,12 +1091,23 @@ def reorder(gate: Gate, task_id: int, action: str, priority: int | None = None) 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
+    if arguments[:1] == ["--version"]:
+        arguments = ["version", *arguments[1:]]
+    if arguments[:1] and arguments[0] in ("version", "updates"):
+        import app_updates
+        return app_updates.main(arguments)
+    if arguments[:1] == ["profiles"]:
+        import learning_control
+        return learning_control.main(arguments[1:])
     if arguments and arguments[0] == "--":
         arguments = ["run", *arguments[1:]]
     elif arguments and arguments[0] == "--label":
         arguments = ["run", *arguments]
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
+    subparsers.add_parser("version", help="show the installed app version without a network request")
+    subparsers.add_parser("updates", help="check published builds or open a verified installer")
+    subparsers.add_parser("profiles", help="inspect and correct learned workload groups and reservations")
     run_parser = subparsers.add_parser("run", help="queue and wait for one foreground command")
     run_parser.add_argument("--label", help="short readable name for this validation batch")
     run_parser.add_argument("command", nargs=argparse.REMAINDER)

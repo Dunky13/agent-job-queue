@@ -60,3 +60,26 @@ test("bounded log and CSRF contracts reject unexpected or unbounded data", () =>
   assert.equal(logSchema.safeParse({ output: "", truncated: "false" }).success, false);
   assert.equal(csrfSchema.safeParse({ token: "" }).success, false);
 });
+
+test("learning schemas accept bounded numeric evidence and reject malformed profiles", async () => {
+  const { profileCatalogSchema, profileDetailSchema } = await import("./schema.mjs");
+  const profile = { id: "a".repeat(64), label: "Browser tests", memberCount: 1, variantCount: 1,
+    successCount: 5, incompleteCount: 1, peakMemoryBytes: 1610612736, peakCpuCores: 1.5,
+    lastRunAt: 1792404000, memoryFloorBytes: null, cpuFloorCores: 2 };
+  const controller = { revision: 4, controllerAppliedRevision: null, controllerStatus: "Pending next fresh pass" };
+  const catalog = { ...controller, profiles: [profile], total: 1, offset: 0, limit: 100 };
+  assert.deepEqual(profileCatalogSchema.parse(catalog), catalog);
+  const detail = { ...controller, profile, members: [{ family: "b".repeat(64), label: "Browser tests", project: "example", executable: "python" }],
+    variants: [], runs: [{ id: "c".repeat(64), family: "b".repeat(64), variant: "d".repeat(64), machine: "e".repeat(64),
+      sampledAt: 1792404000, memoryBytes: 1610612736, cpuCores: 1.5, cpuSeconds: 20, durationSeconds: 15, success: false }],
+    prediction: null, predictionMachine: null, truncated: { members: false, variants: false, runs: false } };
+  assert.deepEqual(profileDetailSchema.parse(detail), detail);
+  for (const invalid of [{ ...catalog, limit: 101 }, { ...catalog, controllerAppliedRevision: -1 },
+    { ...catalog, profiles: [{ ...profile, memoryFloorBytes: -1 }] }, { ...catalog, profiles: [{ ...profile, id: "not-a-hash" }] }]) {
+    assert.equal(profileCatalogSchema.safeParse(invalid).success, false);
+  }
+  assert.equal(profileDetailSchema.safeParse({ ...detail, runs: [{ ...detail.runs[0], success: "false" }] }).success, false);
+  assert.equal(profileDetailSchema.safeParse({ ...detail, members: Array(257).fill(detail.members[0]) }).success, false);
+  const learnedJob = { ...job, resources: { ...resources, learning: { id: profile.id, label: profile.label, reason: "Operator shared this family" } } };
+  assert.deepEqual(snapshotSchema.parse({ ...snapshot, jobs: [learnedJob] }).jobs[0], learnedJob);
+});

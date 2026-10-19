@@ -147,6 +147,71 @@ class ApiTests(unittest.TestCase):
             server.create_app(settings)
 
 
+class ProfileApiTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+        self.identity = "a" * 64
+        self.origin = "https://queue.local:8743"
+        self.result = {"revision": 8, "profile": {"id": self.identity}}
+
+        def runner(arguments, input_data=None):
+            self.calls.append((arguments, input_data))
+            return self.result
+
+        self.app = server.create_app({"hosts": ["queue.local"], "port": 8743, "secret_key": "fixture" * 8}, runner, test_mode=True)
+        self.client = self.app.test_client()
+        token = self.client.get("/api/csrf", base_url=self.origin).json["token"]
+        self.headers = {"Origin": self.origin, "Referer": self.origin + "/", "X-CSRFToken": token}
+
+    def test_list_and_detail_are_bounded_read_only_and_use_strict_cli_arguments(self):
+        result = self.client.get("/api/profiles?offset=100&limit=25&query=Browser%20tests", base_url=self.origin)
+        self.assertEqual(result.json, self.result)
+        self.client.get("/api/profiles/" + self.identity, base_url=self.origin)
+        self.assertEqual(self.calls, [(["profiles", "list", "--offset", "100", "--limit", "25", "--query", "Browser tests", "--json"], None),
+                                      (["profiles", "show", self.identity, "--json"], None)])
+        for query in ("limit=101", "limit=0", "offset=-1", "offset=1.2", "query=" + "x" * 121,
+                      "limit=10&limit=20", "command=run", "query=%00"):
+            self.assertEqual(self.client.get("/api/profiles?" + query, base_url=self.origin).status_code, 400)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(self.client.get("/api/profiles/not-a-hash", base_url=self.origin).status_code, 404)
+        self.assertEqual(self.client.get("/api/profiles/" + self.identity + "?command=run", base_url=self.origin).status_code, 404)
+
+    def test_mutations_require_csrf_explicit_confirmation_and_revision(self):
+        path = "/api/profiles/" + self.identity
+        valid = {"revision": 7, "label": "Browser tests", "memoryFloorBytes": 2147483648, "cpuFloorCores": 2.5}
+        self.assertEqual(self.client.post(path + "/edit", base_url=self.origin, json=valid, headers={"Origin": self.origin}).status_code, 400)
+        self.assertEqual(self.client.post(path + "/reset", base_url=self.origin, json={"revision": 7, "confirm": False}, headers=self.headers).status_code, 400)
+        for invalid in ({**valid, "revision": True}, {**valid, "memoryFloorBytes": True}, {**valid, "cpuFloorCores": float("inf")},
+                        {**valid, "cpuFloorCores": 10 ** 1000},
+                        {**valid, "label": " x "}, {**valid, "label": ""}, {**valid, "label": "x" * 121}, {**valid, "argv": "secret"}):
+            self.assertEqual(self.client.post(path + "/edit", base_url=self.origin, json=invalid, headers=self.headers).status_code, 400)
+        self.assertEqual(self.calls, [])
+        for action, value in (("edit", valid), ("edit", {**valid, "memoryFloorBytes": None, "cpuFloorCores": None}),
+                              ("merge", {"revision": 7, "targetId": "b" * 64}), ("split", {"revision": 7, "family": "c" * 64}),
+                              ("reset", {"revision": 7, "confirm": True})):
+            result = self.client.post(path + "/" + action, base_url=self.origin, json=value, headers=self.headers)
+            self.assertEqual(result.json, self.result)
+            arguments, input_data = self.calls[-1]
+            self.assertEqual(arguments, ["profiles", action, self.identity, "--json"])
+            self.assertEqual(json.loads(input_data), value)
+        self.assertEqual(self.client.post(path + "/delete", base_url=self.origin, json={}, headers=self.headers).status_code, 404)
+
+    def test_core_profile_runner_uses_private_stdin_and_preserves_json_conflict(self):
+        from types import SimpleNamespace
+        payload = '{"revision":7,"confirm":true}'
+        with patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout='{"revision":8,"profile":{}}')) as run:
+            self.assertEqual(server.core_runner(["profiles", "reset", self.identity, "--json"], payload), {"revision": 8, "profile": {}})
+            self.assertEqual(run.call_args.kwargs["input"], payload)
+            self.assertNotIn("stdin", run.call_args.kwargs)
+            self.assertNotIn(payload, run.call_args.args[0])
+        with patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=125, stdout='{"error":"Learning changed; refresh before saving"}')):
+            with self.assertRaisesRegex(server.BackendError, "Learning changed"):
+                server.core_runner(["profiles", "edit", self.identity, "--json"], payload)
+        with patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=125, stdout='private process output')):
+            with self.assertRaisesRegex(server.BackendError, "inspect the local"):
+                server.core_runner(["profiles", "edit", self.identity, "--json"], payload)
+
+
 class PasswordTests(unittest.TestCase):
     def test_rejects_short_nonprintable_and_unsupported_length_before_writing(self):
         paths = control.Paths()

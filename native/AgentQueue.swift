@@ -97,6 +97,7 @@ struct JobResources: Codable, Sendable, Equatable {
     let prediction: ResourcePrediction
     let observed: ResourceObservation?
     let decision: ResourceDecision?
+    var learning: JobLearningReference? = nil
 }
 
 func resourceBytes(_ value: Int64) -> String {
@@ -162,19 +163,30 @@ enum ClientError: LocalizedError {
 
 // CLI I/O and deadline handling stay off the main actor. A file avoids pipe-buffer
 // deadlocks with large status responses; every response is bounded before loading.
+private struct QueueControllerFailure: Decodable { let error: String }
+
 enum QueueClient {
     enum Controller: String, Sendable { case heavy = "agent-heavy", remote = "agent-remote" }
+    enum Budget: Sendable { case normal, updates }
 
-    static func run(_ arguments: [String], controller: Controller = .heavy, input: Data? = nil) async throws -> Data {
+    static func run(_ arguments: [String], controller: Controller = .heavy, input: Data? = nil,
+                    budget: Budget = .normal) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                do { continuation.resume(returning: try runBlocking(arguments, controller: controller, input: input)) }
+                do { continuation.resume(returning: try runBlocking(arguments, controller: controller, input: input, budget: budget)) }
                 catch { continuation.resume(throwing: error) }
             }
         }
     }
 
-    private static func runBlocking(_ arguments: [String], controller: Controller, input: Data?) throws -> Data {
+    static func timeout(for arguments: [String], controller: Controller = .heavy, budget: Budget = .normal) -> TimeInterval {
+        // A verified update includes a bounded download and signature checks. The
+        // backend has a 120-second aggregate deadline; normal queue I/O is unchanged.
+        if budget == .updates && controller == .heavy && arguments.first == "updates" { return 130 }
+        return arguments.first == "status" ? 8 : (controller == .remote ? 35 : 25)
+    }
+
+    private static func runBlocking(_ arguments: [String], controller: Controller, input: Data?, budget: Budget) throws -> Data {
         guard (input?.count ?? 0) <= 16_384 else { throw ClientError.message("Controller input exceeds the private-pipe limit.") }
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent("agent-queue-client-\(UUID().uuidString)")
@@ -213,7 +225,7 @@ enum QueueClient {
                 throw ClientError.message("Could not send private configuration to the controller.")
             }
         }
-        let timeout: TimeInterval = arguments.first == "status" ? 8 : (controller == .remote ? 35 : 25)
+        let timeout = timeout(for: arguments, controller: controller, budget: budget)
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.04) }
         if process.isRunning {
@@ -223,6 +235,9 @@ enum QueueClient {
                 Thread.sleep(forTimeInterval: 0.02)
             }
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            if budget == .updates {
+                throw ClientError.message("The update operation did not finish within \(Int(timeout)) seconds. Check whether the installer opened, then check for updates before retrying.")
+            }
             throw ClientError.message("The queue did not respond within \(Int(timeout)) seconds. Jobs continue independently. Refresh to check whether the change was applied.")
         }
         let input = try FileHandle(forReadingFrom: temporary)
@@ -232,6 +247,9 @@ enum QueueClient {
             throw ClientError.message("The queue response exceeds the 2 MB display limit.")
         }
         guard process.terminationStatus == 0 else {
+            if arguments.first == "profiles", let failure = try? JSONDecoder().decode(QueueControllerFailure.self, from: response) {
+                throw ClientError.message(failure.error)
+            }
             let message = String(decoding: response.prefix(1_000), as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             throw ClientError.message(message.isEmpty ? "Queue command failed (\(process.terminationStatus))." : message)
@@ -570,9 +588,61 @@ final class RemoteAccessStore: ObservableObject {
     static let store = QueueStore()
     static let remoteStore = RemoteAccessStore(fixtureMode: store.fixtureMode)
     static let integrationStore = AgentIntegrationStore(fixtureMode: store.fixtureMode)
+    static let updateStore = QueueUpdateStore(fixtureMode: store.fixtureMode)
+    static let learningStore = LearningStore(fixtureMode: store.fixtureMode)
     static var queueWindow: NSWindow?
     static var remoteWindow: NSWindow?
     static var integrationWindow: NSWindow?
+    static var updatesWindow: NSWindow?
+    static var learningWindow: NSWindow?
+
+    static func showLearningWindow(profileID: String? = nil) {
+        if let learningWindow {
+            learningWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate()
+            if let profileID { learningStore.select(profileID) }
+            return
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 780),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = "Learned Workloads"
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 800, height: 550)
+        window.contentView = NSHostingView(rootView: LearningWindow(store: learningStore) {
+            AppRuntime.learningWindow?.close()
+        })
+        learningWindow = window
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+        if let profileID {
+            Task {
+                await learningStore.loadPage(preserveSelection: true)?.value
+                await learningStore.select(profileID)?.value
+            }
+        }
+    }
+
+    static func showUpdatesWindow() {
+        if let updatesWindow {
+            updatesWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate()
+            Task { await updateStore.refreshInstalled() }
+            return
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 620),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = "About Agent Queue"
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 590, height: 500)
+        window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: updateStore) {
+            AppRuntime.updatesWindow?.close()
+        })
+        updatesWindow = window
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
 
     static func showIntegrationWindow() {
         if let integrationWindow {
@@ -917,6 +987,11 @@ struct QueuePanel: View {
             }
             Menu {
                 Button("View details and output", systemImage: "doc.text") { navigation.show(job) }
+                if let learning = job.resources?.learning {
+                    Button("View learned workload", systemImage: "chart.bar.doc.horizontal") {
+                        AppRuntime.showLearningWindow(profileID: learning.id)
+                    }
+                }
                 if job.canReorder || job.permitsStart {
                     Divider()
                     if job.canReorder {
@@ -948,6 +1023,8 @@ struct QueuePanel: View {
                 Spacer()
                 if !fullWindow { Button("Open window", systemImage: "arrow.up.left.and.arrow.down.right") { AppRuntime.showWindow() }.buttonStyle(.borderless) }
                 Menu {
+                    Button("Learned workloads…", systemImage: "chart.bar.doc.horizontal") { AppRuntime.showLearningWindow() }
+                    Button("About and updates…", systemImage: "info.circle") { AppRuntime.showUpdatesWindow() }
                     Button("Agent integration…", systemImage: "terminal") { AppRuntime.showIntegrationWindow() }
                     Button("Remote access settings…", systemImage: "network") { AppRuntime.showRemoteWindow() }
                     Divider()
@@ -1184,6 +1261,16 @@ struct JobDetail: View {
                         detail("CPU cost", "\(observed.cpuSeconds.formatted(.number.precision(.fractionLength(1)))) CPU-seconds over \(observed.durationSeconds.formatted(.number.precision(.fractionLength(1)))) seconds (\(observed.samples) samples)")
                     }
                     if let decision = resources.decision { detail("Admission", decision.reason) }
+                    if let learning = resources.learning {
+                        GridRow {
+                            Text("Learning").foregroundStyle(.secondary)
+                            VStack(alignment: .leading, spacing: 5) {
+                                Button(learning.label) { AppRuntime.showLearningWindow(profileID: learning.id) }
+                                    .buttonStyle(.link)
+                                Text(learning.reason).foregroundStyle(.secondary).textSelection(.enabled)
+                            }.frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
                 } else { detail("Resources", "No measurements or predictions available.") }
             }.font(.caption).frame(maxWidth: .infinity, alignment: .leading)
             }.frame(maxHeight: 200)
@@ -1282,6 +1369,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: AppRuntime.integrationStore) {})
                     window.minSize = NSSize(width: 520, height: 540)
                     window.setContentSize(NSSize(width: 600, height: 720))
+                    window.center()
+                }
+                if arguments.contains("--snapshot-learning") {
+                    window.contentView = NSHostingView(rootView: LearningWindow(store: AppRuntime.learningStore) {})
+                    window.minSize = NSSize(width: 800, height: 550)
+                    window.setContentSize(NSSize(width: 1000, height: 780))
+                    window.center()
+                }
+                if arguments.contains("--snapshot-updates") {
+                    window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: AppRuntime.updateStore) {})
+                    window.minSize = NSSize(width: 590, height: 500)
+                    window.setContentSize(NSSize(width: 620, height: 620))
                     window.center()
                 }
             }
@@ -1476,13 +1575,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             throw ClientError.message("Could not create snapshot bitmap.")
         }
         view.cacheDisplay(in: view.bounds, to: representation)
-        guard let png = representation.representation(using: .png, properties: [:]) else {
-            throw ClientError.message("PNG encoding failed.")
+        var background = NSColor.windowBackgroundColor.cgColor
+        view.effectiveAppearance.performAsCurrentDrawingAppearance {
+            background = (view.window?.backgroundColor ?? NSColor.windowBackgroundColor).cgColor
         }
+        let png = try NativeSnapshotRenderer.png(from: representation, background: background)
         try png.write(to: URL(fileURLWithPath: path))
     }
 
     private func diagnostic(_ text: String) { FileHandle.standardError.write(Data((text + "\n").utf8)) }
+}
+
+enum NativeSnapshotRenderer {
+    // cacheDisplay captures the hosting view without the window behind it.
+    // Include that background while rendering, so transparent native controls
+    // keep the appearance they have on screen in every PNG viewer.
+    static func png(from representation: NSBitmapImageRep, background: CGColor) throws -> Data {
+        guard let image = representation.cgImage,
+              let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else {
+            throw ClientError.message("Could not prepare opaque snapshot rendering.")
+        }
+        let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        context.setFillColor(background)
+        context.fill(bounds)
+        context.draw(image, in: bounds)
+        guard let result = context.makeImage(),
+              let png = NSBitmapImageRep(cgImage: result).representation(using: .png, properties: [:]) else {
+            throw ClientError.message("PNG encoding failed.")
+        }
+        return png
+    }
 }
 
 struct NavigationVerification: Encodable {

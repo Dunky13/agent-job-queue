@@ -56,6 +56,27 @@ class HomebrewTests(unittest.TestCase):
         self.assertIn('depends_on formula: "pueue"', cask)
         self.assertIn('binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/bin/agent-heavy"', cask)
 
+    def test_seeded_tap_renderer_and_refresh_import_shared_validator_outside_source_tree(self):
+        tap = self.root / "tap"
+        tap.mkdir()
+        for name in ("render_cask.py", "refresh.py"):
+            shutil.copy2(PACKAGING / name, tap / name)
+        shutil.copy2(ROOT / "release_metadata.py", tap / "release_metadata.py")
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        destination = tap / "output"
+        result = subprocess.run([sys.executable, str(tap / "render_cask.py"),
+                                 "--archive", str(self.archive), "--version", self.manifest["version"],
+                                 "--tag", self.manifest["tag"], "--commit", self.manifest["commit"],
+                                 "--build", str(self.manifest["build"]), "--output", str(destination)],
+                                cwd=self.root, env=environment, capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads((destination / "agent-job-queue.json").read_text()), self.manifest)
+        refresh_help = subprocess.run([sys.executable, str(tap / "refresh.py"), "--help"],
+                                      cwd=self.root, env=environment, capture_output=True, text=True,
+                                      timeout=5, check=False)
+        self.assertEqual(refresh_help.returncode, 0, refresh_help.stderr)
+        self.assertIn("--publish", refresh_help.stdout)
+
     def test_renderer_clears_only_staged_quarantine_before_any_executable_artifact(self):
         cask = renderer.render_cask(self.manifest)
         start = cask.index("  if respond_to?(:preflight_steps)\n")

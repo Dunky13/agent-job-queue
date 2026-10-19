@@ -15,7 +15,7 @@ if [[ ${AGENT_QUEUE_INSTALL_TEST_MODE:-} == 1 ]]; then
 else
   [[ $(uname -s) == Darwin ]] || { echo 'Agent Job Queue requires macOS.' >&2; exit 1; }
 fi
-[[ -d "$payload/Agent Queue.app" && -f "$payload/source/agent_heavy.py" && -f "$payload/source/agent_integration.py" && -f "$payload/source/remote/requirements.txt" ]] || {
+[[ -d "$payload/Agent Queue.app" && -f "$payload/source/agent_heavy.py" && -f "$payload/source/agent_integration.py" && -f "$payload/source/learning_control.py" && -f "$payload/source/app_updates.py" && -f "$payload/source/release_metadata.py" && -f "$payload/source/build-info.json" && -f "$payload/Agent Queue.app/Contents/Resources/build-info.json" && -f "$payload/source/remote/requirements.txt" ]] || {
   echo 'Incomplete installer payload.' >&2; exit 1;
 }
 brew_tool=$(command -v brew || true)
@@ -59,14 +59,79 @@ fi
 python_prefix=$("$brew_tool" --prefix python@3.12)
 python_tool="$python_prefix/bin/python3.12"
 [[ -x "$python_tool" ]] || { echo 'Homebrew Python 3.12 is unavailable.' >&2; exit 1; }
+# Reject mismatched or forged package identities before replacing installed support.
+"$python_tool" -B - "$payload" "$root" <<'PY'
+import json
+import plistlib
+import sys
+from pathlib import Path
+payload = Path(sys.argv[1])
+root = Path(sys.argv[2])
+sys.path.insert(0, str(payload / 'source'))
+from app_updates import _read_owned
+from release_metadata import validate_build_info
+source = validate_build_info(json.loads(_read_owned(payload / 'source/build-info.json')))
+app = payload / 'Agent Queue.app/Contents'
+bundled = validate_build_info(json.loads(_read_owned(app / 'Resources/build-info.json')))
+if source != bundled:
+    raise ValueError('Installer app and support build identities differ')
+plist = plistlib.loads(_read_owned(app / 'Info.plist'))
+if (plist.get('CFBundleIdentifier') != 'io.went.agent-queue'
+        or plist.get('CFBundleShortVersionString') != source['version']
+        or plist.get('CFBundleVersion') != str(source['build'] or 0)):
+    raise ValueError('Installer app version differs from its build identity')
+# A crash can leave support, app and completed-marker identities at different
+# points. Every known identity retains its downgrade protection until recovery.
+identities = (root / 'build-info.json', root / 'install-in-progress.json',
+              Path.home() / 'Applications/Agent Queue.app/Contents/Resources/build-info.json')
+for marker in identities:
+    if not marker.exists() and not marker.is_symlink():
+        continue
+    installed = validate_build_info(json.loads(_read_owned(marker)))
+    if source['build'] is not None and installed['build'] is not None:
+        if source['build'] < installed['build']:
+            raise ValueError('Refusing to install an older tracked build over a newer installation')
+        if source['build'] == installed['build'] and source != installed:
+            raise ValueError('The same tracked build number has a different commit or version')
+PY
 pueued_tool=$(command -v pueued)
 pueue_tool=$(command -v pueue)
 "$python_tool" "$payload/source/scripts/migrate-installation.py" "$root" "$state"
+# Publish the incomplete transaction before the first support-file replacement.
+# Leave it in place on every failure so version readers cannot certify a mixture.
+"$python_tool" -B - "$payload/source" "$root" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+source, root = map(Path, sys.argv[1:])
+sys.path.insert(0, str(source))
+from app_updates import _read_owned
+from release_metadata import validate_build_info
+identity = validate_build_info(json.loads(_read_owned(source / 'build-info.json')))
+descriptor, name = tempfile.mkstemp(prefix='.install-in-progress-', dir=root)
+temporary = Path(name)
+try:
+    with os.fdopen(descriptor, 'w') as handle:
+        json.dump(identity, handle, indent=2)
+        handle.write('\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, root / 'install-in-progress.json')
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
 printf 'Installing application support files...\n'
 # Copy only the public payload. Runtime state, credentials and the existing venv stay private.
 cp "$payload/source/agent_heavy.py" "$root/agent_heavy.py"
 cp "$payload/source/agent_integration.py" "$root/agent_integration.py"
-for module in resource_monitor.py job_profiles.py resource_scheduler.py; do
+for module in resource_monitor.py job_profiles.py resource_scheduler.py learning_control.py app_updates.py release_metadata.py; do
   cp "$payload/source/$module" "$root/$module"
 done
 mkdir -p "$root/remote/static" "$root/bin" "$root/scripts"
@@ -168,14 +233,53 @@ fi
 printf 'Installing the prebuilt menu-bar app...\n'
 app="$HOME/Applications/Agent Queue.app"
 staging="$HOME/Applications/.Agent Queue.installing.app"
+previous="$HOME/Applications/.Agent Queue.previous.app"
 rm -rf "$staging"
 cp -R "$payload/Agent Queue.app" "$staging"
 # Quit only the menu-bar UI. Its daemon-owned jobs and optional remote service keep running.
 if [[ ${AGENT_QUEUE_INSTALL_TEST_MODE:-} != 1 ]]; then
   /usr/bin/osascript -e 'tell application id "io.went.agent-queue" to quit' >/dev/null 2>&1 || true
 fi
-rm -rf "$app"
-mv "$staging" "$app"
+rm -rf "$previous"
+if [[ -e "$app" ]]; then mv "$app" "$previous"; fi
+if mv "$staging" "$app"; then
+  rm -rf "$previous"
+else
+  status=$?
+  if [[ -e "$previous" ]]; then mv "$previous" "$app"; fi
+  exit "$status"
+fi
+if launchctl print "gui/$(id -u)/io.went.agent-resources" >/dev/null 2>&1; then
+  # Reload only telemetry/admission code. Keep the incomplete marker until
+  # launchd retires the old controller; Pueue keeps ownership of active jobs.
+  launchctl kickstart -k "gui/$(id -u)/io.went.agent-resources"
+fi
+# Commit completion before clearing the incomplete transaction. A crash between
+# these operations remains visibly incomplete until the same/newer build retries.
+"$python_tool" -B - "$payload/source/build-info.json" "$root" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+source, root = map(Path, sys.argv[1:])
+descriptor, name = tempfile.mkstemp(prefix='.build-info-', dir=root)
+temporary = Path(name)
+try:
+    with os.fdopen(descriptor, 'wb') as handle:
+        handle.write(source.read_bytes())
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, root / 'build-info.json')
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+        (root / 'install-in-progress.json').unlink()
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
 if [[ ${AGENT_QUEUE_INSTALL_TEST_MODE:-} != 1 ]]; then
   /usr/bin/open -a "$app"
 fi
