@@ -117,6 +117,21 @@ def view(gate) -> dict:
     if not isinstance(value.get("jobs"), dict) or not isinstance(value.get("available"), bool) \
             or (value["available"] and host is None):
         raise SchedulingError("Invalid resource controller status")
+    # An older still-running controller cannot authorize work using estimates
+    # from before an operator correction, even after reading a new generation.
+    from job_profiles import ProfileStore
+    store = ProfileStore(gate.state, readonly=True)
+    try:
+        revision = store.revision()
+    finally:
+        store.close()
+    applied = value.get("learningRevision")
+    if applied is not None and (type(applied) is not int or applied < 0):
+        raise SchedulingError("Invalid applied learning revision")
+    if revision and applied != revision:
+        return {**value, "mode": configuration["mode"], "available": False,
+                "admissionReady": False, "jobs": {},
+                "reason": "Saved learning is waiting for a fresh controller pass; automatic admissions are held"}
     return {**value, "mode": configuration["mode"]}
 
 
@@ -336,9 +351,10 @@ class Controller:
         return {"prediction": prediction, "observed": observed, "decision": None}
 
     def tick(self):
-        from agent_heavy import (command_token, private_lock, read_private, result_code, shared_manifest,
+        from agent_heavy import (command_token, display_text, private_lock, read_private, result_code, shared_manifest,
                                  task_status, validate_limit, validate_marker, write_private)
         gate = self.gate
+        learning_revision = self.store.revision()
         host = self.sampler.host()
         if host["memoryPressure"] != "normal" or host["swapOutBytesPerSecond"] > 1024 ** 2:
             self.recovery_until = time.monotonic() + RECOVERY_SECONDS
@@ -364,6 +380,14 @@ class Controller:
                 if task_status(task)[0] in ("Running", "Paused"):
                     active.append({"prediction": {"memoryBytes": GIB, "cpuCores": 2.0}, "observed": {}})
                 continue
+            try:
+                description = read_private(gate.state / "metadata" / f"{token}.json")
+            except FileNotFoundError:
+                description = {}
+            self.store.observe(workload, {
+                key: display_text(description.get(key) or "", 120 if key == "title" else 80) or None
+                for key in ("title", "project", "executable")
+            })
             prediction = self.store.prediction(workload, host["machine"])
             state, details = task_status(task)
             resources = {"prediction": prediction, "observed": None, "decision": None}
@@ -416,12 +440,26 @@ class Controller:
                 self.finalized.add(token)
             elif state in ("Queued", "Stashed"):
                 candidates.append((task_id, token, task, resources))
+            resources["learning"] = self.store.match(workload)
             jobs[token] = resources
         configuration = settings(gate)
         reason = "Collecting workload history" if configuration["mode"] == "fixed" else "Resource predictions are ready"
         with private_lock(gate, "scheduling.lock"), private_lock(gate):
             configuration = settings(gate)
             admissions = ledger(gate, configuration)
+            if self.store.revision() != learning_revision:
+                # Collection happens outside these locks. Discard the whole
+                # decision pass if a correction changed its lookup or floors.
+                admissions["grants"] = {token: grant for token, grant in admissions["grants"].items()
+                                        if grant["manual"] or "pgid" in (gate.receipt(grant["task_id"]) or {})}
+                write_private(gate.state / "resource-admissions.json", admissions)
+                value = {"mode": configuration["mode"], "generation": configuration["generation"],
+                         "boot": self.boot, "sampledAt": time.time(), "updatedAt": datetime.now(UTC).isoformat(),
+                         "available": False, "admissionReady": False, "learningRevision": learning_revision,
+                         "reason": "Learning changed during collection; waiting for fresh predictions",
+                         "host": host, "jobs": {}}
+                write_private(gate.state / "resource-status.json", value)
+                return value
             current = gate.snapshot()
             group = current["groups"]["default"]
             limit = group["parallel_tasks"]
@@ -487,6 +525,7 @@ class Controller:
                 reason = "Collecting a complete resource interval"
             value = {"mode": configuration["mode"], "generation": configuration["generation"],
                      "boot": self.boot, "sampledAt": time.time(), "updatedAt": datetime.now(UTC).isoformat(),
+                     "learningRevision": learning_revision,
                      "available": available, "admissionReady": bool(admission_ready),
                      "reason": reason, "host": host, "jobs": jobs}
             write_private(gate.state / "resource-status.json", value)

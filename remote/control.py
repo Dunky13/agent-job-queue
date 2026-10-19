@@ -527,8 +527,9 @@ def api_process(paths: Paths):
     if paths.testing and os.environ.get("AGENT_REMOTE_TEST_CONTROLLER"):
         fixture = os.environ["AGENT_REMOTE_TEST_CONTROLLER"]
 
-        def fixture_runner(arguments):
-            return json.loads(command([sys.executable, fixture, *arguments], timeout=23).stdout)
+        def fixture_runner(arguments, input_data=None):
+            payload = None if input_data is None else input_data.encode()
+            return json.loads(command([sys.executable, fixture, *arguments], input_data=payload, timeout=23).stdout)
 
         runner = fixture_runner
     serve(api_app(settings, runner, paths.testing), unix_socket=str(paths.socket), unix_socket_perms="600", threads=2,

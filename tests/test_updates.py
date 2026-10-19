@@ -399,7 +399,9 @@ class UpdateTests(unittest.TestCase):
         for phase in ("headers", "body"):
             with self.subTest(phase=phase):
                 incoming, outgoing = socket.socketpair()
-                incoming.settimeout(0.15)
+                # No competing socket-idle timer: this must prove the absolute
+                # alarm interrupts blocking I/O even if the sender is delayed.
+                incoming.settimeout(None)
                 response = http.client.HTTPResponse(incoming)
                 stopped = threading.Event()
                 def send():
@@ -413,6 +415,8 @@ class UpdateTests(unittest.TestCase):
                             outgoing.sendall(bytes([byte]))
                     except OSError:
                         pass
+                    finally:
+                        outgoing.close()
                 worker = threading.Thread(target=send)
                 worker.start()
                 def open_response(*_args, **_kwargs):
@@ -434,6 +438,12 @@ class UpdateTests(unittest.TestCase):
                     outgoing.close()
                     worker.join(timeout=1)
                     response.close()
+
+    def test_socket_timeouts_are_reported_as_timeout_for_direct_and_wrapped_errors(self):
+        for error in (TimeoutError("socket idle"), urllib.error.URLError(TimeoutError("socket idle"))):
+            with self.subTest(error=error), patch.object(urllib.request.OpenerDirector, "open", side_effect=error), \
+                    self.assertRaisesRegex(updates.UpdateError, "timed out"):
+                updates._download(updates.API, 1024, time.monotonic() + 1)
 
     def test_cli_version_is_offline_and_update_install_requires_pinned_build(self):
         import agent_heavy

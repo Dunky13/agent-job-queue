@@ -11,12 +11,16 @@ const hostSchema = z.object({
   swapInBytesPerSecond: nonnegative, swapOutBytesPerSecond: nonnegative,
   diskFreeBytes: integer.nonnegative(), machine: z.string(), complete: z.boolean().optional(),
 });
+export const predictionSchema = z.object({
+  memoryBytes: integer.nonnegative(), cpuCores: nonnegative, durationSeconds: nonnegative.nullable(),
+  samples: integer.nonnegative(), confidence: z.literal(["unknown", "low", "medium", "high"]),
+  source: z.literal(["variant", "family", "prior"]),
+});
+const identitySchema = z.string().regex(/^[0-9a-f]{64}$/);
+const labelSchema = z.string().min(1).max(120);
 const resourcesSchema = z.object({
-  prediction: z.object({
-    memoryBytes: integer.nonnegative(), cpuCores: nonnegative, durationSeconds: nonnegative.nullable(),
-    samples: integer.nonnegative(), confidence: z.literal(["unknown", "low", "medium", "high"]),
-    source: z.literal(["variant", "family", "prior"]),
-  }),
+  prediction: predictionSchema,
+  learning: z.object({ id: identitySchema, label: labelSchema, reason: z.string().max(4096) }).optional(),
   observed: z.object({
     memoryBytes: integer.nonnegative(), peakMemoryBytes: integer.nonnegative(), cpuSeconds: nonnegative,
     cpuCores: nonnegative, durationSeconds: nonnegative, samples: integer.nonnegative(), complete: z.boolean(),
@@ -57,3 +61,28 @@ export function eligible(job, action) {
   if (action === "next" || action === "last") return job.canReorder && waiting(job);
   return action === "cancel" && job.canCancel;
 }
+
+const profileSchema = z.object({
+  id: identitySchema, label: labelSchema, memberCount: integer.nonnegative(), variantCount: integer.nonnegative(),
+  successCount: integer.nonnegative(), incompleteCount: integer.nonnegative(), peakMemoryBytes: integer.nonnegative(),
+  peakCpuCores: nonnegative, lastRunAt: nonnegative.nullable(), memoryFloorBytes: integer.positive().max(2 ** 50).nullable(),
+  cpuFloorCores: z.number().positive().max(1024).nullable(),
+});
+const controllerFields = {
+  controllerAppliedRevision: integer.nonnegative().nullable(), controllerStatus: z.string().max(4096),
+};
+export const profileCatalogSchema = z.object({
+  revision: integer.nonnegative(), profiles: z.array(profileSchema).max(100), total: integer.nonnegative(),
+  offset: integer.nonnegative(), limit: integer.min(1).max(100), ...controllerFields,
+});
+export const profileDetailSchema = z.object({
+  revision: integer.nonnegative(), profile: profileSchema, ...controllerFields,
+  members: z.array(z.object({ family: identitySchema, label: labelSchema, project: z.string().max(120), executable: z.string().max(120) })).max(256),
+  variants: z.array(z.object({ id: identitySchema, family: identitySchema, successCount: integer.nonnegative(),
+    incompleteCount: integer.nonnegative(), lastRunAt: nonnegative.nullable(), peakMemoryBytes: integer.nonnegative(), peakCpuCores: nonnegative })).max(256),
+  runs: z.array(z.object({ id: z.string().min(1).max(128), family: identitySchema, variant: identitySchema, machine: identitySchema,
+    sampledAt: nonnegative, memoryBytes: integer.nonnegative(), cpuCores: nonnegative, cpuSeconds: nonnegative,
+    durationSeconds: nonnegative, success: z.boolean() })).max(100),
+  prediction: predictionSchema.nullable(), predictionMachine: identitySchema.nullable(),
+  truncated: z.object({ members: z.boolean(), variants: z.boolean(), runs: z.boolean() }),
+});

@@ -30,6 +30,9 @@ class FakeQueue:
             self.offline = False
             self.limit = 1
             self.scheduler = None
+            self.profile_revision = 4
+            self.profiles = self.learning_profiles()
+            self.profile_inputs = []
             self.jobs = [self.job(101, "running", "Build app"),
                          self.job(102, "queued", "Run browser tests"),
                          self.job(103, "queued", "Typecheck client")]
@@ -47,10 +50,73 @@ class FakeQueue:
                 "canReorder": state == "queued", "canStart": state == "queued",
                 "canCancel": True, "phase": state.capitalize()}
 
-    def __call__(self, arguments):
+    def learning_profiles(self):
+        def detail(identifier, label, families):
+            members = [{"family": family, "label": f"{label} task {index + 1}", "project": "example-project", "executable": "python"} for index, family in enumerate(families)]
+            profile = {"id": identifier, "label": label, "memberCount": len(members), "variantCount": 1,
+                       "successCount": 5, "incompleteCount": 1, "peakMemoryBytes": 1610612736,
+                       "peakCpuCores": 1.5, "lastRunAt": 1792404000, "memoryFloorBytes": None, "cpuFloorCores": None}
+            return {"revision": 4, "profile": profile, "members": members,
+                    "controllerAppliedRevision": 3, "controllerStatus": "Waiting for next fresh pass",
+                    "variants": [{"id": "f" * 64, "family": families[0], "successCount": 5, "incompleteCount": 1,
+                                  "lastRunAt": 1792404000, "peakMemoryBytes": 1610612736, "peakCpuCores": 1.5}],
+                    "runs": [{"id": "9" * 64, "family": families[0], "variant": "f" * 64, "machine": "2" * 64,
+                              "sampledAt": 1792404000, "memoryBytes": 1610612736, "cpuCores": 1.5,
+                              "cpuSeconds": 20, "durationSeconds": 15, "success": False}],
+                    "prediction": {"memoryBytes": 2147483648, "cpuCores": 2, "durationSeconds": 60,
+                                   "samples": 0, "confidence": "unknown", "source": "family"},
+                    "predictionMachine": "2" * 64, "truncated": {"members": False, "variants": False, "runs": False}}
+        return {"a" * 64: detail("a" * 64, "Browser tests", ["c" * 64, "d" * 64]),
+                "b" * 64: detail("b" * 64, "Client build", ["e" * 64])}
+
+    def profile_call(self, arguments, input_data):
+        action = arguments[1]
+        if action == "list":
+            offset, limit, query = int(arguments[3]), int(arguments[5]), arguments[7]
+            profiles = [copy.deepcopy(detail["profile"]) for detail in self.profiles.values() if query.casefold() in detail["profile"]["label"].casefold()]
+            return {"revision": self.profile_revision, "profiles": profiles[offset:offset + limit],
+                    "total": len(profiles), "offset": offset, "limit": limit,
+                    "controllerAppliedRevision": 3, "controllerStatus": "Waiting for next fresh pass"}
+        identifier = arguments[2]
+        if identifier not in self.profiles:
+            raise BackendError("Workload profile no longer exists; refresh learning")
+        detail = self.profiles[identifier]
+        if action == "show":
+            return copy.deepcopy({**detail, "revision": self.profile_revision})
+        value = json.loads(input_data)
+        if value["revision"] != self.profile_revision:
+            raise BackendError("Learning changed; refresh before saving corrections")
+        self.events.append(arguments)
+        self.profile_inputs.append({"action": action, "id": identifier, "value": value})
+        if action == "edit":
+            detail["profile"].update({key: value[key] for key in ("label", "memoryFloorBytes", "cpuFloorCores")})
+        elif action == "reset":
+            detail["runs"], detail["variants"] = [], []
+            detail["profile"].update(successCount=0, incompleteCount=0, variantCount=0, peakMemoryBytes=0, peakCpuCores=0, lastRunAt=None)
+        elif action == "merge":
+            target = self.profiles[value["targetId"]]
+            target["members"].extend(detail["members"])
+            target["profile"]["memberCount"] = len(target["members"])
+            del self.profiles[identifier]
+            detail = target
+        elif action == "split":
+            member = next(member for member in detail["members"] if member["family"] == value["family"])
+            detail["members"].remove(member)
+            detail["profile"]["memberCount"] = len(detail["members"])
+            separate = copy.deepcopy(detail)
+            separate["profile"].update(id="3" * 64, label=member["label"], memberCount=1)
+            separate["members"] = [member]
+            self.profiles["3" * 64] = separate
+            detail = separate
+        self.profile_revision += 1
+        return copy.deepcopy({**detail, "revision": self.profile_revision})
+
+    def __call__(self, arguments, input_data=None):
         with self.lock:
             if self.offline:
                 raise BackendError("Fixture queue is offline")
+            if arguments[0] == "profiles":
+                return self.profile_call(arguments, input_data)
             if arguments == ["status", "--json"]:
                 snapshot = {"updatedAt": datetime.now(timezone.utc).isoformat(),
                         "queue": {"status": "running", "limit": self.limit,
@@ -119,6 +185,20 @@ def main():
         def update():
             values = request.get_json()
             with queue.lock:
+                if "profileFloors" in values:
+                    queue.profiles["a" * 64]["profile"].update(values["profileFloors"])
+                if "profileRevision" in values:
+                    queue.profile_revision = values["profileRevision"]
+                if "profileCount" in values:
+                    template = queue.learning_profiles()["a" * 64]
+                    queue.profiles = {}
+                    for index in range(values["profileCount"]):
+                        identifier = f"{index:064x}"
+                        detail = copy.deepcopy(template)
+                        detail["profile"].update(id=identifier, label=f"Workload {index}")
+                        queue.profiles[identifier] = detail
+                if "profiles" in values:
+                    queue.profiles = values["profiles"]
                 if "offline" in values:
                     queue.offline = values["offline"]
                 if "title" in values:

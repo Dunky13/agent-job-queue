@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import math
+import re
 import stat
 import subprocess
 import sys
@@ -21,20 +23,29 @@ class BackendError(Exception):
     pass
 
 
-def core_runner(arguments: list[str]) -> dict:
+def core_runner(arguments: list[str], input_data: str | None = None) -> dict:
     try:
-        result = subprocess.run([sys.executable, str(CORE), *arguments], stdin=subprocess.DEVNULL,
+        result = subprocess.run([sys.executable, str(CORE), *arguments],
+                                **({"stdin": subprocess.DEVNULL} if input_data is None else {"input": input_data}),
                                 capture_output=True, text=True, timeout=23, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise BackendError("Queue controller is unavailable") from error
     if result.returncode:
+        if arguments and arguments[0] == "profiles":
+            try:
+                failure = json.loads(result.stdout)
+            except ValueError:
+                failure = None
+            if isinstance(failure, dict) and set(failure) == {"error"} and isinstance(failure["error"], str) \
+                    and 0 < len(failure["error"]) <= 4096:
+                raise BackendError(failure["error"])
         raise BackendError("Queue action failed; inspect the local Agent Queue")
-    if arguments == ["status", "--json"]:
+    if arguments == ["status", "--json"] or arguments and arguments[0] == "profiles":
         try:
             value = json.loads(result.stdout)
         except ValueError as error:
             raise BackendError("Queue controller returned invalid status") from error
-        if not isinstance(value, dict) or not isinstance(value.get("jobs"), list):
+        if not isinstance(value, dict) or arguments[0] == "status" and not isinstance(value.get("jobs"), list):
             raise BackendError("Queue controller returned invalid status")
         return value
     return {"ok": True}
@@ -93,6 +104,46 @@ def create_app(settings: dict, runner=None, *, test_mode: bool = False) -> Flask
     @app.get("/api/status")
     def queue_status():
         return jsonify(run(["status", "--json"]))
+
+    @app.get("/api/profiles")
+    def profiles():
+        if set(request.args) - {"offset", "limit", "query"} or any(len(request.args.getlist(key)) != 1 for key in request.args):
+            return jsonify(error="Unknown profile query parameter"), 400
+        offset, size, query = request.args.get("offset", "0"), request.args.get("limit", "100"), request.args.get("query", "")
+        if not re.fullmatch(r"0|[1-9][0-9]{0,8}", offset) or not re.fullmatch(r"[1-9][0-9]{0,2}", size) \
+                or not 1 <= int(size) <= 100 or len(query) > 120 or any(ord(char) < 32 for char in query):
+            return jsonify(error="Invalid profile pagination or search"), 400
+        return jsonify(run(["profiles", "list", "--offset", offset, "--limit", size, "--query", query, "--json"]))
+
+    @app.get("/api/profiles/<profile_id>")
+    def profile_detail(profile_id):
+        if not re.fullmatch(r"[0-9a-f]{64}", profile_id) or request.args:
+            return jsonify(error="Unknown workload profile"), 404
+        return jsonify(run(["profiles", "show", profile_id, "--json"]))
+
+    @app.post("/api/profiles/<profile_id>/<action>")
+    def profile_action(profile_id, action):
+        if not re.fullmatch(r"[0-9a-f]{64}", profile_id) or action not in {"edit", "merge", "split", "reset"}:
+            return jsonify(error="Unknown workload profile action"), 404
+        value = request.get_json()
+        keys = {"edit": {"revision", "label", "memoryFloorBytes", "cpuFloorCores"},
+                "merge": {"revision", "targetId"}, "split": {"revision", "family"}, "reset": {"revision", "confirm"}}
+        if not isinstance(value, dict) or set(value) != keys[action] \
+                or type(value.get("revision")) is not int or not 0 <= value["revision"] <= 2**53 - 1:
+            return jsonify(error="A current profile revision and valid action fields are required"), 400
+        if action == "edit":
+            memory, cpu, label = value["memoryFloorBytes"], value["cpuFloorCores"], value["label"]
+            if not isinstance(label, str) or not 1 <= len(label) <= 120 or label != label.strip() or not label.isprintable() \
+                    or memory is not None and (type(memory) is not int or not 0 < memory <= 2**50) \
+                    or cpu is not None and (type(cpu) not in (int, float) or not 0 < cpu <= 1024 or not math.isfinite(cpu)):
+                return jsonify(error="Use a valid name and positive memory or CPU floors, or null for automatic"), 400
+        elif action in {"merge", "split"}:
+            identifier = value["targetId" if action == "merge" else "family"]
+            if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{64}", identifier):
+                return jsonify(error="A valid workload identity is required"), 400
+        elif value["confirm"] is not True:
+            return jsonify(error="Reset requires explicit confirmation"), 400
+        return jsonify(run(["profiles", action, profile_id, "--json"], input_data=json.dumps(value, allow_nan=False)))
 
     @app.get("/api/csrf")
     def csrf_token():

@@ -10,7 +10,7 @@
   <script type="module" src="/static/app.js"></script>
 </head>
 <body>
-  <a class="skip-link" href="#content">Skip to queue</a>
+  <a class="skip-link" href="#content">Skip to content</a>
   <div class="shell">
     <header class="app-header">
       <div class="brand"><span class="app-symbol" aria-hidden="true">▱</span><div><p class="eyebrow">YOUR MAC</p><h1>Agent Queue</h1></div></div>
@@ -20,6 +20,19 @@
       <div id="connection" class="connection"><span class="connection-dot" aria-hidden="true"></span><span id="connection-text">Connecting to your Mac…</span></div>
       <div id="error" class="notice error" role="alert" hidden></div>
       <p id="announcement" class="visually-hidden" role="status" aria-live="polite"></p>
+      <nav class="view-navigation" aria-label="Views"><button id="nav-queue" type="button" aria-current="page">Queue</button><button id="nav-profiles" type="button" class="quiet-button">Learned workloads</button></nav>
+      <section id="profiles-view" hidden>
+        <div class="section-title"><div><h2 id="profiles-title" tabindex="-1">Learned workloads</h2><p class="learning-copy">Inspect what your Mac has measured and correct how similar jobs share learning.</p></div><button id="profiles-refresh" type="button" class="quiet-button">Refresh learning</button></div>
+        <p id="profiles-error" class="notice error" role="alert" hidden></p>
+        <p id="profiles-controller" class="notice" role="status"></p>
+        <div id="profiles-catalog">
+          <form id="profiles-search-form" action="/api/profiles" method="get" class="profile-search"><label for="profiles-query">Find a workload</label><div class="button-row"><input id="profiles-query" name="query" type="search" maxlength="120" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"><button type="submit">Search</button></div></form>
+          <p id="profiles-count" class="learning-copy"></p><ul id="profiles-list" class="job-list" role="list"></ul>
+          <div class="button-row pagination"><button id="profiles-previous" type="button" class="quiet-button">Previous</button><button id="profiles-next" type="button" class="quiet-button">Next</button></div>
+        </div>
+        <section id="profile-detail" hidden></section>
+        <section id="profile-confirmation" class="confirmation" aria-labelledby="profile-confirmation-title" hidden><h3 id="profile-confirmation-title" tabindex="-1"></h3><p id="profile-confirmation-copy"></p><div class="button-row"><button id="profile-confirm" type="button">Confirm</button><button id="profile-dismiss" type="button" class="quiet-button">Keep profile</button></div></section>
+      </section>
       <section id="queue-view">
         <div class="summary" aria-label="Queue overview"><div><strong id="running-count">—</strong><span>running</span></div><div><strong id="waiting-count">—</strong><span>waiting</span></div><div><strong id="limit-count">—</strong><span>parallel limit</span></div></div>
         <section class="settings">
@@ -54,7 +67,7 @@
       <section id="detail-view" hidden>
         <button id="back" type="button" class="back-button">‹ Queue</button>
         <h2 id="detail-title" tabindex="-1"></h2><p id="detail-status" class="detail-status"></p>
-        <dl id="detail-metadata" class="metadata"></dl>
+        <dl id="detail-metadata" class="metadata"></dl><button id="detail-profile" type="button" hidden>View learned workload</button><p id="detail-profile-reason" class="learning-copy" hidden></p>
         <div class="section-title output-heading"><div><h3>Output</h3><p id="log-size">Latest 64 KB</p></div><button id="refresh-log" type="button" class="quiet-button">Refresh output</button></div>
         <p id="log-error" class="notice error" role="alert" hidden></p><pre id="log-output" tabindex="0" aria-label="Job output">Loading output…</pre>
       </section>

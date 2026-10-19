@@ -198,7 +198,13 @@ def _download_response(url: str, limit: int, deadline: float, destination: Path 
         if error.code in (403, 429):
             raise UpdateError("GitHub limited the update request. Try again later") from None
         raise UpdateError("GitHub could not provide the release. Try again later") from None
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+    except TimeoutError as error:
+        raise UpdateError("Update operation timed out. Check your connection and try again") from error
+    except urllib.error.URLError as error:
+        if isinstance(error.reason, TimeoutError):
+            raise UpdateError("Update operation timed out. Check your connection and try again") from error
+        raise UpdateError("Cannot reach the release service. Check your connection and try again") from error
+    except ConnectionError as error:
         raise UpdateError("Cannot reach the release service. Check your connection and try again") from error
 
 

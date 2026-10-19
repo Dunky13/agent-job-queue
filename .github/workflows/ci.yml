@@ -80,7 +80,9 @@ jobs:
       - name: Resource sampling and admission tests
         run: python -m unittest discover -s tests -p 'test_resource*.py' -v
       - name: Worktree identity and learning tests
-        run: python -m unittest discover -s tests -p test_job_profiles.py -v
+        run: |
+          python -m unittest discover -s tests -p test_job_profiles.py -v
+          python -m unittest discover -s tests -p 'test_learning*.py' -v
       - name: Release identity and app update tests
         run: |
           python -m unittest discover -s tests -p test_release_metadata.py -v

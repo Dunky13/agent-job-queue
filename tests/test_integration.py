@@ -238,15 +238,19 @@ resource_scheduler.serve(agent_heavy.Gate(),sampler=Sampler())
             self.control("scheduling", "fixed")
             log.close()
 
-    def seed_resource_profile(self):
+    def seed_resource_profile(self, commands):
         from job_profiles import ProfileStore, identify_workload
         environment = dict(self.env, AGENT_HEAVY_PROFILE="adaptive-acceptance")
-        workload = identify_workload([PYTHON, "-c", "pass"], str(Path.cwd()), environment)
         with ProfileStore(self.state) as store:
-            for number in range(5):
-                store.record(f"acceptance-{time.time_ns()}-{number}", workload, "acceptance-machine",
-                             {"memoryBytes": 256 * 1024 ** 2, "cpuSeconds": .1,
-                              "cpuCores": .2, "durationSeconds": 1}, complete=True, exit_code=0)
+            for command in commands:
+                # Known overlap requires successful evidence for the actual
+                # variant. A different inline program only shares its family;
+                # that evidence must not certify a newly changed job as cheap.
+                workload = identify_workload(command, str(Path.cwd()), environment)
+                for number in range(5):
+                    store.record(f"acceptance-{time.time_ns()}-{number}", workload, "acceptance-machine",
+                                 {"memoryBytes": 256 * 1024 ** 2, "cpuSeconds": .1,
+                                  "cpuCores": .2, "durationSeconds": 1}, complete=True, exit_code=0)
         return environment
 
     def test_01_cwd_environment_arguments_and_exact_failure(self):
@@ -608,13 +612,15 @@ print('PREVIOUS-CHILD-GONE')
         self.assertEqual(snapshot["queue"]["limit"], 1)
 
     def test_21_adaptive_admission_overlaps_known_jobs_and_respects_lowered_cap(self):
-        environment = self.seed_resource_profile()
+        started = [self.root / f"adaptive-{index}.started" for index in range(3)]
+        release = [self.root / f"adaptive-{index}.release" for index in range(3)]
+        code = "import pathlib,sys,time;pathlib.Path(sys.argv[1]).touch()\nwhile not pathlib.Path(sys.argv[2]).exists():time.sleep(.05)"
+        environment = self.seed_resource_profile([
+            [PYTHON, "-c", code, str(start), str(end)] for start, end in zip(started, release, strict=True)
+        ])
         with self.resource_controller():
             self.control("limit", 2)
             self.control("scheduling", "adaptive")
-            started = [self.root / f"adaptive-{index}.started" for index in range(3)]
-            release = [self.root / f"adaptive-{index}.release" for index in range(3)]
-            code = "import pathlib,sys,time;pathlib.Path(sys.argv[1]).touch()\nwhile not pathlib.Path(sys.argv[2]).exists():time.sleep(.05)"
             first = self.launch(code, started[0], release[0], env=environment)
             self.queued_id(first)
             until(started[0].exists)
@@ -693,6 +699,58 @@ print('PREVIOUS-CHILD-GONE')
             self.pueue("start")
             until(started.exists)
             self.finish(client)
+
+    def test_25_profile_corrections_hold_waiting_work_and_preserve_active_job(self):
+        from job_profiles import identify_workload
+        started = [self.root / f"learning-{index}.started" for index in range(2)]
+        release = [self.root / f"learning-{index}.release" for index in range(2)]
+        code = "import pathlib,sys,time;pathlib.Path(sys.argv[1]).touch()\nwhile not pathlib.Path(sys.argv[2]).exists():time.sleep(.05)"
+        commands = [[PYTHON, "-c", code, str(start), str(end)] for start, end in zip(started, release, strict=True)]
+        environment = self.seed_resource_profile(commands)
+        identity = identify_workload(commands[0], str(Path.cwd()), environment)["family"]
+
+        def edit(revision, minimum):
+            result = subprocess.run(
+                [PYTHON, str(MODULE), "profiles", "edit", identity, "--json"], env=self.env,
+                input=json.dumps({"revision": revision, "label": "Operator-corrected tests",
+                                  "memoryFloorBytes": minimum, "cpuFloorCores": None}),
+                capture_output=True, text=True, timeout=24, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return json.loads(result.stdout)
+
+        with self.resource_controller():
+            self.control("scheduling", "adaptive")
+            first = self.launch(code, started[0], release[0], env=environment)
+            self.queued_id(first)
+            until(started[0].exists)
+            second = self.launch(code, started[1], release[1], env=environment)
+            second_id = self.queued_id(second)
+            until(lambda: "Stashed" in self.task_state(second_id))
+            catalog = json.loads(self.control("profiles", "list", "--json").stdout)
+            self.assertIn(identity, {profile["id"] for profile in catalog["profiles"]})
+            detail = json.loads(self.control("profiles", "show", identity, "--json").stdout)
+            saved = edit(detail["revision"], 20 * 1024 ** 3)
+            self.assertEqual(saved["profile"]["label"], "Operator-corrected tests")
+            self.control("limit", 2)
+            def applied_wait():
+                status = json.loads(self.control("status", "--json").stdout)
+                waiting = next(job for job in status["jobs"] if job["id"] == int(second_id))
+                decision = waiting.get("resources", {}).get("decision")
+                applied = json.loads(self.control("profiles", "show", identity, "--json").stdout)
+                return applied["controllerAppliedRevision"] == saved["revision"] and decision and "exceeds" in decision["reason"]
+
+            until(applied_wait)
+            self.assertFalse(started[1].exists())
+            self.assertIsNone(first.poll())
+            cleared = edit(saved["revision"], None)
+            self.assertIsNone(cleared["profile"]["memoryFloorBytes"])
+            until(started[1].exists)
+            self.assertIsNone(first.poll())
+            for path in release:
+                path.touch()
+            self.finish(first)
+            self.finish(second)
 
     def test_99_daemon_crash_pauses_queue_until_owned_work_is_reconciled(self):
         started = self.root / "crash.started"

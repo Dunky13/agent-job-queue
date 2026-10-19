@@ -29,7 +29,7 @@ class InstallerTests(unittest.TestCase):
         self.source = self.payload / "source"
         self.source.mkdir(parents=True)
         for name in ("agent_heavy.py", "agent_integration.py", "resource_monitor.py", "job_profiles.py",
-                     "resource_scheduler.py", "app_updates.py", "release_metadata.py", "install-remote.sh"):
+                     "resource_scheduler.py", "learning_control.py", "app_updates.py", "release_metadata.py", "install-remote.sh"):
             shutil.copy2(ROOT / name, self.source / name)
         shutil.copytree(ROOT / "bin", self.source / "bin")
         shutil.copytree(ROOT / "remote", self.source / "remote", ignore=shutil.ignore_patterns(".venv", "__pycache__"))
@@ -125,6 +125,33 @@ fi''')
         self.assertIn("<--require-hashes>", calls)
         self.assertIn("remote/requirements.lock", calls)
         self.assertNotIn("<kill>", calls)
+
+    def test_upgrade_reloads_only_resource_controller_before_installation_commit(self):
+        self.environment["TEST_LOADED"] = "0"
+        self.tool("launchctl", '''if [ "$1" = print ]; then exit 0; fi
+if [ "$1" = kickstart ]; then
+  test "$3" = "gui/$(id -u)/io.went.agent-resources" || exit 80
+  test -f "$HOME/Applications/Agent Queue.app/Contents/Resources/build-info.json" || exit 81
+  test -f "$HOME/.local/share/agent-heavy/install-in-progress.json" || exit 82
+fi''')
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls.read_text()
+        self.assertEqual(calls.count("<kickstart>"), 1)
+        self.assertNotIn("<bootout>", calls)
+        self.assertTrue((self.home / ".local/share/agent-heavy/learning_control.py").is_file())
+
+    def test_failed_resource_reload_retains_incomplete_installation_for_retry(self):
+        self.tool("launchctl", 'if [ "$1" = print ]; then exit 0; fi\nif [ "$1" = kickstart ]; then exit 84; fi')
+        result = self.install()
+        self.assertEqual(result.returncode, 84, result.stdout + result.stderr)
+        support = self.home / ".local/share/agent-heavy"
+        self.assertTrue((support / "install-in-progress.json").is_file())
+        with self.assertRaisesRegex(UpdateError, "incomplete"):
+            installed_version(support, self.home / "Applications/Agent Queue.app")
+        self.tool("launchctl", 'if [ "$1" = print ]; then exit 0; fi')
+        self.assertEqual(self.install().returncode, 0)
+        self.assertFalse((support / "install-in-progress.json").exists())
 
     def test_upgrade_preserves_configuration_state_and_running_daemon(self):
         self.assertEqual(self.install().returncode, 0)

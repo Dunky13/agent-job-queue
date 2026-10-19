@@ -136,7 +136,8 @@ class TemporaryGate:
         self.prepare()
 
     def prepare(self):
-        for path in (self.state, self.state / "workloads", self.state / "resource-runs", self.receipts, self.state / "jobs"):
+        for path in (self.state, self.state / "workloads", self.state / "resource-runs", self.receipts,
+                     self.state / "jobs", self.state / "metadata"):
             path.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def snapshot(self):
@@ -164,6 +165,17 @@ class MemoryStore:
         self.records = []
         self.decisions = []
         self.closed = False
+        self.learning_revision = 0
+        self.observations = []
+
+    def revision(self):
+        return self.learning_revision
+
+    def observe(self, identity, description):
+        self.observations.append((identity, description))
+
+    def match(self, identity):
+        return {"id": identity["family"], "label": "Fixture workload", "reason": "Automatic workload family"}
 
     def prediction(self, identity, _machine):
         return self.demands.get(identity["variant"], prediction()).copy()
@@ -395,6 +407,37 @@ class PermitTests(SchedulerFixture):
 
 
 class ControllerTests(SchedulerFixture):
+    def test_changed_learning_during_collection_holds_old_predictions_and_pending_grants(self):
+        token = self.add_job(1)
+        manual = self.add_job(2)
+        self.admissions({token: self.grant(1), manual: self.grant(2, manual=True)})
+        original = self.store.prediction
+
+        def changing_prediction(*args):
+            result = original(*args)
+            self.store.learning_revision = 1
+            return result
+
+        with patch.object(self.store, "prediction", side_effect=changing_prediction):
+            result = self.controller.tick()
+        self.assertFalse(result["available"])
+        self.assertFalse(result["admissionReady"])
+        self.assertEqual(result["jobs"], {})
+        self.assertEqual(self.starts(), [])
+        grants = scheduler.ledger(self.gate, self.configuration)["grants"]
+        self.assertNotIn(token, grants)
+        self.assertTrue(grants[manual]["manual"])
+
+    def test_job_resources_link_to_safe_observed_profile(self):
+        token = self.add_job(1)
+        agent_heavy.write_private(self.gate.state / "metadata" / f"{token}.json", {
+            "title": "Tests", "project": "example", "executable": "python", "directory": "private path",
+        })
+        result = self.controller.tick()
+        self.assertEqual(self.store.observations[0][1], {"title": "Tests", "project": "example", "executable": "python"})
+        self.assertEqual(result["jobs"][token]["learning"]["id"], self.workload(1)["family"])
+        self.assertEqual(result["learningRevision"], 0)
+
     def test_job_finishing_inside_observation_gap_cannot_supply_complete_training(self):
         token = self.add_job(1, state="Running", owned=True)
         marker = self.gate.receipt(1)

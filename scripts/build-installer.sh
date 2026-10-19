@@ -22,6 +22,7 @@ done
 xcrun lipo -create "$work/Installer-arm64" "$work/Installer-x86_64" -output "$installer/Contents/MacOS/Installer"
 cp "$root/agent_heavy.py" "$root/agent_integration.py" "$root/install-remote.sh" "$payload/source/"
 cp "$root/resource_monitor.py" "$root/job_profiles.py" "$root/resource_scheduler.py" "$payload/source/"
+cp "$root/learning_control.py" "$payload/source/"
 cp "$root/app_updates.py" "$root/release_metadata.py" "$payload/source/"
 cp "$work/build-info.json" "$app/Contents/Resources/build-info.json"
 cp "$work/build-info.json" "$installer/Contents/Resources/build-info.json"

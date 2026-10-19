@@ -26,6 +26,11 @@ MAX_RUNS = 4096
 MAX_ENVELOPES = 2048
 MAX_MACHINES = 64
 MAX_DECISIONS = 4096
+MAX_REGISTERED_FAMILIES = 8192
+MAX_RETAINED_ENVELOPES = 8192
+MAX_DETAIL_MEMBERS = 256
+MAX_DETAIL_VARIANTS = 100
+MAX_DETAIL_RUNS = 30
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 DEFINITIONS = (
     "package.json", "package-lock.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", "yarn.lock", "bun.lock",
@@ -262,9 +267,15 @@ def _identity(identity: dict) -> tuple[str, str, str]:
 
 
 def _number(value, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise ProfileError(f"Invalid resource metric: {name}")
-    return float(value)
+    try:
+        converted = float(value)
+    except OverflowError as error:
+        raise ProfileError(f"Invalid resource metric: {name}") from error
+    if not math.isfinite(converted):
+        raise ProfileError(f"Invalid resource metric: {name}")
+    return converted
 
 
 class ProfileStore:
@@ -274,9 +285,13 @@ class ProfileStore:
         self.state = Path(state)
         self.path = self.state / "resource-history.sqlite3"
         self.readonly = readonly
+        self._empty = False
         try:
             if not readonly:
                 self.state.mkdir(parents=True, mode=0o700, exist_ok=True)
+            elif not self.state.exists() and not self.state.is_symlink():
+                self._empty = True
+                return
             info = self.state.lstat()
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
                 raise ProfileError("Unsafe resource history directory")
@@ -287,12 +302,16 @@ class ProfileStore:
                     pass
                 else:
                     os.close(fd)
+            elif not self.path.exists() and not self.path.is_symlink():
+                self._empty = True
+                return
             with self._connection(write=not readonly) as connection:
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
                 if version == 0 and not readonly:
                     self._schema(connection)
                 elif version == 1 and not readonly:
                     self._decision_schema(connection)
+                    self._learning_schema(connection)
                 elif version != 1:
                     raise ProfileError("Unsupported resource history schema")
                 if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
@@ -328,6 +347,7 @@ class ProfileStore:
                 connection.execute("PRAGMA synchronous=FULL")
             else:
                 connection.execute("PRAGMA query_only=ON")
+                connection.execute("BEGIN")
             yield connection
             if write:
                 connection.commit()
@@ -359,6 +379,35 @@ class ProfileStore:
             PRAGMA user_version=1;
         """)
         ProfileStore._decision_schema(connection)
+        ProfileStore._learning_schema(connection)
+
+    @staticmethod
+    def _learning_schema(connection):
+        # Optional additive tables keep v1 numeric observations readable by old
+        # clients. Opening a reader never creates these tables or a database.
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS learning_state (
+                id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO learning_state VALUES (1,0);
+            CREATE TABLE IF NOT EXISTS learning_profiles (
+                id TEXT PRIMARY KEY, label TEXT, memory_floor INTEGER, cpu_floor REAL,
+                pinned INTEGER NOT NULL, ignore_legacy INTEGER NOT NULL, updated REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS learning_members (
+                family TEXT PRIMARY KEY, profile TEXT NOT NULL, title TEXT, project TEXT,
+                executable TEXT, updated REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS learning_member_profile ON learning_members(profile);
+            CREATE TABLE IF NOT EXISTS learning_resets (
+                family TEXT PRIMARY KEY, sampled REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS learning_retained (
+                machine TEXT NOT NULL, family TEXT NOT NULL, variant TEXT NOT NULL,
+                memory INTEGER NOT NULL, cpu REAL NOT NULL, duration REAL NOT NULL, sampled REAL NOT NULL,
+                PRIMARY KEY(machine, family, variant)
+            );
+        """)
 
     @staticmethod
     def _decision_schema(connection):
@@ -422,34 +471,396 @@ class ProfileStore:
             connection.execute("""DELETE FROM decisions WHERE id IN
                 (SELECT id FROM decisions ORDER BY sampled DESC,id DESC LIMIT -1 OFFSET ?)""", (MAX_DECISIONS,))
 
+    @staticmethod
+    def _has_learning(connection) -> bool:
+        return connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_state'").fetchone() is not None
+
+    @staticmethod
+    def _revision(connection) -> int:
+        if not ProfileStore._has_learning(connection):
+            return 0
+        row = connection.execute("SELECT revision FROM learning_state WHERE id=1").fetchone()
+        if row is None or type(row[0]) is not int or row[0] < 0:
+            raise ProfileError("Invalid learning revision")
+        return row[0]
+
+    def revision(self) -> int:
+        if self._empty:
+            return 0
+        with self._connection() as connection:
+            return self._revision(connection)
+
+    @staticmethod
+    def _label(family: str, member=None) -> str:
+        if member:
+            return member.get("title") or member.get("project") or member.get("executable") or f"Workload {family[:12]}"
+        return f"Workload {family[:12]}"
+
+    @staticmethod
+    def _group_label(profile, members) -> str:
+        if profile["label"]:
+            return profile["label"]
+        representative = min(members, key=lambda member: (member["family"] != profile["id"], member["family"]))
+        return ProfileStore._label(representative["family"], representative)
+
+    @staticmethod
+    def _text(value, name: str, *, optional=False, maximum=120, basename=False):
+        if optional and value is None:
+            return None
+        if (not isinstance(value, str) or not 1 <= len(value) <= maximum
+                or value.strip() != value or not value.isprintable()
+                or (basename and ("/" in value or "\\" in value or value in {".", ".."}))):
+            raise ProfileError(f"Invalid workload {name}")
+        return value
+
+    @staticmethod
+    def _profile_id(value):
+        if not isinstance(value, str) or not HASH.fullmatch(value):
+            raise ProfileError("Invalid workload profile identity")
+        return value
+
+    @staticmethod
+    def _prediction_group(connection, family):
+        if not ProfileStore._has_learning(connection):
+            return [family], {}
+        member = connection.execute("SELECT profile FROM learning_members WHERE family=?", (family,)).fetchone()
+        if member is None:
+            return [family], {}
+        profile = connection.execute("SELECT * FROM learning_profiles WHERE id=?", (member[0],)).fetchone()
+        if profile is None:
+            raise ProfileError("Workload grouping is inconsistent")
+        families = [row[0] for row in connection.execute(
+            "SELECT family FROM learning_members WHERE profile=? ORDER BY family", (member[0],))]
+        return families, dict(profile)
+
+    @staticmethod
+    def _registry_slot(connection) -> bool:
+        count = connection.execute("SELECT COUNT(*) FROM learning_members").fetchone()[0]
+        if count < MAX_REGISTERED_FAMILIES:
+            return True
+        # Explicit corrections are never evicted. Only automatic metadata with
+        # no remaining numeric history can be reclaimed without losing learning.
+        candidate = connection.execute("""SELECT m.family,m.profile FROM learning_members m
+            JOIN learning_profiles p ON p.id=m.profile WHERE p.pinned=0
+            AND NOT EXISTS(SELECT 1 FROM runs r WHERE r.family=m.family)
+            AND NOT EXISTS(SELECT 1 FROM envelopes e WHERE e.family=m.family)
+            AND NOT EXISTS(SELECT 1 FROM learning_retained e WHERE e.family=m.family)
+            ORDER BY m.updated,m.family LIMIT 1""").fetchone()
+        if candidate is None:
+            return False
+        connection.execute("DELETE FROM learning_members WHERE family=?", (candidate["family"],))
+        connection.execute("DELETE FROM learning_profiles WHERE id=?", (candidate["profile"],))
+        return True
+
+    @staticmethod
+    def _register(connection, family, description=None, *, required=False):
+        member = connection.execute("SELECT * FROM learning_members WHERE family=?", (family,)).fetchone()
+        if member is not None:
+            return dict(member)
+        if not ProfileStore._registry_slot(connection):
+            if required:
+                raise ProfileError("Learning registry is full; existing operator corrections were preserved")
+            return None
+        now = time.time()
+        description = description or {}
+        profile_id = family
+        # A root family's original identifier can remain the identifier of a
+        # group after that family has been separated into a new profile.
+        if connection.execute("SELECT 1 FROM learning_profiles WHERE id=?", (profile_id,)).fetchone():
+            profile_id = _digest(["profile-v1", family, os.urandom(16).hex()])
+        connection.execute("INSERT INTO learning_profiles VALUES (?,?,NULL,NULL,0,0,?)", (profile_id, None, now))
+        connection.execute("INSERT INTO learning_members VALUES (?,?,?,?,?,?)",
+                           (family, profile_id, description.get("title"), description.get("project"),
+                            description.get("executable"), now))
+        return {"family": family, "profile": profile_id, "title": description.get("title"),
+                "project": description.get("project"), "executable": description.get("executable"), "updated": now}
+
+    def observe(self, identity: dict, description: dict) -> None:
+        family, _, _ = _identity(identity)
+        if not isinstance(description, dict) or set(description) - {"title", "project", "executable"}:
+            raise ProfileError("Invalid safe workload description")
+        description = {key: self._text(description.get(key), key, optional=True,
+                                       maximum=120 if key == "title" else 80,
+                                       basename=key != "title") for key in ("title", "project", "executable")}
+        with self._connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute("SELECT * FROM learning_members WHERE family=?", (family,)).fetchone()
+            if previous is None:
+                self._register(connection, family, description)
+            else:
+                # Preserve known metadata when an old or minimal caller has no
+                # description. Avoid writes on every controller heartbeat.
+                values = tuple(description[key] or previous[key] for key in ("title", "project", "executable"))
+                if values != (previous["title"], previous["project"], previous["executable"]):
+                    connection.execute("UPDATE learning_members SET title=?,project=?,executable=?,updated=? WHERE family=?",
+                                       (*values, time.time(), family))
+
+    def match(self, identity: dict) -> dict:
+        family, _, _ = _identity(identity)
+        if self._empty:
+            return {"id": family, "label": self._label(family), "reason": "Automatic workload family"}
+        with self._connection() as connection:
+            if self._has_learning(connection):
+                row = connection.execute("""SELECT m.*,p.label FROM learning_members m
+                    JOIN learning_profiles p ON p.id=m.profile WHERE family=?""", (family,)).fetchone()
+                if row:
+                    members = [dict(member) for member in connection.execute(
+                        "SELECT * FROM learning_members WHERE profile=?", (row["profile"],))]
+                    return {"id": row["profile"],
+                            "label": self._group_label({"id": row["profile"], "label": row["label"]}, members),
+                            "reason": "Operator grouping" if len(members) > 1 or row["profile"] != family else "Automatic workload family"}
+        return {"id": family, "label": self._label(family), "reason": "Automatic workload family"}
+
+    @staticmethod
+    def _dataset(connection):
+        profiles = {}
+        members = {}
+        if ProfileStore._has_learning(connection):
+            profiles = {row["id"]: dict(row) for row in connection.execute("SELECT * FROM learning_profiles")}
+            members = {row["family"]: dict(row) for row in connection.execute("SELECT * FROM learning_members")}
+        runs = [dict(row) for row in connection.execute("SELECT * FROM runs")]
+        envelopes = [dict(row) for row in connection.execute("SELECT * FROM envelopes")]
+        if ProfileStore._has_learning(connection):
+            envelopes.extend(dict(row) for row in connection.execute("SELECT * FROM learning_retained"))
+        for row in [*runs, *envelopes]:
+            family = row["family"]
+            if family not in members:
+                if family in profiles:
+                    raise ProfileError("Workload grouping is inconsistent")
+                profiles[family] = {"id": family, "label": None, "memory_floor": None, "cpu_floor": None,
+                                    "pinned": 0, "ignore_legacy": 0, "updated": row["sampled"]}
+                members[family] = {"family": family, "profile": family, "title": None, "project": None, "executable": None}
+        groups = {profile_id: {"members": [], "runs": [], "envelopes": []} for profile_id in profiles}
+        for member in members.values():
+            if member["profile"] not in groups:
+                raise ProfileError("Workload grouping is inconsistent")
+            groups[member["profile"]]["members"].append(member)
+        for kind, observations in (("runs", runs), ("envelopes", envelopes)):
+            for row in observations:
+                groups[members[row["family"]]["profile"]][kind].append(row)
+        return profiles, groups
+
+    @staticmethod
+    def _summary(profile, group):
+        members = sorted(group["members"], key=lambda member: member["family"])
+        if not members:
+            raise ProfileError("Workload profile has no members")
+        observations = [*group["runs"], *group["envelopes"]]
+        return {"id": profile["id"], "label": ProfileStore._group_label(profile, members),
+                "memberCount": len(members),
+                "variantCount": len({(row["family"], row["variant"]) for row in observations}),
+                "successCount": sum(row["success"] == 1 for row in group["runs"]),
+                "incompleteCount": sum(row["success"] != 1 for row in group["runs"]),
+                "peakMemoryBytes": max((row["memory"] for row in observations), default=0),
+                "peakCpuCores": max((row["cpu"] for row in observations), default=0.0),
+                "lastRunAt": max((row["sampled"] for row in observations), default=None),
+                "memoryFloorBytes": profile["memory_floor"], "cpuFloorCores": profile["cpu_floor"]}
+
+    def catalog(self, *, offset=0, limit=100, query="") -> dict:
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+            raise ProfileError("Invalid workload profile page")
+        if not isinstance(query, str) or len(query) > 120 or (query and not query.isprintable()):
+            raise ProfileError("Invalid workload profile search")
+        if self._empty:
+            return {"revision": 0, "profiles": [], "total": 0, "offset": offset, "limit": limit}
+        with self._connection() as connection:
+            revision = self._revision(connection)
+            profiles, groups = self._dataset(connection)
+            entries = [self._summary(profile, groups[profile_id]) for profile_id, profile in profiles.items()]
+            needle = query.casefold().strip()
+            if needle:
+                entries = [entry for entry in entries if needle in entry["label"].casefold() or needle in entry["id"]]
+            entries.sort(key=lambda entry: (entry["label"].casefold(), entry["id"]))
+            return {"revision": revision, "profiles": entries[offset:offset + limit], "total": len(entries),
+                    "offset": offset, "limit": limit}
+
+    def detail(self, profile_id, *, machine=None) -> dict:
+        self._profile_id(profile_id)
+        if machine is not None and (not isinstance(machine, str) or not machine):
+            raise ProfileError("Invalid workload prediction machine")
+        if self._empty:
+            raise ProfileError("Workload profile was not found")
+        with self._connection() as connection:
+            profiles, groups = self._dataset(connection)
+            if profile_id not in profiles:
+                raise ProfileError("Workload profile was not found; refresh the list")
+            profile, group = profiles[profile_id], groups[profile_id]
+            members = sorted(group["members"], key=lambda member: member["family"])
+            variants = {}
+            for row in [*group["envelopes"], *group["runs"]]:
+                key = (row["family"], row["variant"])
+                item = variants.setdefault(key, {"id": row["variant"], "family": row["family"], "successCount": 0,
+                                                 "incompleteCount": 0, "lastRunAt": 0,
+                                                 "peakMemoryBytes": 0, "peakCpuCores": 0.0})
+                item["lastRunAt"] = max(item["lastRunAt"], row["sampled"])
+                item["peakMemoryBytes"] = max(item["peakMemoryBytes"], row["memory"])
+                item["peakCpuCores"] = max(item["peakCpuCores"], row["cpu"])
+                if "success" in row:
+                    item["successCount"] += row["success"] == 1
+                    item["incompleteCount"] += row["success"] != 1
+            variants = sorted(variants.values(), key=lambda row: (-row["lastRunAt"], row["family"], row["id"]))
+            runs = sorted(group["runs"], key=lambda row: (-row["sampled"], row["token"]))
+            prediction = None
+            hashed_machine = None
+            if machine is not None:
+                hashed_machine = _digest(["machine-v1", machine])
+                # All grouped families contribute, with no fabricated exact
+                # variant successes. This is explicitly a group estimate.
+                representative = members[0]["family"]
+                synthetic = _digest(["group-estimate-v1", profile_id])
+                prediction = self._prediction(connection, representative, synthetic, hashed_machine)
+            return {"revision": self._revision(connection), "profile": self._summary(profile, group),
+                    "members": [{"family": member["family"], "label": self._label(member["family"], member),
+                                 "project": member["project"] or "", "executable": member["executable"] or ""}
+                                for member in members[:MAX_DETAIL_MEMBERS]],
+                    "variants": variants[:MAX_DETAIL_VARIANTS],
+                    "runs": [{"id": row["token"], "family": row["family"], "variant": row["variant"],
+                              "machine": row["machine"], "sampledAt": row["sampled"], "memoryBytes": row["memory"],
+                              "cpuCores": row["cpu"], "cpuSeconds": row["cpu_seconds"],
+                              "durationSeconds": row["duration"], "success": bool(row["success"])}
+                             for row in runs[:MAX_DETAIL_RUNS]],
+                    "prediction": prediction, "predictionMachine": hashed_machine,
+                    "truncated": {"members": len(members) > MAX_DETAIL_MEMBERS,
+                                  "variants": len(variants) > MAX_DETAIL_VARIANTS, "runs": len(runs) > MAX_DETAIL_RUNS}}
+
+    @staticmethod
+    def _expected_revision(connection, revision):
+        if type(revision) is not int or revision < 0:
+            raise ProfileError("Invalid expected learning revision")
+        if ProfileStore._revision(connection) != revision:
+            raise ProfileError("Learning changed since you opened it; refresh before saving")
+
+    @staticmethod
+    def _changed(connection):
+        connection.execute("UPDATE learning_state SET revision=revision+1 WHERE id=1")
+
+    def _editable(self, connection, profile_id):
+        self._profile_id(profile_id)
+        profiles, groups = self._dataset(connection)
+        if profile_id not in profiles:
+            raise ProfileError("Workload profile was not found; refresh the list")
+        for member in groups[profile_id]["members"]:
+            self._register(connection, member["family"], required=True)
+        return profiles[profile_id], groups[profile_id]
+
+    def edit(self, profile_id, *, revision, label, memory_floor_bytes, cpu_floor_cores) -> None:
+        label = self._text(label, "profile label")
+        if memory_floor_bytes is not None and (type(memory_floor_bytes) is not int or not 0 < memory_floor_bytes <= 2 ** 50):
+            raise ProfileError("Minimum memory must be a positive integer no greater than 2^50 bytes")
+        if cpu_floor_cores is not None:
+            cpu_floor_cores = _number(cpu_floor_cores, "minimumCpuCores")
+            if not 0 < cpu_floor_cores <= 1024:
+                raise ProfileError("Minimum CPU must be greater than zero and no greater than 1024 cores")
+        with self._connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expected_revision(connection, revision)
+            self._editable(connection, profile_id)
+            connection.execute("UPDATE learning_profiles SET label=?,memory_floor=?,cpu_floor=?,pinned=1,updated=? WHERE id=?",
+                               (label, memory_floor_bytes, cpu_floor_cores, time.time(), profile_id))
+            self._changed(connection)
+
+    def merge(self, profile_id, target_id, *, revision) -> None:
+        self._profile_id(profile_id)
+        self._profile_id(target_id)
+        if profile_id == target_id:
+            raise ProfileError("Choose a different profile to share learning with")
+        with self._connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expected_revision(connection, revision)
+            source, _ = self._editable(connection, profile_id)
+            target, target_group = self._editable(connection, target_id)
+            connection.execute("UPDATE learning_members SET profile=? WHERE profile=?", (target_id, profile_id))
+            connection.execute("""UPDATE learning_profiles SET label=?,memory_floor=?,cpu_floor=?,ignore_legacy=?,pinned=1,updated=?
+                WHERE id=?""", (self._group_label(target, target_group["members"]),
+                               max(source["memory_floor"] or 0, target["memory_floor"] or 0) or None,
+                               max(source["cpu_floor"] or 0, target["cpu_floor"] or 0) or None,
+                               int(bool(source["ignore_legacy"] and target["ignore_legacy"])), time.time(), target_id))
+            connection.execute("DELETE FROM learning_profiles WHERE id=?", (profile_id,))
+            self._changed(connection)
+
+    def split(self, profile_id, family, *, revision) -> str:
+        self._profile_id(family)
+        with self._connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expected_revision(connection, revision)
+            source, group = self._editable(connection, profile_id)
+            if not any(member["family"] == family for member in group["members"]):
+                raise ProfileError("That job family does not belong to this profile")
+            if len(group["members"]) < 2:
+                raise ProfileError("This job family already has an independent profile")
+            new_id = family
+            if connection.execute("SELECT 1 FROM learning_profiles WHERE id=?", (new_id,)).fetchone():
+                new_id = _digest(["profile-v1", family, os.urandom(16).hex()])
+            connection.execute("INSERT INTO learning_profiles VALUES (?,?,?, ?,1,?,?)",
+                               (new_id, None, source["memory_floor"], source["cpu_floor"], source["ignore_legacy"], time.time()))
+            connection.execute("UPDATE learning_members SET profile=? WHERE family=?", (new_id, family))
+            connection.execute("UPDATE learning_profiles SET pinned=1,updated=? WHERE id=?", (time.time(), profile_id))
+            self._changed(connection)
+            return new_id
+
+    def reset(self, profile_id, *, revision) -> None:
+        with self._connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._expected_revision(connection, revision)
+            _, group = self._editable(connection, profile_id)
+            for member in group["members"]:
+                connection.execute("DELETE FROM runs WHERE family=?", (member["family"],))
+                connection.execute("DELETE FROM envelopes WHERE family=?", (member["family"],))
+                connection.execute("DELETE FROM learning_retained WHERE family=?", (member["family"],))
+                connection.execute("""INSERT INTO learning_resets VALUES (?,?) ON CONFLICT(family)
+                    DO UPDATE SET sampled=MAX(sampled,excluded.sampled)""", (member["family"], time.time()))
+            # The legacy retention floor has no family attribution. An explicit
+            # reset opts this group out of that old floor, leaving other groups
+            # untouched and retaining all explicit operator reservations.
+            connection.execute("UPDATE learning_profiles SET ignore_legacy=1,pinned=1,updated=? WHERE id=?",
+                               (time.time(), profile_id))
+            self._changed(connection)
+
     def prediction(self, identity: dict, machine: str) -> dict:
         family, variant, _ = _identity(identity)
         if not isinstance(machine, str) or not machine:
             raise ProfileError("A prediction needs a machine identity")
+        if self._empty:
+            return {"memoryBytes": GIB, "cpuCores": 2.0, "durationSeconds": None,
+                    "samples": 0, "confidence": "unknown", "source": "prior"}
         machine = _digest(["machine-v1", machine])
-        now = time.time()
         with self._connection() as connection:
-            envelopes = connection.execute("SELECT * FROM envelopes WHERE machine=? AND family=?",
-                                           (machine, family)).fetchall()
-            exact = [row for row in envelopes if row["variant"] == variant]
-            runs = connection.execute("SELECT * FROM runs WHERE machine=? AND family=? AND sampled>=?",
-                                      (machine, family, now - 90 * DAY)).fetchall()
-            if exact:
-                runs = [row for row in runs if row["variant"] == variant]
-            floors = connection.execute("SELECT memory,cpu FROM floors WHERE machine IN (?, '*')", (machine,)).fetchall()
+            return self._prediction(connection, family, variant, machine)
+
+    def _prediction(self, connection, family: str, variant: str, machine: str) -> dict:
+        now = time.time()
+        families, operator = self._prediction_group(connection, family)
+        placeholders = ",".join("?" for _ in families)
+        envelopes = connection.execute(
+            f"SELECT * FROM envelopes WHERE machine=? AND family IN ({placeholders})",
+            (machine, *families)).fetchall()
+        if self._has_learning(connection):
+            envelopes.extend(connection.execute(
+                f"SELECT * FROM learning_retained WHERE machine=? AND family IN ({placeholders})",
+                (machine, *families)).fetchall())
+        exact = [row for row in envelopes if row["family"] == family and row["variant"] == variant]
+        # Exact successes never combine across grouped families, including when
+        # there is no exact envelope yet for a newly changed source variant.
+        runs = connection.execute("SELECT * FROM runs WHERE machine=? AND family=? AND variant=? AND sampled>=?",
+                                  (machine, family, variant, now - 90 * DAY)).fetchall()
+        floors = ([] if operator.get("ignore_legacy") else connection.execute(
+            "SELECT memory,cpu FROM floors WHERE machine IN (?, '*')", (machine,)).fetchall())
         successes = [row for row in runs if row["success"]]
         samples = len(successes)
         recent_successes = sum(row["sampled"] >= now - 30 * DAY for row in successes)
         # A censored/failed observation is only a lower bound. It cannot replace
         # the family prior with its small observed prefix. Require repeat exact
         # successes before dropping sibling upper evidence and uncertainty.
-        borrowing = bool(exact) and recent_successes < 5 and any(row["variant"] != variant for row in envelopes)
+        borrowing = bool(exact) and recent_successes < 5 and any(
+            (row["family"], row["variant"]) != (family, variant) for row in envelopes)
         use_exact = bool(exact) and not borrowing
         selected = envelopes if borrowing else exact or envelopes
         source = "variant" if use_exact else "family" if envelopes else "prior"
         age = max(0, now - max((row["sampled"] for row in selected), default=now))
-        memory_floor = max([GIB, *[row["memory"] for row in floors]])
-        cpu_floor = max([2.0, *[row["cpu"] for row in floors]])
+        minimum_memory = operator.get("memory_floor") or 0
+        minimum_cpu = operator.get("cpu_floor") or 0
+        memory_floor = max([GIB, minimum_memory, *[row["memory"] for row in floors]])
+        cpu_floor = max([2.0, minimum_cpu, *[row["cpu"] for row in floors]])
         if not selected:
             return {"memoryBytes": memory_floor, "cpuCores": cpu_floor, "durationSeconds": None,
                     "samples": 0, "confidence": "unknown", "source": source}
@@ -465,14 +876,14 @@ class ProfileStore:
             memory = max(memory, memory_floor)
             cpu = max(cpu, cpu_floor)
         else:
-            memory = max(memory, 64 * 1024 ** 2, *[row["memory"] for row in floors])
-            cpu = max(cpu, 0.1, *[row["cpu"] for row in floors])
+            memory = max(memory, 64 * 1024 ** 2, minimum_memory, *[row["memory"] for row in floors])
+            cpu = max(cpu, 0.1, minimum_cpu, *[row["cpu"] for row in floors])
         durations = [row["duration"] for row in selected if row["duration"] > 0]
         confidence = ("high" if use_exact and recent_successes >= 12
                       else "medium" if use_exact and recent_successes >= 5 else "low")
         if age > 30 * DAY or (runs and not max(runs, key=lambda row: row["sampled"])["success"]):
             confidence = "low"
-        return {"memoryBytes": math.ceil(memory), "cpuCores": round(cpu, 3),
+        return {"memoryBytes": math.ceil(memory), "cpuCores": max(round(cpu, 3), minimum_cpu),
                 "durationSeconds": max(durations) * margin if durations else None,
                 "samples": samples, "confidence": confidence, "source": source}
 
@@ -489,7 +900,8 @@ class ProfileStore:
         memory = math.ceil(_number(metrics.get("memoryBytes", 0), "memoryBytes"))
         cpu_seconds = _number(metrics.get("cpuSeconds", 0), "cpuSeconds")
         duration = _number(metrics.get("durationSeconds", 0), "durationSeconds")
-        cpu = max(_number(metrics.get("cpuCores", 0), "cpuCores"), cpu_seconds / duration if duration else 0)
+        cpu = _number(max(_number(metrics.get("cpuCores", 0), "cpuCores"),
+                          cpu_seconds / duration if duration else 0), "cpuCores")
         sampled = _number(metrics.get("sampledAt", time.time()), "sampledAt")
         if memory > 2 ** 63 - 1 or sampled > time.time() + 300:
             raise ProfileError("Resource metric is out of range")
@@ -497,6 +909,10 @@ class ProfileStore:
         machine = _digest(["machine-v1", machine])
         success = int(complete and exit_code == 0 and memory > 0 and duration > 0)
         with self._connection(write=True) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            reset = connection.execute("SELECT sampled FROM learning_resets WHERE family=?", (family,)).fetchone()
+            if reset is not None and sampled <= reset[0]:
+                return
             prior = connection.execute("SELECT family,variant,machine FROM runs WHERE token=?", (token,)).fetchone()
             if prior and (prior["family"], prior["variant"], prior["machine"]) != (family, variant, machine):
                 raise ProfileError("A resource token cannot change workload identity")
@@ -515,10 +931,25 @@ class ProfileStore:
             overflow = connection.execute("SELECT * FROM envelopes ORDER BY sampled DESC LIMIT -1 OFFSET ?",
                                           (MAX_ENVELOPES,)).fetchall()
             for row in overflow:
+                connection.execute("""INSERT INTO learning_retained VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(machine,family,variant) DO UPDATE SET memory=MAX(memory,excluded.memory),
+                    cpu=MAX(cpu,excluded.cpu),duration=MAX(duration,excluded.duration),sampled=MAX(sampled,excluded.sampled)""",
+                                   (row["machine"], row["family"], row["variant"], row["memory"], row["cpu"],
+                                    row["duration"], row["sampled"]))
+                connection.execute("DELETE FROM envelopes WHERE machine=? AND family=? AND variant=?",
+                                   (row["machine"], row["family"], row["variant"]))
+            overflow_retained = connection.execute("SELECT * FROM learning_retained ORDER BY sampled DESC LIMIT -1 OFFSET ?",
+                                                   (MAX_RETAINED_ENVELOPES,)).fetchall()
+            for row in overflow_retained:
+                # At the outer bound retain a conservative machine floor, as
+                # previous versions did. If a reset group reaches this bound,
+                # restore its use of that floor rather than discard a peak.
                 connection.execute("""INSERT INTO floors VALUES (?,?,?,?) ON CONFLICT(machine) DO UPDATE SET
                     memory=MAX(memory,excluded.memory),cpu=MAX(cpu,excluded.cpu),sampled=MAX(sampled,excluded.sampled)""",
                                    (row["machine"], row["memory"], row["cpu"], row["sampled"]))
-                connection.execute("DELETE FROM envelopes WHERE machine=? AND family=? AND variant=?",
+                connection.execute("""UPDATE learning_profiles SET ignore_legacy=0 WHERE id IN
+                    (SELECT profile FROM learning_members WHERE family=?)""", (row["family"],))
+                connection.execute("DELETE FROM learning_retained WHERE machine=? AND family=? AND variant=?",
                                    (row["machine"], row["family"], row["variant"]))
             overflow_machines = connection.execute("SELECT * FROM floors WHERE machine!='*' ORDER BY sampled DESC LIMIT -1 OFFSET ?",
                                                    (MAX_MACHINES,)).fetchall()

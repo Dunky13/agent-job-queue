@@ -1,3 +1,4 @@
+import { setupProfiles } from "./profiles.js";
 import { snapshotSchema, csrfSchema, resultSchema, errorSchema, logSchema, schedulingModeSchema, waiting, running, eligible } from "./schema.mjs";
 
 const byId = (id) => document.getElementById(id);
@@ -6,7 +7,7 @@ const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", tim
 const POLL_MS = 5000;
 const STALE_MS = 20000;
 const stale = () => !state.snapshot || Boolean(state.error) || Date.now() - state.lastSuccess > STALE_MS;
-const actionsDisabled = () => state.busy || stale();
+const actionsDisabled = () => state.busy || profiles.isBusy() || stale();
 const jobName = (job) => job.title || job.executable || `Job #${job.id}`;
 const readable = (value) => value.replaceAll("_", " ").replace(/^./, (letter) => letter.toUpperCase());
 const jobStatus = (job) => job.exitCode !== null && job.exitCode !== 0 ? `Failed (${job.exitCode})` : readable(job.state);
@@ -44,6 +45,18 @@ async function request(path, schema, options = {}) {
     options.signal?.removeEventListener("abort", abort);
   }
 }
+
+const profiles = setupProfiles({ request, announce, queueBusy: () => state.busy, show: () => {
+  state.logController?.abort();
+  state.logController = null;
+  byId("refresh-log").disabled = false;
+  state.selected = null; state.detailKey = "";
+  byId("queue-view").hidden = true;
+  byId("detail-view").hidden = true;
+  byId("profiles-view").hidden = false;
+  byId("nav-queue").removeAttribute("aria-current");
+  byId("nav-profiles").setAttribute("aria-current", "page");
+} });
 
 function remember(snapshot) {
   state.snapshot = snapshot;
@@ -250,6 +263,10 @@ function renderConfirmation() {
 }
 
 function openDetail(id) {
+  if (!profiles.leave()) return;
+  byId("profiles-view").hidden = true;
+  byId("nav-profiles").removeAttribute("aria-current");
+  byId("nav-queue").setAttribute("aria-current", "page");
   state.selected = id;
   state.confirmation = null;
   renderConfirmation();
@@ -266,6 +283,12 @@ function renderDetail() {
   const detailKey = JSON.stringify({ id: state.selected, job });
   if (detailKey === state.detailKey) return;
   state.detailKey = detailKey;
+  byId("detail-profile").hidden = !job?.resources?.learning;
+  byId("detail-profile-reason").hidden = !job?.resources?.learning;
+  if (job?.resources?.learning) {
+    byId("detail-profile").textContent = `View learned workload: ${job.resources.learning.label}`;
+    byId("detail-profile-reason").textContent = job.resources.learning.reason;
+  }
   if (!job) {
     byId("detail-title").textContent = `Job #${state.selected}`;
     byId("detail-status").textContent = "This job is no longer in the recent queue.";
@@ -319,6 +342,21 @@ async function refreshLog() {
   }
 }
 
+byId("nav-profiles").addEventListener("click", () => { if (!state.busy) void profiles.open(); });
+byId("nav-queue").addEventListener("click", () => {
+  if (!profiles.leave()) return;
+  byId("profiles-view").hidden = true;
+  byId("detail-view").hidden = true;
+  byId("queue-view").hidden = false;
+  byId("nav-profiles").removeAttribute("aria-current");
+  byId("nav-queue").setAttribute("aria-current", "page");
+  state.selected = null; state.detailKey = "";
+  document.title = "Agent Queue"; render();
+});
+byId("detail-profile").addEventListener("click", () => {
+  const learning = state.snapshot?.jobs.find((item) => item.id === state.selected)?.resources?.learning;
+  if (learning) void profiles.open(learning.id);
+});
 byId("refresh").addEventListener("click", () => void refresh({ manual: true }));
 byId("limit").addEventListener("change", () => { state.limitDirty = true; render(); });
 byId("limit-form").addEventListener("submit", (event) => {

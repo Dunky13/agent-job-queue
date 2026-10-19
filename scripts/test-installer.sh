@@ -30,7 +30,7 @@ for bundle, executable in ((app, 'Installer'), (payload / 'Agent Queue.app', 'Ag
     assert (bundle / 'Contents/Resources/build-info.json').read_bytes() == identity_bytes
     architectures = subprocess.check_output(['xcrun', 'lipo', '-archs', str(bundle / 'Contents/MacOS' / executable)], text=True).split()
     assert set(architectures) == {'arm64', 'x86_64'}, architectures
-for name in ('agent_heavy.py', 'agent_integration.py', 'resource_monitor.py', 'job_profiles.py', 'resource_scheduler.py',
+for name in ('agent_heavy.py', 'agent_integration.py', 'resource_monitor.py', 'job_profiles.py', 'resource_scheduler.py', 'learning_control.py',
              'app_updates.py', 'release_metadata.py', 'build-info.json',
              'remote/control.py', 'remote/server.py', 'remote/requirements.txt', 'remote/requirements.lock',
              'remote/static/index.html', 'remote/static/vendor/zod.mjs', 'bin/agent-heavy', 'bin/agent-remote',

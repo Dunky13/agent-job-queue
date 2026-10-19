@@ -15,7 +15,7 @@ if [[ ${AGENT_QUEUE_INSTALL_TEST_MODE:-} == 1 ]]; then
 else
   [[ $(uname -s) == Darwin ]] || { echo 'Agent Job Queue requires macOS.' >&2; exit 1; }
 fi
-[[ -d "$payload/Agent Queue.app" && -f "$payload/source/agent_heavy.py" && -f "$payload/source/agent_integration.py" && -f "$payload/source/app_updates.py" && -f "$payload/source/release_metadata.py" && -f "$payload/source/build-info.json" && -f "$payload/Agent Queue.app/Contents/Resources/build-info.json" && -f "$payload/source/remote/requirements.txt" ]] || {
+[[ -d "$payload/Agent Queue.app" && -f "$payload/source/agent_heavy.py" && -f "$payload/source/agent_integration.py" && -f "$payload/source/learning_control.py" && -f "$payload/source/app_updates.py" && -f "$payload/source/release_metadata.py" && -f "$payload/source/build-info.json" && -f "$payload/Agent Queue.app/Contents/Resources/build-info.json" && -f "$payload/source/remote/requirements.txt" ]] || {
   echo 'Incomplete installer payload.' >&2; exit 1;
 }
 brew_tool=$(command -v brew || true)
@@ -131,7 +131,7 @@ printf 'Installing application support files...\n'
 # Copy only the public payload. Runtime state, credentials and the existing venv stay private.
 cp "$payload/source/agent_heavy.py" "$root/agent_heavy.py"
 cp "$payload/source/agent_integration.py" "$root/agent_integration.py"
-for module in resource_monitor.py job_profiles.py resource_scheduler.py app_updates.py release_metadata.py; do
+for module in resource_monitor.py job_profiles.py resource_scheduler.py learning_control.py app_updates.py release_metadata.py; do
   cp "$payload/source/$module" "$root/$module"
 done
 mkdir -p "$root/remote/static" "$root/bin" "$root/scripts"
@@ -248,6 +248,11 @@ else
   status=$?
   if [[ -e "$previous" ]]; then mv "$previous" "$app"; fi
   exit "$status"
+fi
+if launchctl print "gui/$(id -u)/io.went.agent-resources" >/dev/null 2>&1; then
+  # Reload only telemetry/admission code. Keep the incomplete marker until
+  # launchd retires the old controller; Pueue keeps ownership of active jobs.
+  launchctl kickstart -k "gui/$(id -u)/io.went.agent-resources"
 fi
 # Commit completion before clearing the incomplete transaction. A crash between
 # these operations remains visibly incomplete until the same/newer build retries.
