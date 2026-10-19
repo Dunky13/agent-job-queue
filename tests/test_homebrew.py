@@ -42,7 +42,7 @@ class HomebrewTests(unittest.TestCase):
         self.archive.write_bytes(b"local package fixture; never published")
         self.manifest = renderer.create_manifest(self.archive, version="0.1.0", tag="build-123-abcdef0",
                                                  commit="abcdef0" + "1" * 33, build=123)
-        self.release = {"tag_name": self.manifest["tag"], "target_commitish": self.manifest["commit"],
+        self.release = {"tag_name": self.manifest["tag"], "target_commitish": self.manifest["commit"], "draft": False,
                         "assets": [{"name": self.manifest["asset"]}, {"name": "agent-job-queue.json"}]}
 
     def test_renderer_uses_real_checksum_and_immutable_identity(self):
@@ -148,7 +148,8 @@ class HomebrewTests(unittest.TestCase):
         incomplete = {**self.release, "tag_name": "build-888-abcdef0", "assets": []}
         malformed = {**self.release, "tag_name": "bad; shell"}
         self.assertEqual(refresh.select_release([older, draft, self.release, incomplete, malformed]), self.release)
-        self.assertIsNone(refresh.select_release([]))
+        with self.assertRaisesRegex(ValueError, "No published"):
+            refresh.select_release([])
 
     def test_release_verification_checks_commit_asset_and_actual_download(self):
         self.assertEqual(refresh.verify_release(self.manifest, self.release, self.archive), self.manifest)
