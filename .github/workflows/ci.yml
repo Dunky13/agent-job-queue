@@ -81,6 +81,10 @@ jobs:
         run: python -m unittest discover -s tests -p 'test_resource*.py' -v
       - name: Worktree identity and learning tests
         run: python -m unittest discover -s tests -p test_job_profiles.py -v
+      - name: Release identity and app update tests
+        run: |
+          python -m unittest discover -s tests -p test_release_metadata.py -v
+          python -m unittest discover -s tests -p test_updates.py -v
       - name: Agent instruction integration tests
         run: python -m unittest discover -s tests -p test_agent_integration.py -v
       - name: Isolated real-daemon acceptance tests

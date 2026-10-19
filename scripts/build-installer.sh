@@ -3,15 +3,17 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 version=${VERSION:-$(cat "$root/VERSION")}
-[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || { echo 'Invalid VERSION.' >&2; exit 1; }
+python_tool=${PYTHON:-python3}
 destination=${DIST_DIR:-"$root/dist"}
 mkdir -p "$destination"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+"$python_tool" -B "$root/release_metadata.py" --version "$version" --output "$work/build-info.json"
+bundle_build=$("$python_tool" -c 'import json,sys; print(json.load(open(sys.argv[1]))["build"] or 0)' "$work/build-info.json")
 installer="$work/Agent Job Queue Installer.app"
 payload="$installer/Contents/Resources/payload"
 app="$payload/Agent Queue.app"
-mkdir -p "$installer/Contents/MacOS" "$app/Contents/MacOS" "$payload/source/remote" "$payload/source/scripts" "$payload/source/bin"
+mkdir -p "$installer/Contents/MacOS" "$app/Contents/MacOS" "$app/Contents/Resources" "$payload/source/remote" "$payload/source/scripts" "$payload/source/bin"
 ARCHS='arm64 x86_64' "$root/native/build.sh" "$app/Contents/MacOS/AgentQueue"
 for architecture in arm64 x86_64; do
   xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -O -target "$architecture-apple-macos15.0" \
@@ -20,6 +22,10 @@ done
 xcrun lipo -create "$work/Installer-arm64" "$work/Installer-x86_64" -output "$installer/Contents/MacOS/Installer"
 cp "$root/agent_heavy.py" "$root/agent_integration.py" "$root/install-remote.sh" "$payload/source/"
 cp "$root/resource_monitor.py" "$root/job_profiles.py" "$root/resource_scheduler.py" "$payload/source/"
+cp "$root/app_updates.py" "$root/release_metadata.py" "$payload/source/"
+cp "$work/build-info.json" "$app/Contents/Resources/build-info.json"
+cp "$work/build-info.json" "$installer/Contents/Resources/build-info.json"
+cp "$work/build-info.json" "$payload/source/build-info.json"
 cp "$root/remote/control.py" "$root/remote/server.py" "$root/remote/requirements.txt" "$root/remote/requirements.lock" "$payload/source/remote/"
 cp -R "$root/remote/static" "$payload/source/remote/"
 cp "$root/scripts/install-user.sh" "$root/scripts/migrate-installation.py" "$payload/source/scripts/"
@@ -27,6 +33,7 @@ cp "$root/bin/agent-heavy" "$root/bin/agent-remote" "$payload/source/bin/"
 for document in README.md LICENSE THIRD-PARTY-NOTICES.md VERSION; do
   [[ ! -f "$root/$document" ]] || cp "$root/$document" "$payload/source/$document"
 done
+printf '%s\n' "$version" > "$payload/source/VERSION"
 # Ship only runtime web files, never tests/build entries or local state.
 rm -f "$payload/source/remote/static/schema.test.mjs" "$payload/source/remote/static/vendor/entry.mjs"
 cat > "$app/Contents/Info.plist" <<PLIST
@@ -39,7 +46,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>CFBundleDisplayName</key><string>Agent Queue</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
-<key>CFBundleVersion</key><string>$version</string>
+<key>CFBundleVersion</key><string>$bundle_build</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
@@ -54,7 +61,7 @@ cat > "$installer/Contents/Info.plist" <<PLIST
 <key>CFBundleName</key><string>Agent Job Queue Installer</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
-<key>CFBundleVersion</key><string>$version</string>
+<key>CFBundleVersion</key><string>$bundle_build</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

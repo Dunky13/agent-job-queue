@@ -164,17 +164,26 @@ enum ClientError: LocalizedError {
 // deadlocks with large status responses; every response is bounded before loading.
 enum QueueClient {
     enum Controller: String, Sendable { case heavy = "agent-heavy", remote = "agent-remote" }
+    enum Budget: Sendable { case normal, updates }
 
-    static func run(_ arguments: [String], controller: Controller = .heavy, input: Data? = nil) async throws -> Data {
+    static func run(_ arguments: [String], controller: Controller = .heavy, input: Data? = nil,
+                    budget: Budget = .normal) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                do { continuation.resume(returning: try runBlocking(arguments, controller: controller, input: input)) }
+                do { continuation.resume(returning: try runBlocking(arguments, controller: controller, input: input, budget: budget)) }
                 catch { continuation.resume(throwing: error) }
             }
         }
     }
 
-    private static func runBlocking(_ arguments: [String], controller: Controller, input: Data?) throws -> Data {
+    static func timeout(for arguments: [String], controller: Controller = .heavy, budget: Budget = .normal) -> TimeInterval {
+        // A verified update includes a bounded download and signature checks. The
+        // backend has a 120-second aggregate deadline; normal queue I/O is unchanged.
+        if budget == .updates && controller == .heavy && arguments.first == "updates" { return 130 }
+        return arguments.first == "status" ? 8 : (controller == .remote ? 35 : 25)
+    }
+
+    private static func runBlocking(_ arguments: [String], controller: Controller, input: Data?, budget: Budget) throws -> Data {
         guard (input?.count ?? 0) <= 16_384 else { throw ClientError.message("Controller input exceeds the private-pipe limit.") }
         let temporary = FileManager.default.temporaryDirectory
             .appendingPathComponent("agent-queue-client-\(UUID().uuidString)")
@@ -213,7 +222,7 @@ enum QueueClient {
                 throw ClientError.message("Could not send private configuration to the controller.")
             }
         }
-        let timeout: TimeInterval = arguments.first == "status" ? 8 : (controller == .remote ? 35 : 25)
+        let timeout = timeout(for: arguments, controller: controller, budget: budget)
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.04) }
         if process.isRunning {
@@ -223,6 +232,9 @@ enum QueueClient {
                 Thread.sleep(forTimeInterval: 0.02)
             }
             if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            if budget == .updates {
+                throw ClientError.message("The update operation did not finish within \(Int(timeout)) seconds. Check whether the installer opened, then check for updates before retrying.")
+            }
             throw ClientError.message("The queue did not respond within \(Int(timeout)) seconds. Jobs continue independently. Refresh to check whether the change was applied.")
         }
         let input = try FileHandle(forReadingFrom: temporary)
@@ -570,9 +582,32 @@ final class RemoteAccessStore: ObservableObject {
     static let store = QueueStore()
     static let remoteStore = RemoteAccessStore(fixtureMode: store.fixtureMode)
     static let integrationStore = AgentIntegrationStore(fixtureMode: store.fixtureMode)
+    static let updateStore = QueueUpdateStore(fixtureMode: store.fixtureMode)
     static var queueWindow: NSWindow?
     static var remoteWindow: NSWindow?
     static var integrationWindow: NSWindow?
+    static var updatesWindow: NSWindow?
+
+    static func showUpdatesWindow() {
+        if let updatesWindow {
+            updatesWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate()
+            Task { await updateStore.refreshInstalled() }
+            return
+        }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 620),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = "About Agent Queue"
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 590, height: 500)
+        window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: updateStore) {
+            AppRuntime.updatesWindow?.close()
+        })
+        updatesWindow = window
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
 
     static func showIntegrationWindow() {
         if let integrationWindow {
@@ -948,6 +983,7 @@ struct QueuePanel: View {
                 Spacer()
                 if !fullWindow { Button("Open window", systemImage: "arrow.up.left.and.arrow.down.right") { AppRuntime.showWindow() }.buttonStyle(.borderless) }
                 Menu {
+                    Button("About and updates…", systemImage: "info.circle") { AppRuntime.showUpdatesWindow() }
                     Button("Agent integration…", systemImage: "terminal") { AppRuntime.showIntegrationWindow() }
                     Button("Remote access settings…", systemImage: "network") { AppRuntime.showRemoteWindow() }
                     Divider()
@@ -1282,6 +1318,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: AppRuntime.integrationStore) {})
                     window.minSize = NSSize(width: 520, height: 540)
                     window.setContentSize(NSSize(width: 600, height: 720))
+                    window.center()
+                }
+                if arguments.contains("--snapshot-updates") {
+                    window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: AppRuntime.updateStore) {})
+                    window.minSize = NSSize(width: 590, height: 500)
+                    window.setContentSize(NSSize(width: 620, height: 620))
                     window.center()
                 }
             }

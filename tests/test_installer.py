@@ -26,7 +26,7 @@ class InstallerTests(unittest.TestCase):
         self.source = self.payload / "source"
         self.source.mkdir(parents=True)
         for name in ("agent_heavy.py", "agent_integration.py", "resource_monitor.py", "job_profiles.py",
-                     "resource_scheduler.py", "install-remote.sh"):
+                     "resource_scheduler.py", "app_updates.py", "release_metadata.py", "install-remote.sh"):
             shutil.copy2(ROOT / name, self.source / name)
         shutil.copytree(ROOT / "bin", self.source / "bin")
         shutil.copytree(ROOT / "remote", self.source / "remote", ignore=shutil.ignore_patterns(".venv", "__pycache__"))
@@ -36,6 +36,9 @@ class InstallerTests(unittest.TestCase):
         self.app = self.payload / "Agent Queue.app/Contents/MacOS"
         self.app.mkdir(parents=True)
         (self.app / "AgentQueue").write_text("prebuilt app")
+        self.build_info = {"schemaVersion": 1, "repository": "Dunky13/agent-job-queue", "version": "0.1.0",
+                           "commit": "abcdef0" + "1" * 33, "build": 123}
+        self.set_build_info(self.build_info)
         self.tools = self.base / "tools"
         self.tools.mkdir()
         self.python_prefix = self.base / "python"
@@ -71,6 +74,18 @@ fi''')
         return subprocess.run(["/bin/bash", str(ROOT / "scripts/install-user.sh"), "--payload", str(self.payload)],
                               env=self.environment, capture_output=True, text=True, timeout=30, check=False)
 
+    def set_build_info(self, identity):
+        contents = self.app.parent
+        resources = contents / "Resources"
+        resources.mkdir(exist_ok=True)
+        encoded = json.dumps(identity, indent=2) + "\n"
+        (self.source / "build-info.json").write_text(encoded)
+        (resources / "build-info.json").write_text(encoded)
+        (contents / "Info.plist").write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "io.went.agent-queue", "CFBundleShortVersionString": identity["version"],
+            "CFBundleVersion": str(identity["build"] or 0),
+        }))
+
     def test_fresh_install_creates_private_dedicated_queue_and_no_remote_credentials(self):
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -90,6 +105,14 @@ fi''')
         self.assertEqual(controller["ProgramArguments"][-1], "scheduler")
         self.assertTrue(controller["KeepAlive"])
         self.assertTrue((self.home / ".local/share/agent-heavy/resource_scheduler.py").is_file())
+        support = self.home / ".local/share/agent-heavy"
+        marker = support / "build-info.json"
+        self.assertEqual(json.loads(marker.read_text()), self.build_info)
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(marker.read_bytes(),
+                         (self.home / "Applications/Agent Queue.app/Contents/Resources/build-info.json").read_bytes())
+        self.assertTrue((support / "app_updates.py").is_file())
+        self.assertTrue((support / "release_metadata.py").is_file())
         self.assertFalse((self.home / ".config/agent-heavy/remote.json").exists())
         calls = self.calls.read_text()
         self.assertIn("launchctl <bootstrap>", calls)
@@ -286,6 +309,112 @@ fi''')
         self.assertEqual(result.returncode, 42)
         self.assertEqual(existing.read_text(), "existing executable")
         self.assertTrue((self.home / ".local/state/agent-heavy/install.lock").is_file())
+
+    def test_upgraded_marker_tracks_completed_app_and_source_identity(self):
+        self.assertEqual(self.install().returncode, 0)
+        newer = {**self.build_info, "build": 124, "commit": "2" * 40}
+        self.set_build_info(newer)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        marker = self.home / ".local/share/agent-heavy/build-info.json"
+        self.assertEqual(json.loads(marker.read_text()), newer)
+        self.assertEqual(marker.read_bytes(),
+                         (self.home / "Applications/Agent Queue.app/Contents/Resources/build-info.json").read_bytes())
+        self.assertEqual(list(marker.parent.glob(".build-info-*")), [])
+        self.assertFalse((self.home / "Applications/.Agent Queue.previous.app").exists())
+
+    def test_untracked_local_build_remains_explicitly_untracked_after_install(self):
+        self.set_build_info({**self.build_info, "build": None, "commit": None})
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        marker = json.loads((self.home / ".local/share/agent-heavy/build-info.json").read_text())
+        self.assertIsNone(marker["build"])
+        self.assertIsNone(marker["commit"])
+
+    def test_mismatched_payload_is_rejected_before_replacing_installed_support(self):
+        self.assertEqual(self.install().returncode, 0)
+        support = self.home / ".local/share/agent-heavy"
+        old_marker = (support / "build-info.json").read_bytes()
+        (self.source / "agent_heavy.py").write_text("must not be copied")
+        (self.source / "build-info.json").write_text(json.dumps({**self.build_info, "build": 124}))
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("build identities differ", result.stderr)
+        self.assertNotEqual((support / "agent_heavy.py").read_text(), "must not be copied")
+        self.assertEqual((support / "build-info.json").read_bytes(), old_marker)
+
+    def test_plist_identity_must_match_validated_metadata(self):
+        info = self.app.parent / "Info.plist"
+        plist = plistlib.loads(info.read_bytes())
+        info.write_bytes(plistlib.dumps({**plist, "CFBundleVersion": "999"}))
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("app version differs", result.stderr)
+        self.assertFalse((self.home / ".local/share/agent-heavy/agent_heavy.py").exists())
+
+    def test_failed_upgrade_keeps_old_identity_marker(self):
+        self.assertEqual(self.install().returncode, 0)
+        marker = self.home / ".local/share/agent-heavy/build-info.json"
+        old_marker = marker.read_bytes()
+        self.set_build_info({**self.build_info, "build": 124, "commit": "2" * 40})
+        self.tool("uv", "exit 42")
+        result = self.install()
+        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+        self.assertEqual(marker.read_bytes(), old_marker)
+
+    def test_failed_app_replacement_restores_app_without_advancing_marker(self):
+        self.assertEqual(self.install().returncode, 0)
+        marker = self.home / ".local/share/agent-heavy/build-info.json"
+        old_marker = marker.read_bytes()
+        executable = self.home / "Applications/Agent Queue.app/Contents/MacOS/AgentQueue"
+        executable.write_text("original executable")
+        self.set_build_info({**self.build_info, "build": 124, "commit": "2" * 40})
+        self.tool("mv", 'if [[ "$1" == *".Agent Queue.installing.app" ]]; then exit 42; fi\n/bin/mv "$@"')
+        result = self.install()
+        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+        self.assertEqual(executable.read_text(), "original executable")
+        self.assertEqual(marker.read_bytes(), old_marker)
+
+    def test_delayed_older_installer_cannot_downgrade_completed_tracked_install(self):
+        self.set_build_info({**self.build_info, "build": 124, "commit": "2" * 40})
+        self.assertEqual(self.install().returncode, 0)
+        support = self.home / ".local/share/agent-heavy"
+        old_marker = (support / "build-info.json").read_bytes()
+        old_source = (support / "agent_heavy.py").read_bytes()
+        self.set_build_info(self.build_info)
+        (self.source / "agent_heavy.py").write_text("must not replace newer support")
+        self.calls.write_text("")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("older tracked build", result.stderr)
+        self.assertEqual((support / "build-info.json").read_bytes(), old_marker)
+        self.assertEqual((support / "agent_heavy.py").read_bytes(), old_source)
+        self.assertNotIn("<bootstrap>", self.calls.read_text())
+        self.assertNotIn("<--require-hashes>", self.calls.read_text())
+
+    def test_same_tracked_build_requires_identical_commit_and_version(self):
+        self.assertEqual(self.install().returncode, 0)
+        marker = self.home / ".local/share/agent-heavy/build-info.json"
+        old_marker = marker.read_bytes()
+        for changed in ({"commit": "2" * 40}, {"version": "0.2.0"}):
+            with self.subTest(changed=changed):
+                self.set_build_info({**self.build_info, **changed})
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("different commit or version", result.stderr)
+                self.assertEqual(marker.read_bytes(), old_marker)
+        self.set_build_info(self.build_info)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_explicit_local_build_can_replace_tracked_install_without_claiming_release_identity(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.set_build_info({**self.build_info, "build": None, "commit": None})
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        marker = json.loads((self.home / ".local/share/agent-heavy/build-info.json").read_text())
+        self.assertIsNone(marker["build"])
+        self.assertIsNone(marker["commit"])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 Copy render_cask.py, refresh.py, test-cask.rb, LICENSE and .github/workflows/refresh.yml
 into the dedicated Dunky13/homebrew-agent-job-queue repository. Use a signed,
 DCO-signed-off initial commit on its default branch named tap. Do not copy SEED.txt.
+Also copy release_metadata.py from the app repository root beside render_cask.py;
+the runtime and trusted tap renderer share its strict manifest validator.
 The app source repository's protected main branch remains independent.
 
 The refresh workflow reads only the known public app repository. It selects the
