@@ -6,7 +6,22 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
     esac
     case "$remote_ref" in
         refs/heads/*)
-            python3 scripts/check-commits.py --base "$remote_sha" --head "$local_sha" --verify-local
+            # Validate the complete PR range, including commits already pushed on
+            # this branch. A new remote ref must not make existing main history
+            # part of the PR's commit-policy range.
+            if git show-ref --verify --quiet refs/remotes/origin/main; then
+                base=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}')
+            else
+                lookup_status=$?
+                if [ "$lookup_status" -ne 1 ]; then
+                    echo 'Could not inspect origin/main; push blocked.' >&2
+                    exit "$lookup_status"
+                fi
+                # Bootstrap repositories may not have an origin/main yet. The
+                # checker treats a zero remote SHA as the full initial history.
+                base=$remote_sha
+            fi
+            python3 scripts/check-commits.py --base "$base" --head "$local_sha" --verify-local
             ;;
     esac
 done
