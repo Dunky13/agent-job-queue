@@ -12,6 +12,9 @@ import time
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app_updates import UpdateError, installed_version
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -109,6 +112,7 @@ fi''')
         marker = support / "build-info.json"
         self.assertEqual(json.loads(marker.read_text()), self.build_info)
         self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((support / 'install-in-progress.json').exists())
         self.assertEqual(marker.read_bytes(),
                          (self.home / "Applications/Agent Queue.app/Contents/Resources/build-info.json").read_bytes())
         self.assertTrue((support / "app_updates.py").is_file())
@@ -321,6 +325,8 @@ fi''')
         self.assertEqual(marker.read_bytes(),
                          (self.home / "Applications/Agent Queue.app/Contents/Resources/build-info.json").read_bytes())
         self.assertEqual(list(marker.parent.glob(".build-info-*")), [])
+        self.assertFalse((marker.parent / 'install-in-progress.json').exists())
+        self.assertEqual(list(marker.parent.glob(".install-in-progress-*")), [])
         self.assertFalse((self.home / "Applications/.Agent Queue.previous.app").exists())
 
     def test_untracked_local_build_remains_explicitly_untracked_after_install(self):
@@ -361,6 +367,13 @@ fi''')
         result = self.install()
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(marker.read_bytes(), old_marker)
+        pending = marker.parent / 'install-in-progress.json'
+        self.assertEqual(json.loads(pending.read_text())['build'], 124)
+        self.assertEqual(pending.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads((self.home / 'Applications/Agent Queue.app/Contents/Resources/build-info.json')
+                                    .read_text())['build'], 123)
+        with self.assertRaises(UpdateError):
+            installed_version(marker.parent, self.home / 'Applications/Agent Queue.app')
 
     def test_failed_app_replacement_restores_app_without_advancing_marker(self):
         self.assertEqual(self.install().returncode, 0)
@@ -374,6 +387,7 @@ fi''')
         self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
         self.assertEqual(executable.read_text(), "original executable")
         self.assertEqual(marker.read_bytes(), old_marker)
+        self.assertEqual(json.loads((marker.parent / 'install-in-progress.json').read_text())['build'], 124)
 
     def test_delayed_older_installer_cannot_downgrade_completed_tracked_install(self):
         self.set_build_info({**self.build_info, "build": 124, "commit": "2" * 40})
@@ -415,6 +429,128 @@ fi''')
         marker = json.loads((self.home / ".local/share/agent-heavy/build-info.json").read_text())
         self.assertIsNone(marker["build"])
         self.assertIsNone(marker["commit"])
+
+    def test_retry_same_or_higher_target_recovers_incomplete_support_copy(self):
+        self.assertEqual(self.install().returncode, 0)
+        support = self.home / '.local/share/agent-heavy'
+        app = self.home / 'Applications/Agent Queue.app'
+        for failed_build, recovered_build in ((124, 124), (125, 126)):
+            with self.subTest(failed_build=failed_build, recovered_build=recovered_build):
+                self.set_build_info({**self.build_info, 'build': failed_build, 'commit': '2' * 40})
+                self.tool('uv', 'exit 42')
+                result = self.install()
+                self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+                self.assertEqual(json.loads((support / 'install-in-progress.json').read_text())['build'], failed_build)
+                with self.assertRaises(UpdateError):
+                    installed_version(support, app)
+                self.set_build_info({**self.build_info, 'build': recovered_build, 'commit': '2' * 40})
+                self.tool('uv', 'exit 0')
+                result = self.install()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse((support / 'install-in-progress.json').exists())
+                self.assertEqual(installed_version(support, app)['build'], recovered_build)
+
+    def test_newer_app_with_stale_completed_marker_blocks_delayed_older_installer(self):
+        self.assertEqual(self.install().returncode, 0)
+        app = self.home / 'Applications/Agent Queue.app/Contents'
+        actual = {**self.build_info, 'build': 124, 'commit': '2' * 40}
+        (app / 'Resources/build-info.json').write_text(json.dumps(actual))
+        plist = plistlib.loads((app / 'Info.plist').read_bytes())
+        (app / 'Info.plist').write_bytes(plistlib.dumps({**plist, 'CFBundleVersion': '124'}))
+        support = self.home / '.local/share/agent-heavy'
+        old_source = (support / 'agent_heavy.py').read_bytes()
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('older tracked build', result.stderr)
+        self.assertEqual((support / 'agent_heavy.py').read_bytes(), old_source)
+        self.assertEqual(json.loads((app / 'Resources/build-info.json').read_text()), actual)
+        self.assertEqual(json.loads((support / 'build-info.json').read_text())['build'], 123)
+        self.assertFalse((support / 'install-in-progress.json').exists())
+
+    def test_newer_pending_target_blocks_delayed_older_installer_before_replacement(self):
+        self.assertEqual(self.install().returncode, 0)
+        support = self.home / '.local/share/agent-heavy'
+        self.set_build_info({**self.build_info, 'build': 124, 'commit': '2' * 40})
+        self.tool('uv', 'exit 42')
+        self.assertEqual(self.install().returncode, 42)
+        pending = support / 'install-in-progress.json'
+        original_pending = pending.read_bytes()
+        original_source = (support / 'agent_heavy.py').read_bytes()
+        self.set_build_info(self.build_info)
+        (self.source / 'agent_heavy.py').write_text('must not overwrite incomplete newer support')
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('older tracked build', result.stderr)
+        self.assertEqual(pending.read_bytes(), original_pending)
+        self.assertEqual((support / 'agent_heavy.py').read_bytes(), original_source)
+        self.assertEqual(json.loads((support / 'build-info.json').read_text())['build'], 123)
+        self.assertEqual(json.loads((self.home / 'Applications/Agent Queue.app/Contents/Resources/build-info.json')
+                                    .read_text())['build'], 123)
+
+    def test_interrupted_completion_keeps_pending_until_new_app_identity_is_committed(self):
+        self.assertEqual(self.install().returncode, 0)
+        support = self.home / '.local/share/agent-heavy'
+        app = self.home / 'Applications/Agent Queue.app'
+        newer = {**self.build_info, 'build': 124, 'commit': '2' * 40}
+        self.set_build_info(newer)
+        python_tool = self.python_prefix / 'bin/python3.12'
+        python_tool.unlink()
+        python_tool.write_text('#!/bin/bash\n'
+                               'if [[ "$1" == -B && "$2" == - && "$3" == */source/build-info.json ]]; then\n'
+                               '  exit 42\nfi\nexec "$TEST_PYTHON" "$@"\n')
+        python_tool.chmod(0o755)
+        result = self.install()
+        self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+        self.assertEqual(json.loads((support / 'build-info.json').read_text())['build'], 123)
+        self.assertEqual(json.loads((app / 'Contents/Resources/build-info.json').read_text()), newer)
+        self.assertEqual(json.loads((support / 'install-in-progress.json').read_text()), newer)
+        with self.assertRaises(UpdateError):
+            installed_version(support, app)
+        self.set_build_info(self.build_info)
+        delayed = self.install()
+        self.assertNotEqual(delayed.returncode, 0)
+        self.assertIn('older tracked build', delayed.stderr)
+        python_tool.unlink()
+        python_tool.symlink_to(sys.executable)
+        self.set_build_info(newer)
+        recovered = self.install()
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        self.assertFalse((support / 'install-in-progress.json').exists())
+        self.assertEqual(installed_version(support, app)['build'], 124)
+
+    def test_conflicting_equal_build_in_app_or_pending_identity_is_rejected(self):
+        self.assertEqual(self.install().returncode, 0)
+        support = self.home / '.local/share/agent-heavy'
+        identities = (self.home / 'Applications/Agent Queue.app/Contents/Resources/build-info.json',
+                      support / 'install-in-progress.json')
+        for path in identities:
+            with self.subTest(path=path.name):
+                previous = path.read_bytes() if path.exists() else None
+                path.write_text(json.dumps({**self.build_info, 'commit': '2' * 40}))
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('different commit or version', result.stderr)
+                if previous is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(previous)
+
+    def test_unsafe_or_oversized_pending_identity_is_rejected_before_support_copy(self):
+        self.assertEqual(self.install().returncode, 0)
+        support = self.home / '.local/share/agent-heavy'
+        pending = support / 'install-in-progress.json'
+        original = (support / 'agent_heavy.py').read_bytes()
+        pending.symlink_to(support / 'build-info.json')
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(pending.is_symlink())
+        self.assertEqual((support / 'agent_heavy.py').read_bytes(), original)
+        pending.unlink()
+        pending.write_text(' ' * 16_385)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('size limit', result.stderr)
+        self.assertEqual((support / 'agent_heavy.py').read_bytes(), original)
 
 
 if __name__ == "__main__":

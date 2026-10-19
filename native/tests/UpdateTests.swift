@@ -56,7 +56,7 @@ actor UpdateFixture {
         if arguments == ["updates", "install", "--build", "101", "--json"] {
             if failInstall { throw ClientError.message("Checksum mismatch") }
             return try encoder.encode(QueueInstallerResult(installerOpened: true, build: installerBuild,
-                message: "Installer opened."))
+                message: "Installer opened. Choose Install to finish. Queued and running jobs are preserved"))
         }
         throw ClientError.message("Unexpected update command")
     }

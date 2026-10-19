@@ -15,6 +15,7 @@ import os
 import plistlib
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -33,6 +34,7 @@ API = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100"
 TAG = re.compile(r"build-([1-9][0-9]{0,8})-([0-9a-f]{7})\Z")
 MAX_ARCHIVE = 128 * 1024 ** 2
 MAX_EXPANDED = 512 * 1024 ** 2
+MAX_RELEASE_PAGES = 10
 INSTALLER = "Agent Job Queue Installer.app"
 ALLOWED_HOSTS = {"api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"}
 
@@ -54,7 +56,22 @@ def _read_owned(path: Path, limit: int = 16_384) -> bytes:
         return data
 
 
+def _require_completed_installation(root: Path):
+    pending = root / "install-in-progress.json"
+    if pending.exists() or pending.is_symlink():
+        validate_build_info(json.loads(_read_owned(pending)))
+        raise UpdateError("Installation is incomplete. Finish or retry the installer before checking versions or updates")
+
+
 def installed_version(root: Path | None = None, app: Path | None = None) -> dict:
+    root = root if root is not None else Path.home() / ".local/share/agent-heavy"
+    _require_completed_installation(root)
+    result = _installed_version(root, app)
+    _require_completed_installation(root)
+    return result
+
+
+def _installed_version(root: Path, app: Path | None) -> dict:
     root = root if root is not None else Path.home() / ".local/share/agent-heavy"
     app = app if app is not None else Path.home() / "Applications/Agent Queue.app"
     marker = root / "build-info.json"
@@ -114,11 +131,41 @@ def _remaining(deadline: float) -> float:
     return remaining
 
 
+@contextlib.contextmanager
+def _network_deadline(deadline: float):
+    """Interrupt DNS, TLS, headers and trickling bodies at the CLI deadline.
+
+    A socket's timeout is an idle timeout and cannot bound a slow stream. This
+    module's network entry point runs in the main thread of its own CLI process.
+    An existing process alarm is never silently replaced.
+    """
+    remaining = _remaining(deadline)
+    if signal.getitimer(signal.ITIMER_REAL)[0]:
+        raise UpdateError("Update networking requires an independent CLI process")
+    def expired(_signal, _frame):
+        raise UpdateError("Update operation timed out. Check your connection and try again")
+    try:
+        previous = signal.signal(signal.SIGALRM, expired)
+    except ValueError:
+        raise UpdateError("Update networking requires the CLI main thread") from None
+    try:
+        signal.setitimer(signal.ITIMER_REAL, remaining)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
 def _download(url: str, limit: int, deadline: float, destination: Path | None = None) -> bytes:
+    with _network_deadline(deadline):
+        return _download_response(url, limit, deadline, destination)
+
+
+def _download_response(url: str, limit: int, deadline: float, destination: Path | None) -> bytes:
     if not _trusted_url(url):
         raise UpdateError("Release download URL is not trusted")
     request = urllib.request.Request(url, headers={"User-Agent": "Agent-Job-Queue-Updater",
-        "Accept": "application/vnd.github+json" if url == API else "application/octet-stream",
+        "Accept": "application/vnd.github+json" if urllib.parse.urlsplit(url).hostname == "api.github.com" else "application/octet-stream",
         "X-GitHub-Api-Version": "2022-11-28"})
     try:
         opener = urllib.request.build_opener(_ReleaseRedirect())
@@ -133,7 +180,8 @@ def _download(url: str, limit: int, deadline: float, destination: Path | None = 
                 size = 0
                 while True:
                     _remaining(deadline)
-                    chunk = response.read(min(256 * 1024, limit + 1 - size))
+                    chunk = response.read1(min(256 * 1024, limit + 1 - size))
+                    _remaining(deadline)
                     if not chunk:
                         break
                     size += len(chunk)
@@ -257,9 +305,18 @@ class UpdateClient:
 
     def _release(self, deadline: float) -> tuple[dict, dict] | None:
         try:
-            releases = json.loads(_download(API, 4 * 1024 ** 2, deadline))
-            if not isinstance(releases, list) or len(releases) > 100:
-                raise UpdateError("Release service returned an invalid response")
+            releases = []
+            for page in range(1, MAX_RELEASE_PAGES + 1):
+                url = API if page == 1 else f"{API}&page={page}"
+                items = json.loads(_download(url, 4 * 1024 ** 2, deadline))
+                _remaining(deadline)
+                if not isinstance(items, list) or len(items) > 100:
+                    raise UpdateError("Release service returned an invalid response")
+                releases.extend(items)
+                if len(items) < 100:
+                    break
+            else:
+                raise UpdateError("Release search exceeded its limit. Open the project release page to check for updates")
             candidates = [item for item in releases if isinstance(item, dict) and item.get("draft") is False
                           and isinstance(item.get("tag_name"), str) and TAG.fullmatch(item["tag_name"])
                           and isinstance(item.get("assets"), list)

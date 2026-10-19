@@ -3,12 +3,16 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import http.client
 import io
 import json
 import os
 import plistlib
+import signal
+import socket
 import stat
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -136,6 +140,23 @@ class UpdateTests(unittest.TestCase):
         value = updates.installed_version(self.root, self.app)
         self.assertEqual((value["build"], value["bundleBuild"], value["tracked"]), (None, "0", False))
 
+    def test_incomplete_installation_cannot_report_an_old_completed_controller_version(self):
+        self.install()
+        pending = self.root / "install-in-progress.json"
+        pending.write_text(json.dumps(self.info(20, "a" * 40)))
+        with self.assertRaisesRegex(updates.UpdateError, "Installation is incomplete"):
+            updates.installed_version(self.root, self.app)
+        pending.unlink()
+        original = updates._read_owned
+        def read(path, limit=16_384):
+            value = original(path, limit)
+            if path == self.app / "Contents/Info.plist":
+                pending.write_text(json.dumps(self.info(20, "a" * 40)))
+            return value
+        with patch.object(updates, "_read_owned", side_effect=read), \
+                self.assertRaisesRegex(updates.UpdateError, "Installation is incomplete"):
+            updates.installed_version(self.root, self.app)
+
     def test_corrupt_missing_symlink_hardlink_and_writable_metadata_fail_closed(self):
         for kind in ("corrupt", "missing-app", "symlink", "hardlink", "writable", "plist"):
             with self.subTest(kind=kind):
@@ -187,6 +208,24 @@ class UpdateTests(unittest.TestCase):
             self.assertIsNone(self.client.check()["latest"])
         with patch.object(updates, "_download", return_value=json.dumps([self.release, self.release]).encode()), \
                 self.assertRaisesRegex(updates.UpdateError, "ambiguous"):
+            self.client.check()
+
+    def test_release_search_paginates_and_never_claims_latest_after_truncation(self):
+        original = self.download
+        requested = []
+        def download(url, limit, deadline, destination=None):
+            requested.append(url)
+            if url == updates.API:
+                return json.dumps([{"tag_name": "unrelated", "draft": False}] * 100).encode()
+            if url == updates.API + "&page=2":
+                return json.dumps([self.release]).encode()
+            return original(url, limit, deadline, destination)
+        with patch.object(updates, "_download", side_effect=download):
+            self.assertEqual(self.client.check()["latest"]["build"], 20)
+        self.assertIn(updates.API + "&page=2", requested)
+        with patch.object(updates, "MAX_RELEASE_PAGES", 2), \
+                patch.object(updates, "_download", return_value=json.dumps([self.release] * 100).encode()), \
+                self.assertRaisesRegex(updates.UpdateError, "search exceeded"):
             self.client.check()
 
     def test_release_manifest_identity_digest_and_source_are_verified(self):
@@ -341,6 +380,60 @@ class UpdateTests(unittest.TestCase):
                 updates._download(updates.API, 3, time.monotonic() + 10)
         with self.assertRaisesRegex(updates.UpdateError, "timed out"):
             updates._remaining(time.monotonic() - 1)
+
+    def test_transport_rejects_eof_that_arrives_after_deadline(self):
+        clock = [0.0]
+        class Response(io.BytesIO):
+            headers = {}
+            def geturl(self):
+                return updates.API
+            def read1(self, size):
+                clock[0] = 100.0
+                return b""
+        with patch.object(urllib.request.OpenerDirector, "open", return_value=Response()), \
+                patch.object(updates.time, "monotonic", side_effect=lambda: clock[0]), \
+                self.assertRaisesRegex(updates.UpdateError, "timed out"):
+            updates._download(updates.API, 1024, 40.0)
+
+    def test_hard_deadline_interrupts_trickled_headers_and_body_and_restores_alarm(self):
+        for phase in ("headers", "body"):
+            with self.subTest(phase=phase):
+                incoming, outgoing = socket.socketpair()
+                incoming.settimeout(0.15)
+                response = http.client.HTTPResponse(incoming)
+                stopped = threading.Event()
+                def send():
+                    try:
+                        data = b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n" if phase == "headers" else b"x" * 200
+                        if phase == "body":
+                            outgoing.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n")
+                        for byte in data:
+                            if stopped.wait(0.02):
+                                break
+                            outgoing.sendall(bytes([byte]))
+                    except OSError:
+                        pass
+                worker = threading.Thread(target=send)
+                worker.start()
+                def open_response(*_args, **_kwargs):
+                    response.begin()
+                    response.geturl = lambda: updates.API
+                    return response
+                original = signal.getsignal(signal.SIGALRM)
+                started = time.monotonic()
+                try:
+                    with patch.object(urllib.request.OpenerDirector, "open", side_effect=open_response), \
+                            self.assertRaisesRegex(updates.UpdateError, "timed out"):
+                        updates._download(updates.API, 1024, started + 0.12)
+                    self.assertLess(time.monotonic() - started, 0.8)
+                    self.assertEqual(signal.getsignal(signal.SIGALRM), original)
+                    self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+                finally:
+                    stopped.set()
+                    incoming.close()
+                    outgoing.close()
+                    worker.join(timeout=1)
+                    response.close()
 
     def test_cli_version_is_offline_and_update_install_requires_pinned_build(self):
         import agent_heavy

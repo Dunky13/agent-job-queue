@@ -140,7 +140,7 @@ final class QueueUpdateStore: ObservableObject {
             return check?.installed.tracked == false ? nil : "The running app has no published build number. Choose a published release to replace it."
         }
         if runningBuild > release.build { return "The running app is newer than the published release. Downgrades are disabled." }
-        if runningBuild == release.build { return "The running app already has this build. Reopen Agent Queue after installation to load any changed components." }
+        if runningBuild == release.build { return "The running app already has this published build." }
         return nil
     }
     var progressLabel: String {
@@ -205,7 +205,7 @@ final class QueueUpdateStore: ObservableObject {
                     throw ClientError.message("The requested installer was not opened. Check for updates before retrying.")
                 }
                 installerOpened = true
-                notice = "\(result.message) Choose Install in the installer, then reopen Agent Queue when it finishes."
+                notice = result.message
             } catch { self.error = "Could not open the update installer. \(error.localizedDescription)" }
         }
     }
