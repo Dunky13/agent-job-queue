@@ -660,6 +660,7 @@ def acquire_lease(gate: Gate, marker: dict, capacity: int = 1) -> bool:
         if len(list((gate.slot / "agent-heavy-jobs").iterdir())) >= capacity:
             return False
         marker["lease_id"] = manifest["lease_id"]
+        marker["executionStartedAt"] = time.time()
         path = job_marker_path(gate, marker)
         if path.exists():
             raise GateError("Job already owns a validation lease member")
@@ -1009,7 +1010,7 @@ def persisted_limit(gate: Gate) -> int:
 def set_limit(gate: Gate, limit: int):
     validate_limit(limit)
     gate.prepare()
-    with control_budget(gate), private_lock(gate, "settings.lock"):
+    with control_budget(gate), private_lock(gate, "settings.lock"), private_lock(gate, "scheduling.lock"), private_lock(gate):
         gate.pueue("parallel", str(limit), "--group", "default")
         save_barrier(gate)
         current = gate.snapshot().get("groups", {}).get("default", {}).get("parallel_tasks")

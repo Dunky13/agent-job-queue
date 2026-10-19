@@ -229,6 +229,7 @@ class SchedulerFixture(unittest.TestCase):
             agent_heavy.write_private(self.gate.receipts / f"{task_id}.json", {
                 "task_id": task_id, "token": token, "pgid": 10000 + task_id,
                 "members": [{"pid": 20000 + task_id, "birth": "fixture birth"}],
+                "executionStartedAt": NOW,
             })
         return token
 
@@ -270,6 +271,29 @@ class PermitTests(SchedulerFixture):
         self.assertTrue(scheduler.permit(self.gate, self.marker, 1))
         self.assertFalse(scheduler.permit(self.gate, self.marker, 2))
         self.publish(available=False)
+        self.assertFalse(scheduler.permit(self.gate, self.marker, 0))
+
+    def test_blocking_queue_read_cannot_outlive_grant_or_host_freshness(self):
+        for expires, elapsed in ((NOW + 1, 2), (NOW + 60, 12)):
+            with self.subTest(expires=expires, elapsed=elapsed):
+                self.clock_mock.return_value = NOW
+                self.admissions({self.token: self.grant(1, expires=expires)})
+                self.publish()
+
+                def delayed_snapshot():
+                    self.clock_mock.return_value = NOW + elapsed
+                    return copy.deepcopy(self.gate.data)
+
+                with patch.object(self.gate, "snapshot", side_effect=delayed_snapshot):
+                    self.assertFalse(scheduler.permit(self.gate, self.marker, 0))
+
+    def test_paused_queue_and_unmanaged_running_owner_hold_automatic_start(self):
+        self.admissions({self.token: self.grant(1)})
+        self.publish()
+        self.gate.data["groups"]["default"]["status"] = "Paused"
+        self.assertFalse(scheduler.permit(self.gate, self.marker, 0))
+        self.gate.data["groups"]["default"]["status"] = "Running"
+        self.gate.data["tasks"]["10"] = {"command": "unmanaged", "status": {"Running": {}}}
         self.assertFalse(scheduler.permit(self.gate, self.marker, 0))
 
     def test_grant_is_rechecked_against_latest_host_pressure_and_recovery_state(self):
@@ -361,6 +385,27 @@ class PermitTests(SchedulerFixture):
 
 
 class ControllerTests(SchedulerFixture):
+    def test_late_first_observation_preserves_duration_but_censors_unseen_prefix(self):
+        token = self.add_job(1, state="Running", owned=True)
+        marker = self.gate.receipt(1)
+        marker["executionStartedAt"] = NOW - 600
+        self.controller.sample_run(1, token, marker, host(), prediction())
+        self.clock_mock.return_value += 2
+        self.controller.sample_run(1, token, marker, host(), prediction())
+        self.finish()
+        self.assertEqual(self.store.records[0]["metrics"]["durationSeconds"], 602)
+        self.assertFalse(self.store.records[0]["complete"])
+
+    def test_missing_execution_start_cannot_establish_a_cheap_complete_run(self):
+        token = self.add_job(1, state="Running", owned=True)
+        marker = self.gate.receipt(1)
+        marker.pop("executionStartedAt")
+        self.controller.sample_run(1, token, marker, host(), prediction())
+        self.clock_mock.return_value += 2
+        self.controller.sample_run(1, token, marker, host(), prediction())
+        self.finish()
+        self.assertFalse(self.store.records[0]["complete"])
+
     def test_adaptive_grant_starts_one_job_and_publishes_decision(self):
         token = self.add_job(1)
         value = self.controller.tick()

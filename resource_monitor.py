@@ -9,10 +9,14 @@ environment variables, executable paths, or hardware serial numbers are read.
 
 import ctypes
 import hashlib
+import math
 import os
 import platform
 import subprocess
 import time
+
+MAX_SAMPLE_INTERVAL = 10.0
+MAX_CLOCK_DRIFT = 1.0
 
 
 class SamplingError(Exception):
@@ -205,6 +209,22 @@ def _counter_delta(current: int, previous: int, bits: int | None = None) -> int 
     return None
 
 
+def _sample_interval(previous: tuple, current: tuple, *, collection: bool = False) -> float | None:
+    """Reject gaps and suspend/clock changes instead of averaging across them.
+
+    Darwin's monotonic clock can exclude sleep. Wall time bounds that gap, and
+    comparison of the two clocks also catches a discontinuous wall-clock edit.
+    """
+    elapsed = current[0] - previous[0]
+    wall_elapsed = current[1] - previous[1]
+    if (not all(math.isfinite(value) for value in (*previous, *current))
+            or not 0 <= elapsed <= MAX_SAMPLE_INTERVAL or not 0 <= wall_elapsed <= MAX_SAMPLE_INTERVAL
+            or (not collection and (elapsed == 0 or wall_elapsed == 0))
+            or abs(elapsed - wall_elapsed) > MAX_CLOCK_DRIFT):
+        return None
+    return elapsed
+
+
 class ResourceSampler:
     """Stateful interval sampler. Discard or forget group state after each job.
 
@@ -214,6 +234,9 @@ class ResourceSampler:
     is not yet available. Missing or racing first observations have no baseline
     exemption. Totals retain observed exited workers, keyed by PID and kernel
     birth identity. A restart intentionally starts a fresh observation window.
+    Intervals over ten seconds, suspend and clock discontinuities are incomplete
+    observations, preserving the distinction between a recent timestamp and a
+    continuously observed interval.
     """
 
     def __init__(self, disk_path: str = ".", *, backend=None, clock=None, wall_clock=None):
@@ -230,15 +253,18 @@ class ResourceSampler:
         return self._backend
 
     def host(self) -> dict:
+        started = (self._clock(), self._wall_clock())
         raw = self._reader().host_counters()
-        now = self._clock()
+        current = (self._clock(), self._wall_clock())
+        collection_valid = _sample_interval(started, current, collection=True) is not None
         previous = self._host_previous
-        self._host_previous = (now, raw)
+        self._host_previous = (*current, raw) if collection_valid else None
         complete = False
         busy = float(raw["cpuCores"])
         swap_in = swap_out = 0.0
-        if previous is not None and now > previous[0] and raw["machine"] == previous[1]["machine"]:
-            old = previous[1]
+        elapsed = _sample_interval(previous[:2], current) if previous is not None and collection_valid else None
+        if elapsed is not None and raw["machine"] == previous[2]["machine"]:
+            old = previous[2]
             deltas = [_counter_delta(current, before, 32) for current, before in zip(raw["cpuTicks"], old["cpuTicks"])]
             in_delta = _counter_delta(raw["swapInBytes"], old["swapInBytes"])
             out_delta = _counter_delta(raw["swapOutBytes"], old["swapOutBytes"])
@@ -246,11 +272,11 @@ class ResourceSampler:
                 total = sum(deltas)
                 if total > 0:
                     busy = raw["cpuCores"] * (total - deltas[2]) / total
-                    swap_in = in_delta / (now - previous[0])
-                    swap_out = out_delta / (now - previous[0])
+                    swap_in = in_delta / elapsed
+                    swap_out = out_delta / elapsed
                     complete = True
         return {**{key: value for key, value in raw.items() if key not in ("cpuTicks", "swapInBytes", "swapOutBytes")},
-                "sampledAt": self._wall_clock(), "cpuBusyCores": float(busy),
+                "sampledAt": current[1], "cpuBusyCores": float(busy),
                 "swapInBytesPerSecond": swap_in, "swapOutBytesPerSecond": swap_out, "complete": complete}
 
     def forget_group(self, pgid: int):
@@ -270,14 +296,16 @@ class ResourceSampler:
                     raise SamplingError("Resource group ownership identities are invalid")
                 expected.add((member["pid"], " ".join(member["birth"].split())))
         reader = self._reader()
+        started = (self._clock(), self._wall_clock())
         members = reader.members(pgid)
         identities = {(member["pid"], member["birth"]) for member in members}
         if expected is not None and not identities.intersection(expected):
             raise SamplingError("Resource group ownership cannot be verified")
-        state = self._groups.setdefault(pgid, {"previous": None, "processes": {}, "cpu": 0, "read": 0, "write": 0})
-        now = self._clock()
-        baseline = state["previous"] is None
-        interval_available = state["previous"] is not None and now > state["previous"]
+        state = self._groups.setdefault(pgid, {
+            "previous": None, "attempts": 0, "processes": {}, "cpu": 0, "read": 0, "write": 0,
+        })
+        baseline = state["attempts"] == 0
+        state["attempts"] += 1
         complete = True
         memory = 0
         sampled = []
@@ -317,10 +345,13 @@ class ResourceSampler:
             state["processes"][identity] = usage
             memory += usage["memoryBytes"]
             count += 1
-        elapsed = None if state["previous"] is None else now - state["previous"]
-        state["previous"] = now
+        current = (self._clock(), self._wall_clock())
+        collection_valid = _sample_interval(started, current, collection=True) is not None
+        elapsed = (_sample_interval(state["previous"], current)
+                   if state["previous"] is not None and collection_valid else None)
+        state["previous"] = current if collection_valid else None
         return {"memoryBytes": memory, "cpuSeconds": state["cpu"] / 1_000_000_000,
-                "cpuCores": (state["cpu"] - before_cpu) / 1_000_000_000 / elapsed if elapsed and elapsed > 0 else 0.0,
-                "processCount": count, "complete": complete and count == len(members) and count > 0 and interval_available,
-                "baseline": baseline and complete and count == len(members) and count > 0,
+                "cpuCores": (state["cpu"] - before_cpu) / 1_000_000_000 / elapsed if elapsed is not None else 0.0,
+                "processCount": count, "complete": complete and count == len(members) and count > 0 and elapsed is not None,
+                "baseline": baseline and complete and count == len(members) and count > 0 and collection_valid,
                 "readBytes": state["read"], "writeBytes": state["write"]}

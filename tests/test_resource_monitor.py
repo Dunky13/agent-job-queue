@@ -45,7 +45,9 @@ class ResourceSamplerTests(unittest.TestCase):
     def setUp(self):
         self.backend = FakeBackend()
         self.now = 10.0
-        self.sampler = monitor.ResourceSampler(backend=self.backend, clock=lambda: self.now, wall_clock=lambda: 123.5)
+        self.wall_shift = 0.0
+        self.sampler = monitor.ResourceSampler(backend=self.backend, clock=lambda: self.now,
+                                               wall_clock=lambda: 123.5 + self.now - 10 + self.wall_shift)
 
     def test_first_host_read_reserves_all_cpu_and_marks_interval_unavailable(self):
         sample = self.sampler.host()
@@ -92,6 +94,53 @@ class ResourceSamplerTests(unittest.TestCase):
         self.now += 1
         self.assertFalse(self.sampler.host()["complete"])
 
+    def test_host_suspend_sampling_gaps_and_clock_changes_cannot_look_idle(self):
+        for monotonic_gap, wall_gap in ((600, 600), (2, 602), (2, -298), (600, 2),
+                                       (0, 600), (-1, 2), (2, 0), (2, 5)):
+            with self.subTest(monotonic_gap=monotonic_gap, wall_gap=wall_gap):
+                self.backend.raw = host_counters()
+                sampler = monitor.ResourceSampler(backend=self.backend, clock=lambda: self.now,
+                    wall_clock=lambda: 123.5 + self.now - 10 + self.wall_shift)
+                sampler.host()
+                self.now += monotonic_gap
+                self.wall_shift += wall_gap - monotonic_gap
+                self.backend.raw.update(cpuTicks=[101, 100, 699, 100], swapOutBytes=4000)
+                sample = sampler.host()
+                self.assertFalse(sample["complete"])
+                self.assertEqual(sample["cpuBusyCores"], 8.0)
+                self.now += 2
+                self.backend.raw.update(cpuTicks=[103, 101, 700, 100], swapOutBytes=6000)
+                recovered = sampler.host()
+                self.assertTrue(recovered["complete"])
+                self.assertEqual(recovered["cpuBusyCores"], 6.0)
+                self.assertEqual(recovered["swapOutBytesPerSecond"], 1000.0)
+
+    def test_host_collection_spanning_suspend_needs_a_fresh_baseline(self):
+        original = self.backend.host_counters
+
+        def suspended_collection():
+            counters = original()
+            self.wall_shift += 600
+            return counters
+
+        with patch.object(self.backend, "host_counters", side_effect=suspended_collection):
+            self.assertFalse(self.sampler.host()["complete"])
+        self.now += 2
+        self.backend.raw["cpuTicks"] = [110, 100, 110, 100]
+        self.assertFalse(self.sampler.host()["complete"])
+        self.now += 2
+        self.backend.raw["cpuTicks"] = [120, 100, 120, 100]
+        self.assertTrue(self.sampler.host()["complete"])
+
+    def test_host_interval_limit_is_bounded_inclusively(self):
+        self.sampler.host()
+        self.now += monitor.MAX_SAMPLE_INTERVAL
+        self.backend.raw["cpuTicks"] = [110, 100, 110, 100]
+        self.assertTrue(self.sampler.host()["complete"])
+        self.now += monitor.MAX_SAMPLE_INTERVAL + 0.001
+        self.backend.raw["cpuTicks"] = [120, 100, 120, 100]
+        self.assertFalse(self.sampler.host()["complete"])
+
     def test_machine_capacity_change_requires_new_baseline(self):
         self.sampler.host()
         self.now += 1
@@ -126,6 +175,65 @@ class ResourceSamplerTests(unittest.TestCase):
         self.assertEqual(sample["cpuCores"], 1.5)
         self.assertEqual(sample["memoryBytes"], 60)
         self.assertEqual(sample["readBytes"], 30)
+
+    def test_group_suspend_sampling_gaps_and_clock_changes_are_not_cheap_complete_intervals(self):
+        for monotonic_gap, wall_gap in ((600, 600), (2, 602), (2, -298), (600, 2),
+                                       (0, 600), (-1, 2), (2, 0), (2, 5)):
+            with self.subTest(monotonic_gap=monotonic_gap, wall_gap=wall_gap):
+                self.backend.usages[101] = usage()
+                sampler = monitor.ResourceSampler(backend=self.backend, clock=lambda: self.now,
+                    wall_clock=lambda: 123.5 + self.now - 10 + self.wall_shift)
+                self.assertTrue(sampler.group(400)["baseline"])
+                self.now += monotonic_gap
+                self.wall_shift += wall_gap - monotonic_gap
+                self.backend.usages[101] = usage(cpu=3_000_000_000, memory=500)
+                sample = sampler.group(400)
+                self.assertFalse(sample["complete"])
+                self.assertFalse(sample["baseline"])
+                self.assertEqual(sample["cpuCores"], 0.0)
+                self.assertEqual(sample["cpuSeconds"], 3.0)
+                self.assertEqual(sample["memoryBytes"], 500)
+                self.now += 2
+                self.backend.usages[101] = usage(cpu=5_000_000_000)
+                recovered = sampler.group(400)
+                self.assertTrue(recovered["complete"])
+                self.assertFalse(recovered["baseline"])
+                self.assertEqual(recovered["cpuCores"], 1.0)
+
+    def test_group_collection_spanning_suspend_never_gets_an_initial_baseline_exemption(self):
+        original = self.backend.process
+
+        def suspended_collection(pid, pgid):
+            counters = original(pid, pgid)
+            self.wall_shift += 600
+            return counters
+
+        with patch.object(self.backend, "process", side_effect=suspended_collection):
+            sample = self.sampler.group(400)
+        self.assertFalse(sample["complete"])
+        self.assertFalse(sample["baseline"])
+        self.now += 2
+        self.backend.usages[101] = usage(cpu=2_000_000_000)
+        sample = self.sampler.group(400)
+        self.assertFalse(sample["complete"])
+        self.assertFalse(sample["baseline"])
+        self.now += 2
+        self.backend.usages[101] = usage(cpu=3_000_000_000)
+        recovered = self.sampler.group(400)
+        self.assertTrue(recovered["complete"])
+        self.assertFalse(recovered["baseline"])
+        self.assertEqual(recovered["cpuCores"], 0.5)
+
+    def test_group_interval_limit_is_bounded_inclusively(self):
+        self.sampler.group(400)
+        self.now += monitor.MAX_SAMPLE_INTERVAL
+        self.backend.usages[101] = usage(cpu=2_000_000_000)
+        self.assertTrue(self.sampler.group(400)["complete"])
+        self.now += monitor.MAX_SAMPLE_INTERVAL + 0.001
+        self.backend.usages[101] = usage(cpu=3_000_000_000)
+        sample = self.sampler.group(400)
+        self.assertFalse(sample["complete"])
+        self.assertFalse(sample["baseline"])
 
     def test_worker_exit_retains_observed_cpu_without_memory_or_cpu_spike(self):
         self.backend.identities.append({"pid": 102, "birth": "worker birth"})

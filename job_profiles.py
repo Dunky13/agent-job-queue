@@ -432,8 +432,6 @@ class ProfileStore:
             envelopes = connection.execute("SELECT * FROM envelopes WHERE machine=? AND family=?",
                                            (machine, family)).fetchall()
             exact = [row for row in envelopes if row["variant"] == variant]
-            selected = exact or envelopes
-            source = "variant" if exact else "family" if envelopes else "prior"
             runs = connection.execute("SELECT * FROM runs WHERE machine=? AND family=? AND sampled>=?",
                                       (machine, family, now - 90 * DAY)).fetchall()
             if exact:
@@ -441,26 +439,34 @@ class ProfileStore:
             floors = connection.execute("SELECT memory,cpu FROM floors WHERE machine IN (?, '*')", (machine,)).fetchall()
         successes = [row for row in runs if row["success"]]
         samples = len(successes)
+        # A censored/failed observation is only a lower bound. It cannot replace
+        # the family prior with its small observed prefix. Require repeat exact
+        # successes before dropping sibling upper evidence and uncertainty.
+        borrowing = bool(exact) and samples < 5 and any(row["variant"] != variant for row in envelopes)
+        use_exact = bool(exact) and not borrowing
+        selected = envelopes if borrowing else exact or envelopes
+        source = "variant" if use_exact else "family" if envelopes else "prior"
         age = max(0, now - max((row["sampled"] for row in selected), default=now))
         memory_floor = max([GIB, *[row["memory"] for row in floors]])
         cpu_floor = max([2.0, *[row["cpu"] for row in floors]])
         if not selected:
             return {"memoryBytes": memory_floor, "cpuCores": cpu_floor, "durationSeconds": None,
                     "samples": 0, "confidence": "unknown", "source": source}
-        margin = 1.25 if exact else 1.5
+        margin = 1.25 if use_exact else 1.5
         # Keep upper evidence across retention pruning. Very old evidence eases
         # only to 75 percent, and stale profiles regain the cold-start floor.
         age_factor = max(0.75, 1 - max(0, age - 30 * DAY) / (240 * DAY))
         memory = max(row["memory"] for row in selected) * margin * age_factor
         cpu = max(row["cpu"] for row in selected) * margin * age_factor
-        if not exact or samples < 5 or age > 30 * DAY:
+        if not use_exact or samples < 5 or age > 30 * DAY:
             memory = max(memory, memory_floor)
             cpu = max(cpu, cpu_floor)
         else:
             memory = max(memory, 64 * 1024 ** 2, *[row["memory"] for row in floors])
             cpu = max(cpu, 0.1, *[row["cpu"] for row in floors])
         durations = [row["duration"] for row in selected if row["duration"] > 0]
-        confidence = "high" if exact and samples >= 12 and age <= 30 * DAY else "medium" if exact and samples >= 5 else "low"
+        confidence = ("high" if use_exact and samples >= 12 and age <= 30 * DAY
+                      else "medium" if use_exact and samples >= 5 else "low")
         if age > 30 * DAY or (runs and not max(runs, key=lambda row: row["sampled"])["success"]):
             confidence = "low"
         return {"memoryBytes": math.ceil(memory), "cpuCores": round(cpu, 3),

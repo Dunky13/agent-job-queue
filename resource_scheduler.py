@@ -172,7 +172,11 @@ def permit(gate, marker: dict, member_count: int) -> bool:
                         return False
                     active.append(measured)
             allowed, _reason = decision(state["host"], grant["prediction"], active, limit)
-            return allowed
+            # Queue/socket and filesystem reads above can block. Admission must
+            # still be fresh after the final blocking read, not just before it.
+            now = time.time()
+            return (allowed and now <= grant["expires"] and 0 <= now - state["sampledAt"] <= FRESH_SECONDS
+                    and 0 <= now - state["host"]["sampledAt"] <= FRESH_SECONDS)
     if configuration["mode"] != "adaptive":
         # A helper launched during an earlier adaptive generation still obeys
         # the current ceiling when the operator returns to a fixed policy.
@@ -282,13 +286,19 @@ class Controller:
 
     def sample_run(self, task_id, token, marker, host, prediction):
         from agent_heavy import read_private, write_private
-        from resource_monitor import SamplingError
+        from resource_monitor import SamplingError, MAX_SAMPLE_INTERVAL
         run = self.runs.get(token)
         if run is None:
             try:
                 run = read_private(self.gate.state / "resource-runs" / f"{token}.json")
             except FileNotFoundError:
-                run = {"started": time.time(), "boot": self.boot, "samples": 0, "attempts": 0, "complete": True,
+                observed_since = time.time()
+                started = marker.get("executionStartedAt")
+                timely = _number(started) and 0 <= observed_since - started <= MAX_SAMPLE_INTERVAL
+                # Old/missing start receipts and a controller arriving late can
+                # supply upper evidence, but never certify an unseen prefix.
+                run = {"started": started if _number(started) and started <= observed_since else observed_since,
+                       "observedSince": observed_since, "boot": self.boot, "samples": 0, "attempts": 0, "complete": timely,
                        "memoryBytes": 0, "peakMemoryBytes": 0, "cpuSeconds": 0.0,
                        "cpuCores": 0.0, "peakCpuCores": 0.0, "durationSeconds": 0.0}
             else:

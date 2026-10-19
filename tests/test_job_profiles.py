@@ -253,6 +253,49 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertGreater(estimate["memoryBytes"], self.prediction()["memoryBytes"])
         self.assertEqual(self.prediction(machine="other-machine")["source"], "prior")
 
+    def test_borrowed_family_demand_survives_censored_exact_rows_until_repeat_success(self):
+        for index in range(12):
+            self.record(index, memory=8 * profiles.GIB, cpu=4, duration=60)
+        changed = {**self.identity, "variant": "d" * 64}
+        borrowed = self.prediction(changed)
+        self.assertEqual(borrowed["source"], "family")
+        self.record("partial-prefix", identity=changed, memory=64 * 1024 ** 2, cpu=0.1, duration=1,
+                    complete=False, code=None)
+        self.record("failed-prefix", identity=changed, memory=64 * 1024 ** 2, cpu=0.1, duration=1, code=1)
+        for successes in range(5):
+            estimated = self.prediction(changed)
+            self.assertEqual(estimated["source"], "family")
+            self.assertEqual(estimated["samples"], successes)
+            self.assertEqual(estimated["confidence"], "low")
+            for field in ("memoryBytes", "cpuCores", "durationSeconds"):
+                self.assertGreaterEqual(estimated[field], borrowed[field])
+            self.record("exact-success-" + str(successes), identity=changed,
+                        memory=64 * 1024 ** 2, cpu=0.1, duration=2)
+        learned = self.prediction(changed)
+        self.assertEqual(learned["source"], "variant")
+        self.assertEqual(learned["samples"], 5)
+        self.assertEqual(learned["confidence"], "medium")
+        for field in ("memoryBytes", "cpuCores", "durationSeconds"):
+            self.assertLess(learned[field], borrowed[field])
+
+    def test_failed_high_exact_peaks_immediately_raise_a_borrowed_family_envelope(self):
+        for index in range(12):
+            self.record(index, memory=8 * profiles.GIB, cpu=4, duration=60)
+        changed = {**self.identity, "variant": "d" * 64}
+        borrowed = self.prediction(changed)
+        self.record("failed-high", identity=changed, memory=16 * profiles.GIB, cpu=8, duration=120, code=137)
+        estimated = self.prediction(changed)
+        self.assertEqual((estimated["source"], estimated["samples"]), ("family", 0))
+        for field, peak in (("memoryBytes", 16 * profiles.GIB), ("cpuCores", 8), ("durationSeconds", 120)):
+            self.assertGreaterEqual(estimated[field], peak)
+            self.assertGreater(estimated[field], borrowed[field])
+        self.record("partial-high", identity=changed, memory=24 * profiles.GIB, cpu=12, duration=180,
+                    complete=False, code=None)
+        partial = self.prediction(changed)
+        self.assertEqual(partial["samples"], 0)
+        for field in ("memoryBytes", "cpuCores", "durationSeconds"):
+            self.assertGreater(partial[field], estimated[field])
+
     def test_aged_profiles_reduce_confidence_without_erasing_upper_evidence(self):
         for index in range(12):
             self.record(index, memory=4 * profiles.GIB)
