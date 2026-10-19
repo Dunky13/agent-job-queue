@@ -12,7 +12,7 @@ The initial signed import is on main. GitHub reports its signature verified. Mai
 
 The complete bootstrap CI passed. The first main run then exposed a real Darwin process-lifecycle race in the crash acceptance test. Its aggregate gate failed and correctly withheld publication. [Failing main run](https://github.com/Dunky13/agent-job-queue/actions/runs/39216528279).
 
-PR 1 repairs that race. Hosted PR validation and owner merge approval are the remaining gates before the first main installer release. This document records the repair's delivery state; query GitHub for the current result.
+PR 1 repairs that race. Its first complete hosted PR run passed crash recovery on both macOS architectures but exposed a separate scheduling assumption in the native refresh test. That fixture is now synchronized explicitly. Hosted validation of the updated head and owner merge approval remain before the first main installer release. This document records the repair's delivery state; query GitHub for the current result.
 
 ## Diagnosis and repair
 
@@ -24,10 +24,13 @@ Boot and process-birth checks still precede actual signals. The same departure r
 
 CI push triggers cover main and the bootstrap branch; pull request triggers still cover every PR targeting main. This avoids duplicate feature push and PR builds. Each main run has a unique concurrency group, and only successful validation can publish its installer.
 
+The native refresh test previously used 10 ms and 50 ms sleeps to assume a poll was still in flight. On the Apple Silicon hosted runner, the poll could complete before the simulated mutation, invalidating that assumption. Checked continuations now hold the captured read until the test explicitly releases it, so both silent polling and stale-read rejection have deterministic ordering. A follow-up assertion verifies that refresh resumes after mutation. Production refresh behavior and CI timeouts are unchanged.
+
 ## Validation evidence
 
 - The full local repair run passed core tests, 22 real-daemon acceptance/environment tests, 18 real HTTPS/API tests, five schema tests, six browser tests, native regression checks, and 11 installer tests.
 - After the final reaping-boundary change, all 59 core tests and the original crash acceptance test passed again. The installer payload was compared with the final backend source and matched.
+- After replacing fixture sleeps, all native regression checks passed. The refresh tests passed 20 consecutive executions with warnings treated as errors. A negative control removing the production mutation guard failed the stale-read assertion as expected.
 - Installer checks exercise generated configuration and installed wrappers against a real temporary Pueue daemon. Payload checks verify both executable architectures, ad hoc signatures, and exclusion of credentials and state.
 - Scoped independent source reviews reported no remaining actionable blocker before the final positive-kernel-confirmation refinement. Root review and regression tests covered that refinement.
 - Physical Android certificate installation, an off-site VPN connection, and Apple notarization are outside this repair's validation. The installer is ad hoc signed.
