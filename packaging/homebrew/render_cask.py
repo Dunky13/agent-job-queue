@@ -47,6 +47,22 @@ def render_cask(data: object) -> str:
   depends_on formula: "uv"
   depends_on macos: :sequoia
 
+  # Ad hoc signed and not notarized: clear quarantine only on this staged build
+  # before executing its installer or copying its app and command wrappers.
+  if respond_to?(:preflight_steps)
+    preflight_steps do
+      run "/usr/bin/xattr",
+          args: ["-dr", "com.apple.quarantine", "{{{{staged_path}}}}"],
+          must_succeed: true
+    end
+  else
+    preflight do
+      system_command "/usr/bin/xattr",
+                     args: ["-dr", "com.apple.quarantine", staged_path],
+                     must_succeed: true
+    end
+  end
+
   # The vendor installer also prepares private per-user CLI support and services.
   payload = "#{{staged_path}}/Agent Job Queue Installer.app/Contents/Resources/payload"
   installer script: {{
@@ -68,6 +84,7 @@ def render_cask(data: object) -> str:
   caveats <<~EOS
     Installs and opens Agent Queue for this macOS account without a manual setup step.
     Phone access is off until enabled in the app. This build is ad hoc signed, not notarized.
+    Installation clears quarantine only on this cask's staged files so they can run.
     Uninstall removes the menu app and Homebrew command links. The shared per-user backend,
     operator commands, queue jobs, credentials and enabled remote access remain available.
     Disable phone access in settings before uninstall if you want its HTTPS service stopped.
