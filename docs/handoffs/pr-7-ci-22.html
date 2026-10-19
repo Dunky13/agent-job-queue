@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PR 7 follow-up: main CI run 22 shutdown repair</title>
+<style>
+:root { color-scheme: light dark; font: 16px/1.65 system-ui, sans-serif; }
+body { margin: 0; background: light-dark(#f4f5f7, #17191d); color: light-dark(#24272e, #e4e7ed); }
+main { max-width: 850px; margin: 32px auto; padding: 32px; background: light-dark(#fff, #22252b); border-radius: 16px; }
+h1 { font-size: clamp(1.65rem, 4vw, 2.2rem); line-height: 1.2; }
+h2 { font-size: 1.2rem; margin-top: 2rem; }
+a { color: light-dark(#175bb7, #95bfff); }
+code, pre { font-family: ui-monospace, monospace; overflow-wrap: anywhere; }
+code { font-size: .9em; }
+pre { padding: 16px; border-radius: 8px; background: light-dark(#edf0f5, #14161a); overflow: auto; }
+li { margin-block: 10px; }
+@media (max-width: 600px) { main { margin: 0; padding: 20px; border-radius: 0; } }
+</style>
+<main>
+<h1>PR 7 follow-up: main CI run 22 shutdown repair</h1>
+<h2>Scope and diagnosis</h2>
+<p><a href="https://github.com/Dunky13/agent-job-queue/actions/runs/39271222753">Main CI run 22</a> failed after <a href="https://github.com/Dunky13/agent-job-queue/pull/7">PR 7</a> merged as <code>086f0c3fa3c13b411f68fb6702696c91219623d7</code>. On macOS ARM, the pre-acknowledgement gateway test observed <code>disable</code> exiting 125. The next test could not become ready. Installer publication was skipped, so the version and learning-controls release did not publish.</p>
+<p>An unacknowledged child can exit after its supervisor dies, between the controller's birth check and process-group lookup. Supervisors can likewise depart between their identity check and signal delivery. Four deterministic regressions against the original main source reproduce <code>ProcessLookupError</code> or a shutdown error containing <code>[Errno 3] No such process</code>. The CI log omitted the original disable error text: this establishes a matching failure mechanism rather than proving its exact historical stderr.</p>
+<h2>Repair and safety</h2>
+<p><code>remote/control.py</code> treats <code>ProcessLookupError</code> as an already departed process at the owned child group lookup, supervisor TERM/KILL signals, and test-mode service stop. Child cleanup retains its final birth check before removing the record. Permission errors and mismatched identities remain failures. Boot, birth, self-process, generation, acknowledgement, ownership and escalation checks remain intact.</p>
+<p><code>remote/tests/test_remote.py</code> adds nine deterministic real-process regressions with private temporary state. Four departure cases fail against the original source and pass with the repair. Ownership and permission controls pass against both. The existing real HTTPS scenario now includes CLI stdout/stderr in its assertions. No tests, deadlines or checks were weakened.</p>
+<h2>Validation and delivery boundary</h2>
+<ul>
+<li>All 32 remote/API/real-Caddy HTTPS tests passed after the final changes, including the original pre-acknowledgement scenario. The complete run used the shared heavy-command queue.</li>
+<li>Repository-wide Python Ruff, the public-source boundary check and diff whitespace checks passed. There is no configured Python type checker.</li>
+<li>Independent Standards and Spec/security source reviews reported no findings in the executable diff. Cross-provider review was unavailable and skipped.</li>
+<li>Hosted CI on the new PR, merge, main installer publication, Homebrew publication and operator installation are separate steps. Their live state belongs to GitHub, rather than this local validation record.</li>
+</ul>
+<p>Reproduce the applicable suite in the configured development environment using the operator's shared queue policy:</p>
+<pre>python -m unittest discover -s remote/tests -p test_remote.py -v
+python -m ruff check .
+python scripts/check-public-source.py</pre>
+<h2>Homebrew observations and proposed synchronization</h2>
+<p>Read-only inspection on 2026-10-19 found one installed user app and one running Agent Queue UI, both from Homebrew build 15. The Caskroom installer and its nested payload are staging copies. Both CLI entry points use the same per-user backend. No duplicate running queue was established, and no installed files or live services were changed.</p>
+<p>The remote tap also still pointed to build 15, although app build 18 was published. Its refresh workflow was active, but GitHub reported zero scheduled runs and only manual refreshes. Build 18 predates PR 7's version window. Installing it alone would not supply that window.</p>
+<p>Recommended follow-up, not implemented by this repair: make each successfully published immutable main build dispatch the tap workflow using a narrowly scoped GitHub App. The tap should validate the exact source commit, manifest and installer digest, publish its signed cask commit with its own token, and allow the source delivery job to verify the result. Serialize updates, reject downgrades, make retries idempotent, and retain scheduled reconciliation plus a visible drift failure as recovery mechanisms. Synchronize tap tooling and its manifest validator through a reviewed update from the same source revision so copied helpers cannot silently drift.</p>
+<p>The target is the latest successfully published main build. Failed CI must leave the prior Homebrew build available. Once the repaired main release and tap are verified, use the Homebrew upgrade path for this installation. The version appears in the app gear menu under <strong>About and updates</strong> after the new app is installed and running.</p>
+</main>
+</html>
