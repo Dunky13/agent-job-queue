@@ -32,6 +32,8 @@ brew install --cask dunky13/agent-job-queue/agent-job-queue
 
 Homebrew installs the dependencies, sets up your private queue, and opens the menu-bar app. Both `agent-heavy` and `agent-remote` are linked into Homebrew's bin directory. No Xcode or manual installer window is needed.
 
+The build is ad hoc signed and not notarized. The cask removes only `com.apple.quarantine` from its own staged download before running the installer, so installation does not require an Apple Developer Program membership or a Gatekeeper approval prompt. The download's SHA-256 is verified first; signatures and other extended attributes remain intact. This is a deliberate trust decision for this project's tap and does not change system-wide security settings.
+
 The tap becomes installable after the first validated `main` installer release is published. It tracks published builds, so updates can use:
 
 ```sh
@@ -49,13 +51,13 @@ Uninstalling the cask removes the menu app and Homebrew command links. It preser
 
 The installer includes prebuilt universal executables, so Xcode is not required. Homebrew supplies Pueue, Caddy, uv, and Python 3.12; the installer needs an internet connection to install missing dependencies and the locked Python environment. It installs into your user account without `sudo`.
 
-The installer and app are ad hoc signed. Apple Developer ID signing and notarization are not configured, so macOS may require approval in Privacy & Security before opening a downloaded build. Installer checksums identify the downloaded bytes; they do not replace Apple notarization.
+The installer and app are ad hoc signed. Apple Developer ID signing and notarization are not configured, so macOS may require approval in Privacy & Security before opening a manually downloaded build. Installer checksums identify the downloaded bytes; they do not replace Apple notarization.
 
 Upgrades preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. Only the menu-bar UI is replaced. Existing dependencies are not upgraded by the installer.
 
 ### If macOS blocks opening the app
 
-Current releases are **not notarized**. Passing the package's code-signature integrity check does not mean Gatekeeper will accept it. macOS can block the installer or the installed menu app; Homebrew does not provide Apple notarization.
+Current releases are **not notarized**. Passing the package's code-signature integrity check does not mean Gatekeeper will accept a quarantined download. The Homebrew cask clears quarantine on its own staged download as described above. A manually downloaded ZIP or DMG can still require approval for the installer or installed menu app.
 
 For a downloaded Agent Job Queue app that you trust, use Apple's per-app approval flow:
 
@@ -65,7 +67,7 @@ For a downloaded Agent Job Queue app that you trust, use Apple's per-app approva
 
 Use the app name in Privacy & Security to identify a generic verification popup before approving anything. If no matching entry appears, the popup's source is still unknown. Managed Macs can restrict these choices. See [Apple's opening instructions](https://support.apple.com/102445).
 
-Developer ID signing and notarization require an Apple Developer Program membership and are not configured for this project. Keep Gatekeeper and quarantine enabled; the app does not remove them during installation.
+Developer ID signing and notarization require an Apple Developer Program membership and are not configured for this project. The manual installer does not remove quarantine. The cask's exception applies only to its own staged files; Gatekeeper remains enabled system-wide.
 
 ## Connect your coding agents
 

@@ -56,6 +56,24 @@ class HomebrewTests(unittest.TestCase):
         self.assertIn('depends_on formula: "pueue"', cask)
         self.assertIn('binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/bin/agent-heavy"', cask)
 
+    def test_renderer_clears_only_staged_quarantine_before_any_executable_artifact(self):
+        cask = renderer.render_cask(self.manifest)
+        start = cask.index("  if respond_to?(:preflight_steps)\n")
+        end = cask.index("  # The vendor installer", start)
+        preflight = cask[start:end]
+        self.assertIn("preflight_steps do", preflight)
+        self.assertIn('run "/usr/bin/xattr"', preflight)
+        self.assertIn('["-dr", "com.apple.quarantine", "{{staged_path}}"]', preflight)
+        self.assertIn("preflight do", preflight)
+        self.assertIn('system_command "/usr/bin/xattr"', preflight)
+        self.assertIn('["-dr", "com.apple.quarantine", staged_path]', preflight)
+        self.assertEqual(preflight.count("must_succeed: true"), 2)
+        self.assertNotIn("sudo: true", preflight)
+        self.assertNotIn("-cr", preflight)
+        self.assertNotIn("must_succeed: false", preflight)
+        self.assertLess(end, cask.index("  installer script:"))
+        self.assertLess(end, cask.index("  binary "))
+
     def test_existing_release_workflow_compares_assets_without_mutation(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         marker = 'python3 - "$existing" "$GITHUB_SHA" <<\'PY\'\n'
@@ -167,10 +185,25 @@ class HomebrewTests(unittest.TestCase):
     def test_real_homebrew_dsl_runs_automated_install_in_private_fixture(self):
         self._probe_install()
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS quarantine attributes required")
+    def test_real_homebrew_preflight_clears_quarantined_payload_and_installed_executables(self):
+        self._probe_install(quarantined=True)
+
+    def test_real_homebrew_helper_rejects_missing_preflight(self):
+        self._probe_install(omit_preflight=True)
+
+    def test_real_homebrew_preflight_failure_aborts_before_installer(self):
+        self._probe_install(preflight_fails=True)
+
     def test_older_homebrew_api_runs_same_automated_install_without_privilege_method(self):
         self._probe_install(older_api=True)
 
-    def _probe_install(self, *, older_api=False):
+    @unittest.skipUnless(sys.platform == "darwin", "macOS quarantine attributes required")
+    def test_legacy_homebrew_preflight_clears_quarantined_payload(self):
+        self._probe_install(older_api=True, legacy_preflight=True, quarantined=True)
+
+    def _probe_install(self, *, older_api=False, legacy_preflight=False, quarantined=False,
+                       omit_preflight=False, preflight_fails=False):
         brew = shutil.which("brew", path=os.environ.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin")
         self.assertIsNotNone(brew, "Homebrew packaging checks require Homebrew on macOS")
         fixture = test_installer.InstallerTests(methodName="runTest")
@@ -182,12 +215,19 @@ class HomebrewTests(unittest.TestCase):
         fixture_environment.write_text(json.dumps({key: fixture.environment[key] for key in keys}))
         fixture_environment.chmod(0o600)
         cask = self.root / "agent-job-queue.rb"
-        cask.write_text(renderer.render_cask(self.manifest))
+        body = renderer.render_cask(self.manifest)
+        if omit_preflight:
+            start = body.index("  if respond_to?(:preflight_steps)\n")
+            end = body.index("  # The vendor installer", start)
+            body = body[:start] + body[end:]
+        if preflight_fails:
+            body = body.replace('"/usr/bin/xattr"', '"/usr/bin/false"')
+        cask.write_text(body)
         # This fixture evaluates a local cask and stubs dependency installation.
         # A fresh HOME must not trigger a live Homebrew package-index download.
         environment = {**fixture.environment, "HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_DEVELOPER": "1",
                        "HOMEBREW_NO_INSTALL_FROM_API": "1"}
-        invocation = [brew, "ruby"]
+        invocation = [brew, "ruby", "--"]
         if older_api:
             shim = self.root / "older-homebrew.rb"
             shim.write_text(
@@ -205,9 +245,34 @@ class HomebrewTests(unittest.TestCase):
                 '  end\nend\n'
                 'Cask::Artifact::Installer.prepend(compatibility)\nload ARGV.shift\n'
             )
+            if legacy_preflight:
+                # Model the older DSL's block registration without calling the
+                # current deprecated method or changing developer-mode checks.
+                # Keep the real legacy artifact implementation and execution.
+                content = shim.read_text()
+                content = content.replace('load ARGV.shift\n',
+                    'Cask::DSL.class_eval do\n'
+                    '  undef_method :preflight_steps if method_defined?(:preflight_steps)\n'
+                    '  define_method(:preflight) do |&block|\n'
+                    '    artifacts.add(Cask::Artifact::PreflightBlock.new(cask, preflight: block))\n'
+                    '  end\nend\n'
+                    'load ARGV.shift\n')
+                shim.write_text(content)
             invocation.append(str(shim))
         invocation.extend([str(PACKAGING / "test-cask.rb"), str(cask), str(fixture.base)])
+        if quarantined:
+            invocation.append("--quarantined")
         result = subprocess.run(invocation, env=environment, capture_output=True, text=True, timeout=45, check=False)
+        if omit_preflight or preflight_fails:
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            if omit_preflight:
+                self.assertIn("preflight", result.stderr.lower())
+            else:
+                self.assertIn("/usr/bin/false", result.stderr)
+            self.assertFalse((fixture.home / ".local/share/agent-heavy").exists())
+            self.assertFalse((fixture.home / "Library/LaunchAgents").exists())
+            self.assertFalse(fixture.calls.exists(), "Installer must not run after a failed preflight")
+            return
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((fixture.home / "Applications/Agent Queue.app/Contents/MacOS/AgentQueue").exists())
         self.assertTrue((fixture.home / ".local/bin/agent-heavy").exists())
@@ -217,6 +282,31 @@ class HomebrewTests(unittest.TestCase):
         self.assertEqual(data["version"], "0.1.0,123")
         self.assertEqual(data["sha256"], self.manifest["sha256"])
         self.assertIn("Installed Agent Queue", result.stdout)
+        order = data["artifact_order"]
+        preflights = [name for name in order if name in
+                      ("Cask::Artifact::PreflightSteps", "Cask::Artifact::PreflightBlock")]
+        self.assertEqual(len(preflights), 1)
+        if legacy_preflight:
+            self.assertEqual(preflights, ["Cask::Artifact::PreflightBlock"])
+        self.assertLess(order.index(preflights[0]), order.index("Cask::Artifact::Installer"))
+        self.assertLess(order.index(preflights[0]), order.index("Cask::Artifact::Binary"))
+        if quarantined:
+            attributes = data["fixture_attributes"]
+            self.assertGreater(attributes["entries"], 4)
+            self.assertEqual(attributes["quarantine_before"], attributes["entries"])
+            self.assertEqual(attributes["retained_before"], attributes["entries"])
+            self.assertEqual(attributes["quarantine_after"], 0)
+            self.assertEqual(attributes["retained_after"], attributes["entries"])
+            for root in (fixture.home / ".local/bin", fixture.home / ".local/share/agent-heavy/bin",
+                         fixture.home / "Applications/Agent Queue.app"):
+                output = subprocess.run(["/usr/bin/xattr", "-lr", str(root)], capture_output=True,
+                                        text=True, timeout=5, check=True)
+                self.assertNotIn("com.apple.quarantine", output.stdout, str(root))
+            for name in ("agent-heavy", "agent-remote"):
+                cli = subprocess.run([str(fixture.home / ".local/bin" / name), "--help"],
+                                     env=fixture.environment, capture_output=True, text=True, timeout=5, check=False)
+                self.assertEqual(cli.returncode, 0, cli.stderr)
+                self.assertIn("usage:", cli.stdout.lower())
 
 
 if __name__ == "__main__":
