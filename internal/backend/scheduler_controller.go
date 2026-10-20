@@ -132,10 +132,6 @@ type schedulerAudit struct {
 func taskState(task Object) (string, Object, error) { return TaskStatus(task) }
 func (c *Controller) Tick() (Object, error) {
 	g := c.gate
-	learningRevision, e := c.store.Revision()
-	if e != nil {
-		return nil, e
-	}
 	host, e := c.sampler.Host()
 	if e != nil {
 		return nil, e
@@ -151,6 +147,11 @@ func (c *Controller) Tick() (Object, error) {
 	candidates := []schedulerCandidate{}
 	audits := []schedulerAudit{}
 	sampledActive := map[string]bool{}
+	requests := []profileRequest{}
+	collected := []struct {
+		token     string
+		resources Object
+	}{}
 	snapshot, e := g.Snapshot()
 	if e != nil {
 		return nil, e
@@ -237,13 +238,8 @@ func (c *Controller) Tick() (Object, error) {
 				safe[key] = label
 			}
 		}
-		if e = c.store.Observe(workload, safe); e != nil {
-			return nil, e
-		}
-		prediction, e := c.store.Prediction(workload, text(host["machine"]))
-		if e != nil {
-			return nil, e
-		}
+		// Predictions are read together after every completion has been recorded.
+		prediction := Object{}
 		resources := Object{"prediction": prediction, "observed": nil, "decision": nil}
 		receipt, e := g.Receipt(id)
 		if e != nil {
@@ -316,12 +312,28 @@ func (c *Controller) Tick() (Object, error) {
 		} else if state == "Queued" || state == "Stashed" {
 			candidates = append(candidates, schedulerCandidate{id, value, task, resources})
 		}
-		match, e := c.store.Match(workload)
-		if e != nil {
-			return nil, e
-		}
-		resources["learning"] = match
+		requests = append(requests, profileRequest{workload, safe})
+		collected = append(collected, struct {
+			token     string
+			resources Object
+		}{value, resources})
 		jobs[value] = resources
+	}
+	collection, e := c.store.collectProfiles(requests, text(host["machine"]))
+	if e != nil {
+		return nil, e
+	}
+	defer collection.Close()
+	learningRevision := collection.revision
+	for i, entry := range collected {
+		prediction := collection.predictions[i]
+		if sampledActive[entry.token] {
+			run := c.runs[entry.token]
+			prediction["memoryBytes"] = int64(max(metric(prediction["memoryBytes"]), float64(int64(metric(run["peakMemoryBytes"])*1.2))))
+			prediction["cpuCores"] = max(metric(prediction["cpuCores"]), metric(run["peakCpuCores"]))
+		}
+		entry.resources["prediction"] = prediction
+		entry.resources["learning"] = collection.matches[i]
 	}
 	configuration, e := SchedulingSettings(g)
 	if e != nil {
@@ -358,23 +370,6 @@ func (c *Controller) Tick() (Object, error) {
 	admissions, e := SchedulingLedger(g, configuration)
 	if e != nil {
 		return nil, e
-	}
-	revision, e := c.store.Revision()
-	if e != nil {
-		return nil, e
-	}
-	if revision != learningRevision {
-		if e = retainActiveGrants(g, admissions); e != nil {
-			return nil, e
-		}
-		if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
-			return nil, e
-		}
-		value := c.status(configuration, host, Object{}, learningRevision, false, false, "Learning changed during collection; waiting for fresh predictions")
-		if e = WritePrivate(filepath.Join(g.State, "resource-status.json"), value); e != nil {
-			return nil, e
-		}
-		return value, nil
 	}
 	current, e := g.Snapshot()
 	if e != nil {
@@ -491,6 +486,27 @@ func (c *Controller) Tick() (Object, error) {
 			selected = index
 		}
 	}
+	// Serialize snapshot validation with the durable grant write. This read lock
+	// is released before queue RPC so a slow daemon cannot block history writers.
+	valid, releaseProfiles, e := collection.Validate()
+	if e != nil {
+		return nil, e
+	}
+	defer releaseProfiles()
+	if !valid {
+		releaseProfiles()
+		if e = retainActiveGrants(g, admissions); e != nil {
+			return nil, e
+		}
+		if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
+			return nil, e
+		}
+		value := c.status(configuration, host, Object{}, learningRevision, false, false, "Learning changed during collection; waiting for fresh predictions")
+		if e = WritePrivate(filepath.Join(g.State, "resource-status.json"), value); e != nil {
+			return nil, e
+		}
+		return value, nil
+	}
 	available := boolean(host["complete"]) && resourceNow()-metric(host["sampledAt"]) >= 0 && resourceNow()-metric(host["sampledAt"]) <= resourceFreshSeconds
 	if !available {
 		reason = "Collecting a complete resource interval"
@@ -499,6 +515,14 @@ func (c *Controller) Tick() (Object, error) {
 	if e = WritePrivate(filepath.Join(g.State, "resource-status.json"), value); e != nil {
 		return nil, e
 	}
+	if configuration["mode"] == "adaptive" && selected >= 0 && available {
+		entry := candidates[selected]
+		grants[entry.token] = Object{"task_id": entry.id, "manual": false, "expires": resourceNow() + resourceGrantSeconds, "prediction": entry.resources["prediction"]}
+	}
+	if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
+		return nil, e
+	}
+	releaseProfiles()
 	if configuration["mode"] == "adaptive" {
 		for id, raw := range currentTasks {
 			task := obj(raw)
@@ -514,10 +538,6 @@ func (c *Controller) Tick() (Object, error) {
 		}
 		if selected >= 0 && available {
 			entry := candidates[selected]
-			grants[entry.token] = Object{"task_id": entry.id, "manual": false, "expires": resourceNow() + resourceGrantSeconds, "prediction": entry.resources["prediction"]}
-			if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
-				return nil, e
-			}
 			state, _, e := taskState(obj(currentTasks[fmt.Sprint(entry.id)]))
 			if e != nil {
 				return nil, e
@@ -528,9 +548,6 @@ func (c *Controller) Tick() (Object, error) {
 				}
 			}
 		}
-	}
-	if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
-		return nil, e
 	}
 	unlockLease()
 	locked = false

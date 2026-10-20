@@ -388,16 +388,16 @@ func profileRegister(c profileSQL, family string, description Object, required b
 	}
 	return Object{"family": family, "profile": id, "title": description["title"], "project": description["project"], "executable": description["executable"], "updated": now}, nil
 }
-func (s *ProfileStore) Observe(identity, description Object) error {
+func profileDescription(identity, description Object) (Object, error) {
 	if description == nil {
-		return fmt.Errorf("Invalid safe workload description")
+		return nil, fmt.Errorf("Invalid safe workload description")
 	}
 	if !validProfileIdentity(identity) {
-		return fmt.Errorf("Invalid workload identity")
+		return nil, fmt.Errorf("Invalid workload identity")
 	}
 	for key := range description {
 		if !containsString([]string{"title", "project", "executable"}, key) {
-			return fmt.Errorf("Invalid safe workload description")
+			return nil, fmt.Errorf("Invalid safe workload description")
 		}
 	}
 	clean := Object{}
@@ -408,34 +408,60 @@ func (s *ProfileStore) Observe(identity, description Object) error {
 		}
 		value, e := profileText(description[key], key, true, maximum, key != "title")
 		if e != nil {
-			return e
+			return nil, e
 		}
 		clean[key] = value
 	}
+	return clean, nil
+}
+func profileDescriptionChanged(prior, clean Object) bool {
+	if prior == nil {
+		return true
+	}
+	for _, key := range []string{"title", "project", "executable"} {
+		if clean[key] != nil && !reflect.DeepEqual(clean[key], prior[key]) {
+			return true
+		}
+	}
+	return false
+}
+func profileObserve(c profileSQL, family string, clean Object) error {
+	prior, e := profileRow(c, "SELECT * FROM learning_members WHERE family=?", family)
+	if e != nil {
+		return e
+	}
+	if prior == nil {
+		_, e = profileRegister(c, family, clean, false)
+		return e
+	}
+	if !profileDescriptionChanged(prior, clean) {
+		return nil
+	}
+	for _, key := range []string{"title", "project", "executable"} {
+		if clean[key] == nil {
+			clean[key] = prior[key]
+		}
+	}
+	return profileExec(c, "UPDATE learning_members SET title=?,project=?,executable=?,updated=? WHERE family=?", clean["title"], clean["project"], clean["executable"], resourceNow(), family)
+}
+func (s *ProfileStore) Observe(identity, description Object) error {
+	clean, e := profileDescription(identity, description)
+	if e != nil {
+		return e
+	}
+	if s.readonly {
+		return fmt.Errorf("Resource history was opened read-only")
+	}
 	family := text(identity["family"])
-	return s.connection(true, func(c profileSQL) error {
-		prior, e := profileRow(c, "SELECT * FROM learning_members WHERE family=?", family)
-		if e != nil {
-			return e
-		}
-		if prior == nil {
-			_, e = profileRegister(c, family, clean, false)
-			return e
-		}
-		changed := false
-		for _, key := range []string{"title", "project", "executable"} {
-			if clean[key] == nil {
-				clean[key] = prior[key]
-			}
-			if !reflect.DeepEqual(clean[key], prior[key]) {
-				changed = true
-			}
-		}
-		if !changed {
-			return nil
-		}
-		return profileExec(c, "UPDATE learning_members SET title=?,project=?,executable=?,updated=? WHERE family=?", clean["title"], clean["project"], clean["executable"], resourceNow(), family)
-	})
+	changed := false
+	if e = s.connection(false, func(c profileSQL) error {
+		prior, err := profileRow(c, "SELECT * FROM learning_members WHERE family=?", family)
+		changed = profileDescriptionChanged(prior, clean)
+		return err
+	}); e != nil || !changed {
+		return e
+	}
+	return s.connection(true, func(c profileSQL) error { return profileObserve(c, family, clean) })
 }
 func profileLabel(family string, member Object) string {
 	for _, key := range []string{"title", "project", "executable"} {

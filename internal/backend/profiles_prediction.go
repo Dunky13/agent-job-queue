@@ -59,7 +59,6 @@ func (s *ProfileStore) Prediction(identity Object, machine string) (Object, erro
 	return result, e
 }
 func profilePrediction(c profileSQL, family, variant, machine string) (Object, error) {
-	now := resourceNow()
 	families, operator, e := profilePredictionGroup(c, family)
 	if e != nil {
 		return nil, e
@@ -84,16 +83,7 @@ func profilePrediction(c profileSQL, family, variant, machine string) (Object, e
 		}
 		envelopes = append(envelopes, retained...)
 	}
-	exact := []Object{}
-	sibling := false
-	for _, row := range envelopes {
-		if text(row["family"]) == family && text(row["variant"]) == variant {
-			exact = append(exact, row)
-		} else {
-			sibling = true
-		}
-	}
-	runs, e := profileRows(c, "SELECT * FROM runs WHERE machine=? AND family=? AND variant=? AND sampled>=?", machine, family, variant, now-90*profileDay)
+	runs, e := profileRows(c, "SELECT * FROM runs WHERE machine=? AND family=? AND variant=? AND sampled>=?", machine, family, variant, resourceNow()-90*profileDay)
 	if e != nil {
 		return nil, e
 	}
@@ -102,6 +92,21 @@ func profilePrediction(c profileSQL, family, variant, machine string) (Object, e
 		floors, e = profileRows(c, "SELECT memory,cpu FROM floors WHERE machine IN (?, '*')", machine)
 		if e != nil {
 			return nil, e
+		}
+	}
+	return profileEstimate(family, variant, operator, envelopes, runs, floors), nil
+}
+
+// profileEstimate is shared by individual reads and a collection's batched snapshot.
+func profileEstimate(family, variant string, operator Object, envelopes, runs, floors []Object) Object {
+	now := resourceNow()
+	exact := []Object{}
+	sibling := false
+	for _, row := range envelopes {
+		if text(row["family"]) == family && text(row["variant"]) == variant {
+			exact = append(exact, row)
+		} else {
+			sibling = true
 		}
 	}
 	samples, recent := 0, 0
@@ -136,7 +141,7 @@ func profilePrediction(c profileSQL, family, variant, machine string) (Object, e
 		cpuFloor = max(cpuFloor, metric(row["cpu"]))
 	}
 	if len(selected) == 0 {
-		return Object{"memoryBytes": profileCeilInteger(memoryFloor), "cpuCores": cpuFloor, "durationSeconds": nil, "samples": 0, "confidence": "unknown", "source": source}, nil
+		return Object{"memoryBytes": profileCeilInteger(memoryFloor), "cpuCores": cpuFloor, "durationSeconds": nil, "samples": 0, "confidence": "unknown", "source": source}
 	}
 	age, maxMemory, maxCPU, maxDuration := 0.0, 0.0, 0.0, 0.0
 	latestAt := 0.0
@@ -177,7 +182,7 @@ func profilePrediction(c profileSQL, family, variant, machine string) (Object, e
 	if maxDuration > 0 {
 		duration = maxDuration * margin
 	}
-	return Object{"memoryBytes": profileCeilInteger(memory), "cpuCores": max(profileRoundedCPU(cpu), minimumCPU), "durationSeconds": duration, "samples": samples, "confidence": confidence, "source": source}, nil
+	return Object{"memoryBytes": profileCeilInteger(memory), "cpuCores": max(profileRoundedCPU(cpu), minimumCPU), "durationSeconds": duration, "samples": samples, "confidence": confidence, "source": source}
 }
 func (s *ProfileStore) Record(runToken string, identity Object, machine string, metrics Object, complete bool, exitCode *int) error {
 	if metrics == nil {

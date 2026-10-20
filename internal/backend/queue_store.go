@@ -37,7 +37,54 @@ type queueJob struct {
 const queueSchema = `CREATE TABLE queue_settings(id INTEGER PRIMARY KEY CHECK(id=1),parallel_limit INTEGER NOT NULL CHECK(parallel_limit BETWEEN 1 AND 8),status TEXT NOT NULL CHECK(status IN ('Running','Paused')),dirty INTEGER NOT NULL,next_id INTEGER NOT NULL,imported INTEGER NOT NULL DEFAULT 0);
 INSERT INTO queue_settings VALUES(1,1,'Running',0,0,0);
 CREATE TABLE queue_jobs(id INTEGER PRIMARY KEY CHECK(id>=0),token TEXT NOT NULL UNIQUE,task TEXT NOT NULL,attempt TEXT NOT NULL DEFAULT '',phase TEXT NOT NULL CHECK(phase IN ('queued','starting','running','outcome','done')),worker TEXT,outcome INTEGER CHECK(outcome BETWEEN 0 AND 255));
-PRAGMA user_version=1;`
+` + queueSchemaV2
+
+const queueUnfinishedIndex = "CREATE INDEX queue_jobs_unfinished ON queue_jobs(id) WHERE phase!='done'"
+const queueSchemaV2 = queueUnfinishedIndex + "; PRAGMA user_version=2;"
+
+func ensureQueueSchema(db *sql.DB, create bool) error {
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version == 2 {
+		return nil
+	}
+	if version != 1 && (version != 0 || !create) {
+		return errors.New("Unsupported queue schema")
+	}
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	// Serialize migrations and recheck after obtaining the write lock: workers
+	// and the daemon may open an existing queue concurrently during an upgrade.
+	if _, err = conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	defer conn.ExecContext(context.Background(), "ROLLBACK")
+	if err = conn.QueryRowContext(context.Background(), "PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	switch version {
+	case 0:
+		if !create {
+			return errors.New("Unsupported queue schema")
+		}
+		_, err = conn.ExecContext(context.Background(), queueSchema)
+	case 1:
+		_, err = conn.ExecContext(context.Background(), queueSchemaV2)
+	case 2:
+	default:
+		return errors.New("Unsupported queue schema")
+	}
+	if err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(context.Background(), "COMMIT")
+	return err
+}
 
 func queuePrivateFiles(path string) error {
 	for _, suffix := range []string{"", "-journal", "-wal", "-shm"} {
@@ -88,22 +135,12 @@ func openQueueStore(state string, create bool) (*queueStore, error) {
 	}
 	db.SetMaxOpenConns(1)
 	s := &queueStore{state: state, path: path, db: db}
-	var version int
-	if err = db.QueryRow("PRAGMA user_version").Scan(&version); err == nil {
-		if version == 0 && create {
-			tx, e := db.Begin()
-			if e != nil {
-				err = e
-			} else {
-				_, err = tx.Exec(queueSchema)
-				if err == nil {
-					err = tx.Commit()
-				} else {
-					_ = tx.Rollback()
-				}
-			}
-		} else if version != 1 {
-			err = errors.New("Unsupported queue schema")
+	err = ensureQueueSchema(db, create)
+	if err == nil {
+		var index string
+		err = db.QueryRow("SELECT sql FROM sqlite_schema WHERE type='index' AND name='queue_jobs_unfinished'").Scan(&index)
+		if err == nil && index != queueUnfinishedIndex {
+			err = errors.New("Invalid queue operational index")
 		}
 	}
 	if err == nil {
@@ -172,10 +209,20 @@ func scanQueueJob(row interface{ Scan(...any) error }) (queueJob, error) {
 const queueColumns = "id,token,task,attempt,phase,worker,outcome"
 
 func (s *queueStore) jobs() ([]queueJob, error) {
+	return s.readJobs("")
+}
+
+// unfinishedJobs retains outcomes until ownership-checked cleanup completes.
+// Public snapshots still include all retained history through jobs().
+func (s *queueStore) unfinishedJobs() ([]queueJob, error) {
+	return s.readJobs(" WHERE phase!='done'")
+}
+
+func (s *queueStore) readJobs(filter string) ([]queueJob, error) {
 	if e := queuePrivateFiles(s.path); e != nil {
 		return nil, e
 	}
-	rows, e := s.db.Query("SELECT " + queueColumns + " FROM queue_jobs ORDER BY id")
+	rows, e := s.db.Query("SELECT " + queueColumns + " FROM queue_jobs" + filter + " ORDER BY id")
 	if e != nil {
 		return nil, e
 	}

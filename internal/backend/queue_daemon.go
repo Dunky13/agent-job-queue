@@ -220,7 +220,7 @@ func ServeQueue(g *Gate) error {
 			servers.Wait()
 			d.cleanup.Wait()
 			d.mu.Lock()
-			jobs, e := store.jobs()
+			jobs, e := store.unfinishedJobs()
 			active := false
 			for _, j := range jobs {
 				active = active || j.phase == "starting" || j.phase == "running" || j.phase == "outcome"
@@ -243,7 +243,7 @@ func ServeQueue(g *Gate) error {
 	}
 }
 func (d *queueDaemon) recover() error {
-	jobs, e := d.store.jobs()
+	jobs, e := d.store.unfinishedJobs()
 	if e != nil {
 		return e
 	}
@@ -596,7 +596,7 @@ func (d *queueDaemon) finish(j queueJob, code int) error {
 	return e
 }
 func (d *queueDaemon) tick() error {
-	jobs, e := d.store.jobs()
+	jobs, e := d.store.unfinishedJobs()
 	if e != nil {
 		return e
 	}
