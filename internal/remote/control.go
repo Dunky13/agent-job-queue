@@ -41,12 +41,13 @@ const remoteUsage = "Usage: agent-remote status [--json] | configure | enable | 
 // Settings is the durable, backwards-compatible remote configuration. Passwords
 // use bcrypt hashes and are never accepted through command line arguments.
 type Settings struct {
-	Enabled      bool     `json:"enabled"`
-	Username     string   `json:"username"`
-	Port         int      `json:"port"`
-	Hosts        []string `json:"hosts"`
-	PasswordHash string   `json:"password_hash"`
-	SecretKey    string   `json:"secret_key"`
+	Enabled       bool                   `json:"enabled"`
+	Username      string                 `json:"username"`
+	Port          int                    `json:"port"`
+	Hosts         []string               `json:"hosts"`
+	PasswordHash  string                 `json:"password_hash"`
+	SecretKey     string                 `json:"secret_key"`
+	AuthAdmission *AuthAdmissionSettings `json:"auth_admission,omitempty"`
 }
 
 type remotePaths struct {
@@ -190,13 +191,17 @@ func loadSettings(p remotePaths) (*Settings, error) {
 	} else if err != nil {
 		return nil, err
 	}
-	if !keysAre(raw, "enabled", "username", "port", "hosts", "password_hash", "secret_key") {
+	if !keysAre(raw, "enabled", "username", "port", "hosts", "password_hash", "secret_key") && !keysAre(raw, "enabled", "username", "port", "hosts", "password_hash", "secret_key", "auth_admission") {
 		return nil, errors.New("Invalid remote settings fields")
 	}
 	for _, name := range []string{"enabled", "username", "port", "hosts", "password_hash", "secret_key"} {
 		if bytes.Equal(raw[name], []byte("null")) {
 			return nil, errors.New("Invalid remote settings")
 		}
+	}
+	admission, err := parseAuthAdmission(raw["auth_admission"])
+	if err != nil {
+		return nil, err
 	}
 	data, _ := json.Marshal(raw)
 	var settings Settings
@@ -214,6 +219,7 @@ func loadSettings(p remotePaths) (*Settings, error) {
 			return nil, errors.New("Invalid remote host configuration")
 		}
 	}
+	settings.AuthAdmission = admission
 	return &settings, nil
 }
 
@@ -538,7 +544,11 @@ func (c *controller) status() (map[string]any, error) {
 	if info, err := os.Stat(c.p.certificate); err == nil && info.Mode().IsRegular() {
 		cert = c.p.certificate
 	}
-	return map[string]any{"enabled": enabled, "configured": settings != nil, "running": running, "url": url, "port": port, "username": username, "certificatePath": cert, "error": errorValue}, nil
+	admission := defaultAuthAdmission()
+	if settings != nil && settings.AuthAdmission != nil {
+		admission = *settings.AuthAdmission
+	}
+	return map[string]any{"authAdmission": admission, "enabled": enabled, "configured": settings != nil, "running": running, "url": url, "port": port, "username": username, "certificatePath": cert, "error": errorValue}, nil
 }
 
 func readConfigurationInput(reader io.Reader) (map[string]json.RawMessage, error) {
@@ -560,8 +570,8 @@ func readConfigurationInput(reader io.Reader) (map[string]json.RawMessage, error
 		if err != nil {
 			return nil, errors.New("Configure expects JSON on stdin")
 		}
-		if !keysAre(fields, "password") && !keysAre(fields, "password", "port") {
-			return nil, errors.New("Configure accepts only password and optional port")
+		if !keysAre(fields, "password") && !keysAre(fields, "password", "port") && !keysAre(fields, "password", "auth_admission") && !keysAre(fields, "password", "port", "auth_admission") {
+			return nil, errors.New("Configure accepts only password, optional port and auth_admission")
 		}
 		return fields, nil
 	case <-time.After(5 * time.Second):
@@ -570,8 +580,9 @@ func readConfigurationInput(reader io.Reader) (map[string]json.RawMessage, error
 }
 
 type preparedConfiguration struct {
-	passwordHash string
-	port         int
+	passwordHash  string
+	port          int
+	authAdmission *AuthAdmissionSettings
 }
 
 func prepareConfiguration(value map[string]json.RawMessage) (*preparedConfiguration, error) {
@@ -590,6 +601,10 @@ func prepareConfiguration(value map[string]json.RawMessage) (*preparedConfigurat
 			return nil, errors.New("Port must be from 1024 to 65535")
 		}
 	}
+	admission, err := parseAuthAdmission(value["auth_admission"])
+	if err != nil {
+		return nil, err
+	}
 	hashed, err := bcrypt.GenerateFromPassword([]byte(password), 14)
 	if err != nil {
 		return nil, err
@@ -598,7 +613,7 @@ func prepareConfiguration(value map[string]json.RawMessage) (*preparedConfigurat
 	if !bcryptHash.MatchString(hash) {
 		return nil, errors.New("Could not generate a valid password hash")
 	}
-	return &preparedConfiguration{passwordHash: hash, port: int(port)}, nil
+	return &preparedConfiguration{passwordHash: hash, port: int(port), authAdmission: admission}, nil
 }
 
 func (c *controller) configure(value map[string]json.RawMessage) error {
@@ -627,6 +642,10 @@ func (c *controller) applyConfiguration(prepared *preparedConfiguration) error {
 		return err
 	}
 	settings := &Settings{Enabled: previous != nil && previous.Enabled, Username: username, Port: prepared.port, Hosts: hosts, PasswordHash: prepared.passwordHash, SecretKey: hex.EncodeToString(key)}
+	settings.AuthAdmission = prepared.authAdmission
+	if settings.AuthAdmission == nil && previous != nil {
+		settings.AuthAdmission = previous.AuthAdmission
+	}
 	// Caddy validation provisions modules and can generate a CA. Keep configure
 	// pure with respect to gateway state; only the acknowledged service child
 	// may provision the generated configuration.

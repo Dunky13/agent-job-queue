@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -59,13 +60,13 @@ func fixtureGatewayBasicAuth(t *testing.T, p remotePaths, settings *Settings) ca
 		if err := json.Unmarshal(raw, &handler); err != nil {
 			t.Fatal(err)
 		}
-		if handler.Handler == "authentication" {
-			var auth caddyauth.Authentication
-			if err := json.Unmarshal(raw, &auth); err != nil {
+		if handler.Handler == "agent_queue_auth_admission" {
+			var admission authAdmission
+			if err := json.Unmarshal(raw, &admission); err != nil {
 				t.Fatal(err)
 			}
 			var basic caddyauth.HTTPBasicAuth
-			if err := json.Unmarshal(auth.ProvidersRaw["http_basic"], &basic); err != nil {
+			if err := json.Unmarshal(admission.Authentication.ProvidersRaw["http_basic"], &basic); err != nil {
 				t.Fatal(err)
 			}
 			return basic
@@ -166,7 +167,17 @@ func assertLegacyBasicAuthParity(t *testing.T, p remotePaths, settings *Settings
 	if err != nil {
 		t.Fatal(err)
 	}
-	embedded, err := json.Marshal(fixtureGatewayBasicAuth(t, p, settings))
+	embeddedProvider := fixtureGatewayBasicAuth(t, p, settings)
+	// Compare credential semantics across the supported upstream encodings.
+	// Embedded provisioning uses base64 to avoid Caddy's short-input cache race.
+	for i := range embeddedProvider.AccountList {
+		hash, err := base64.StdEncoding.DecodeString(embeddedProvider.AccountList[i].Password)
+		if err != nil {
+			t.Fatal(err)
+		}
+		embeddedProvider.AccountList[i].Password = string(hash)
+	}
+	embedded, err := json.Marshal(embeddedProvider)
 	if err != nil {
 		t.Fatal(err)
 	}

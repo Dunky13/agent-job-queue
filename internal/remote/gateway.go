@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 )
 
 const embeddedGateway = "embedded-caddy-v1"
+const gatewayResponseTimeout = 30 * time.Second
 
 func prepareGatewayLog(p remotePaths) error {
 	path := filepath.Join(p.state, "gateway.log")
@@ -93,14 +95,25 @@ func gatewayConfiguration(p remotePaths, settings *Settings) ([]byte, error) {
 	disabled := false
 	// Match Caddy's basic_auth adapter default: its bounded upstream cache and
 	// singleflight keep each dashboard poll from recomputing cost-14 bcrypt.
-	basic := caddyauth.HTTPBasicAuth{HashRaw: b.raw(map[string]string{"algorithm": "bcrypt"}), AccountList: []caddyauth.Account{{Username: username, Password: settings.PasswordHash}}, HashCache: &caddyauth.Cache{}}
-	auth := caddyauth.Authentication{ProvidersRaw: caddy.ModuleMap{"http_basic": b.raw(basic)}}
+	// The pinned Caddy provider also accepts base64-encoded bcrypt hashes.
+	// Its decode path gives the 60-byte hash an exact-capacity backing slice,
+	// avoiding shared tail writes in its cache-key append for short passwords.
+	// Durable settings retain their original modular-crypt bcrypt format.
+	basic := caddyauth.HTTPBasicAuth{HashRaw: b.raw(map[string]string{"algorithm": "bcrypt"}), AccountList: []caddyauth.Account{{Username: username, Password: base64.StdEncoding.EncodeToString([]byte(settings.PasswordHash))}}, HashCache: &caddyauth.Cache{}}
+	limits := defaultAuthAdmission()
+	if settings.AuthAdmission != nil {
+		limits = *settings.AuthAdmission
+	}
+	if err := limits.validate(); err != nil {
+		return nil, err
+	}
+	auth := authAdmission{Limits: limits, Authentication: caddyauth.Authentication{ProvidersRaw: caddy.ModuleMap{"http_basic": b.raw(basic)}}}
 	responseHeaders := headers.Handler{Response: &headers.RespHeaderOps{HeaderOps: &headers.HeaderOps{Delete: []string{"Server"}}, Deferred: true}}
 	proxy := reverseproxy.Handler{Upstreams: reverseproxy.UpstreamPool{&reverseproxy.Upstream{Dial: "unix/" + p.socket}}, Headers: &headers.Handler{Request: &headers.HeaderOps{Delete: []string{"Authorization", "Forwarded", "X-Forwarded-Host"}, Set: http.Header{"X-Forwarded-Proto": []string{"https"}}}}}
 	httpApp := caddyhttp.App{GracePeriod: caddy.Duration(time.Second), Servers: map[string]*caddyhttp.Server{"remote": {
 		Listen: []string{net.JoinHostPort(settings.Hosts[0], fmt.Sprint(settings.Port))}, Protocols: []string{"h1", "h2"}, AutoHTTPS: &caddyhttp.AutoHTTPSConfig{DisableRedir: true}, TLSConnPolicies: caddytls.ConnectionPolicies{&caddytls.ConnectionPolicy{ProtocolMin: "tls1.2"}},
-		ReadHeaderTimeout: caddy.Duration(5 * time.Second), ReadTimeout: caddy.Duration(30 * time.Second), WriteTimeout: caddy.Duration(30 * time.Second), IdleTimeout: caddy.Duration(30 * time.Second), MaxHeaderBytes: 16384,
-		Routes: caddyhttp.RouteList{{MatcherSetsRaw: caddyhttp.RawMatcherSets{caddy.ModuleMap{"host": b.raw(settings.Hosts)}}, HandlersRaw: []json.RawMessage{b.module(responseHeaders, "handler", "headers"), b.module(auth, "handler", "authentication"), b.module(proxy, "handler", "reverse_proxy")}, Terminal: true}},
+		ReadHeaderTimeout: caddy.Duration(5 * time.Second), ReadTimeout: caddy.Duration(30 * time.Second), WriteTimeout: caddy.Duration(gatewayResponseTimeout), IdleTimeout: caddy.Duration(30 * time.Second), MaxHeaderBytes: 16384,
+		Routes: caddyhttp.RouteList{{MatcherSetsRaw: caddyhttp.RawMatcherSets{caddy.ModuleMap{"host": b.raw(settings.Hosts)}}, HandlersRaw: []json.RawMessage{b.module(responseHeaders, "handler", "headers"), b.module(&auth, "handler", "agent_queue_auth_admission"), b.module(proxy, "handler", "reverse_proxy")}, Terminal: true}},
 	}}}
 	tlsApp := caddytls.TLS{Automation: &caddytls.AutomationConfig{Policies: []*caddytls.AutomationPolicy{{SubjectsRaw: settings.Hosts, IssuersRaw: []json.RawMessage{b.module(caddytls.InternalIssuer{CA: "local"}, "module", "internal")}}}}}
 	pkiApp := caddypki.PKI{CAs: map[string]*caddypki.CA{"local": {InstallTrust: &disabled}}}
