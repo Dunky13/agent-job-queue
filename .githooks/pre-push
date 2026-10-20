@@ -21,7 +21,7 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
                 # checker treats a zero remote SHA as the full initial history.
                 base=$remote_sha
             fi
-            python3 scripts/check-commits.py --base "$base" --head "$local_sha" --verify-local
+            go run -p 2 ./cmd/queue-tool check-commits --base "$base" --head "$local_sha" --verify-local
             ;;
     esac
 done

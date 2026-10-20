@@ -25,14 +25,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Verify pre-push PR-range and fail-closed behavior
-        run: python3 -m unittest discover -s tests -p test_git_hooks.py -v
+        run: go test -p 2 ./internal/tooling -run TestPrePush -v
       - name: Check DCO and verified signatures
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 scripts/check-commits.py --base "$BASE_SHA" --head "$HEAD_SHA" --github-repository "$GITHUB_REPOSITORY"
+        run: go run -p 2 ./cmd/queue-tool check-commits --base "$BASE_SHA" --head "$HEAD_SHA" --github-repository "$GITHUB_REPOSITORY"
 
   lint:
     name: Lint
@@ -42,9 +46,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          python-version: '3.12'
+          go-version-file: go.mod
+          cache: true
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
@@ -52,9 +57,23 @@ jobs:
       - run: brew install actionlint shellcheck
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
-      - run: python -m pip install -r requirements-dev.txt
       - run: npm ci
       - run: bash scripts/lint.sh
+
+  vulnerability-check:
+    name: Go vulnerability scan
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check shipped CLI and HTTPS dependencies
+        run: go run -p 2 golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./cmd/agent-heavy ./cmd/agent-remote
 
   macos-tests:
     name: macOS tests (${{ matrix.os }})
@@ -68,33 +87,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          python-version: '3.12'
-      - run: brew install pueue caddy
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-      - run: python -m pip install --require-hashes -r remote/requirements.lock
-      - name: Core unit tests
-        run: python -m unittest discover -s tests -p test_agent_heavy.py -v
-      - name: Resource sampling and admission tests
-        run: python -m unittest discover -s tests -p 'test_resource*.py' -v
-      - name: Worktree identity and learning tests
-        run: |
-          python -m unittest discover -s tests -p test_job_profiles.py -v
-          python -m unittest discover -s tests -p 'test_learning*.py' -v
-      - name: Release identity and app update tests
-        run: |
-          python -m unittest discover -s tests -p test_release_metadata.py -v
-          python -m unittest discover -s tests -p test_updates.py -v
-          python -m unittest discover -s tests -p 'test_homebrew_*.py' -v
-          python -m unittest discover -s packaging/homebrew -p test_refresh.py -v
-      - name: Agent instruction integration tests
-        run: python -m unittest discover -s tests -p test_agent_integration.py -v
-      - name: Isolated real-daemon acceptance tests
-        run: python -m unittest discover -s tests -p test_integration.py -v
-      - name: Real HTTPS and API tests
-        run: python -m unittest discover -s remote/tests -p test_remote.py -v
+          go-version-file: go.mod
+          cache: true
+      - name: Go unit, ownership, SQLite, real daemon, HTTPS, and installer regressions
+        run: go test -p 2 -parallel 2 -race ./cmd/... ./internal/... ./packaging/homebrew ./remote/static -timeout 12m
       - name: Native regression tests
         run: bash scripts/test-native.sh
 
@@ -106,16 +104,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          python-version: '3.12'
+          go-version-file: go.mod
+          cache: true
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
           cache: npm
-      - run: python -m pip install --require-hashes -r remote/requirements.lock
       - run: npm ci
       - run: npx playwright install --with-deps chromium
+      - run: go build -p 2 -trimpath -o build/queue-preview ./cmd/queue-preview
       - run: npm run test:web
       - run: npm run test:browser
 
@@ -127,14 +126,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          python-version: '3.12'
+          go-version-file: go.mod
+          cache: true
       - name: Build macOS 15+ universal installer app
         run: scripts/build-installer.sh
       - name: Generate immutable release manifest and Homebrew cask
         run: |
-          python packaging/homebrew/render_cask.py \
+          go run -p 2 ./cmd/queue-tool render-cask \
             --archive "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" \
             --version "$(cat VERSION)" --tag "build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" \
             --commit "$GITHUB_SHA" --build "$GITHUB_RUN_NUMBER" --output dist
@@ -144,11 +144,7 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_DEVELOPER: '1'
-        run: python -m unittest discover -s tests -p test_homebrew.py -v
-      - name: Install daemon for isolated installer smoke test
-        run: brew install pueue
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
+        run: go test -p 2 ./internal/tooling -run TestHomebrew -v
       - name: Verify payload and first install / upgrade behavior
         run: scripts/test-installer.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip"
       - name: Upload installer and checksums
@@ -161,7 +157,7 @@ jobs:
 
   ci-required:
     name: ci-required
-    needs: [commit-policy, lint, macos-tests, web-tests, installer]
+    needs: [commit-policy, lint, vulnerability-check, macos-tests, web-tests, installer]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -170,16 +166,12 @@ jobs:
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import sys
-          results = json.loads(os.environ['RESULTS'])
-          failed = [name for name, job in results.items() if job['result'] != 'success']
-          if failed:
-              sys.exit('Required jobs did not pass: ' + ', '.join(failed))
-          print('All required validation jobs passed.')
-          PY
+          if printf '%s' "$RESULTS" | jq -e 'all(.[]; .result == "success")' >/dev/null; then
+            echo 'All required validation jobs passed.'
+          else
+            echo 'Required validation jobs did not pass.' >&2
+            exit 1
+          fi
 
   publish:
     name: Publish main installer
@@ -194,6 +186,13 @@ jobs:
         with:
           name: Agent-Job-Queue-Installer
           path: dist
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Publish immutable main build
         env:
           GH_TOKEN: ${{ github.token }}
@@ -206,23 +205,7 @@ jobs:
             for asset in dist/*; do
               gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "${asset##*/}" --dir "$existing"
             done
-            python3 - "$existing" "$GITHUB_SHA" <<'PY'
-          import hashlib
-          import json
-          import sys
-          from pathlib import Path
-          existing = Path(sys.argv[1])
-          if json.loads((existing / 'release.json').read_text())['targetCommitish'] != sys.argv[2]:
-              sys.exit('Existing immutable release has a different target commit')
-          for asset in Path('dist').iterdir():
-              with asset.open('rb') as handle:
-                  expected = hashlib.file_digest(handle, 'sha256').hexdigest()
-              with (existing / asset.name).open('rb') as handle:
-                  actual = hashlib.file_digest(handle, 'sha256').hexdigest()
-              if actual != expected:
-                  sys.exit('Existing immutable release differs: ' + asset.name)
-          print('Existing release target and all assets match; no overwrite performed.')
-          PY
+            go run -p 2 ./cmd/queue-tool verify-release --existing "$existing" --assets dist --commit "$GITHUB_SHA"
           else
             notes=$(mktemp)
             trap 'rm -f "$notes"' EXIT
@@ -248,9 +231,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          python-version: '3.12'
+          go-version-file: go.mod
+          cache: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: Agent-Job-Queue-Installer
@@ -278,5 +262,5 @@ jobs:
           GH_TOKEN: ${{ steps.tap-token.outputs.token }}
           SOURCE_GH_TOKEN: ${{ github.token }}
         run: |
-          python packaging/homebrew/sync.py --manifest dist/agent-job-queue.json \
+          go run -p 2 ./cmd/queue-delivery --manifest dist/agent-job-queue.json \
             --timeout 600 --poll-interval 5 | tee -a "$GITHUB_STEP_SUMMARY"

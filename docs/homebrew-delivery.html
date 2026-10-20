@@ -22,14 +22,17 @@
 <pre><code>gh workflow run refresh.yml --repo Dunky13/homebrew-agent-job-queue --ref tap</code></pre>
 <p>To inspect the workflow runs:</p>
 <pre><code>gh run list --repo Dunky13/homebrew-agent-job-queue --workflow refresh.yml --limit 5</code></pre>
-<p>Changes to the trusted tap files need a reviewed companion tap PR. Copy <code>refresh.py</code>, <code>render_cask.py</code>, <code>test-cask.rb</code>, <code>test_refresh.py</code> and <code>.github/workflows/refresh.yml</code> from <code>packaging/homebrew/</code>, together with the root <code>release_metadata.py</code>. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated <code>Casks/</code> files manually or execute arbitrary code from a release to repair drift.</p>
+<p>Changes to the trusted tap files need a reviewed companion tap PR. Copy the standalone <code>refresh.go</code>, <code>refresh_test.go</code>, <code>test-cask.rb</code>, and <code>.github/workflows/refresh.yml</code> from <code>packaging/homebrew/</code>, together with the root <code>LICENSE</code>. The tap helper uses only the Go standard library and never downloads application source or dependencies to execute. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated <code>Casks/</code> files manually or execute arbitrary code from a release to repair drift.</p>
 <p>After verified delivery, Homebrew users can upgrade normally:</p>
 <pre><code>brew update
 brew upgrade --cask dunky13/agent-job-queue/agent-job-queue</code></pre>
 <p>Publishing a release or updating the tap does not install the app on the operator&#x27;s Mac. Version visibility requires the new app to be installed and running; open its gear menu and choose <strong>About and updates</strong>.</p>
 <h2>Validation</h2>
 <p>Source-side tests simulate exact-run dispatch, failures, deadline expiry, token routing, signed readback, canonical helper/cask comparison, conflicting identities and verified supersession. Tap tests simulate pagination, requested release validation, checksum failures, stale heads, idempotence, ancestry and signed publication. They do not call GitHub, install an app or use the live queue.</p>
-<pre><code>python -m unittest discover -s tests -p &#x27;test_homebrew_*.py&#x27; -v
-python -m unittest discover -s packaging/homebrew -p test_refresh.py -v</code></pre>
+<p>From the app source checkout:</p>
+<pre><code>go test -p 2 ./internal/delivery ./internal/tooling ./packaging/homebrew -v</code></pre>
+<p>From the standalone tap checkout, using Go 1.26 or later:</p>
+<pre><code>go test -p 2 refresh.go refresh_test.go
+go vet refresh.go</code></pre>
 <p>This guide has a complete standalone <a href="homebrew-delivery.html">HTML version</a>. API and setup references: <a href="https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event">workflow dispatch</a>, <a href="https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app">App registration</a>, <a href="https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/managing-private-keys-for-github-apps">App keys</a>, and <a href="https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule">schedule behavior</a>.</p>
 </main></html>

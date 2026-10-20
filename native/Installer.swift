@@ -7,7 +7,7 @@ enum InstallerActivity { static var running = false }
 
 @MainActor
 final class InstallerModel: ObservableObject {
-    @Published var output = "Install Agent Queue for your macOS account.\n\nRequires Homebrew and an internet connection. Existing queue settings and running jobs are preserved. Phone access stays off until you enable it.\n"
+    @Published var output = "Install Agent Queue for your macOS account.\n\nIncludes its queue and HTTPS runtime for offline installation. Finish or cancel all existing jobs before the first legacy queue migration. Later embedded queue upgrades preserve running jobs and settings. Phone access stays off until you enable it.\n"
     @Published var running = false
     @Published var completed = false
     private var process: Process?

@@ -1,23 +1,13 @@
 #!/bin/bash
-# Finite local equivalent of CI. Apply the caller's heavy-command admission policy once.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
-[[ -x .venv/bin/python ]] || { echo 'Create the development venv first; see CONTRIBUTING.md.' >&2; exit 1; }
-export PATH="$root/.venv/bin:$PATH"
-export AGENT_QUEUE_TEST_PYTHON="$root/.venv/bin/python"
 bash scripts/lint.sh
-python -m unittest discover -s tests -p test_agent_heavy.py -v
-python -m unittest discover -s tests -p 'test_resource*.py' -v
-python -m unittest discover -s tests -p test_job_profiles.py -v
-python -m unittest discover -s tests -p 'test_learning*.py' -v
-python -m unittest discover -s tests -p test_release_metadata.py -v
-python -m unittest discover -s tests -p test_updates.py -v
-python -m unittest discover -s tests -p 'test_homebrew_*.py' -v
-python -m unittest discover -s packaging/homebrew -p test_refresh.py -v
-python -m unittest discover -s tests -p test_agent_integration.py -v
-python -m unittest discover -s tests -p test_integration.py -v
-python -m unittest discover -s remote/tests -p test_remote.py -v
+go run -p 2 golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./cmd/agent-heavy ./cmd/agent-remote
+go test -p 2 -parallel 2 -race ./cmd/... ./internal/... ./packaging/homebrew ./remote/static -timeout 12m
+bash scripts/build-go.sh
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 2 -trimpath -o build/queue-preview-linux ./cmd/queue-preview
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 2 -trimpath -o build/queue-tool-linux ./cmd/queue-tool
 npm run test:web
 npm run test:browser
 bash scripts/test-native.sh

@@ -1,11 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-python scripts/check-public-source.py
-python -m ruff check .
+go run -p 2 ./cmd/queue-tool check-source
+unformatted=$(gofmt -l cmd internal remote/static/embed.go packaging/homebrew/refresh.go packaging/homebrew/refresh_test.go)
+[[ -z "$unformatted" ]] || { printf 'Go files need formatting:\n%s\n' "$unformatted" >&2; exit 1; }
+go vet -p 2 ./cmd/... ./internal/... ./packaging/homebrew ./remote/static
 npm run lint:web
-shellcheck bin/agent-heavy bin/agent-remote .githooks/pre-push scripts/lint.sh scripts/test-native.sh scripts/capture-native-screenshots.sh native/tests/run-menu-bar-ui-tests.sh
+shellcheck bin/agent-heavy bin/agent-remote packaging/links/agent-heavy packaging/links/agent-remote .githooks/pre-push
 while IFS= read -r -d '' path; do
+  [[ -f "$path" ]] || continue
+  case "$(head -n 1 "$path")" in
+    '#!/bin/zsh'|'#!/usr/bin/env zsh') ;;
+    *) shellcheck "$path" ;;
+  esac
   zsh -n "$path"
 done < <(git ls-files --cached --others --exclude-standard -z '*.sh')
 actionlint .github/workflows/ci.yml packaging/homebrew/.github/workflows/refresh.yml

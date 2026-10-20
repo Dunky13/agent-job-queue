@@ -30,7 +30,7 @@ On macOS 15 or later, install the app and CLI through the project's [Homebrew ta
 brew install --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
-Homebrew installs the dependencies, sets up your private queue, and opens the menu-bar app. Both `agent-heavy` and `agent-remote` are linked into Homebrew's bin directory. No Xcode or manual installer window is needed.
+Homebrew sets up your private queue and opens the menu-bar app. Both `agent-heavy` and `agent-remote` are linked into Homebrew's bin directory. No Xcode or manual installer window is needed.
 
 The build is ad hoc signed and not notarized. The cask removes only `com.apple.quarantine` from its own staged download before running the installer, so installation does not require an Apple Developer Program membership or a Gatekeeper approval prompt. The download's SHA-256 is verified first; signatures and other extended attributes remain intact. This is a deliberate trust decision for this project's tap and does not change system-wide security settings.
 
@@ -46,16 +46,18 @@ Uninstalling the cask removes the menu app and Homebrew command links. It preser
 
 ### Installer app
 
-1. Use macOS 15 or later on an Apple Silicon or Intel Mac. Install [Homebrew](https://brew.sh/) first.
+1. Use macOS 15 or later on an Apple Silicon or Intel Mac.
 2. Download the installer ZIP or DMG from [Releases](https://github.com/Dunky13/agent-job-queue/releases). Every successful push to `main` publishes a new prerelease build with SHA-256 checksums. CI runs also retain the installer as an artifact for 30 days.
-3. Open **Agent Job Queue Installer.app**, then choose **Install**. The installer displays progress and dependency errors in its window.
+3. Open **Agent Job Queue Installer.app**, then choose **Install**. The installer displays progress and any errors in its window.
 4. The app appears in your menu bar. Add your local bin directory to your shell's `PATH` to use `agent-heavy` by name.
 
-The installer includes prebuilt universal executables, so Xcode is not required. Homebrew supplies Pueue, Caddy, uv, and Python 3.12; the installer needs an internet connection to install missing dependencies and the locked Python environment. It installs into your user account without `sudo`.
+The installer includes prebuilt universal executables and a Go queue daemon. The Go remote service embeds Caddy's HTTPS and authentication modules. Installation works offline after downloading the artifact; Homebrew, Pueue, Python, uv, Xcode, and a Go toolchain are not required on the installed Mac. It installs into your user account without `sudo`.
 
 The installer and app are ad hoc signed. Apple Developer ID signing and notarization are not configured, so macOS may require approval in Privacy & Security before opening a manually downloaded build. Installer checksums identify the downloaded bytes; they do not replace Apple notarization.
 
-Upgrades preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. Only the menu-bar UI is replaced. Existing dependencies are not upgraded by the installer.
+Upgrades of the embedded Go queue preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. The native app and Go support binaries are replaced atomically.
+
+For the first upgrade from Pueue, finish all running and waiting jobs first. If migrating from the Python backend, also disable remote access in the old app. The installer refuses an unsafe migration before replacing support files, then replaces the drained private daemon and resource controller. Completed job IDs, logs, learning history, operator settings, and remote credentials are retained. Previously installed Homebrew packages are left alone because other software may use them.
 
 ### If macOS blocks opening the app
 
@@ -124,7 +126,7 @@ Use the same shared queue across repositories and worktrees. Keep each tool's
 internal worker count conservative. Run small focused checks directly.
 ```
 
-Pueue owns submitted jobs independently of the calling terminal and menu app. Closing the UI does not stop jobs. Abruptly losing a submitter leaves its accepted job visible until it finishes or is explicitly cancelled.
+The Go queue daemon owns submitted jobs independently of the calling terminal and menu app. Closing the UI does not stop jobs. Abruptly losing a submitter leaves its accepted job visible until it finishes or is explicitly cancelled.
 
 ## View and manage jobs
 
@@ -162,7 +164,7 @@ agent-heavy scheduling adaptive
 agent-heavy scheduling fixed
 ```
 
-Changing the limit is an explicit operator choice. Adaptive mode cannot increase it. It reserves room for later job peaks, waits during memory pressure or active swapping, and requires a recovery interval before starting more work. Unfamiliar workloads run alone until comparable successful measurements accumulate. If resource telemetry is unavailable or stale, adaptive jobs remain waiting with an explanation. Fixed and learning modes remain available. Returning to Fixed returns waiting jobs to ordinary Pueue scheduling without stopping active jobs. **Start now** is an explicit override of resource admission and the parallel limit.
+Changing the limit is an explicit operator choice. Adaptive mode cannot increase it. It reserves room for later job peaks, waits during memory pressure or active swapping, and requires a recovery interval before starting more work. Unfamiliar workloads run alone until comparable successful measurements accumulate. If resource telemetry is unavailable or stale, adaptive jobs remain waiting with an explanation. Fixed and learning modes remain available. Returning to Fixed returns waiting jobs to ordinary queue scheduling without stopping active jobs. **Start now** is an explicit override of resource admission and the parallel limit.
 
 Worktrees of the same repository share a logical workload family, using repository-relative task and target identity rather than checkout paths or branch names. Changed source revisions, scripts, dependencies, toolchains and worker settings create variants that cautiously borrow the family's history. New worktrees can have cold caches; their timing is not assumed to match a warm checkout. For opaque commands, an optional logical name can relate comparable jobs deliberately:
 
@@ -188,7 +190,7 @@ The settings window displays the HTTPS address and certificate sharing controls:
 
 The dashboard shows the queue, details and logs, and supports reordering, concurrency changes, starting, and cancelling jobs. Connection failures preserve the last data and disable mutations until a successful refresh. No router forwarding or public hosting is configured.
 
-Caddy provides HTTPS and Basic authentication. Only a bcrypt hash is stored. Flask-WTF handles CSRF checks, and Waitress serves a private Unix-socket API with a fixed queue-control allowlist. Disabling access stops only the remote service. Quitting the menu app leaves an enabled remote service running independently. A failed stop remains visible as **Needs attention**.
+Caddy's Go modules provide HTTPS and Basic authentication inside the remote server process. Only a bcrypt hash is stored. Gorilla CSRF protects mutations, and the Go HTTP server serves a private Unix-socket interface with a fixed queue-control allowlist. Existing passwords and certificate trust survive the embedded gateway upgrade. Disabling access stops only the remote service. Quitting the menu app leaves an enabled remote service running independently. A failed stop remains visible as **Needs attention**.
 
 ## Local data and service operation
 
@@ -198,27 +200,29 @@ The installation uses these intentional per-user locations:
 | --- | --- |
 | App | `~/Applications/Agent Queue.app` |
 | CLI commands | `~/.local/bin/agent-heavy`, `~/.local/bin/agent-remote` |
-| Runtime source and Python environment | `~/.local/share/agent-heavy/` |
+| Go backend binaries, build identity, and licenses | `~/.local/share/agent-heavy/` |
 | Private configuration | `~/.config/agent-heavy/` |
 | Private jobs, receipts, logs and daemon state | `~/.local/state/agent-heavy/` |
 | Login services | `~/Library/LaunchAgents/io.went.agent-*.plist` |
 
-The dedicated Pueue daemon uses a private Unix socket. Existing default Pueue installations are not reused. The queue fails closed when its daemon, state, or process ownership cannot be verified. Do not clear a lock or kill a process to bypass an unknown owner.
+The dedicated Go daemon uses a private Unix socket and a durable SQLite database. The queue fails closed when its daemon, state, or process ownership cannot be verified. Do not clear a lock or kill a process to bypass an unknown owner.
+
+After an unclean daemon restart, automatic scheduling remains paused while owned workers and their outcomes are reconciled. Inspect `agent-heavy status`, then use `agent-heavy resume` to resume the queue. `agent-heavy pause` holds future automatic starts without stopping active jobs. An uncertain command attempt is never automatically replayed.
 
 `agent-remote status --json` reports the remote service. `agent-remote disable` stops it. Passwords are passed privately through the native settings form, not command-line arguments.
 
-For an optional migration bridge, `AGENT_HEAVY_LEGACY_SLOT` selects an existing external lease directory; otherwise the queue uses its private execution lease. `AGENT_HEAVY_CONFIG` and `AGENT_HEAVY_STATE` select alternative queue configuration and state. `AGENT_HEAVY_PUEUE` and `AGENT_REMOTE_CADDY` can select absolute executable paths. Set overrides consistently for both submitters and the daemon environment.
+For an optional migration bridge, `AGENT_HEAVY_LEGACY_SLOT` selects an existing external lease directory; otherwise the queue uses its private execution lease. `AGENT_HEAVY_STATE` selects an alternative private queue state directory. `AGENT_HEAVY_CONFIG` retains the legacy configuration location for migration. Set overrides consistently for both submitters and the daemon environment.
 
 ## Development and CI
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for local commands and the [workflow](.github/workflows/ci.yml) for exact hosted checks.
 
-Pull requests run Python and JavaScript lint, shell and workflow checks, core unit tests, isolated Pueue acceptance tests, real Caddy HTTPS/API tests, browser regression tests, native Swift regression tests, and universal installer verification. macOS behavior is tested on Apple Silicon and Intel runners. All validation jobs feed one required `ci-required` check; a failure, cancellation, or skipped required job fails that check.
+Pull requests run Go formatting, vet, vulnerability scanning and race tests, JavaScript lint, shell and workflow checks, isolated Go daemon acceptance tests, embedded Caddy HTTPS/API tests, browser regression tests, native Swift regression tests, and universal installer verification. The workflow runs macOS behavior on Apple Silicon and Intel runners. All validation jobs feed one required `ci-required` check; a failure, cancellation, or skipped required job fails that check.
 
 `main` requires a pull request, current passing checks, resolved review conversations, and verified commit signatures. Force pushes and deletion are blocked, including for administrators. Commits also require an author-matching DCO sign-off. The initial repository import bootstraps the branch; later changes use pull requests.
 
-Only a successful `main` workflow can publish an installer. Pull request code receives read-only repository permissions. Actions are pinned to immutable commit SHAs, npm dependencies use a lockfile, and runtime Python dependencies are hash locked.
+Only a successful `main` workflow can publish an installer. Pull request code receives read-only repository permissions. Actions are pinned to immutable commit SHAs, npm dependencies use a lockfile, and Go dependencies are pinned in `go.mod` and `go.sum`.
 
 ## License
 
-[MIT](LICENSE). See [third-party notices](THIRD-PARTY-NOTICES.md) for bundled Zod and separately installed dependencies.
+[MIT](LICENSE). See [third-party notices](THIRD-PARTY-NOTICES.md) for bundled Go modules, Zod, and separately installed dependencies.
