@@ -125,6 +125,7 @@ final class LearningStore: ObservableObject {
     let fixtureMode: Bool
     let pageSize = 50
     private var selectionGeneration = 0
+    private var selectionTask: Task<Void, Never>?
     private let command: @Sendable ([String], Data?) async throws -> Data
 
     init(fixtureMode: Bool = false, command: @escaping @Sendable ([String], Data?) async throws -> Data = {
@@ -177,14 +178,15 @@ final class LearningStore: ObservableObject {
                 let result = try await readCatalog(offset: max(0, offset), query: requestedQuery)
                 catalog = result
                 if (!preserveSelection || selectedID == nil) && selectionGeneration == requestedGeneration {
-                    selectionGeneration += 1
-                    let generation = selectionGeneration
-                    selectedID = result.profiles.first?.id
-                    detail = nil
-                    if let id = selectedID {
-                        let next = try await readDetail(id)
-                        if selectedID == id && selectionGeneration == generation { apply(next) }
-                    } else { clearDraft() }
+                    if let id = result.profiles.first?.id { await select(id)?.value }
+                    else {
+                        selectionTask?.cancel()
+                        selectionGeneration += 1
+                        selectedID = nil
+                        detail = nil
+                        isDetailLoading = false
+                        clearDraft()
+                    }
                 }
             } catch { self.error = "Could not load learned workloads. \(error.localizedDescription)" }
         }
@@ -193,6 +195,8 @@ final class LearningStore: ObservableObject {
     @discardableResult
     func select(_ id: String) -> Task<Void, Never>? {
         guard !fixtureMode else { return nil }
+        let previous = selectionTask
+        previous?.cancel()
         selectionGeneration += 1
         let generation = selectionGeneration
         selectedID = id
@@ -201,17 +205,25 @@ final class LearningStore: ObservableObject {
         clearDraft()
         error = nil
         notice = nil
-        return Task {
+        let task = Task {
             defer { if selectionGeneration == generation { isDetailLoading = false } }
             do {
+                // Wait for the obsolete private read to be reaped before starting
+                // another. Rapid selections keep at most one live detail child.
+                await previous?.value
+                try Task.checkCancellation()
                 let next = try await readDetail(id)
-                if selectedID == id && selectionGeneration == generation { apply(next) }
+                if !Task.isCancelled && selectedID == id && selectionGeneration == generation { apply(next) }
+            } catch is CancellationError {
+                // Superseding a selection is not a workload-loading error.
             } catch {
                 if selectedID == id && selectionGeneration == generation {
                     self.error = "Could not load this workload. \(error.localizedDescription)"
                 }
             }
         }
+        selectionTask = task
+        return task
     }
 
     @discardableResult

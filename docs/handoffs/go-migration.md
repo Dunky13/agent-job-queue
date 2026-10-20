@@ -93,12 +93,12 @@ The universal native executable rebuilt for Apple Silicon and Intel, and all 134
 
 ## Local installer artifacts
 
-These version 0.1.0 artifacts include the reviewed command compatibility and CI fixes, and predate the later native row-selection correction. They were built from the local working tree for verification. Their release commit and build fields are null; they are not published releases.
+These version 0.1.0 artifacts were rebuilt after the native row-selection and security/performance corrections. They were built from the local working tree for verification and passed the complete installer, payload, and mounted-image checks. Their release commit and build fields are null; they are not published releases.
 
 - ZIP: `dist/Agent-Job-Queue-Installer-0.1.0-universal.zip`
-- ZIP SHA-256: `4774a9b6f6c24e3e58bbe59b6dccd99304aaa074cfd5fe796ea1f5839539745a`
+- ZIP SHA-256: `2cb44eb62e7d145149bfd54e4a7d9a8799ac861692083d6a927d652cf21f5568`
 - DMG: `dist/Agent-Job-Queue-Installer-0.1.0-universal.dmg`
-- DMG SHA-256: `298ec754d589e9e0e6107b5c145b55e98a8188369ec0ad59a7f8e8f7ce397df4`
+- DMG SHA-256: `1c1eceb64750c2f56ff87dbf335351d1b8fd6b75b18527f76adbb04c0ce8581f`
 
 ## Verification boundaries
 
@@ -119,3 +119,5 @@ agent-heavy run --label "Agent Queue validation" -- bash scripts/validate.sh
 Inspect `agent-heavy status` after a paused recovery before explicitly choosing `agent-heavy resume`. Do not remove locks or discard an unknown process owner to resume work.
 
 This handoff has a complete self-contained [HTML version](go-migration.html).
+
+The subsequent [security and performance implementation](security-performance.md), with its self-contained [HTML version](security-performance.html), records authentication admission, operational indexing, profile batching, native cancellation/capture, off-main snapshot preparation, measurements, and validation boundaries.
