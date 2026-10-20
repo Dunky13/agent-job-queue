@@ -569,36 +569,54 @@ func readConfigurationInput(reader io.Reader) (map[string]json.RawMessage, error
 	}
 }
 
-func (c *controller) configure(value map[string]json.RawMessage) error {
+type preparedConfiguration struct {
+	passwordHash string
+	port         int
+}
+
+func prepareConfiguration(value map[string]json.RawMessage) (*preparedConfiguration, error) {
 	password, ok := text(value["password"])
 	if !ok || utf8.RuneCountInString(password) < 4 || !printable(password) {
-		return errors.New("Use at least 4 characters. No special characters required.")
+		return nil, errors.New("Use at least 4 characters. No special characters required.")
 	}
 	if len(password) > 72 {
-		return errors.New("Password must be at most 72 UTF-8 bytes for Caddy bcrypt")
+		return nil, errors.New("Password must be at most 72 UTF-8 bytes for Caddy bcrypt")
 	}
 	port := int64(defaultPort)
 	if value["port"] != nil {
 		var valid bool
 		port, valid = integer(value["port"], 1024, 65535)
 		if !valid {
-			return errors.New("Port must be from 1024 to 65535")
+			return nil, errors.New("Port must be from 1024 to 65535")
 		}
-	}
-	if err := c.p.prepare(); err != nil {
-		return err
-	}
-	previous, err := loadSettings(c.p)
-	if err != nil {
-		return err
 	}
 	hashed, err := bcrypt.GenerateFromPassword([]byte(password), 14)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	hash := strings.TrimSpace(string(hashed))
 	if !bcryptHash.MatchString(hash) {
-		return errors.New("Could not generate a valid password hash")
+		return nil, errors.New("Could not generate a valid password hash")
+	}
+	return &preparedConfiguration{passwordHash: hash, port: int(port)}, nil
+}
+
+func (c *controller) configure(value map[string]json.RawMessage) error {
+	prepared, err := prepareConfiguration(value)
+	if err != nil {
+		return err
+	}
+	return c.applyConfiguration(prepared)
+}
+
+func (c *controller) applyConfiguration(prepared *preparedConfiguration) error {
+	if err := c.p.prepare(); err != nil {
+		return err
+	}
+	// Read the latest enabled choice under control.lock, after expensive hashing.
+	previous, err := loadSettings(c.p)
+	if err != nil {
+		return err
 	}
 	hosts, err := c.allowedHosts()
 	if err != nil {
@@ -608,7 +626,7 @@ func (c *controller) configure(value map[string]json.RawMessage) error {
 	if _, err := rand.Read(key); err != nil {
 		return err
 	}
-	settings := &Settings{Enabled: previous != nil && previous.Enabled, Username: username, Port: int(port), Hosts: hosts, PasswordHash: hash, SecretKey: hex.EncodeToString(key)}
+	settings := &Settings{Enabled: previous != nil && previous.Enabled, Username: username, Port: prepared.port, Hosts: hosts, PasswordHash: prepared.passwordHash, SecretKey: hex.EncodeToString(key)}
 	// Caddy validation provisions modules and can generate a CA. Keep configure
 	// pure with respect to gateway state; only the acknowledged service child
 	// may provision the generated configuration.
@@ -1542,6 +1560,12 @@ func (c *controller) supervisor() (result error) {
 
 // Main is the standalone remote controller entrypoint.
 func Main(arguments []string) int {
+	return runMain(arguments, os.Stdin, prepareConfiguration, func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 30*time.Second)
+	})
+}
+
+func runMain(arguments []string, inputReader io.Reader, prepare func(map[string]json.RawMessage) (*preparedConfiguration, error), lifecycleContext func() (context.Context, context.CancelFunc)) int {
 	if len(arguments) == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
 		fmt.Println(remoteUsage)
 		return 0
@@ -1575,10 +1599,22 @@ func Main(arguments []string) int {
 	if err != nil {
 		return printFailure(err)
 	}
+	var prepared *preparedConfiguration
+	var preparationErr error
+	if action == "configure" {
+		var input map[string]json.RawMessage
+		input, preparationErr = readConfigurationInput(inputReader)
+		if preparationErr == nil {
+			prepared, preparationErr = prepare(input)
+		}
+	}
+	// Credential preparation has no service side effects and must not consume
+	// the finite stop/start budget, especially on slower CPUs. Only lifecycle
+	// work holds control.lock; applyConfiguration rereads authoritative settings.
 	ctx := context.Background()
 	var cancel context.CancelFunc
 	if action == "configure" || action == "enable" || action == "disable" || action == "migrate" {
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		ctx, cancel = lifecycleContext()
 		defer cancel()
 	}
 	c := newController(p, ctx)
@@ -1594,10 +1630,9 @@ func Main(arguments []string) int {
 		defer unlock()
 		switch action {
 		case "configure":
-			var input map[string]json.RawMessage
-			input, err = readConfigurationInput(os.Stdin)
+			err = preparationErr
 			if err == nil {
-				err = c.configure(input)
+				err = c.applyConfiguration(prepared)
 			}
 		case "enable":
 			err = c.enable()

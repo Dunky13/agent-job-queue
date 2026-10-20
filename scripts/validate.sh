@@ -13,3 +13,4 @@ npm run test:browser
 bash scripts/test-native.sh
 scripts/build-installer.sh
 scripts/test-installer.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip"
+bash scripts/test-dmg.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.dmg"

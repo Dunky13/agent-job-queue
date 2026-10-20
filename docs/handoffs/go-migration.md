@@ -69,20 +69,34 @@ Installer fixtures cover fully drained migration, offline compressed legacy stat
 
 Independent GPT-6.1 Sol high reviews covered daemon recovery, stale writes, installer ownership, package suitability, process liveness, and delivery tooling. The final Standards review found no material violation; the Spec review's two confirmed command defects were corrected and reviewed again without a remaining material execution or ownership finding. The tap review's outdated recovery instructions were also corrected. Source review is separate from runtime evidence.
 
+## CI follow-up and actual app verification
+
+[Source CI run 39477254885](https://github.com/Dunky13/agent-job-queue/actions/runs/39477254885) passed commit policy, lint, vulnerability scanning, web tests, and the Apple Silicon runtime suite. The Intel runtime suite failed during enabled credential reconfiguration: remote shutdown exhausted its tool deadline and reported a busy service registry. The universal installer compiled and signed successfully, then failed with `hdiutil: create failed - Resource busy`.
+
+An initial probe using real cost-14 hashing exhausted a short lifecycle budget before shutdown began and reproduced the tool-deadline error. The permanent regression injects lifecycle expiration during preparation, making the ordering check independent of CPU speed. It failed before the fix and passes for enabled and disabled configuration, a concurrent disable, and invalid input. Configure now prepares credentials before starting the existing 30-second service deadline and acquiring the control lock. It rereads authoritative enabled state under that lock before publishing configuration. Password hash cost and service deadlines remain unchanged. The exact registry contention branch from the hosted failure was not individually traced.
+
+The packaging log did not identify the process holding the resource. Packaging now flushes staged writes, explicitly selects HFS+, disables image indexing, and retains verbose phase diagnostics. These are contention mitigations, not proof of the original holder. The [runner-images investigation](https://github.com/actions/runner-images/issues/7522) documents this class of platform failure. No security service is stopped and no timeout or automatic retry is added. An alternative mount-free hybrid image was tested and rejected because it broke strict installer signatures.
+
+CI and the local validation batch now explicitly require a DMG check. It verifies checksums, mounts the image read-only at a private mountpoint, and verifies executable permissions, both architectures, build identities, and strict code signatures of its enclosed installer. Normal detachment is required; failed detach retains the temporary directory and fails validation. Strict signature verification caught the rejected hybrid-image regression that image checksums alone missed. Script regressions cover successful cleanup, verifier failure, failed detach, and an attachment that fails after exposing its simulated mount.
+
+The actual packaged native app was also launched with an isolated user home and real Go queue daemon and scheduler. Its native UI displayed running and waiting jobs, cancelled a running command through confirmation, displayed the next job's real completed output, and applied then restored the queue limit with CLI readback. The installed queue was preserved. This verifies those native interactions in the isolated running app; it does not establish installation or upgrade of the user's existing app.
+
+The final CI-fix validation passed lint and all remote and tooling race tests in 133.098 and 3.138 seconds respectively. The remote suite includes the real enabled reconfiguration flow from the failed Intel job. Both universal formats rebuilt successfully. Installer fixtures passed in 9.375 seconds, actual packaged queue execution in 5.43 seconds, and the actual packaged HTTPS gateway in 5.18 seconds. The explicit mounted-DMG check verified the rebuilt installer and detached successfully. An independent Sol 6.1 high follow-up review found no material issue in the deadline, ownership, packaging, or cleanup changes. Hosted results on the new commit remain separate evidence.
+
 ## Local installer artifacts
 
-These version 0.1.0 artifacts include the reviewed command compatibility fixes. They were built from the local working tree for verification. Their release commit and build fields are null; they are not published releases.
+These version 0.1.0 artifacts include the reviewed command compatibility and CI fixes. They were built from the local working tree for verification. Their release commit and build fields are null; they are not published releases.
 
 - ZIP: `dist/Agent-Job-Queue-Installer-0.1.0-universal.zip`
-- ZIP SHA-256: `7e8b8ca7ae67ba288c3b418e176e56985ba712fab2daa3224263c5b127ea2d76`
+- ZIP SHA-256: `4774a9b6f6c24e3e58bbe59b6dccd99304aaa074cfd5fe796ea1f5839539745a`
 - DMG: `dist/Agent-Job-Queue-Installer-0.1.0-universal.dmg`
-- DMG SHA-256: `13c36b3f759a6fe36e66108dd84030e2c7709bbc72f8698f11c82dad99cc4caf`
+- DMG SHA-256: `298ec754d589e9e0e6107b5c145b55e98a8188369ec0ad59a7f8e8f7ce397df4`
 
 ## Verification boundaries
 
 Installer payload tests exercise the Go installation flow with a test-owned launchctl fixture and an extracted universal payload. They then run the actual packaged daemon, client, and scheduler with system-only PATH. This does not establish execution of the packaged installer GUI or its full InstallMain entry point.
 
-Remote payload tests run the actual universal remote executable and its embedded HTTPS gateway. Native regressions are headless fixtures. Intel binaries are cross-built and inspected; actual Intel runtime and hosted CI require their separate runners. Local tests do not establish production installation, Apple notarization, release publication, or Homebrew delivery.
+Remote payload tests run the actual universal remote executable and its embedded HTTPS gateway. Automated native regressions are headless fixtures; the separate actual native app interactions are recorded above. Intel binaries are cross-built and inspected; actual Intel runtime and hosted CI require their separate runners. Local tests do not establish production installation, Apple notarization, release publication, or Homebrew delivery.
 
 This Mac's filesystem rejects non-UTF-8 directory names with EILSEQ, so the raw-byte cwd/executable/filename success test is explicitly skipped here. Private codec roundtrips preserve those bytes, and actual-daemon tests verify that a raw cwd cannot silently alias a Unicode replacement-character directory. Actual raw argv and environment names/values were verified through the daemon. A successful raw-path execution still requires a filesystem that accepts those pathnames.
 

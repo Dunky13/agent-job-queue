@@ -80,7 +80,11 @@ codesign --verify --strict --deep "$installer"
 base="Agent-Job-Queue-Installer-$version-universal"
 ditto -c -k --sequesterRsrc --keepParent "$installer" "$destination/$base.zip"
 if [[ ${BUILD_DMG:-1} == 1 ]]; then
-  hdiutil create -volname 'Agent Job Queue' -srcfolder "$installer" -ov -format UDZO "$destination/$base.dmg"
+  # Flush the staged bundle and keep the temporary image out of Spotlight.
+  # Verbose diagnostics retain the failing phase if macOS reports contention.
+  sync
+  hdiutil create -verbose -nospotlight -fs HFS+ -volname 'Agent Job Queue' \
+    -srcfolder "$installer" -ov -format UDZO "$destination/$base.dmg"
 fi
 (cd "$destination" && shasum -a 256 "$base.zip") > "$destination/$base.zip.sha256"
 if [[ ${BUILD_DMG:-1} == 1 ]]; then

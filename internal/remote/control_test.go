@@ -114,6 +114,73 @@ func TestRemoteConfigureRejectsInvalidInputBeforeWriting(t *testing.T) {
 	}
 }
 
+func TestRemoteConfigureCredentialPreparationDoesNotConsumeLifecycleDeadline(t *testing.T) {
+	for _, scenario := range []string{"enabled", "disabled", "disable during preparation", "invalid input"} {
+		t.Run(scenario, func(t *testing.T) {
+			c := fixtureController(t)
+			settings := testSettings()
+			settings.Enabled = scenario != "disabled"
+			if err := writePrivate(c.p.config, settings); err != nil {
+				t.Fatal(err)
+			}
+			var cancelLifecycle context.CancelFunc
+			preparedBeforeLifecycle := false
+			newLifecycleContext := func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancelLifecycle = cancel
+				return ctx, cancel
+			}
+			hash := "$2a$14$" + strings.Repeat("b", 53)
+			prepare := func(map[string]json.RawMessage) (*preparedConfiguration, error) {
+				// Model arbitrarily slow hashing without relying on CPU speed or a
+				// tight wall deadline: any lifecycle context created already expires.
+				preparedBeforeLifecycle = cancelLifecycle == nil
+				if cancelLifecycle != nil {
+					cancelLifecycle()
+				}
+				if scenario == "invalid input" {
+					return nil, errors.New("fixture invalid credentials")
+				}
+				if scenario == "disable during preparation" {
+					// A concurrent disable is permitted to hold the same control lock
+					// while hashing; its latest choice must survive the later apply.
+					unlock, err := c.lock("control.lock", true)
+					if err != nil {
+						return nil, err
+					}
+					settings.Enabled = false
+					err = writePrivate(c.p.config, settings)
+					unlock()
+					if err != nil {
+						return nil, err
+					}
+				}
+				return &preparedConfiguration{passwordHash: hash, port: settings.Port}, nil
+			}
+			code := runMain([]string{"configure"}, strings.NewReader(`{"password":"replacement-fixture-password"}`), prepare, newLifecycleContext)
+			if !preparedBeforeLifecycle {
+				t.Fatal("credential preparation consumed the lifecycle context")
+			}
+			updated, err := loadSettings(c.p)
+			if err != nil || updated == nil || updated.Enabled != settings.Enabled {
+				t.Fatal("configure lost the latest enabled choice", err)
+			}
+			if scenario == "invalid input" {
+				if code != 125 || revision(updated) != revision(&settings) {
+					t.Fatal("invalid credentials changed settings", code)
+				}
+				if _, err := os.Stat(c.p.plist); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("invalid credentials changed the service", err)
+				}
+				return
+			}
+			if code != 0 || updated.PasswordHash != hash || updated.SecretKey == settings.SecretKey {
+				t.Fatal("configure did not rotate credentials", code)
+			}
+		})
+	}
+}
+
 func TestRemoteOwnershipRejectsUnknownAndRecycledProcesses(t *testing.T) {
 	c := fixtureController(t)
 	c.bootFn = func() (string, error) { return "fixture-boot", nil }

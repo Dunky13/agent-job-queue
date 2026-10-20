@@ -147,6 +147,8 @@ jobs:
         run: go test -p 2 ./internal/tooling -run TestHomebrew -v
       - name: Verify payload and first install / upgrade behavior
         run: scripts/test-installer.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip"
+      - name: Verify signed installer on the mounted disk image
+        run: bash scripts/test-dmg.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.dmg"
       - name: Upload installer and checksums
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
