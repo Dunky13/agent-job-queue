@@ -504,6 +504,7 @@ struct LearningWindow: View {
                                 Text("\(profile.memberCount) families · \(profile.variantCount) variants")
                                 Text("\(profile.successCount) successful · \(profile.incompleteCount) incomplete")
                             }.font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                                .contentShape(Rectangle())
                                 .background(store.selectedID == profile.id ? Color.accentColor.opacity(0.13) : Color.clear)
                                 .clipShape(RoundedRectangle(cornerRadius: 7))
                         }.buttonStyle(.plain).disabled(store.fixtureMode)

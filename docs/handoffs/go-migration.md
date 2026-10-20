@@ -83,9 +83,17 @@ The actual packaged native app was also launched with an isolated user home and 
 
 The final CI-fix validation passed lint and all remote and tooling race tests in 133.098 and 3.138 seconds respectively. The remote suite includes the real enabled reconfiguration flow from the failed Intel job. Both universal formats rebuilt successfully. Installer fixtures passed in 9.375 seconds, actual packaged queue execution in 5.43 seconds, and the actual packaged HTTPS gateway in 5.18 seconds. The explicit mounted-DMG check verified the rebuilt installer and detached successfully. An independent Sol 6.1 high follow-up review found no material issue in the deadline, ownership, packaging, or cleanup changes. Hosted results on the new commit remain separate evidence.
 
+[Source CI run 39481863397](https://github.com/Dunky13/agent-job-queue/actions/runs/39481863397) subsequently passed on commit `5ec350a487b435d671853e449ab7533226dc906e`, including Apple Silicon and Intel runtime/native suites, universal installer inspection, and the aggregate required check. Publication and Homebrew delivery were skipped as expected for a pull request. This run predates the native selection correction below.
+
+## Learned workload row selection
+
+Actual point clicks reproduced a native interaction defect: clicking the empty background of the second workload left the first selected, while clicking its text selected the second. The plain SwiftUI button now defines a rectangular content shape after the full-width frame and padding, covering the whole row label.
+
+The universal native executable rebuilt for Apple Silicon and Intel, and all 134 existing native regression checks passed. After replacing and signing only the isolated app's executable, eleven actual point-click checks passed: empty backgrounds on both rows, left/top/bottom padding, an already selected background, text on both rows, and unchanged selection in the gap and below the rows. Each check read back the displayed detail title. The same empty-background coordinate that missed before the fix selected the second row afterward. The real private Go daemon, scheduler, jobs, and learned data were retained, and the updated app was left running for review. This establishes local interaction behavior; hosted CI on the follow-up commit is separate evidence.
+
 ## Local installer artifacts
 
-These version 0.1.0 artifacts include the reviewed command compatibility and CI fixes. They were built from the local working tree for verification. Their release commit and build fields are null; they are not published releases.
+These version 0.1.0 artifacts include the reviewed command compatibility and CI fixes, and predate the later native row-selection correction. They were built from the local working tree for verification. Their release commit and build fields are null; they are not published releases.
 
 - ZIP: `dist/Agent-Job-Queue-Installer-0.1.0-universal.zip`
 - ZIP SHA-256: `4774a9b6f6c24e3e58bbe59b6dccd99304aaa074cfd5fe796ea1f5839539745a`
@@ -96,7 +104,7 @@ These version 0.1.0 artifacts include the reviewed command compatibility and CI 
 
 Installer payload tests exercise the Go installation flow with a test-owned launchctl fixture and an extracted universal payload. They then run the actual packaged daemon, client, and scheduler with system-only PATH. This does not establish execution of the packaged installer GUI or its full InstallMain entry point.
 
-Remote payload tests run the actual universal remote executable and its embedded HTTPS gateway. Automated native regressions are headless fixtures; the separate actual native app interactions are recorded above. Intel binaries are cross-built and inspected; actual Intel runtime and hosted CI require their separate runners. Local tests do not establish production installation, Apple notarization, release publication, or Homebrew delivery.
+Remote payload tests run the actual universal remote executable and its embedded HTTPS gateway. Automated native regressions are headless fixtures; the separate actual native app interactions are recorded above. Intel binaries are cross-built and inspected locally; actual Intel runtime was verified by the pinned hosted run above. Later changes require their own hosted results. Local tests do not establish production installation, Apple notarization, release publication, or Homebrew delivery.
 
 This Mac's filesystem rejects non-UTF-8 directory names with EILSEQ, so the raw-byte cwd/executable/filename success test is explicitly skipped here. Private codec roundtrips preserve those bytes, and actual-daemon tests verify that a raw cwd cannot silently alias a Unicode replacement-character directory. Actual raw argv and environment names/values were verified through the daemon. A successful raw-path execution still requires a filesystem that accepts those pathnames.
 
