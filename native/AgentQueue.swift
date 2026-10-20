@@ -162,21 +162,44 @@ enum ClientError: LocalizedError {
     }
 }
 
-// CLI I/O and deadline handling stay off the main actor. A file avoids pipe-buffer
-// deadlocks with large status responses; every response is bounded before loading.
+// CLI I/O and deadline handling stay off the main actor. Drain the private pipe
+// while the child runs so neither pipe capacity nor output size can block us.
 private struct QueueControllerFailure: Decodable { let error: String }
+
+private final class QueueReadCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    func cancel() { lock.withLock { cancelled = true } }
+    func check() throws { if lock.withLock({ cancelled }) { throw CancellationError() } }
+}
 
 enum QueueClient {
     enum Controller: String, Sendable { case heavy = "agent-heavy", remote = "agent-remote" }
     enum Budget: Sendable { case normal, updates }
+    // Private executable/deadline injection keeps transport tests off installed state.
+    struct Transport: Sendable {
+        let executable: URL
+        let timeout: TimeInterval
+    }
 
     static func run(_ arguments: [String], controller: Controller = .heavy, input: Data? = nil,
-                    budget: Budget = .normal) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                do { continuation.resume(returning: try runBlocking(arguments, controller: controller, input: input, budget: budget)) }
-                catch { continuation.resume(throwing: error) }
+                    budget: Budget = .normal, transport: Transport? = nil) async throws -> Data {
+        // Only known, discardable reads observe task cancellation. Accepted changes
+        // keep their original response/deadline and are never retried or rolled back.
+        let discardable = input == nil && (arguments.first == "status" ||
+            (controller == .heavy && arguments.first == "profiles" &&
+                ["list", "show"].contains(arguments.dropFirst().first ?? "")))
+        let cancellation = discardable ? QueueReadCancellation() : nil
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async {
+                    do { continuation.resume(returning: try runBlocking(arguments, controller: controller,
+                        input: input, budget: budget, cancellation: cancellation, transport: transport)) }
+                    catch { continuation.resume(throwing: error) }
+                }
             }
+        } onCancel: {
+            cancellation?.cancel()
         }
     }
 
@@ -187,24 +210,26 @@ enum QueueClient {
         return arguments.first == "status" ? 8 : (controller == .remote ? 35 : 25)
     }
 
-    private static func runBlocking(_ arguments: [String], controller: Controller, input: Data?, budget: Budget) throws -> Data {
+    private static func runBlocking(_ arguments: [String], controller: Controller, input: Data?, budget: Budget,
+                                    cancellation: QueueReadCancellation?, transport: Transport?) throws -> Data {
+        try cancellation?.check()
         guard (input?.count ?? 0) <= 16_384 else { throw ClientError.message("Controller input exceeds the private-pipe limit.") }
-        let temporary = FileManager.default.temporaryDirectory
-            .appendingPathComponent("agent-queue-client-\(UUID().uuidString)")
-        guard FileManager.default.createFile(atPath: temporary.path, contents: nil,
-                                             attributes: [.posixPermissions: 0o600]) else {
-            throw ClientError.message("Could not create a temporary response file.")
+        let output = Pipe()
+        defer {
+            try? output.fileHandleForReading.close()
+            try? output.fileHandleForWriting.close()
         }
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        let output = try FileHandle(forWritingTo: temporary)
-        defer { try? output.close() }
+        guard fcntl(output.fileHandleForReading.fileDescriptor, F_SETFL, O_NONBLOCK) != -1 else {
+            throw ClientError.message("Could not prepare the private controller output pipe.")
+        }
         let process = Process()
-        process.executableURL = FileManager.default.homeDirectoryForCurrentUser
+        process.executableURL = transport?.executable ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".local/bin/\(controller.rawValue)")
         process.arguments = arguments
         let inputPipe = input == nil ? nil : Pipe()
         if let inputPipe {
-            guard fcntl(inputPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) != -1 else {
+            guard fcntl(inputPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) != -1,
+                  fcntl(inputPipe.fileHandleForWriting.fileDescriptor, F_SETFL, O_NONBLOCK) != -1 else {
                 throw ClientError.message("Could not prepare the private controller input pipe.")
             }
             process.standardInput = inputPipe.fileHandleForReading
@@ -213,40 +238,81 @@ enum QueueClient {
             try? inputPipe?.fileHandleForReading.close()
             try? inputPipe?.fileHandleForWriting.close()
         }
-        process.standardOutput = output
-        process.standardError = output
+        process.standardOutput = output.fileHandleForWriting
+        process.standardError = output.fileHandleForWriting
+        try cancellation?.check()
         try process.run()
-        if let input, let inputPipe {
-            do {
-                try inputPipe.fileHandleForReading.close()
-                try inputPipe.fileHandleForWriting.write(contentsOf: input)
-                try inputPipe.fileHandleForWriting.close()
-            } catch {
-                if process.isRunning { process.terminate() }
-                throw ClientError.message("Could not send private configuration to the controller.")
+        // Every exit path tears down and reaps only this private controller child.
+        // Queue daemon jobs have their own ownership and are never signalled here.
+        defer {
+            if process.isRunning {
+                process.terminate()
+                for _ in 0..<25 {
+                    if !process.isRunning { break }
+                    Thread.sleep(forTimeInterval: 0.01)
+                }
+                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
             }
+            process.waitUntilExit()
         }
-        let timeout = timeout(for: arguments, controller: controller, budget: budget)
-        let deadline = Date().addingTimeInterval(timeout)
-        while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval: 0.04) }
-        if process.isRunning {
-            process.terminate()
-            for _ in 0..<25 {
-                if !process.isRunning { break }
-                Thread.sleep(forTimeInterval: 0.02)
+        try output.fileHandleForWriting.close()
+        try inputPipe?.fileHandleForReading.close()
+        var inputOffset = 0
+        var inputClosed = inputPipe == nil
+        let timeout = transport?.timeout ?? timeout(for: arguments, controller: controller, budget: budget)
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var response = Data()
+        let captureLimit = 2_097_152
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        var observedChildExit = false
+        while true {
+            try cancellation?.check()
+            if ProcessInfo.processInfo.systemUptime >= deadline {
+                if budget == .updates {
+                    throw ClientError.message("The update operation did not finish within \(Int(timeout)) seconds. Check whether the installer opened, then check for updates before retrying.")
+                }
+                throw ClientError.message("The queue did not respond within \(Int(timeout)) seconds. Jobs continue independently. Refresh to check whether the change was applied.")
             }
-            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-            if budget == .updates {
-                throw ClientError.message("The update operation did not finish within \(Int(timeout)) seconds. Check whether the installer opened, then check for updates before retrying.")
+            // Bound each read, including the one that detects overflow. No output
+            // is written to disk and retained response bytes never exceed the cap.
+            let count = read(output.fileHandleForReading.fileDescriptor, &buffer,
+                             min(buffer.count, captureLimit - response.count + 1))
+            let readError = count < 0 ? errno : 0
+            if count > 0 {
+                guard count <= captureLimit - response.count else {
+                    throw ClientError.message("The queue response exceeds the 2 MB display limit.")
+                }
+                response.append(contentsOf: buffer.prefix(count))
+            } else if count < 0 && readError != EAGAIN && readError != EINTR {
+                throw ClientError.message("Could not read the private controller response.")
             }
-            throw ClientError.message("The queue did not respond within \(Int(timeout)) seconds. Jobs continue independently. Refresh to check whether the change was applied.")
+            if !inputClosed, let input, let inputPipe {
+                let written = input.withUnsafeBytes { bytes in
+                    write(inputPipe.fileHandleForWriting.fileDescriptor,
+                          bytes.baseAddress?.advanced(by: inputOffset), input.count - inputOffset)
+                }
+                if written > 0 { inputOffset += written }
+                else if written < 0 && errno != EAGAIN && errno != EINTR {
+                    throw ClientError.message("Could not send private configuration to the controller.")
+                }
+                if inputOffset == input.count {
+                    try inputPipe.fileHandleForWriting.close()
+                    inputClosed = true
+                }
+            }
+            // Drain remaining buffered bytes after exit without waiting on a pipe
+            // descriptor inherited by an independently running daemon.
+            if count < 0 && readError == EINTR { continue }
+            if count <= 0 && !process.isRunning {
+                if observedChildExit { break }
+                // The child may have written its final bytes between our empty
+                // read and the exit observation. Drain once more after that fence.
+                observedChildExit = true
+                continue
+            }
+            if count <= 0 { Thread.sleep(forTimeInterval: 0.01) }
         }
-        let input = try FileHandle(forReadingFrom: temporary)
-        defer { try? input.close() }
-        let response = try input.read(upToCount: 2_097_153) ?? Data()
-        guard response.count <= 2_097_152 else {
-            throw ClientError.message("The queue response exceeds the 2 MB display limit.")
-        }
+        try cancellation?.check()
         guard process.terminationStatus == 0 else {
             if arguments.first == "profiles", let failure = try? JSONDecoder().decode(QueueControllerFailure.self, from: response) {
                 throw ClientError.message(failure.error)
@@ -273,9 +339,50 @@ enum QueueClient {
     }
 }
 
+struct PreparedQueueSnapshot: Sendable {
+    let snapshot: QueueSnapshot
+    let running: [QueueJob]
+    let waiting: [QueueJob]
+    let recent: [QueueJob]
+
+    init(_ snapshot: QueueSnapshot) {
+        self.snapshot = snapshot
+        running = snapshot.jobs.filter(\.isRunning)
+        waiting = snapshot.jobs.filter(\.isWaiting).sorted {
+            ($0.queuePosition ?? Int.max, $0.id) < ($1.queuePosition ?? Int.max, $1.id)
+        }
+        recent = Array(snapshot.jobs.lazy.filter { !$0.isRunning && !$0.isWaiting }.prefix(12))
+    }
+
+    static func decode(_ data: Data, comparedTo previous: QueueSnapshot?) async throws -> Self? {
+        let preparation = Task<Self?, Error>.detached(priority: .utility) {
+            assert(!Thread.isMainThread, "Queue snapshot decoding must stay off the main thread.")
+            try Task.checkCancellation()
+            let next = try JSONDecoder().decode(QueueSnapshot.self, from: data)
+            guard previous?.hasSameContent(as: next) != true else { return nil }
+            try Task.checkCancellation()
+            return Self(next)
+        }
+        return try await withTaskCancellationHandler {
+            let next = try await preparation.value
+            try Task.checkCancellation()
+            return next
+        } onCancel: { preparation.cancel() }
+    }
+}
+
 @MainActor
 final class QueueStore: ObservableObject {
-    @Published var snapshot: QueueSnapshot?
+    @Published private var prepared: PreparedQueueSnapshot?
+    // Synchronous assignment is used only by isolated fixture navigation checks.
+    // Live refresh publishes one complete, precomputed value from the worker.
+    var snapshot: QueueSnapshot? {
+        get { prepared?.snapshot }
+        set { prepared = newValue.map(PreparedQueueSnapshot.init) }
+    }
+    var snapshotPublisher: AnyPublisher<QueueSnapshot?, Never> {
+        $prepared.map { $0?.snapshot }.eraseToAnyPublisher()
+    }
     @Published var error: String?
     @Published var lastRefreshed: Date?
     @Published var isRefreshing = false
@@ -285,6 +392,7 @@ final class QueueStore: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private let statusLoader: @Sendable () async throws -> Data
     private let command: @Sendable ([String]) async throws -> Data
+    private let snapshotPreparer: @Sendable (Data, QueueSnapshot?) async throws -> PreparedQueueSnapshot?
     private var refreshInFlight = false
     private var refreshRequested = false
     private var mutationRevision = 0
@@ -293,9 +401,13 @@ final class QueueStore: ObservableObject {
 
     init(statusLoader: @escaping @Sendable () async throws -> Data = {
         try await QueueClient.run(["status", "--json"])
-    }, command: @escaping @Sendable ([String]) async throws -> Data = { try await QueueClient.run($0) }) {
+    }, command: @escaping @Sendable ([String]) async throws -> Data = { try await QueueClient.run($0) },
+         snapshotPreparer: @escaping @Sendable (Data, QueueSnapshot?) async throws -> PreparedQueueSnapshot? = {
+             try await PreparedQueueSnapshot.decode($0, comparedTo: $1)
+         }) {
         self.statusLoader = statusLoader
         self.command = command
+        self.snapshotPreparer = snapshotPreparer
         let args = CommandLine.arguments
         if let index = args.firstIndex(of: "--fixture"), args.indices.contains(index + 1) {
             fixtureMode = true
@@ -308,13 +420,9 @@ final class QueueStore: ObservableObject {
         } else { fixtureMode = false }
     }
 
-    var running: [QueueJob] { snapshot?.jobs.filter(\.isRunning) ?? [] }
-    var waiting: [QueueJob] {
-        (snapshot?.jobs.filter(\.isWaiting) ?? []).sorted {
-            ($0.queuePosition ?? Int.max, $0.id) < ($1.queuePosition ?? Int.max, $1.id)
-        }
-    }
-    var recent: [QueueJob] { Array((snapshot?.jobs.filter { !$0.isRunning && !$0.isWaiting } ?? []).prefix(12)) }
+    var running: [QueueJob] { prepared?.running ?? [] }
+    var waiting: [QueueJob] { prepared?.waiting ?? [] }
+    var recent: [QueueJob] { prepared?.recent ?? [] }
     var actionsDisabled: Bool { (fixtureMode && fixtureRecorder == nil) || isRefreshing || isMutating || error != nil }
     func start() {
         guard !fixtureMode, pollTask == nil else { return }
@@ -356,12 +464,16 @@ final class QueueStore: ObservableObject {
         do {
             let data = try await statusLoader()
             guard revision == mutationRevision, !isMutating else { return }
-            let next = try JSONDecoder().decode(QueueSnapshot.self, from: data)
-            if snapshot?.hasSameContent(as: next) != true {
-                snapshot = next
+            let next = try await snapshotPreparer(data, snapshot)
+            try Task.checkCancellation()
+            guard revision == mutationRevision, !isMutating else { return }
+            if let next {
+                prepared = next
                 lastRefreshed = Date()
             }
             if error != nil { error = nil }
+        } catch is CancellationError {
+            // A discarded refresh is not a controller failure.
         } catch {
             guard revision == mutationRevision, !isMutating else { return }
             if self.error != error.localizedDescription { self.error = error.localizedDescription }
@@ -804,7 +916,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
             button.setAccessibilityIdentifier("agent-queue-status-item")
         }
         buildMenu()
-        observation = store.$snapshot.combineLatest(store.$error).sink { [weak self] snapshot, error in
+        observation = store.snapshotPublisher.combineLatest(store.$error).sink { [weak self] snapshot, error in
             let presentation = QueueStatusPresentation(snapshot: snapshot, error: error)
             self?.statusItem.button?.title = presentation.title
             self?.statusItem.button?.setAccessibilityLabel(presentation.accessibilityLabel)

@@ -1,8 +1,10 @@
-Copy render_cask.py, refresh.py, test-cask.rb, test_refresh.py, LICENSE and .github/workflows/refresh.yml
+Copy refresh.go, refresh_test.go, test-cask.rb, LICENSE and .github/workflows/refresh.yml
 into the dedicated Dunky13/homebrew-agent-job-queue repository. Use a signed,
 DCO-signed-off initial commit on its default branch named tap. Do not copy SEED.txt.
-Also copy release_metadata.py from the app repository root beside render_cask.py;
-the runtime and trusted tap renderer share its strict manifest validator.
+The refresh program is self-contained and uses only Go's standard library. It
+needs no module downloads, Python installation, uv environment, or fetched app
+source. Source tests verify that its trusted cask template matches the app's
+renderer. Run its isolated tests with: go test -p 2 refresh.go refresh_test.go
 The app source repository's protected main branch remains independent.
 
 The refresh workflow reads only the known public app repository. It selects the
@@ -27,7 +29,7 @@ metadata is revalidated before no-op. Newer published descendants may supersede
 older requests; downgrades and conflicting identities are rejected.
 
 PRs targeting tap run read-only refresh regressions, separately from publication.
-Keep all copied trusted helpers and release_metadata.py byte-identical to the
+Keep all copied trusted helpers byte-identical to the
 reviewed source revision. The source delivery job checks parity before dispatch,
 so merge a companion tooling PR before the corresponding source PR. Do not
 advertise installation until a first validated refresh has published a cask.

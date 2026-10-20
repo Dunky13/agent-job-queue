@@ -15,3 +15,7 @@ xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -fram
 xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -framework SwiftUI -framework AppKit \
   "$temporary/AgentQueue.swift" "$root/native/AgentIntegration.swift" "$root/native/AgentUpdates.swift" "$root/native/AgentLearning.swift" "$root/native/tests/LearningTests.swift" -o "$temporary/LearningTests"
 "$temporary/LearningTests"
+
+xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -framework SwiftUI -framework AppKit \
+  "$temporary/AgentQueue.swift" "$root/native/AgentIntegration.swift" "$root/native/AgentUpdates.swift" "$root/native/AgentLearning.swift" "$root/native/tests/TransportTests.swift" -o "$temporary/TransportTests"
+"$temporary/TransportTests"

@@ -51,6 +51,18 @@ actor StatusFixture {
     }
 }
 
+private actor PreparationFixture {
+    private let gate = StatusFixture(Data())
+    func hold() async { await gate.holdNextRead() }
+    func waitUntilHeld() async { await gate.waitUntilReadHeld() }
+    func release() async { await gate.releaseRead() }
+    func prepare(_ data: Data, previous: QueueSnapshot?) async throws -> PreparedQueueSnapshot? {
+        let result = try await PreparedQueueSnapshot.decode(data, comparedTo: previous)
+        _ = try await gate.load()
+        return result
+    }
+}
+
 @main
 struct RefreshTests {
     @MainActor static func main() async throws {
@@ -144,5 +156,56 @@ struct RefreshTests {
         })
         await unsupported.refresh()
         try check(unsupported.dispatchScheduling(.adaptive) == nil, "Older controller cannot receive unsupported scheduling mutation")
+
+        let preparation = PreparationFixture()
+        let preparedFixture = StatusFixture(try snapshot("initial"))
+        let preparedStore = QueueStore(statusLoader: { try await preparedFixture.load() },
+            command: { _ in Data("{}".utf8) },
+            snapshotPreparer: { try await preparation.prepare($0, previous: $1) })
+        await preparedStore.refresh()
+        await preparation.hold()
+        await preparedFixture.set(try snapshot("obsolete", limit: 2))
+        let preparedRead = Task { await preparedStore.refresh() }
+        await preparation.waitUntilHeld()
+        await preparedFixture.set(try snapshot("new mutation", limit: 3))
+        await preparedStore.dispatchLimit(3)?.value
+        await preparation.release()
+        await preparedRead.value
+        // Mutation completion coalesces one fresh refresh behind the obsolete one.
+        for _ in 0..<100 where preparedStore.snapshot?.queue.limit != 3 {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try check(preparedStore.snapshot?.queue.limit == 3,
+                  "Prepared obsolete refresh cannot overwrite a completed mutation and coalesced fresh refresh")
+
+        await preparation.hold()
+        await preparedFixture.set(try snapshot("cancelled", limit: 4))
+        let cancelledRead = Task { await preparedStore.refresh() }
+        await preparation.waitUntilHeld()
+        cancelledRead.cancel()
+        await preparation.release()
+        await cancelledRead.value
+        try check(preparedStore.snapshot?.queue.limit == 3 && preparedStore.error == nil,
+                  "Cancelled prepared refresh publishes neither stale data nor a controller error")
+
+        let jobs = (0..<1000).map { id in
+            QueueJob(id: id, state: id < 2 ? "running" : id < 970 ? "queued" : "done",
+                title: "Fixture \(id)", project: "Fixture", branch: "test", directory: "/fixture",
+                executable: "test", priority: 0, queuePosition: id % 3 == 0 ? nil : 1000 - id,
+                submittedAt: nil, startedAt: nil, finishedAt: nil, exitCode: nil, logPath: "/fixture/log",
+                canReorder: true, canCancel: true, phase: "fixture")
+        }
+        let large = QueueSnapshot(updatedAt: "large", queue: telemetry.queue, jobs: jobs)
+        let largeData = try JSONEncoder().encode(large)
+        let largeStore = QueueStore(statusLoader: { largeData })
+        await largeStore.refresh()
+        let expectedWaiting = jobs.filter(\.isWaiting).sorted {
+            ($0.queuePosition ?? Int.max, $0.id) < ($1.queuePosition ?? Int.max, $1.id)
+        }
+        try check(largeStore.snapshot?.jobs == jobs && largeStore.running == jobs.filter(\.isRunning) &&
+                  largeStore.waiting == expectedWaiting && largeStore.recent == Array(jobs.suffix(30).prefix(12)),
+                  "Large prepared snapshot atomically preserves source, queue position, tie, and recent order")
+        let unchangedPrepared = try await PreparedQueueSnapshot.decode(largeData, comparedTo: large)
+        try check(unchangedPrepared == nil, "Off-main comparison suppresses unchanged prepared snapshots")
     }
 }

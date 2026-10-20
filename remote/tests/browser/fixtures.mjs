@@ -12,8 +12,8 @@ const eventsSchema = z.object({ events: z.array(z.array(z.string())) });
 export const test = base.extend({
   fixtureURL: [async ({ playwright }, use) => {
     expect(playwright.chromium.name()).toBe("chromium");
-    const python = process.env.AGENT_QUEUE_TEST_PYTHON || "python3";
-    const child = spawn(python, [fileURLToPath(new URL("./server.py", import.meta.url))], {
+    const preview = process.env.AGENT_QUEUE_TEST_PREVIEW || fileURLToPath(new URL("../../../build/queue-preview", import.meta.url));
+    const child = spawn(preview, [], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stderr = "";

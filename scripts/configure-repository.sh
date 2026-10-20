@@ -10,16 +10,14 @@ gh api --method PATCH "repos/$repository" \
 gh api --method PUT "repos/$repository/branches/main/protection" \
   --input "$root/repository/main-protection.json" >/dev/null
 gh api --method POST "repos/$repository/branches/main/protection/required_signatures" >/dev/null
-gh api "repos/$repository/branches/main/protection" | python3 -c '
-import json,sys
-p=json.load(sys.stdin)
-assert p["required_status_checks"]["strict"]
-assert p["required_status_checks"]["checks"] == [{"context":"ci-required","app_id":15368}]
-assert p["enforce_admins"]["enabled"]
-assert p["required_pull_request_reviews"] is not None
-assert p["required_signatures"]["enabled"]
-assert p["required_conversation_resolution"]["enabled"]
-assert not p["allow_force_pushes"]["enabled"]
-assert not p["allow_deletions"]["enabled"]
-print("Verified main: required up-to-date CI, pull requests, signatures, conversations; no force/deletion/admin bypass.")
-'
+gh api "repos/$repository/branches/main/protection" --jq '
+  if .required_status_checks.strict == true
+    and .required_status_checks.checks == [{"context":"ci-required","app_id":15368}]
+    and .enforce_admins.enabled == true
+    and .required_pull_request_reviews != null
+    and .required_signatures.enabled == true
+    and .required_conversation_resolution.enabled == true
+    and .allow_force_pushes.enabled == false
+    and .allow_deletions.enabled == false
+  then "Verified main: required up-to-date CI, pull requests, signatures, conversations; no force/deletion/admin bypass."
+  else error("Repository protection verification failed") end'

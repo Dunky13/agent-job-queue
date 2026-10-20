@@ -1,4 +1,8 @@
 #!/bin/sh
 set -eu
-root="${HOME:?}/.local/share/agent-heavy"
-exec "$root/.venv/bin/python" "$root/agent_heavy.py" "$@"
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+test -x "$root/build/agent-heavy" || {
+  echo 'Build the Go commands first: bash scripts/build-go.sh' >&2
+  exit 125
+}
+exec "$root/build/agent-heavy" "$@"

@@ -3,40 +3,46 @@
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 version=${VERSION:-$(cat "$root/VERSION")}
-python_tool=${PYTHON:-python3}
 destination=${DIST_DIR:-"$root/dist"}
 mkdir -p "$destination"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-"$python_tool" -B "$root/release_metadata.py" --version "$version" --output "$work/build-info.json"
-bundle_build=$("$python_tool" -c 'import json,sys; print(json.load(open(sys.argv[1]))["build"] or 0)' "$work/build-info.json")
+sdk=$(xcrun --sdk macosx --show-sdk-path)
+(cd "$root" && go run -p 2 ./cmd/queue-build-info --version "$version" --output "$work/build-info.json")
+bundle_build=$(cd "$root" && go run -p 2 ./cmd/queue-build-info --version "$version" --field build)
 installer="$work/Agent Job Queue Installer.app"
 payload="$installer/Contents/Resources/payload"
 app="$payload/Agent Queue.app"
-mkdir -p "$installer/Contents/MacOS" "$app/Contents/MacOS" "$app/Contents/Resources" "$payload/source/remote" "$payload/source/scripts" "$payload/source/bin"
+mkdir -p "$installer/Contents/MacOS" "$app/Contents/MacOS" "$app/Contents/Resources" "$payload/source/scripts" "$payload/source/bin" "$payload/source/links"
 ARCHS='arm64 x86_64' "$root/native/build.sh" "$app/Contents/MacOS/AgentQueue"
 for architecture in arm64 x86_64; do
   xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -O -target "$architecture-apple-macos15.0" \
     -framework SwiftUI -framework AppKit "$root/native/Installer.swift" -o "$work/Installer-$architecture"
+  goarch=$architecture
+  [[ "$architecture" != x86_64 ]] || goarch=amd64
+  for command in agent-heavy agent-remote; do
+    (cd "$root" && GOOS=darwin GOARCH="$goarch" CGO_ENABLED=1 CC="$(xcrun --find clang)" SDKROOT="$sdk" \
+      CGO_CFLAGS="-arch $architecture -isysroot \"$sdk\" -mmacosx-version-min=15.0" \
+      CGO_LDFLAGS="-arch $architecture -isysroot \"$sdk\" -mmacosx-version-min=15.0" \
+      go build -p 2 -trimpath -ldflags='-s -w' -o "$work/$command-$architecture" "./cmd/$command")
+  done
 done
 xcrun lipo -create "$work/Installer-arm64" "$work/Installer-x86_64" -output "$installer/Contents/MacOS/Installer"
-cp "$root/agent_heavy.py" "$root/agent_integration.py" "$root/install-remote.sh" "$payload/source/"
-cp "$root/resource_monitor.py" "$root/job_profiles.py" "$root/resource_scheduler.py" "$payload/source/"
-cp "$root/learning_control.py" "$payload/source/"
-cp "$root/app_updates.py" "$root/release_metadata.py" "$payload/source/"
+for command in agent-heavy agent-remote; do
+  xcrun lipo -create "$work/$command-arm64" "$work/$command-x86_64" -output "$payload/source/bin/$command"
+  codesign --force --sign - "$payload/source/bin/$command"
+  cp "$root/packaging/links/$command" "$payload/source/links/$command"
+done
 cp "$work/build-info.json" "$app/Contents/Resources/build-info.json"
 cp "$work/build-info.json" "$installer/Contents/Resources/build-info.json"
 cp "$work/build-info.json" "$payload/source/build-info.json"
-cp "$root/remote/control.py" "$root/remote/server.py" "$root/remote/requirements.txt" "$root/remote/requirements.lock" "$payload/source/remote/"
-cp -R "$root/remote/static" "$payload/source/remote/"
-cp "$root/scripts/install-user.sh" "$root/scripts/migrate-installation.py" "$payload/source/scripts/"
-cp "$root/bin/agent-heavy" "$root/bin/agent-remote" "$payload/source/bin/"
+cp "$root/scripts/install-user.sh" "$payload/source/scripts/"
+(cd "$root" && go run -p 2 ./cmd/queue-tool licenses --output "$payload/source/licenses")
 for document in README.md LICENSE THIRD-PARTY-NOTICES.md VERSION; do
   [[ ! -f "$root/$document" ]] || cp "$root/$document" "$payload/source/$document"
 done
 printf '%s\n' "$version" > "$payload/source/VERSION"
-# Ship only runtime web files, never tests/build entries or local state.
-rm -f "$payload/source/remote/static/schema.test.mjs" "$payload/source/remote/static/vendor/entry.mjs"
+# Dashboard assets are embedded in the Go remote command.
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -74,7 +80,11 @@ codesign --verify --strict --deep "$installer"
 base="Agent-Job-Queue-Installer-$version-universal"
 ditto -c -k --sequesterRsrc --keepParent "$installer" "$destination/$base.zip"
 if [[ ${BUILD_DMG:-1} == 1 ]]; then
-  hdiutil create -volname 'Agent Job Queue' -srcfolder "$installer" -ov -format UDZO "$destination/$base.dmg"
+  # Flush the staged bundle and keep the temporary image out of Spotlight.
+  # Verbose diagnostics retain the failing phase if macOS reports contention.
+  sync
+  hdiutil create -verbose -nospotlight -fs HFS+ -volname 'Agent Job Queue' \
+    -srcfolder "$installer" -ov -format UDZO "$destination/$base.dmg"
 fi
 (cd "$destination" && shasum -a 256 "$base.zip") > "$destination/$base.zip.sha256"
 if [[ ${BUILD_DMG:-1} == 1 ]]; then

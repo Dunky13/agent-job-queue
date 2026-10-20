@@ -40,7 +40,7 @@ To inspect the workflow runs:
 gh run list --repo Dunky13/homebrew-agent-job-queue --workflow refresh.yml --limit 5
 ```
 
-Changes to the trusted tap files need a reviewed companion tap PR. Copy `refresh.py`, `render_cask.py`, `test-cask.rb`, `test_refresh.py` and `.github/workflows/refresh.yml` from `packaging/homebrew/`, together with the root `release_metadata.py`. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated `Casks/` files manually or execute arbitrary code from a release to repair drift.
+Changes to the trusted tap files need a reviewed companion tap PR. Copy the standalone `refresh.go`, `refresh_test.go`, `test-cask.rb`, and `.github/workflows/refresh.yml` from `packaging/homebrew/`, together with the root `LICENSE`. The tap helper uses only the Go standard library and never downloads application source or dependencies to execute. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated `Casks/` files manually or execute arbitrary code from a release to repair drift.
 
 After verified delivery, Homebrew users can upgrade normally:
 
@@ -55,9 +55,17 @@ Publishing a release or updating the tap does not install the app on the operato
 
 Source-side tests simulate exact-run dispatch, failures, deadline expiry, token routing, signed readback, canonical helper/cask comparison, conflicting identities and verified supersession. Tap tests simulate pagination, requested release validation, checksum failures, stale heads, idempotence, ancestry and signed publication. They do not call GitHub, install an app or use the live queue.
 
+From the app source checkout:
+
 ```sh
-python -m unittest discover -s tests -p 'test_homebrew_*.py' -v
-python -m unittest discover -s packaging/homebrew -p test_refresh.py -v
+go test -p 2 ./internal/delivery ./internal/tooling ./packaging/homebrew -v
+```
+
+From the standalone tap checkout, using Go 1.26 or later:
+
+```sh
+go test -p 2 refresh.go refresh_test.go
+go vet refresh.go
 ```
 
 This guide has a complete standalone [HTML version](homebrew-delivery.html). API and setup references: [workflow dispatch](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event), [App registration](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app), [App keys](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/managing-private-keys-for-github-apps), and [schedule behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).

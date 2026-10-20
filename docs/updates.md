@@ -36,7 +36,7 @@ One preparation runs at a time. Private staging retains at most three opened ins
 
 The public GitHub release is the distribution trust boundary. Builds remain ad hoc signed. This feature does not add Developer ID notarization or a background installation service, disable Gatekeeper, or remove quarantine. Platform approval may still be required. Older archives without embedded build metadata remain available through their release pages; the updater refuses to present those archives as verified new-format installations.
 
-Homebrew's existing cask and generated manifest remain compatible. Direct installation through the app updater uses the vendor installer and does not rewrite Homebrew's receipt. Homebrew-managed installations can continue using their existing cask upgrade flow. When synchronizing the dedicated tap's helper scripts, copy release_metadata.py beside render_cask.py as documented in the tap seed instructions.
+Homebrew's existing cask and generated manifest remain compatible. Direct installation through the app updater uses the vendor installer and does not rewrite Homebrew's receipt. Homebrew-managed installations can continue using their existing cask upgrade flow. When synchronizing the dedicated tap's helper scripts, copy the standalone refresh.go, its regression tests, and the reviewed workflow as documented in the tap seed instructions. The first upgrade from Pueue requires a drained queue; migration from Python also requires disabled old remote access. Subsequent embedded Go queue upgrades preserve active daemon jobs and restart enabled remote access with the embedded gateway, retaining credentials and the trusted CA.
 
 ## Validation contract
 
