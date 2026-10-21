@@ -32,3 +32,11 @@ The original PR run passed lint, vulnerability scanning, both macOS architecture
 Review the exact replacement head, require successful `ci-required`, and inspect unresolved review threads. Squash through the protected path with author `Marc Went <marc@went.io>` and exactly matching `Signed-off-by` trailer. Verify the resulting main commit's signature and DCO through GitHub. The CI workflow automatically publishes main installers after its checks; release publication and Homebrew delivery are separate results from this requested PR merge.
 
 This repairs PR 12 only. Future Dependabot commits still need matching author and sign-off identities under the existing policy.
+
+## Squash identity recovery
+
+PR 12 merged after all required checks passed on `552417d67948a7e4a04540fdcb8afb3f5e9e17f1`. Standards and spec reviews had no findings; the Jev advisory returned 2.92/3, ready. Cross-provider review was skipped because Anthropic subscription access was unavailable.
+
+The resulting commit, `3e0be5efcd6b00b053f716345f7c560123c7960f`, is GitHub-verified and has exactly the reviewed tree. However, GitHub retained author `dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>` despite the merge request's maintainer email. Its trailer remains `Signed-off-by: Marc Went <marc@went.io>`. The unchanged checker rejects that historical squash for missing an author-matching sign-off.
+
+A maintainer-owned follow-up PR corrects the contributor instructions and PR checklist and records this recovery. Its new signed, author-matching commit becomes a valid main head through the normal protected merge path; it does not retroactively certify or rewrite the historical bot squash. The main workflow checks the new push range and retains publication gates. Verify the follow-up merge identity and the main commit-policy result before declaring recovery complete. Installer publication and Homebrew delivery remain separate outcomes.
