@@ -1,4 +1,4 @@
-# PR 12: setup-go v7
+# PR 12: setup-go v7 and concurrent cleanup
 
 [Pull request](https://github.com/Dunky13/agent-job-queue/pull/12)
 
@@ -8,7 +8,15 @@ The original Dependabot commit, `800082c3413f18d4bad0848fc05b0234ee0621d8`, had 
 
 Recreate the dependency update as a maintainer-authored, cryptographically signed commit with the maintainer's matching DCO trailer. Replace only the PR branch using an explicit lease against the original head. Keep commit policy and branch protection intact.
 
-The workflow update changes all eight setup-go references from v6.5.0 to v7.0.0, pinned to `b7ad1dad31e06c5925ef5d2fc7ad053ef454303e`. GitHub's upstream v7.0.0 tag resolves to that commit. Its action metadata uses Node 24 and retains the workflow's `go-version-file` and `cache` inputs. No application or queue behavior changes.
+The workflow update changes all eight setup-go references from v6.5.0 to v7.0.0, pinned to `b7ad1dad31e06c5925ef5d2fc7ad053ef454303e`. GitHub's upstream v7.0.0 tag resolves to that commit. Its action metadata uses Node 24 and retains the workflow's `go-version-file` and `cache` inputs.
+
+## Cleanup race exposed by fresh CI
+
+The signed replacement, `ae6267d`, passed commit policy. Its Intel macOS test job failed in `TestRealDaemonCrashRetainsOwnershipAndPausesRestart` with `Slot ownership changed during cleanup; shared slot retained`. The restarted daemon and the recovery caller can both clean the same job. One removes the receipt while the other waits for the process group to exit; the second caller then mistakes the completed cleanup for an ownership change.
+
+Separate the final release phase so this interleaving can be tested deterministically. After verifying process-group quiescence and reacquiring the lease lock, return success without further mutation only when both marker and receipt are absent. A replacement receipt, changed marker, live group, or uncertain identity still retains its existing rejection behavior. Cleanup never removes another job's lease.
+
+A concurrent-cleanup regression reproduced the exact error in five of ten runs before the fix. Ten repetitions of the repaired concurrent test, deterministic stale-cleanup cases, and existing ownership guards passed. Deterministic cases cover completion by another caller, a new pending receipt, a new lease for the same task, and a lease for another task. Full Go race validation and repeated real crash recovery are required for the expanded change.
 
 ## Local evidence
 
@@ -17,7 +25,7 @@ The workflow update changes all eight setup-go references from v6.5.0 to v7.0.0,
 - `go test -p 2 -parallel 2 ./internal/tooling -run TestPrePush -v` verifies the existing fail-closed, full-range push checks.
 - The installed pre-push hook and `check-commits --verify-local` must verify the replacement commit before push.
 
-The original PR run passed lint, vulnerability scanning, both macOS architectures, web tests, and universal installer validation. Those results belong to the original head. Fresh hosted checks and independent review of the replacement head are required before merge; local checks do not establish that outcome.
+The original PR run passed lint, vulnerability scanning, both macOS architectures, web tests, and universal installer validation. Those results belong to the original head. Fresh hosted checks and independent review of the final head, including the cleanup repair, are required before merge; local checks do not establish that outcome.
 
 ## Completion procedure
 
