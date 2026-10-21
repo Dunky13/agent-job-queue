@@ -246,6 +246,84 @@ func TestSharedLeaseCapacityAndIndependentCleanup(t *testing.T) {
 		t.Fatal("final lease retained", err)
 	}
 }
+func TestConcurrentCleanupSameJob(t *testing.T) {
+	g := testGate(t)
+	if ok, err := AcquireLease(g, marker(1), 1); !ok || err != nil {
+		t.Fatalf("acquire lease: %v %v", ok, err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 16)
+	for range cap(results) {
+		go func() {
+			<-start
+			results <- Cleanup(g, 1)
+		}()
+	}
+	close(start)
+	for range cap(results) {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+	if receipt, err := g.Receipt(1); err != nil || receipt != nil {
+		t.Fatalf("cleanup retained receipt: %v %v", receipt, err)
+	}
+	if _, err := os.Stat(g.Slot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("cleanup retained shared slot", err)
+	}
+}
+
+func TestCleanupAfterConcurrentCompletion(t *testing.T) {
+	for _, replacement := range []string{"none", "pending", "leased", "other-job"} {
+		t.Run(replacement, func(t *testing.T) {
+			g := testGate(t)
+			original := marker(1)
+			if ok, err := AcquireLease(g, original, 1); !ok || err != nil {
+				t.Fatalf("acquire original: %v %v", ok, err)
+			}
+			// Both callers observed this owner before either released it. Finish
+			// the first caller, then resume the second with its stale snapshot.
+			if err := Cleanup(g, 1); err != nil {
+				t.Fatal(err)
+			}
+			var retained Object
+			switch replacement {
+			case "pending":
+				retained = Object{"task_id": 1, "token": strings.Repeat("c", 32)}
+				mustWrite(t, g.ReceiptPath(1), retained)
+			case "leased", "other-job":
+				id := 1
+				if replacement == "other-job" {
+					id = 2
+				}
+				retained = marker(id)
+				retained["token"] = strings.Repeat("c", 32)
+				if ok, err := AcquireLease(g, retained, 1); !ok || err != nil {
+					t.Fatalf("acquire replacement: %v %v", ok, err)
+				}
+			}
+			err := releaseCompletedLease(g, 1, original)
+			wantError := replacement == "pending" || replacement == "leased"
+			if (err != nil) != wantError {
+				t.Fatalf("stale cleanup: %v; want error: %v", err, wantError)
+			}
+			if retained != nil {
+				id, _ := integer(retained["task_id"])
+				receipt, err := g.Receipt(id)
+				if err != nil || !jsonEqual(receipt, retained) {
+					t.Fatalf("stale cleanup changed replacement receipt: %v %v", receipt, err)
+				}
+				if replacement != "pending" {
+					current, err := ValidateMarker(g, id)
+					if err != nil || !jsonEqual(current, retained) {
+						t.Fatalf("stale cleanup changed replacement lease: %v %v", current, err)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestExternalLeaseRemainsExclusive(t *testing.T) {
 	g := testGate(t)
 	if err := os.Mkdir(g.Slot, 0o700); err != nil {

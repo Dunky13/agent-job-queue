@@ -525,12 +525,17 @@ func Cleanup(g *Gate, id int) error {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
+	return releaseCompletedLease(g, id, marker)
+}
+
+func releaseCompletedLease(g *Gate, id int, marker Object) error {
+	pgid, _ := integer(marker["pgid"])
 	if exists, err := GroupExists(pgid); err != nil {
 		return err
 	} else if exists {
 		return fmt.Errorf("Job %d process group %d remains; shared slot retained", id, pgid)
 	}
-	unlock, err = LockPrivate(g, "")
+	unlock, err := LockPrivate(g, "")
 	if err != nil {
 		return err
 	}
@@ -538,6 +543,17 @@ func Cleanup(g *Gate, id int) error {
 	current, err := ValidateMarker(g, id)
 	if err != nil {
 		return err
+	}
+	// Another cleanup may have removed the receipt while this caller waited for
+	// the process group to exit. Nothing remains for this caller to release.
+	if current == nil {
+		receipt, err := g.Receipt(id)
+		if err != nil {
+			return err
+		}
+		if receipt == nil {
+			return nil
+		}
 	}
 	if !jsonEqual(current, marker) {
 		return errors.New("Slot ownership changed during cleanup; shared slot retained")
