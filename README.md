@@ -32,7 +32,7 @@ brew install --cask dunky13/agent-job-queue/agent-job-queue
 
 Homebrew sets up your private queue and opens the menu-bar app. Both `agent-heavy` and `agent-remote` are linked into Homebrew's bin directory. No Xcode or manual installer window is needed.
 
-The build is ad hoc signed and not notarized. The cask removes only `com.apple.quarantine` from its own staged download before running the installer, so installation does not require an Apple Developer Program membership or a Gatekeeper approval prompt. The download's SHA-256 is verified first; signatures and other extended attributes remain intact. This is a deliberate trust decision for this project's tap and does not change system-wide security settings.
+New releases produced by the notarized release pipeline use Developer ID signatures and Apple notarization. Their Homebrew cask verifies the download's SHA-256 and retains quarantine for macOS assessment. It does not bypass Gatekeeper. Older published builds remain ad hoc signed; their historical casks are preserved until a newer release replaces them. See [Apple signing and notarization](docs/apple-signing.md) for the release requirements and verification limits.
 
 The tap becomes installable after the first validated `main` installer release is published. It tracks published builds, so updates can use:
 
@@ -51,9 +51,9 @@ Uninstalling the cask removes the menu app and Homebrew command links. It preser
 3. Open **Agent Job Queue Installer.app**, then choose **Install**. The installer displays progress and any errors in its window.
 4. The app appears in your menu bar. Add your local bin directory to your shell's `PATH` to use `agent-heavy` by name.
 
-The installer includes prebuilt universal executables and a Go queue daemon. The Go remote service embeds Caddy's HTTPS and authentication modules. Installation works offline after downloading the artifact; Homebrew, Pueue, Python, uv, Xcode, and a Go toolchain are not required on the installed Mac. It installs into your user account without `sudo`.
+The installer includes prebuilt universal executables and a Go queue daemon. The Go remote service embeds Caddy's HTTPS and authentication modules. Homebrew, Pueue, Python, uv, Xcode, and a Go toolchain are not required on the installed Mac. It installs into your user account without `sudo`. The payload is self-contained, but first-launch Gatekeeper assessment can require Apple connectivity. Offline first launch of the standalone Go executables has not been verified.
 
-The installer and app are ad hoc signed. Apple Developer ID signing and notarization are not configured, so macOS may require approval in Privacy & Security before opening a manually downloaded build. Installer checksums identify the downloaded bytes; they do not replace Apple notarization.
+The notarized release pipeline signs the installer, menu app and executable payload with Developer ID, submits the release to Apple, and staples tickets to the app bundles and DMG. Historical releases and local development packages can remain ad hoc signed. Installer checksums identify the downloaded bytes; they do not establish notarization.
 
 Upgrades of the embedded Go queue preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. The native app and Go support binaries are replaced atomically.
 
@@ -61,7 +61,7 @@ For the first upgrade from Pueue, finish all running and waiting jobs first. If 
 
 ### If macOS blocks opening the app
 
-Current releases are **not notarized**. Passing the package's code-signature integrity check does not mean Gatekeeper will accept a quarantined download. The Homebrew cask clears quarantine on its own staged download as described above. A manually downloaded ZIP or DMG can still require approval for the installer or installed menu app.
+Check the release provenance first: historical releases and local development packages can be ad hoc signed, while releases from the notarized pipeline carry Developer ID signatures and Apple notarization. Signature integrity alone does not establish Gatekeeper acceptance. Neither the new Homebrew cask nor the manual installer removes quarantine; macOS policy still controls whether a downloaded installer or menu app opens.
 
 For a downloaded Agent Job Queue app that you trust, use Apple's per-app approval flow:
 
@@ -71,7 +71,7 @@ For a downloaded Agent Job Queue app that you trust, use Apple's per-app approva
 
 Use the app name in Privacy & Security to identify a generic verification popup before approving anything. If no matching entry appears, the popup's source is still unknown. Managed Macs can restrict these choices. See [Apple's opening instructions](https://support.apple.com/102445).
 
-Developer ID signing and notarization require an Apple Developer Program membership and are not configured for this project. The manual installer does not remove quarantine. The cask's exception applies only to its own staged files; Gatekeeper remains enabled system-wide.
+Do not clear quarantine to work around a failed verification of a release advertised as notarized. Preserve the downloaded artifact and check its signatures, stapled tickets and release provenance using [Apple signing and notarization](docs/apple-signing.md). Gatekeeper remains enabled system-wide.
 
 ## Version and updates
 

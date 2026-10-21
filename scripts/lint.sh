@@ -11,7 +11,7 @@ while IFS= read -r -d '' path; do
   [[ -f "$path" ]] || continue
   case "$(head -n 1 "$path")" in
     '#!/bin/zsh'|'#!/usr/bin/env zsh') ;;
-    *) shellcheck "$path" ;;
+    *) shellcheck -x "$path" ;;
   esac
   zsh -n "$path"
 done < <(git ls-files --cached --others --exclude-standard -z '*.sh')

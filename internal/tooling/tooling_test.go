@@ -76,12 +76,12 @@ func TestHomebrewManifestAndCaskContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{manifest.SHA256, "source/links/agent-heavy", "source/links/agent-remote", "must_succeed: true", "com.apple.quarantine", "sudo:       false"} {
+	for _, expected := range []string{manifest.SHA256, "source/links/agent-heavy", "source/links/agent-remote", "source/bin/agent-heavy", `args:       ["install", "--payload", payload]`, "Developer ID signed and notarized", "Quarantine is retained", "sudo:       false"} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("missing %s", expected)
 		}
 	}
-	for _, obsolete := range []string{"depends_on formula:", "sudo:       true"} {
+	for _, obsolete := range []string{"depends_on formula:", "sudo:       true", "preflight", "/usr/bin/xattr", "com.apple.quarantine", "source/scripts/install-user.sh"} {
 		if strings.Contains(body, obsolete) {
 			t.Errorf("obsolete dependency %s", obsolete)
 		}

@@ -386,25 +386,12 @@ const caskTemplate = `cask "agent-job-queue" do
 
   depends_on macos: :sequoia
 
-  # Clear quarantine only on this checksum-verified staged download.
-  if respond_to?(:preflight_steps)
-    preflight_steps do
-      run "/usr/bin/xattr",
-          args: ["-dr", "com.apple.quarantine", "{{staged_path}}"],
-          must_succeed: true
-    end
-  else
-    preflight do
-      system_command "/usr/bin/xattr",
-                     args: ["-dr", "com.apple.quarantine", staged_path],
-                     must_succeed: true
-    end
-  end
+  # Preserve quarantine so macOS can assess the notarized release.
 
   payload = "#{staged_path}/Agent Job Queue Installer.app/Contents/Resources/payload"
   installer script: {
-    executable: "#{payload}/source/scripts/install-user.sh",
-    args:       ["--payload", payload],
+    executable: "#{payload}/source/bin/agent-heavy",
+    args:       ["install", "--payload", payload],
     sudo:       false,
   }
 
@@ -420,7 +407,8 @@ const caskTemplate = `cask "agent-job-queue" do
 
   caveats <<~EOS
     Installs and opens Agent Queue for this account without Python, uv, or a Go toolchain.
-    Phone access is off until enabled. This build is ad hoc signed, not notarized.
+    Release installer and app are Developer ID signed and notarized.
+    Quarantine is retained. Phone access is off until enabled.
     Uninstall preserves the independent queue, jobs, credentials and remote access.
     Disable phone access in settings before uninstall to stop its HTTPS service.
   EOS

@@ -175,19 +175,23 @@ jobs:
             exit 1
           fi
 
-  publish:
-    name: Publish main installer
+  notarize:
+    name: Sign and notarize main installer
     needs: [ci-required, installer]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
+    runs-on: macos-15
+    timeout-minutes: 120
+    environment: apple-signing
+    outputs:
+      team_id: ${{ steps.apple-team.outputs.team_id }}
     steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: Agent-Job-Queue-Installer
-          path: dist
+      - name: Record the expected public Apple team identifier
+        id: apple-team
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]
+          printf 'team_id=%s\n' "$APPLE_TEAM_ID" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -195,6 +199,111 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Agent-Job-Queue-Installer
+          path: validated-installer
+      - name: Verify and extract the validated installer
+        run: |
+          (cd validated-installer && shasum -a 256 -c ./*.zip.sha256)
+          mkdir -p prepared-installer
+          ditto -x -k "validated-installer/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" prepared-installer
+          go run -p 2 ./cmd/queue-tool verify-installer --installer 'prepared-installer/Agent Job Queue Installer.app'
+      - name: Sign, notarize and staple payload, installer and disk image
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+          NOTARY_LOG_DIR: ${{ runner.temp }}/notary-logs
+          NOTARY_TIMEOUT: ${{ vars.APPLE_NOTARY_TIMEOUT || '30m' }}
+        run: scripts/with-apple-signing.sh scripts/macos-signing.sh package 'prepared-installer/Agent Job Queue Installer.app' dist "$(cat VERSION)"
+      - name: Generate final immutable manifest and Homebrew cask
+        run: |
+          go run -p 2 ./cmd/queue-tool render-cask \
+            --archive "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" \
+            --version "$(cat VERSION)" --tag "build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" \
+            --commit "$GITHUB_SHA" --build "$GITHUB_RUN_NUMBER" --output dist
+      - name: Upload notarized installer and final checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Agent-Job-Queue-Notarized-Installer
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Retain public notarization submission receipts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Apple-notarization-receipts
+          path: ${{ runner.temp }}/notary-logs/**
+          if-no-files-found: ignore
+          retention-days: 30
+
+  notarized-tests:
+    name: Notarized distribution (${{ matrix.os }})
+    needs: [notarize]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Agent-Job-Queue-Notarized-Installer
+          path: dist
+      - name: Verify final checksums, signatures, tickets and production app copy
+        env:
+          APPLE_TEAM_ID: ${{ needs.notarize.outputs.team_id }}
+        run: |
+          (cd dist && shasum -a 256 -c ./*.sha256)
+          scripts/test-notarized-installer.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.dmg" "$APPLE_TEAM_ID"
+      - name: Exercise the hardened packaged queue and HTTPS gateway
+        run: scripts/test-installer.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip"
+      - name: Install through the real Homebrew DSL with quarantine retained
+        env:
+          APPLE_TEAM_ID: ${{ needs.notarize.outputs.team_id }}
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_DEVELOPER: '1'
+        run: |
+          mkdir prepared-signed-installer
+          ditto -x -k "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" prepared-signed-installer
+          export AGENT_QUEUE_TEST_NOTARIZED_PAYLOAD="$PWD/prepared-signed-installer/Agent Job Queue Installer.app/Contents/Resources/payload"
+          go test -p 2 -parallel 2 ./internal/tooling -run '^TestNotarizedHomebrew$' -count=1 -v -timeout 3m
+
+  publish:
+    name: Publish main installer
+    needs: [notarize, notarized-tests]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Agent-Job-Queue-Notarized-Installer
+          path: dist
       - name: Publish immutable main build
         env:
           GH_TOKEN: ${{ github.token }}
@@ -211,10 +320,9 @@ jobs:
           else
             notes=$(mktemp)
             trap 'rm -f "$notes"' EXIT
-            printf '%s\n\n%s\n\n%s\n' \
+            printf '%s\n\n%s\n' \
               "Automated installer from validated main commit ${GITHUB_SHA}. Includes Apple Silicon and Intel executables plus checksum-pinned Homebrew metadata." \
-              '**macOS approval required:** This build is ad hoc signed and is not notarized. Gatekeeper can block the installer or menu app; Homebrew does not change that.' \
-              'After an opening attempt, use System Settings > Privacy & Security > Open Anyway for the named Agent Job Queue app, if offered. Keep Gatekeeper and quarantine enabled. See https://support.apple.com/102445 for Apple instructions.' > "$notes"
+              'Signed with Apple Developer ID and notarized by Apple. The installer, installed menu app and DMG carry stapled tickets. Homebrew preserves quarantine. Standalone CLI first launch can require access to Apple notarization services.' > "$notes"
             gh release create "$tag" dist/* \
               --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "Main build ${GITHUB_RUN_NUMBER}" --prerelease \
@@ -239,7 +347,7 @@ jobs:
           cache: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: Agent-Job-Queue-Installer
+          name: Agent-Job-Queue-Notarized-Installer
           path: dist
       - name: Require Homebrew dispatch configuration
         env:
