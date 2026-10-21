@@ -16,6 +16,7 @@ Before confirming a squash merge:
 
 - Required checks pass on the reviewed head.
 - The final squash author name and email have an exactly matching `Signed-off-by` trailer. Check the selected email, including any GitHub noreply default.
+- Preserve both established maintainer sign-offs in the final squash body: `Marc Went <marc@went.io>` and `Marc Went <Dunky13@users.noreply.github.com>`.
 - A maintainer takeover of a bot update uses a maintainer-owned PR so the final author and certification remain aligned.
 - Keep Verified signatures and branch protection enabled.
 
