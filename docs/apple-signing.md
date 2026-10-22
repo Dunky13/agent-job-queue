@@ -229,17 +229,22 @@ gh run list --repo Dunky13/agent-job-queue --workflow distribution.yml --limit 5
 ```
 
 Distribution executions share the original CI run's concurrency lock, including
-legacy signing retries, without cancelling an active signing job. Recovery discovers earlier executions for that build and
+legacy signing retries, without cancelling an active signing job. Recovery
+discovers earlier executions for that build and
 includes the original CI run's legacy checkpoints. New checkpoint names include
 build run ID, distribution run ID, attempt and stage slot. Recovery verifies run
 provenance, the source artifact binding, both archive digests, team, version and
-stage receipts. A prepared stage also records its execution run ID, so a new
+stage receipts. Numeric attempt and slot order select state within an execution;
+verified checkpoint creation times order separate executions. Artifact IDs are
+opaque. Missing, malformed or tied creation times stop recovery. A prepared
+stage also records its execution run ID, so a new
 run with attempt number `1` cannot accidentally repeat an uncertain upload from
 an older run's attempt `1`.
 
 Checkpoint obligations follow actual signing jobs across attempts. A retry of
 acceptance or publication can retain an earlier successful signing checkpoint;
-a run whose signing job was explicitly skipped does not require a new one.
+a complete job history proving all three signing stages were skipped does not
+require a new one, including setup failures before the initial checkpoint.
 Missing state after signing could have begun still stops recovery.
 
 Recovery continues accepted stages and existing submission IDs without signing

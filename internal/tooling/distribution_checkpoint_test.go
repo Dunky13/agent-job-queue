@@ -81,6 +81,109 @@ func TestDistributionCheckpointRecoversAcrossAutomationRuns(t *testing.T) {
 	}
 }
 
+func distributionTwoCheckpointExecutions(t *testing.T, f checkpointFixture) {
+	t.Helper()
+	f.changeJSON(t, "execution-999.json", func(v map[string]any) { v["run_attempt"] = 2 })
+	f.changeJSON(t, "jobs-222.json", func(v map[string]any) {
+		job := v["jobs"].([]any)[0].(map[string]any)
+		job["run_id"] = 999
+		job["head_sha"] = strings.Repeat("b", 40)
+		f.writeJSON(t, "jobs-999.json", v)
+		job["run_id"] = 222
+		job["head_sha"] = strings.Repeat("d", 40)
+	})
+}
+
+func TestDistributionCheckpointUsesCreationTimeAcrossExecutions(t *testing.T) {
+	for _, variant := range []string{"newer execution", "older execution rerun"} {
+		for _, reversed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/reversed=%t", variant, reversed), func(t *testing.T) {
+				f := newDistributionCheckpointFixture(t)
+				distributionTwoCheckpointExecutions(t, f)
+				olderRun, newerRun := "222", "999"
+				if variant == "older execution rerun" {
+					olderRun, newerRun = newerRun, olderRun
+					f.changeJSON(t, "execution-222.json", func(v map[string]any) { v["run_attempt"] = 2 })
+					f.changeJSON(t, "jobs-222.json", func(v map[string]any) {
+						job := v["jobs"].([]any)[0].(map[string]any)
+						v["jobs"] = append(v["jobs"].([]any), map[string]any{"id": 23, "run_id": 222, "head_sha": strings.Repeat("d", 40), "status": "completed", "conclusion": "success", "name": "Sign and notarize main installer", "run_attempt": 2, "steps": job["steps"]})
+						v["total_count"] = 2
+					})
+				}
+				// Real GitHub IDs decrease while creation times advance.
+				older := f.distributionArtifact(t, 12429202197, olderRun, 1, 9)
+				older["created_at"] = "2026-10-22T13:27:20Z"
+				attempt := 1
+				if newerRun == "222" {
+					attempt = 2
+				}
+				newer := f.distributionArtifact(t, 12428179680, newerRun, attempt, 9)
+				newer["created_at"] = "2026-10-22T13:31:43Z"
+				for run, artifact := range map[string]map[string]any{olderRun: older, newerRun: newer} {
+					priorID := 12429202200
+					if run == "999" {
+						priorID++
+					}
+					prior := f.distributionArtifact(t, priorID, run, 1, 0)
+					prior["created_at"] = "2026-10-22T13:20:00Z"
+					artifacts := []any{prior, artifact}
+					if reversed {
+						artifacts[0], artifacts[1] = artifacts[1], artifacts[0]
+					}
+					f.writeJSON(t, "inventory-"+run+"-1.json", map[string]any{"total_count": 2, "artifacts": artifacts})
+				}
+				if reversed {
+					f.changeJSON(t, "runs-1.json", func(v map[string]any) {
+						runs := v["workflow_runs"].([]any)
+						runs[0], runs[1] = runs[1], runs[0]
+					})
+				}
+				output, err := f.run(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "restore", f.state)
+				if err != nil {
+					t.Fatalf("chronological checkpoint restore: %v: %s", err, output)
+				}
+				body, err := os.ReadFile(filepath.Join(f.state, "executable"))
+				if err != nil || string(body) != "checkpoint 12428179680" {
+					t.Fatalf("wrong chronological checkpoint: %s (%v)", body, err)
+				}
+			})
+		}
+	}
+}
+
+func TestDistributionCheckpointRejectsUnprovenCreationTime(t *testing.T) {
+	for _, variant := range []string{"missing", "null", "invalid", "invalid date", "noncanonical", "ambiguous"} {
+		t.Run(variant, func(t *testing.T) {
+			f := newDistributionCheckpointFixture(t)
+			distributionTwoCheckpointExecutions(t, f)
+			previous := f.distributionArtifact(t, 2010, "222", 1, 9)
+			current := f.distributionArtifact(t, 2009, "999", 1, 9)
+			current["created_at"] = "2026-10-22T13:31:43Z"
+			switch variant {
+			case "missing":
+				delete(previous, "created_at")
+			case "null":
+				previous["created_at"] = nil
+			case "invalid":
+				previous["created_at"] = "yesterday"
+			case "invalid date":
+				previous["created_at"] = "2026-02-30T13:27:20Z"
+			case "noncanonical":
+				previous["created_at"] = "2026-10-22T15:27:20+02:00"
+			case "ambiguous":
+				previous["created_at"] = current["created_at"]
+			}
+			f.writeJSON(t, "inventory-222-1.json", map[string]any{"total_count": 1, "artifacts": []any{previous}})
+			f.writeJSON(t, "inventory-999-1.json", map[string]any{"total_count": 1, "artifacts": []any{current}})
+			f.reject(t, "creation time", "GITHUB_RUN_ATTEMPT=2")
+			calls, _ := os.ReadFile(filepath.Join(f.root, "calls"))
+			if strings.Contains(string(calls), "/zip") {
+				t.Fatalf("unproven chronology downloaded fallback: %s", calls)
+			}
+		})
+	}
+}
+
 func TestDistributionCheckpointPreservesLegacyCIRecovery(t *testing.T) {
 	f := newDistributionCheckpointFixture(t)
 	// No prior distribution execution; the source CI failed after Apple submission.
@@ -335,6 +438,129 @@ func TestDistributionCheckpointRejectsUnknownSigningHistory(t *testing.T) {
 			calls, _ := os.ReadFile(filepath.Join(f.root, "calls"))
 			if strings.Contains(string(calls), "/zip") {
 				t.Fatalf("unknown history downloaded fallback: %s", calls)
+			}
+		})
+	}
+}
+
+func TestDistributionCheckpointRecoversBeforeNotarizationStages(t *testing.T) {
+	for _, failedStep := range []string{"Set up Go", "Download original installer"} {
+		for _, execution := range []string{"fresh execution", "same execution retry"} {
+			t.Run(failedStep+"/"+execution, func(t *testing.T) {
+				f := newDistributionCheckpointFixture(t)
+				distributionFailedSetupJob(t, f, failedStep)
+				extra := []string{}
+				if execution == "same execution retry" {
+					f.changeJSON(t, "runs-1.json", func(v map[string]any) {
+						v["workflow_runs"] = v["workflow_runs"].([]any)[:1]
+						v["total_count"] = 1
+					})
+					f.changeJSON(t, "execution-999.json", func(v map[string]any) { v["run_attempt"] = 2 })
+					f.changeJSON(t, "jobs-222.json", func(v map[string]any) {
+						job := v["jobs"].([]any)[0].(map[string]any)
+						job["run_id"] = 999
+						job["head_sha"] = strings.Repeat("b", 40)
+						f.writeJSON(t, "jobs-999.json", v)
+					})
+					extra = []string{"GITHUB_RUN_ATTEMPT=2"}
+				}
+				output, err := f.run(t, extra, "restore", f.state)
+				if err != nil {
+					t.Fatalf("proven setup failure blocked recovery: %v: %s", err, output)
+				}
+				result, _ := os.ReadFile(filepath.Join(f.root, "output"))
+				if string(result) != "restored=false\n" {
+					t.Fatalf("wrong no-upload recovery decision: %s", result)
+				}
+			})
+		}
+	}
+}
+
+func distributionFailedSetupJob(t *testing.T, f checkpointFixture, failedStep string) {
+	t.Helper()
+	f.changeJSON(t, "jobs-222.json", func(v map[string]any) {
+		job := v["jobs"].([]any)[0].(map[string]any)
+		job["conclusion"] = "failure"
+		job["started_at"] = "2026-10-22T13:25:36Z"
+		job["completed_at"] = "2026-10-22T13:26:00Z"
+		steps := []any{map[string]any{"number": 1, "name": failedStep, "status": "completed", "conclusion": "failure"}}
+		for i, name := range []string{"Notarize the installed payload", "Notarize the enclosing installer", "Notarize the distribution disk image"} {
+			steps = append(steps, map[string]any{"number": i + 2, "name": name, "status": "completed", "conclusion": "skipped"})
+		}
+		job["steps"] = steps
+	})
+}
+
+func TestDistributionCheckpointRejectsUnprovenSkippedStages(t *testing.T) {
+	for _, variant := range []string{"missing stages", "missing stage", "duplicate stage", "entered stage", "incomplete stage", "incomplete job", "incomplete setup", "duplicate step number"} {
+		t.Run(variant, func(t *testing.T) {
+			f := newDistributionCheckpointFixture(t)
+			distributionFailedSetupJob(t, f, "Set up Go")
+			f.changeJSON(t, "jobs-222.json", func(v map[string]any) {
+				job := v["jobs"].([]any)[0].(map[string]any)
+				steps := job["steps"].([]any)
+				switch variant {
+				case "missing stages":
+					delete(job, "steps")
+				case "missing stage":
+					job["steps"] = steps[:3]
+				case "duplicate stage":
+					job["steps"] = append(steps, map[string]any{"number": 5, "name": "Notarize the installed payload", "status": "completed", "conclusion": "skipped"})
+				case "entered stage":
+					steps[1].(map[string]any)["conclusion"] = "failure"
+				case "incomplete stage":
+					steps[1].(map[string]any)["status"] = "queued"
+				case "incomplete job":
+					job["status"] = "in_progress"
+				case "incomplete setup":
+					steps[0].(map[string]any)["status"] = "in_progress"
+				case "duplicate step number":
+					steps[1].(map[string]any)["number"] = 1
+				}
+			})
+			f.reject(t, "no surviving checkpoint")
+			calls, _ := os.ReadFile(filepath.Join(f.root, "calls"))
+			if strings.Contains(string(calls), "/zip") {
+				t.Fatalf("uncertain signing downloaded fallback: %s", calls)
+			}
+		})
+	}
+}
+
+func TestDistributionCheckpointSetupFailurePreservesSigningObligations(t *testing.T) {
+	for _, laterSigner := range []bool{false, true} {
+		t.Run(fmt.Sprintf("later signer=%t", laterSigner), func(t *testing.T) {
+			f := newDistributionCheckpointFixture(t)
+			distributionFailedSetupJob(t, f, "Set up Go")
+			attempt := 2
+			if laterSigner {
+				attempt = 3
+			}
+			f.changeJSON(t, "execution-222.json", func(v map[string]any) { v["run_attempt"] = attempt })
+			f.changeJSON(t, "jobs-222.json", func(v map[string]any) {
+				setup := v["jobs"].([]any)[0].(map[string]any)
+				setup["id"] = 23
+				setup["run_attempt"] = 2
+				jobs := []any{map[string]any{"id": 22, "run_id": 222, "head_sha": strings.Repeat("d", 40), "status": "completed", "conclusion": "success", "name": "Sign and notarize main installer", "run_attempt": 1, "steps": []any{map[string]any{"name": "Notarize the distribution disk image", "status": "completed", "conclusion": "success"}}}, setup}
+				if laterSigner {
+					jobs = append(jobs, map[string]any{"id": 24, "run_id": 222, "head_sha": strings.Repeat("d", 40), "status": "completed", "conclusion": "failure", "name": "Sign and notarize main installer", "run_attempt": 3, "steps": []any{map[string]any{"name": "Notarize the installed payload", "status": "completed", "conclusion": "failure"}}})
+				}
+				v["jobs"] = jobs
+				v["total_count"] = len(jobs)
+			})
+			f.writeJSON(t, "inventory-222-1.json", map[string]any{"total_count": 1, "artifacts": []any{f.distributionArtifact(t, 2009, "222", 1, 9)}})
+			if laterSigner {
+				f.reject(t, "Newest execution attempt has no surviving checkpoint")
+				return
+			}
+			output, err := f.run(t, nil, "restore", f.state)
+			if err != nil {
+				t.Fatalf("setup failure lost earlier signed state: %v: %s", err, output)
+			}
+			body, _ := os.ReadFile(filepath.Join(f.state, "executable"))
+			if string(body) != "checkpoint 2009" {
+				t.Fatalf("earlier signed checkpoint not preserved: %s", body)
 			}
 		})
 	}

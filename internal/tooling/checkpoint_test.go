@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 const checkpointSHA = "1111111111111111111111111111111111111111"
@@ -131,6 +132,7 @@ func (f checkpointFixture) artifactBytes(t *testing.T, id, attempt, slot int, da
 	return map[string]any{
 		"id": id, "name": fmt.Sprintf("Apple-notarization-123-a%d-s%02d", attempt, slot), "expired": false,
 		"digest":       fmt.Sprintf("sha256:%x", sha256.Sum256(data)),
+		"created_at":   time.Date(2026, 10, 22, 13, attempt, slot, 0, time.UTC).Format(time.RFC3339),
 		"workflow_run": map[string]any{"id": 123, "head_branch": "main", "head_sha": checkpointSHA},
 	}
 }

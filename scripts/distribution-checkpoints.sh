@@ -40,7 +40,17 @@ checkpoint_distribution_candidates() {
     fi
     checkpoint_distribution_inventory "$temporary" "$id" distribution "$sha" "$attempt" "$minimum"
   done < "$temporary/matching"
-  selected=$(jq -s -c 'sort_by(.id)|last // empty' "$temporary/candidates")
+  # Artifact IDs and run creation order do not order checkpoint production:
+  # an older execution can be rerun after a newer one. Each execution has
+  # already selected its numeric attempt/slot; compare those states by the
+  # authoritative artifact creation time, without an arbitrary tie breaker.
+  jq -s -e '
+    all(.[]; (.created_at|type) == "string" and
+      (.created_at|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+      (try ((.created_at|fromdateiso8601|todateiso8601) == .created_at) catch false)) and
+    ([.[].created_at]|length) == ([.[].created_at]|unique|length)
+  ' "$temporary/candidates" >/dev/null || checkpoint_error 'Missing, invalid or ambiguous checkpoint creation time.'
+  selected=$(jq -s -c 'sort_by(.created_at)|last // empty' "$temporary/candidates")
   printf '%s' "$selected"
 }
 
@@ -118,11 +128,20 @@ checkpoint_distribution_inventory() {
   fi
   selected=$minimum
   minimum=$(jq -s -r --argjson through "$selected" '
+    def notarization_not_entered:
+      . as $job | .status == "completed" and (.steps|type) == "array" and
+      all(.steps[]; (.name|type) == "string" and
+        (.number|type) == "number" and .number > 0 and .number == (.number|floor) and
+        .status == "completed" and (.conclusion|type) == "string" and .conclusion != "") and
+      ([.steps[].number]|length) == ([.steps[].number]|unique|length) and
+      (["Notarize the installed payload", "Notarize the enclosing installer", "Notarize the distribution disk image"] |
+        all(.[]; . as $name | [$job.steps[]|select(.name == $name)] |
+          length == 1 and .[0].conclusion == "skipped"));
     [.[] | select(.name == "Sign and notarize main installer" and .run_attempt <= $through) |
       select((.status == "completed" and .conclusion == "skipped" and
         all(.steps[]?; .conclusion == "skipped")) or
         (.status == "completed" and .conclusion == "cancelled" and has("started_at") and .started_at == null and
-          all(.steps[]?; .conclusion == "skipped"))) | .id] as $never_started |
+          all(.steps[]?; .conclusion == "skipped")) or notarization_not_entered) | .id] as $never_started |
     [.[] | select(.name == "Sign and notarize main installer" and .run_attempt <= $through) |
       select(.id as $id | $never_started | index($id) | not) | .custody_attempt] | max // 0
   ' "$temporary/jobs-$id")

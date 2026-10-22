@@ -33,8 +33,11 @@ no downloaded build script is executed with Apple credentials.
 - Check installer production separately from effective required-validation
   success, allowing successful partial CI retries without rebuilding.
 - Derive checkpoint obligations from actual signing progress across attempts;
-  acceptance-only retries and explicitly skipped signing jobs do not invent
-  a requirement for a newer signing checkpoint.
+  acceptance-only retries and complete histories proving all signing stages
+  were skipped do not invent a requirement for a newer signing checkpoint.
+- Order each execution by numeric attempt and stage slot, then order retained
+  checkpoints across executions by verified creation time. Artifact IDs do not
+  encode chronology; missing or tied creation times stop recovery.
 - Bind prepared-stage custody to both execution run ID and attempt.
 - Stop on missing or expired latest state, changed artifacts, corruption,
   rejection or uncertain upload outcomes. Never create a fresh submission to
@@ -59,11 +62,11 @@ unknown-upload reconciliation or new observer is part of this change.
 - All Go packages passed race tests with at most two package/test workers.
   Source portability, Go formatting and vet, reachable-vulnerability scanning,
   Linux builds of the trusted tools, workflow lint and shell syntax checks passed.
-- Review reproduced three integration defects: the credential wrapper rejected
-  both distribution events; source selection tied the aggregate validation gate
-  to the artifact attempt; checkpoint recovery required new state for signing
-  that had not executed again. Each now has a failing-before/passing-after
-  regression, including copied successful jobs and queued retries.
+- Review reproduced integration defects in trigger trust, partial CI retries
+  and signing-state recovery. Regression coverage includes copied successful
+  jobs, queued retries, setup/download failures before signing, older workflow
+  executions resumed later, and nonchronological artifact IDs. Missing or
+  ambiguous histories and timestamps retain explicit failure paths.
 - Focused race checks passed after the fixes, including the actual credential
   wrapper and resume path with private simulated tools. Checkpoint checks retain
   refusal for unknown signing history, changed artifacts, deleted trailing
