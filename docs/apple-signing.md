@@ -71,12 +71,14 @@ Its non-secret variables are `APPLE_SIGNING_IDENTITY`, `APPLE_TEAM_ID`,
 wait, not a claim about Apple's turnaround time.
 
 PRs build and test ad hoc development artifacts without Apple credentials.
-After required main validation passes, a separate hosted macOS job imports the
+After required main validation passes, a separate distribution workflow imports the
 identity into a disposable private Keychain and signs the already-built
 installer. It does not recompile code with the signing key loaded. The wrapper
 removes temporary credentials on success, failure and cancellation. Publication
 consumes only the finalized notarized artifact. Missing credentials, rejection,
-stapling or policy failures stop publication with no ad hoc fallback.
+stapling or policy failures stop publication with no ad hoc fallback. Distribution
+uses trusted main automation and the original build's verified artifacts. Its
+workflow run number and automation commit never replace the source build identity.
 
 Before invoking a signing child, the wrapper checks both the matching and valid
 code-signing identity inventories in its owned Keychain. It requires exactly
@@ -169,58 +171,100 @@ resolution rather than an automatic retry.
 
 ## Resuming a pending CI submission
 
+Build CI and distribution run independently. `ci.yml` validates and retains the
+universal installer. `distribution.yml` automatically follows a successful
+same-repository main-push CI run. It can also be dispatched manually from `main`
+with the original `build_run_id`, so a merged automation repair can process the
+retained installer without recompiling it.
+
+The build run ID, artifact-producing attempt, build number, source commit,
+artifact ID, artifact digest and embedded version identify the original build.
+The workflow checks API provenance, the successful artifact-producing installer
+job and the effective successful required validation gate for the same run and
+source commit, the outer GitHub artifact digest, ZIP/DMG checksums and the
+embedded build identities before credentials are used. The installer may come
+from an earlier attempt when a failed-job retry passed the remaining checks. It reads the version from the original
+artifact, even when current main has a different `VERSION`.
+
+Manual recovery also supports a completed legacy CI run whose installer and
+required validation passed before its old distribution jobs failed. It does not
+make a failed application build eligible. Automatic distribution requires the
+whole triggering CI run to have succeeded.
+
+The automation commit is pinned separately across distribution jobs. Release
+tags, manifests and target commits keep the original build identity. Changing
+application source requires a new CI build; changing distribution automation can
+reuse the existing artifact.
+
 The protected signing job uses `scripts/macos-resume.sh`; local one-shot
 `macos-signing.sh package` remains available. Each payload, installer and DMG
 stage persists an immutable checkpoint before uploading, immediately after
-recording its submission ID, and after waiting, including a failed wait.
-An initial `s00` checkpoint precedes credential setup and signing, so an import
-or first preparation failure still leaves verified recovery state. It permits
-the first submission on a later attempt only when no stage upload was prepared.
-The checkpoint contains the original prepared installer, exact signed upload
-archives, their SHA-256 values, stage records and public Apple receipts.
-ZIP wrapping preserves executable modes and macOS resource forks.
+recording its submission ID, and after waiting, including a failed wait. An
+initial `s00` checkpoint precedes credential setup and signing. Checkpoints
+contain the original prepared installer, exact signed upload archives, their
+SHA-256 values, stage records and public Apple receipts. ZIP wrapping preserves
+executable modes and macOS resource forks.
 
-If Apple remains pending after the finite wait, publication stops. Later,
-open that original main-push run in GitHub Actions and choose **Re-run failed
-jobs**, or run the following with its numeric run ID:
+If Apple remains pending after the finite wait, publication stops. Once the
+existing submission is ready, rerun failed jobs on the **distribution run** to
+reuse unchanged automation:
 
 ```sh
-gh run rerun RUN_ID --failed --repo Dunky13/agent-job-queue
+gh run rerun DISTRIBUTION_RUN_ID --failed --repo Dunky13/agent-job-queue
 ```
 
-The new runner restores the newest checkpoint from a previous attempt of
-that exact run. It checks the API's repository, main-push event, workflow,
-commit and build number, the artifact's digest and checkpoint checksum, then
-the state's team, version, source and archive hashes. It queries the existing
-submission and continues accepted stages without re-signing or re-uploading
-them. Accepted Apple logs must match the submission ID and exact archive hash.
-Only all three completed stages can export release assets. Fresh ARM and Intel
-acceptance jobs still precede publication and Homebrew delivery.
+If the workflow or scripts needed a repair, merge that repair first, then
+substitute the original numeric CI run ID for `BUILD_RUN_ID`:
 
-This deliberately resumes the original run rather than dispatching a new build:
-GitHub retains its original commit, ref, actor privileges and run number.
-Final artifacts use attempt-specific names, and downstream jobs select the
-successful signing job's exact artifact. A retry of a failed acceptance or
-publication job can reuse that successful artifact. See GitHub's
-[rerun rules](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)
+```sh
+gh workflow run distribution.yml --repo Dunky13/agent-job-queue \
+  --ref main -f build_run_id=BUILD_RUN_ID
+```
+
+The expected result is a new **Distribute build BUILD_RUN_ID** run using main's
+corrected automation and the original source artifact. Inspect it with:
+
+```sh
+gh run list --repo Dunky13/agent-job-queue --workflow distribution.yml --limit 5
+```
+
+Distribution executions share the original CI run's concurrency lock, including
+legacy signing retries, without cancelling an active signing job. Recovery discovers earlier executions for that build and
+includes the original CI run's legacy checkpoints. New checkpoint names include
+build run ID, distribution run ID, attempt and stage slot. Recovery verifies run
+provenance, the source artifact binding, both archive digests, team, version and
+stage receipts. A prepared stage also records its execution run ID, so a new
+run with attempt number `1` cannot accidentally repeat an uncertain upload from
+an older run's attempt `1`.
+
+Checkpoint obligations follow actual signing jobs across attempts. A retry of
+acceptance or publication can retain an earlier successful signing checkpoint;
+a run whose signing job was explicitly skipped does not require a new one.
+Missing state after signing could have begun still stops recovery.
+
+Recovery continues accepted stages and existing submission IDs without signing
+or uploading them again. Accepted Apple logs must match the submission ID and
+exact archive hash. Only three completed stages can export release assets.
+Fresh Apple Silicon and Intel acceptance jobs still precede publication and
+Homebrew delivery. Final artifacts use execution-specific names; downstream
+jobs consume the successful signing job's exact artifact.
+
+Checkpoints and original CI artifacts are retained for 30 days. Missing or
+expired latest state, invalid provenance, corruption, a changed source artifact
+or signing team, rejection and an uncertain upload stop recovery. There is no
+fallback to older state or a fresh upload. Whole-runner loss before durable
+persistence can require provider reconciliation. Legacy checkpoints with an
+unknown upload outcome remain blocked; a new distribution run does not clear
+that uncertainty. Inspect preserved receipts and Apple's submission history
+with the original credentials before deciding how to recover. Automatic receipt
+import or duplicate resubmission is not provided.
+
+GitHub failed-job retries retain the original automation revision, ref and
+actor privileges, and are available for 30 days with at most 50 attempts.
+Dispatching a new distribution run is the path for using a repaired workflow.
+See GitHub's [rerun rules](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
+[workflow-run trigger](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run)
 and [artifact API](https://docs.github.com/en/rest/actions/artifacts).
-
-Checkpoints are retained for 30 days. GitHub permits reruns within 30 days of
-the original run and limits a run to 50 attempts. Missing or expired state,
-invalid provenance, corruption and a changed signing team stop recovery; there
-is no fallback to an older checkpoint or a fresh upload. Use failed-job reruns
-instead of rebuilding a new main run to retry a pending submission.
-
-There is an uncertain-outcome window if Apple creates a submission but the
-runner dies before persisting its ID. Older native-client checkpoints can
-also have an unknown upload outcome. A restored prepared or uploading stage
-without an ID refuses another create request. Inspect the preserved receipts and
-Apple's submission history with the original credentials before deciding how
-to recover. Automatic receipt import or duplicate resubmission is not provided.
-A rerun with no checkpoint also stops for reconciliation, even if signing
-never started. Runs created before the initial-checkpoint change do not gain
-that checkpoint retroactively. Rejected submissions remain failures. The job summary links the
-safe rerun action; no timer or privileged cross-workflow trigger is required.
 
 ## Local use
 

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Separate build and distribution workflow</title><style>html{color-scheme:light dark;font:17px/1.65 system-ui,sans-serif}body{margin:0 auto;max-width:76ch;padding:2rem 1.25rem 5rem}h1,h2{line-height:1.25}h2{margin-top:2rem}a{color:light-dark(#175bb7,#95bfff)}pre{padding:1rem;overflow:auto;border:1px solid #8886;border-radius:.5rem;white-space:pre-wrap;overflow-wrap:anywhere}code{font-size:.88em}li{margin:.5rem 0}h1 span,h2 span{display:none}@media print{body{max-width:none;padding:0}}</style></head><body id="top"><main>
+<h1 id="separate-build-and-distribution-workflow">Separate build and distribution workflow<span><a href="#separate-build-and-distribution-workflow">&para;</a> <a href="#top">&uarr;</a></span></h1>
+
+<p>The accepted change separates application builds from distribution repairs. The original report concerned build 56: its notarization succeeded, then fresh verification lost its connection to Apple&#39;s ticket service during <code>stapler validate</code>. The existing repair thread retained ownership of that release and retried its failed acceptance jobs using the signed artifacts. This change does not retry or replace that release.</p>
+
+<h2 id="resulting-behavior">Resulting behavior<span><a href="#resulting-behavior">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>CI tests the app, builds the universal installer and retains its artifact. A separate distribution workflow consumes the verified main-build artifact, notarizes payload, installer and DMG, runs fresh Apple Silicon and Intel acceptance, publishes the original numbered build, and verifies Homebrew delivery. Automatic runs require successful same-repository main-push CI. Manual runs accept an original build run ID and use trusted main automation.</p>
+
+<p>The original source SHA, build number, version and artifact identity remain separate from the distribution execution and its automation SHA. A pipeline repair can reuse the original build bytes. An application change requires a new build. The source installer archive is inspected as data before signing; no downloaded build script is executed with Apple credentials.</p>
+
+<h2 id="recovery-contract">Recovery contract<span><a href="#recovery-contract">&para;</a> <a href="#top">&uarr;</a></span></h2>
+<ul><li>
+<p>Serialize distribution executions for the same source build.</p>
+</li><li>
+<p>Check the source run, successful validation, exact source artifact ID/digest,  ZIP/DMG checksums and embedded build metadata before credentials.</p>
+</li><li>
+<p>Discover previous distribution checkpoints and legacy CI checkpoints for the  same build; validate repository, workflow, source SHA, team and version.</p>
+</li><li>
+<p>Preserve exact signed bytes and Apple submission IDs across workflow runs.</p>
+</li><li>
+<p>Check installer production separately from effective required-validation  success, allowing successful partial CI retries without rebuilding.</p>
+</li><li>
+<p>Derive checkpoint obligations from actual signing progress across attempts;  acceptance-only retries and explicitly skipped signing jobs do not invent  a requirement for a newer signing checkpoint.</p>
+</li><li>
+<p>Bind prepared-stage custody to both execution run ID and attempt.</p>
+</li><li>
+<p>Stop on missing or expired latest state, changed artifacts, corruption,  rejection or uncertain upload outcomes. Never create a fresh submission to  evade an unresolved earlier one.</p>
+</li><li>
+<p>Publish only after all three stages and both architecture acceptance jobs  succeed. Keep the existing immutable-release comparison and exact-build  Homebrew verification.</p>
+</li></ul>
+
+<h2 id="operator-entry-point">Operator entry point<span><a href="#operator-entry-point">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The <a href="../apple-signing.html#resuming-a-pending-ci-submission">signing guide</a> contains recovery commands, expected results, retention limits and credential boundaries. Use failed-job retries for unchanged automation. After merging an automation fix, dispatch <code>distribution.yml</code> from <code>main</code> with the original <code>build_run_id</code>. Neither path rebuilds application binaries.</p>
+
+<p>No operator installation, live queue mutation, credential change, old unknown-upload reconciliation or new observer is part of this change.</p>
+
+<h2 id="validation">Validation<span><a href="#validation">&para;</a> <a href="#top">&uarr;</a></span></h2>
+<ul><li>
+<p>All Go packages passed race tests with at most two package/test workers.  Source portability, Go formatting and vet, reachable-vulnerability scanning,  Linux builds of the trusted tools, workflow lint and shell syntax checks passed.</p>
+</li><li>
+<p>Review reproduced three integration defects: the credential wrapper rejected  both distribution events; source selection tied the aggregate validation gate  to the artifact attempt; checkpoint recovery required new state for signing  that had not executed again. Each now has a failing-before/passing-after  regression, including copied successful jobs and queued retries.</p>
+</li><li>
+<p>Focused race checks passed after the fixes, including the actual credential  wrapper and resume path with private simulated tools. Checkpoint checks retain  refusal for unknown signing history, changed artifacts, deleted trailing  progress and missing newer signing state.</p>
+</li><li>
+<p>A read-only download of original CI artifact <code>12429070300</code> from run  <code>39784200861</code> passed the new artifact verifier against build 56, source commit  <code>c7ed359a425064514469195b3989b44fb8ebce5b</code> and version <code>0.1.0</code>. Its GitHub digest  was <code>sha256:d2e73446d634415cf1931ee658af12a015d2084b08bc76d68bed35bb2a592b76</code>.  The retained production checkpoint&#39;s initial installer matched the original  archive&#39;s contents, modes and resource metadata.</p>
+</li><li>
+<p>Native ditto/resource-metadata round trips passed under both <code>022</code> and <code>077</code>  umasks. The complete offline HTML reports contain no external assets.</p>
+</li></ul>
+
+<p>These checks do not establish a hosted distribution execution, real Apple submission or fresh ARM/Intel acceptance through the new workflow. Those gates remain required after merge. No live release or installed queue was changed by local validation.</p>
+
+<p>A complete standalone <a href="distribution-workflow.html">HTML version</a> accompanies this handoff.</p>
+</main></body></html>

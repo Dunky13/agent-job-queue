@@ -19,6 +19,27 @@ func run(args []string) error {
 	}
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
+	case "verify-checkpoint-origin":
+		original := flags.String("original", "", "verified original installer ZIP")
+		initial := flags.String("initial", "", "checkpoint initial installer ZIP")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		return tooling.VerifyCheckpointOrigin(*original, *initial)
+	case "verify-build-artifact":
+		archive := flags.String("archive", "", "original GitHub artifact ZIP")
+		digest := flags.String("digest", "", "GitHub artifact SHA-256 digest")
+		commit := flags.String("commit", "", "original source commit")
+		build := flags.Int("build", 0, "original build number")
+		output := flags.String("output", "", "new verified artifact directory")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		version, err := tooling.VerifyBuildArtifact(*archive, *digest, *commit, *build, *output)
+		if err == nil {
+			fmt.Println(version)
+		}
+		return err
 	case "notarize":
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()

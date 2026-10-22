@@ -1,6 +1,7 @@
 # Agent Job Queue
 
 [![CI](https://github.com/Dunky13/agent-job-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/Dunky13/agent-job-queue/actions/workflows/ci.yml)
+[![Distribution](https://github.com/Dunky13/agent-job-queue/actions/workflows/distribution.yml/badge.svg)](https://github.com/Dunky13/agent-job-queue/actions/workflows/distribution.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Run many coding agents while sharing a limited number of heavy local job slots. Agents can read, reason, and edit concurrently. Builds, test suites, type checks, and other expensive commands wait their turn.
@@ -47,7 +48,7 @@ Uninstalling the cask removes the menu app and Homebrew command links. It preser
 ### Installer app
 
 1. Use macOS 15 or later on an Apple Silicon or Intel Mac.
-2. Download the installer ZIP or DMG from [Releases](https://github.com/Dunky13/agent-job-queue/releases). Every successful push to `main` publishes a new prerelease build with SHA-256 checksums. CI runs also retain the installer as an artifact for 30 days.
+2. Download the installer ZIP or DMG from [Releases](https://github.com/Dunky13/agent-job-queue/releases). Successful main CI builds trigger distribution; a prerelease appears after notarization and both architecture checks pass. CI runs also retain the installer as an artifact for 30 days.
 3. Open **Agent Job Queue Installer.app**, then choose **Install**. The installer displays progress and any errors in its window.
 4. The app appears in your menu bar. Add your local bin directory to your shell's `PATH` to use `agent-heavy` by name.
 
@@ -231,13 +232,13 @@ For an optional migration bridge, `AGENT_HEAVY_LEGACY_SLOT` selects an existing 
 
 ## Development and CI
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for local commands and the [workflow](.github/workflows/ci.yml) for exact hosted checks.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local commands and the [CI workflow](.github/workflows/ci.yml) for exact hosted checks. The separate [distribution workflow](.github/workflows/distribution.yml) signs, notarizes, verifies and publishes retained main-build artifacts.
 
 Pull requests run Go formatting, vet, vulnerability scanning and race tests, JavaScript lint, shell and workflow checks, isolated Go daemon acceptance tests, embedded Caddy HTTPS/API tests, browser regression tests, native Swift regression tests, and universal installer verification. The workflow runs macOS behavior on Apple Silicon and Intel runners. All validation jobs feed one required `ci-required` check; a failure, cancellation, or skipped required job fails that check.
 
 `main` requires a pull request, current passing checks, resolved review conversations, and verified commit signatures. Force pushes and deletion are blocked, including for administrators. Commits also require an author-matching DCO sign-off. The initial repository import bootstraps the branch; later changes use pull requests.
 
-Only a successful `main` workflow can publish an installer. Pull request code receives read-only repository permissions. Actions are pinned to immutable commit SHAs, npm dependencies use a lockfile, and Go dependencies are pinned in `go.mod` and `go.sum`.
+Distribution requires a successful, verified `main` CI build. A manual distribution run can use corrected main automation with that same build's retained artifacts and notarization checkpoints, preserving its original commit, version and build number. See [Apple signing and notarization](docs/apple-signing.md) for recovery. Pull request code receives read-only repository permissions. Actions are pinned to immutable commit SHAs, npm dependencies use a lockfile, and Go dependencies are pinned in `go.mod` and `go.sum`.
 
 ## License
 

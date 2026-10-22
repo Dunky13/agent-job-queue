@@ -1,6 +1,6 @@
 # Verified Homebrew delivery
 
-The tap follows the latest successfully published main build. Main CI validates the app and publishes its immutable installer before a separate **Verify Homebrew delivery** job starts. A failed app build leaves the prior Homebrew build available.
+The tap follows the latest successfully published main build. Main CI validates and retains the installer. The separate distribution workflow signs, notarizes, tests and publishes that exact build before its **Verify Homebrew delivery** job starts. A failed app build or distribution attempt leaves the prior Homebrew build available.
 
 ## Delivery contract
 
@@ -26,7 +26,7 @@ The workflow uses the SHA-pinned official `actions/create-github-app-token` acti
 
 ## Recovery and tooling changes
 
-Inspect the failed source **Verify Homebrew delivery** job and its linked exact tap run. Correct the reported problem, then rerun failed source jobs. A matching immutable release is verified rather than overwritten. A repeated refresh verifies an already-current cask without creating another commit.
+Inspect the failed distribution **Verify Homebrew delivery** job and its linked exact tap run. Rerun failed distribution jobs to retry unchanged automation. If the automation itself needs a fix, merge the repair and dispatch distribution against the original build run ID as documented in [Apple signing and notarization](apple-signing.md#resuming-a-pending-ci-submission). A matching immutable release is verified rather than overwritten. A repeated refresh verifies an already-current cask without creating another commit.
 
 An owner can reconcile the latest published build without supplying release inputs:
 

@@ -190,7 +190,7 @@ func TestAppleSigningRejectsUntrustedCIBeforeToolsAndSecrets(t *testing.T) {
 			env = append(env, "GITHUB_ACTIONS=true", "GITHUB_EVENT_NAME="+test.event,
 				"GITHUB_REF="+test.reference, "APPLE_NOTARY_KEY_P8=")
 			code, output := appleSigningExitCode(t, appleSigningCommand(t, env, "/usr/bin/true"))
-			if code == 0 || !strings.Contains(output, "trusted push to main") {
+			if code == 0 || !strings.Contains(output, "trusted push to main") && !strings.Contains(output, "Trusted main automation") {
 				t.Fatalf("untrusted job accepted or credentials inspected: %d %s", code, output)
 			}
 			if _, err := os.Stat(filepath.Join(root, "calls")); !errors.Is(err, os.ErrNotExist) {
@@ -464,4 +464,61 @@ printf '%s' "$!" > "$KEYCHAIN_TEST_ROOT/grandchild"
 	}
 	assertAppleSigningRemoved(t, root)
 	assertAppleSigningProcessStopped(t, grandchild)
+}
+
+func TestAppleSigningDistributionWrapperReachesResume(t *testing.T) {
+	for _, event := range []string{"workflow_run", "workflow_dispatch"} {
+		t.Run(event, func(t *testing.T) {
+			root, env := appleSigningFixture(t)
+			env = append(env, appleSigningDistributionContext(event)...)
+			resume, err := filepath.Abs("../../scripts/macos-resume.sh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			code, output := appleSigningExitCode(t, appleSigningCommand(t, env, "/bin/bash", resume,
+				"verify-state", filepath.Join(root, "absent-private-state"), "0.1.0"))
+			if code != 1 || !strings.Contains(output, "State directory is missing or is a symlink") ||
+				!strings.Contains(output, "phase=preflight classification=ready") {
+				t.Fatalf("trusted distribution did not reach real resume private-state guard: %d %s", code, output)
+			}
+			assertAppleSigningRemoved(t, root)
+		})
+	}
+}
+
+func appleSigningDistributionContext(event string) []string {
+	return []string{
+		"GITHUB_ACTIONS=true", "GITHUB_EVENT_NAME=" + event, "GITHUB_REF=refs/heads/main",
+		"GITHUB_REF_PROTECTED=true", "GITHUB_WORKFLOW_REF=owner/project/.github/workflows/distribution.yml@refs/heads/main",
+		"GITHUB_REPOSITORY=owner/project", "GITHUB_SHA=" + strings.Repeat("b", 40),
+		"GITHUB_RUN_ID=999", "GITHUB_RUN_NUMBER=101", "GITHUB_RUN_ATTEMPT=1", "RUNNER_ENVIRONMENT=github-hosted",
+		"BUILD_RUN_ID=123", "BUILD_RUN_NUMBER=45", "BUILD_RUN_ATTEMPT=1", "BUILD_SHA=" + checkpointSHA,
+		"BUILD_ARTIFACT_ID=800", "BUILD_ARTIFACT_DIGEST=sha256:" + strings.Repeat("c", 64),
+		"BUILD_VERSION=0.1.0", "BUILD_TAG=build-45-1111111", "AUTOMATION_SHA=" + strings.Repeat("b", 40),
+	}
+}
+
+func TestAppleSigningDistributionRejectsInvalidContextBeforeCredentials(t *testing.T) {
+	for _, event := range []string{"workflow_run", "workflow_dispatch"} {
+		for _, override := range []string{
+			"GITHUB_EVENT_NAME=pull_request", "GITHUB_EVENT_NAME=pull_request_target", "GITHUB_REF=refs/heads/feature",
+			"GITHUB_REF_PROTECTED=false", "GITHUB_WORKFLOW_REF=owner/project/.github/workflows/evil.yml@refs/heads/main",
+			"RUNNER_ENVIRONMENT=self-hosted", "GITHUB_RUN_ID=0999", "GITHUB_SHA=invalid", "GITHUB_REPOSITORY=fork/project",
+			"BUILD_RUN_ID=", "BUILD_RUN_NUMBER=0", "BUILD_RUN_ATTEMPT=bad", "BUILD_SHA=invalid", "BUILD_ARTIFACT_ID=0800",
+			"BUILD_ARTIFACT_DIGEST=invalid", "BUILD_VERSION=", "BUILD_TAG=build-101-bbbbbbb", "AUTOMATION_SHA=" + checkpointSHA,
+		} {
+			t.Run(event+"/"+override, func(t *testing.T) {
+				root, env := appleSigningFixture(t)
+				env = append(env, appleSigningDistributionContext(event)...)
+				env = append(env, override, "APPLE_NOTARY_KEY_P8=")
+				code, output := appleSigningExitCode(t, appleSigningCommand(t, env, "/usr/bin/true"))
+				if code == 0 || strings.Contains(output, "requires APPLE_NOTARY_KEY_P8") {
+					t.Fatalf("invalid context reached credentials: %d %s", code, output)
+				}
+				if _, err := os.Stat(filepath.Join(root, "calls")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("invalid context invoked tools: %v", err)
+				}
+			})
+		}
+	}
 }

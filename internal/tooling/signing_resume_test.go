@@ -759,3 +759,78 @@ if [[ ${0##*/} == xcrun && $1:$2 == notarytool:log ]]; then
   exit
 fi
 `
+
+func distributionResumeIdentity() []string {
+	return []string{"BUILD_RUN_ID=1234", "BUILD_RUN_NUMBER=21", "BUILD_RUN_ATTEMPT=1", "BUILD_SHA=" + strings.Repeat("a", 40), "BUILD_ARTIFACT_ID=800", "BUILD_ARTIFACT_DIGEST=sha256:" + strings.Repeat("d", 64), "BUILD_VERSION=0.1.0"}
+}
+
+func TestMacOSResumeReusesSignedBytesAndSubmissionAcrossDistributionRuns(t *testing.T) {
+	identity := distributionResumeIdentity()
+	first := append(append([]string{}, identity...), "GITHUB_RUN_ID=5555", "GITHUB_RUN_NUMBER=100", "GITHUB_SHA="+strings.Repeat("b", 40))
+	f := newResumeFixture(t, first...)
+	f.step(t, "prepare", "payload")
+	original, err := os.ReadFile(filepath.Join(f.state, "archives/payload.zip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.step(t, "submit", "payload")
+	f.reject(t, []string{"SIGNING_TEST_FAILURE=payload-timeout"}, "preserved", "finish", f.state, "payload", "0.1.0")
+	second := []string{"GITHUB_RUN_ID=6666", "GITHUB_RUN_NUMBER=101", "GITHUB_SHA=" + strings.Repeat("c", 40), "GITHUB_RUN_ATTEMPT=1"}
+	f.command(t, second, "verify-state", f.state, "0.1.0")
+	for _, operation := range []string{"prepare", "submit", "finish"} {
+		f.step(t, operation, "payload", second...)
+	}
+	after, err := os.ReadFile(filepath.Join(f.state, "archives/payload.zip"))
+	if err != nil || string(original) != string(after) {
+		t.Fatal("new distribution execution changed original signed bytes")
+	}
+	calls := f.recorded(t)
+	if strings.Count(calls, "xcrun|notarytool|submit|") != 1 || strings.Count(calls, "codesign|--force|") != 3 {
+		t.Fatalf("cross-run recovery signed or uploaded again: %s", calls)
+	}
+	f.mutate(t, "metadata.json", func(v map[string]any) {
+		if v["run_id"] != "1234" || v["run_number"] != "21" || v["source_sha"] != strings.Repeat("a", 40) || v["artifact_id"] != "800" {
+			t.Fatalf("source identity replaced by automation execution: %v", v)
+		}
+	})
+}
+
+func TestMacOSResumeUnknownPreparedCustodyAcrossExecutions(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprint("legacy=", legacy), func(t *testing.T) {
+			identity := distributionResumeIdentity()
+			f := newResumeFixture(t, identity...)
+			f.step(t, "prepare", "payload")
+			if legacy {
+				f.mutate(t, "stages/payload.json", func(v map[string]any) { delete(v, "prepared_run_id") })
+			}
+			f.reject(t, []string{"GITHUB_RUN_ID=5555", "GITHUB_RUN_NUMBER=100", "GITHUB_SHA=" + strings.Repeat("b", 40), "GITHUB_RUN_ATTEMPT=1"}, "Upload outcome is unknown", "submit", f.state, "payload", "0.1.0")
+			if strings.Contains(f.recorded(t), "xcrun|notarytool|submit|") {
+				t.Fatal("same numeric attempt in another execution resubmitted unknown signed bytes")
+			}
+		})
+	}
+}
+
+func TestMacOSResumeBindsExactOriginalArtifactAndTeam(t *testing.T) {
+	for _, field := range []string{"BUILD_RUN_ID", "BUILD_RUN_NUMBER", "BUILD_RUN_ATTEMPT", "BUILD_SHA", "BUILD_ARTIFACT_ID", "BUILD_ARTIFACT_DIGEST", "APPLE_TEAM_ID", "GITHUB_REPOSITORY"} {
+		t.Run(field, func(t *testing.T) {
+			f := newResumeFixture(t, distributionResumeIdentity()...)
+			value := "999"
+			switch field {
+			case "BUILD_SHA":
+				value = strings.Repeat("e", 40)
+			case "BUILD_ARTIFACT_DIGEST":
+				value = "sha256:" + strings.Repeat("e", 64)
+			case "APPLE_TEAM_ID":
+				value = "ZZZZZZZZZZ"
+			case "GITHUB_REPOSITORY":
+				value = "other/queue"
+			}
+			f.reject(t, []string{field + "=" + value}, "State metadata does not match", "verify-state", f.state, "0.1.0")
+			if strings.Contains(f.recorded(t), "codesign|--force|") || strings.Contains(f.recorded(t), "xcrun|notarytool|") {
+				t.Fatal("mismatched state reached signing/provider")
+			}
+		})
+	}
+}

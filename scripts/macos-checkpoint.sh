@@ -8,7 +8,17 @@ checkpoint_error() {
   exit 1
 }
 
+root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=scripts/distribution-common.sh
+source "$root/scripts/distribution-common.sh"
+# shellcheck source=scripts/distribution-checkpoints.sh
+source "$root/scripts/distribution-checkpoints.sh"
+
 checkpoint_context() {
+  if [[ -n ${BUILD_RUN_ID:-} ]]; then
+    distribution_context
+    return
+  fi
   [[ ${GITHUB_ACTIONS:-} == true && ${GITHUB_EVENT_NAME:-} == push && ${GITHUB_REF:-} == refs/heads/main ]] ||
     checkpoint_error 'Recovery requires a trusted push to main.'
   local sha_pattern='^[a-fA-F0-9]{40}$' number_pattern='^[1-9][0-9]{0,14}$'
@@ -97,6 +107,10 @@ checkpoint_restore() {
   temporary=$(mktemp -d "${state%/*}/.checkpoint.XXXXXX")
   CHECKPOINT_TEMPORARY=$temporary
   trap 'rm -rf "$CHECKPOINT_TEMPORARY"' EXIT
+  if [[ -n ${BUILD_RUN_ID:-} ]]; then
+    selected=$(checkpoint_distribution_candidates "$temporary")
+    if [[ -z $selected ]]; then checkpoint_output false; return; fi
+  else
   metadata="$temporary/run.json"
   gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > "$metadata"
   jq -e --arg repository "$GITHUB_REPOSITORY" --arg sha "$GITHUB_SHA" --arg id "$GITHUB_RUN_ID" --arg number "$GITHUB_RUN_NUMBER" '
@@ -138,6 +152,7 @@ checkpoint_restore() {
     [[ $GITHUB_RUN_ATTEMPT == 1 ]] || checkpoint_error 'Rerun has no surviving checkpoint; refusing a fresh submission.'
     checkpoint_output false
     return
+  fi
   fi
   [[ $(jq -r '.expired' <<< "$selected") == false ]] || checkpoint_error 'Newest checkpoint expired; refusing an older state.'
   artifact_id=$(jq -r '.id' <<< "$selected")
