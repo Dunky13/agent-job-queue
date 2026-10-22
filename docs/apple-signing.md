@@ -109,6 +109,11 @@ local runs keep the unlisted probe and never change search settings. Registratio
 requires `GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`, rejecting
 self-hosted runners. The operator authorized this CI-only registration scope;
 the operator's local search list and trust settings remain untouched.
+Only the newly owned Keychain's existing parent is resolved to its physical
+path before registration. Captured original entries and order remain exact;
+readback and concurrent-change checks are not relaxed. A symlinked final file
+is rejected. The fixed `owned-path-normalized` classification reports this
+case without exposing paths.
 The probe is separate from Developer ID acceptance
 and never executes its signed target.
 

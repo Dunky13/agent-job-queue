@@ -48,7 +48,12 @@ if { [ "$failure" = add-readback-mismatch ] && [ "$setters" = 1 ]; } ||
    { [ "$failure" = restore-readback-mismatch ] && [ "$setters" = 2 ]; }; then exit 0; fi
 shift 3
 : > "$KEYCHAIN_TEST_ROOT/search-state"
-for entry in "$@"; do printf '    "%s"\n' "$entry" >> "$KEYCHAIN_TEST_ROOT/search-state"; done
+for entry in "$@"; do
+  if [ "${KEYCHAIN_TEST_CANONICALIZE_OWNED:-}" = true ] && [ "$entry" = "$(cat "$KEYCHAIN_TEST_ROOT/keychain")" ]; then
+    entry=$(cat "$KEYCHAIN_TEST_ROOT/physical-keychain")
+  fi
+  printf '    "%s"\n' "$entry" >> "$KEYCHAIN_TEST_ROOT/search-state"
+done
 if [ "$failure" = partial-set-failure ] && [ "$setters" = 1 ]; then
   printf 'private partial mutation error\n' >&2; exit 17
 fi
@@ -80,7 +85,8 @@ func assertAppleSigningSearchState(t *testing.T, root, want string) {
 }
 
 const appleSigningVisibleChild = `set -eu
-grep -Fxq "    \"$APPLE_SIGNING_KEYCHAIN\"" "$KEYCHAIN_TEST_ROOT/search-state" || exit 98
+physical_parent=$(cd -P -- "${APPLE_SIGNING_KEYCHAIN%/*}" && pwd -P)
+grep -Fxq "    \"$physical_parent/${APPLE_SIGNING_KEYCHAIN##*/}\"" "$KEYCHAIN_TEST_ROOT/search-state" || exit 98
 printf child > "$KEYCHAIN_TEST_ROOT/child"
 exit "${KEYCHAIN_TEST_CHILD_STATUS:-0}"
 `
@@ -99,7 +105,7 @@ func TestAppleSigningHostedSearchRegistersAndRestoresExactOrder(t *testing.T) {
 				if code != wantCode || !strings.Contains(output, "phase=register classification=ready") || !strings.Contains(output, "phase=restore classification=ready") {
 					t.Fatalf("registration or restoration failed: %d %s", code, output)
 				}
-				keychain, err := os.ReadFile(filepath.Join(root, "keychain"))
+				keychain, err := os.ReadFile(filepath.Join(root, "physical-keychain"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -116,6 +122,72 @@ func TestAppleSigningHostedSearchRegistersAndRestoresExactOrder(t *testing.T) {
 				assertAppleSigningRemoved(t, root)
 			})
 		}
+	}
+}
+
+func TestAppleSigningHostedSearchNormalizesOnlyTheOwnedSymlinkedParent(t *testing.T) {
+	root, env := appleSigningFixture(t)
+	physicalParent := filepath.Join(root, "physical parent")
+	aliasParent := filepath.Join(root, "aliased parent")
+	if err := os.Mkdir(physicalParent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(physicalParent, aliasParent); err != nil {
+		t.Fatal(err)
+	}
+	originalAlias := filepath.Join(aliasParent, "existing.keychain-db")
+	if err := os.WriteFile(originalAlias, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	original := appleSigningOriginalSearchList + "    \"" + originalAlias + "\"\n"
+	if err := os.WriteFile(filepath.Join(root, "search-state"), []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	env = append(appleSigningHostedSearchEnvironment(env), "TMPDIR="+aliasParent, "KEYCHAIN_TEST_CANONICALIZE_OWNED=true")
+	code, output := appleSigningExitCode(t, appleSigningCommand(t, env, "/bin/bash", "-c", appleSigningVisibleChild))
+	if code != 0 || !strings.Contains(output, "phase=register classification=owned-path-normalized") ||
+		!strings.Contains(output, "phase=register classification=ready") || !strings.Contains(output, "phase=restore classification=ready") {
+		t.Fatalf("owned path normalization or exact restoration failed: %d %s", code, output)
+	}
+	physicalOwned, err := os.ReadFile(filepath.Join(root, "physical-keychain"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalArgs := []string{"-d", "user", "-s", "/private/fixture/Login Keychain.keychain-db", "/Library/Keychains/System.keychain", originalAlias}
+	assertAppleSigningSearchArguments(t, root, 1, append(append([]string{}, originalArgs...), string(physicalOwned)))
+	assertAppleSigningSearchArguments(t, root, 2, originalArgs)
+	assertAppleSigningSearchState(t, root, original)
+	if strings.Contains(output, root) || strings.Contains(output, "aliased parent") || strings.Contains(output, "physical parent") {
+		t.Fatalf("path normalization exposed private paths: %s", output)
+	}
+	assertAppleSigningRemoved(t, root)
+}
+
+func TestAppleSigningSearchHelperRejectsASymlinkedOwnedFileBeforeSettings(t *testing.T) {
+	root, env := appleSigningFixture(t)
+	module, err := filepath.Abs("../../scripts/macos-keychain-search.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target.keychain-db")
+	owned := filepath.Join(root, "owned.keychain-db")
+	if err := os.WriteFile(target, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, owned); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/bin/bash", "-c", `set -euo pipefail
+source "$1"
+macos_keychain_search_register "$2"
+`, "fixture", module, owned)
+	command.Env = appleSigningHostedSearchEnvironment(env)
+	code, output := appleSigningExitCode(t, command)
+	if code == 0 || !strings.Contains(output, "classification=invalid-owned-keychain") || strings.Contains(output, root) {
+		t.Fatalf("symlinked owned file was accepted or leaked: %d %s", code, output)
+	}
+	if _, err := os.Stat(filepath.Join(root, "calls")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("symlinked owned file reached settings tools: %v", err)
 	}
 }
 
@@ -258,6 +330,10 @@ func TestAppleSigningSearchHelperCanRestoreThenRegisterAnEmptyList(t *testing.T)
 	if err := os.WriteFile(owned, []byte("fixture"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	physicalOwned, err := filepath.EvalSymlinks(owned)
+	if err != nil {
+		t.Fatal(err)
+	}
 	command := exec.Command("/bin/bash", "-c", `set -euo pipefail
 source "$1"
 macos_keychain_search_register "$2"
@@ -270,7 +346,7 @@ macos_keychain_search_restore
 	if code, output := appleSigningExitCode(t, command); code != 0 {
 		t.Fatalf("sequential helper registration failed: %d %s", code, output)
 	}
-	assertAppleSigningSearchArguments(t, root, 3, []string{"-d", "user", "-s", owned})
+	assertAppleSigningSearchArguments(t, root, 3, []string{"-d", "user", "-s", physicalOwned})
 	assertAppleSigningSearchArguments(t, root, 4, []string{"-d", "user", "-s"})
 	assertAppleSigningSearchState(t, root, "")
 }

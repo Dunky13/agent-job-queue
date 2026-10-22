@@ -70,10 +70,27 @@ macos_keychain_search_register() {
     macos_keychain_search_diagnostic register forbidden-runner
     return 1
   fi
-  if [[ $# != 1 || $1 != /* || ! -f $1 || $1 == *'"'* || $1 == *\\* || $1 =~ [[:cntrl:]] ||
+  if [[ $# != 1 || $1 != /* || ! -f $1 || -L $1 || $1 == *'"'* || $1 == *\\* || $1 =~ [[:cntrl:]] ||
     -n $macos_keychain_search_work ]]; then
     macos_keychain_search_diagnostic register invalid-owned-keychain
     return 1
+  fi
+  # security can return a physical parent spelling, such as /private/var for
+  # /var. Normalize only the owned file's existing parent before the setter;
+  # captured entries remain byte-exact and the strict readback is unchanged.
+  local owned_parent=${1%/*} owned_keychain
+  if ! owned_parent=$(cd -P -- "${owned_parent:-/}" && pwd -P) 2>/dev/null; then
+    macos_keychain_search_diagnostic register invalid-owned-keychain
+    return 1
+  fi
+  owned_keychain="${owned_parent%/}/${1##*/}"
+  if [[ ! -f $owned_keychain || -L $owned_keychain || $owned_keychain == *'"'* ||
+    $owned_keychain == *\\* || $owned_keychain =~ [[:cntrl:]] ]]; then
+    macos_keychain_search_diagnostic register invalid-owned-keychain
+    return 1
+  fi
+  if [[ $owned_keychain != "$1" ]]; then
+    macos_keychain_search_diagnostic register owned-path-normalized
   fi
   macos_keychain_search_original=()
   macos_keychain_search_expected=()
@@ -89,13 +106,13 @@ macos_keychain_search_register() {
   fi
   local index=0
   while ((index < macos_keychain_search_original_count)); do
-    if [[ ${macos_keychain_search_original[$index]} == "$1" ]]; then
+    if [[ ${macos_keychain_search_original[$index]} == "$owned_keychain" ]]; then
       macos_keychain_search_diagnostic register already-present
       return 1
     fi
     index=$((index + 1))
   done
-  macos_keychain_search_expected[macos_keychain_search_original_count]=$1
+  macos_keychain_search_expected[macos_keychain_search_original_count]=$owned_keychain
   # A setter can mutate state and still fail, so cleanup owns restoration before
   # the first write. No credential values or search-list paths are logged.
   macos_keychain_search_restore_needed=1

@@ -161,3 +161,40 @@ GitHub-hosted runners and validate updated PR 17. No operator-Mac or self-hosted
 settings changes, trust overrides, production uploads or merge are authorized
 by that exception. Exact-head hosted ARM and Intel results are still required.
 Do not weaken the test or bypass the separate human merge gate after validation.
+
+## Registration readback repair
+
+At approved registration head `621a230917a08e571e33b09f2c0eeb395c443854`,
+[Intel job 119748005067](https://github.com/Dunky13/agent-job-queue/actions/runs/39755991806/job/119748005067)
+failed before signing with `phase=register classification=readback-mismatch`
+and `phase=restore classification=conflict`. It did not report a final cleanup
+or host-setting comparison failure. The failed runner's paths were withheld,
+so its exact mismatch is not established by that log.
+
+Apple's published implementation
+[canonicalizes database paths](https://github.com/apple-oss-distributions/Security/blob/db15acbe6a7f257a859ad9a3bb86097bfe0679d9/OSX/libsecurity_cdsa_utilities/lib/cssmdbname.cpp#L55-L100)
+and [returns the canonical database name](https://github.com/apple-oss-distributions/Security/blob/db15acbe6a7f257a859ad9a3bb86097bfe0679d9/OSX/libsecurity_cdsa_client/lib/dlclient.cpp#L253-L267).
+This supports a physical-path alias as a plausible mechanism; it does not
+prove the failed runner's incident cause or exact source/binary correspondence.
+
+A regression uses a real symlinked temporary parent and a mocked settings
+tool returning the physical owned path. Before the repair, it reproduces the
+same readback-mismatch and restore-conflict sequence. After the repair, it
+registers and restores successfully, preserving an existing aliased entry
+byte-for-byte and in its original position. Another regression rejects a
+symlinked final Keychain file before any settings tool is invoked.
+
+The helper resolves only the newly owned file's existing parent using physical
+directory traversal, retains the filename, and validates it again. Original
+captured paths are never normalized. Ordered exact readback and conflicting
+change refusal remain mandatory. The fixed `owned-path-normalized` diagnostic
+exposes no paths. Wrapper tests model the physical owned path separately from
+the caller's path. No operator settings, trust or credentials were used.
+
+The focused wrapper/helper suite passed in 33.493 seconds. Queued lint and the
+complete tooling race suite passed, with race tests taking 121.776 seconds.
+Standalone HTML and diff checks passed. Independent Sol 6.1 high source review
+found no blocking findings in the narrow patch; cross-provider review remained
+unavailable and skipped. Exact-head hosted ARM and Intel results are still
+required before separate merge approval; production signing and delivery
+remain unverified.

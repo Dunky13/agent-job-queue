@@ -59,6 +59,8 @@ list-keychains)
   exec "$KEYCHAIN_TEST_ROOT/search-list-tool" "$@";;
 create-keychain)
   printf '%s' "$last" > "$KEYCHAIN_TEST_ROOT/keychain"
+  physical_parent=$(cd -P -- "${last%/*}" && pwd -P)
+  printf '%s/%s' "$physical_parent" "${last##*/}" > "$KEYCHAIN_TEST_ROOT/physical-keychain"
   touch "$last";;
 unlock-keychain|set-keychain-settings|set-key-partition-list)
   [ "$last" = "$(cat "$KEYCHAIN_TEST_ROOT/keychain")" ] || exit 99;;
@@ -83,7 +85,7 @@ delete-keychain)
   if [ "${KEYCHAIN_TEST_FAIL:-}" != delete-keychain ]; then
     rm -f "$1"
     while IFS= read -r entry || [ -n "$entry" ]; do
-      if [ "$entry" != "    \"$1\"" ]; then printf '%s\n' "$entry"; fi
+      if [ "$entry" != "    \"$1\"" ] && [ "$entry" != "    \"$(cat "$KEYCHAIN_TEST_ROOT/physical-keychain")\"" ]; then printf '%s\n' "$entry"; fi
     done < "$KEYCHAIN_TEST_ROOT/search-state" > "$KEYCHAIN_TEST_ROOT/search-state.new"
     mv "$KEYCHAIN_TEST_ROOT/search-state.new" "$KEYCHAIN_TEST_ROOT/search-state"
   fi;;
