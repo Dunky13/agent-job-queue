@@ -2,6 +2,10 @@
 # Produce a self-contained native installer. End users do not need Xcode.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=scripts/macos-signing.sh
+source "$root/scripts/macos-signing.sh"
+# Reject partial production configuration before starting any compilation.
+macos_signing_configure
 version=${VERSION:-$(cat "$root/VERSION")}
 destination=${DIST_DIR:-"$root/dist"}
 mkdir -p "$destination"
@@ -30,7 +34,6 @@ done
 xcrun lipo -create "$work/Installer-arm64" "$work/Installer-x86_64" -output "$installer/Contents/MacOS/Installer"
 for command in agent-heavy agent-remote; do
   xcrun lipo -create "$work/$command-arm64" "$work/$command-x86_64" -output "$payload/source/bin/$command"
-  codesign --force --sign - "$payload/source/bin/$command"
   cp "$root/packaging/links/$command" "$payload/source/links/$command"
 done
 cp "$work/build-info.json" "$app/Contents/Resources/build-info.json"
@@ -74,20 +77,4 @@ cat > "$installer/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 plutil -lint "$app/Contents/Info.plist" "$installer/Contents/Info.plist"
-codesign --force --sign - "$app"
-codesign --force --sign - "$installer"
-codesign --verify --strict --deep "$installer"
-base="Agent-Job-Queue-Installer-$version-universal"
-ditto -c -k --sequesterRsrc --keepParent "$installer" "$destination/$base.zip"
-if [[ ${BUILD_DMG:-1} == 1 ]]; then
-  # Flush the staged bundle and keep the temporary image out of Spotlight.
-  # Verbose diagnostics retain the failing phase if macOS reports contention.
-  sync
-  hdiutil create -verbose -nospotlight -fs HFS+ -volname 'Agent Job Queue' \
-    -srcfolder "$installer" -ov -format UDZO "$destination/$base.dmg"
-fi
-(cd "$destination" && shasum -a 256 "$base.zip") > "$destination/$base.zip.sha256"
-if [[ ${BUILD_DMG:-1} == 1 ]]; then
-  (cd "$destination" && shasum -a 256 "$base.dmg") > "$destination/$base.dmg.sha256"
-fi
-printf 'Built %s\n' "$destination/$base.zip"
+macos_package_installer "$installer" "$destination" "$version"

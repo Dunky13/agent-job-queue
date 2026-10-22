@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Apple signing and notarization</title>
+<style>html{color-scheme:light dark;font:17px/1.65 system-ui,sans-serif}body{margin:0 auto;max-width:76ch;padding:2rem 1.25rem 5rem}h1,h2{line-height:1.25}h2{margin-top:2rem}a{color:#3478d4}pre{padding:1rem;overflow:auto;border:1px solid #8886;border-radius:.5rem}code{font-size:.88em}li{margin:.5rem 0}h1 span,h2 span{display:none}@media print{body{max-width:none;padding:0}pre{white-space:pre-wrap;overflow-wrap:anywhere}}</style>
+<body id="top"><main>
+<h1 id="label-Apple+signing+and+notarization">Apple signing and notarization<span><a href="#label-Apple+signing+and+notarization">&para;</a> <a href="#top">&uarr;</a></span></h1>
+
+<p>Research checked against Apple and GitHub primary documentation on 2026-10-22. This guide describes the release implementation and its acceptance criteria. It does not certify an artifact while Apple is still processing it.</p>
+
+<h2 id="label-Signing+policy">Signing policy<span><a href="#label-Signing+policy">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Use Developer ID Application for both app bundles, both Go executables, and the DMG. Sign universal executables after combining their architecture slices. Each executable receives Hardened Runtime, a secure timestamp, and a stable code identifier. Verify both architecture slices against Apple&#39;s certificate chain and the configured team. Sign components explicitly from the inside out; use <code>--deep</code> for verification only. These choices follow Apple&#39;s <a href="https://developer.apple.com/documentation/xcode/creating-distribution-signed-code-for-the-mac/">distribution signing instructions</a>.</p>
+
+<p>Start without exception entitlements. In particular, do not add JIT, unsigned executable memory, disabled library validation, or debugging access merely because an example for another runtime uses them. Test the actual Swift app, Go queue daemon and HTTPS gateway with their hardened signatures. Apple advises using only exceptions required by the app&#39;s behavior in its <a href="https://developer.apple.com/documentation/security/hardened-runtime">Hardened Runtime documentation</a>.</p>
+
+<p>Developer ID notarization is separate from App Store distribution. The current product needs no App Store upload, sandbox conversion, or Developer ID Installer certificate for its ZIP and DMG formats. The Apple <a href="https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution">notarization prerequisites</a> require Developer ID signing, runtime protection and secure timestamps.</p>
+
+<h2 id="label-Packaging+order">Packaging order<span><a href="#label-Packaging+order">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>This is a custom installer that copies another app and standalone helpers. Apple explicitly requires payload notarization before assembling such an installer. Our additional DMG distribution also receives its own ticket:</p>
+<ol><li>
+<p>Sign the two Go helpers and the menu app. Submit the complete payload ZIP.</p>
+</li><li>
+<p>Require acceptance, fetch the log, then staple and validate the menu app.</p>
+</li><li>
+<p>Sign the outer installer, submit its ZIP, require acceptance, and staple it.</p>
+</li><li>
+<p>Recreate the distribution ZIP with the stapled installer inside it.</p>
+</li><li>
+<p>Create and sign the DMG containing that installer, notarize it, and staple it.</p>
+</li><li>
+<p>Generate final checksums and Homebrew metadata after all byte changes.</p>
+</li></ol>
+
+<p>Record each submission ID before waiting. A timeout leaves a submission at Apple; inspect it before retrying. Read successful logs for warnings too. ZIPs and standalone executables cannot themselves carry stapled tickets. Bare Go helpers can require access to Apple&#39;s service on first launch, so offline first launch of the complete installed product remains a separate test. These requirements come from Apple&#39;s <a href="https://developer.apple.com/documentation/security/customizing-the-notarization-workflow">custom notarization workflow</a>.</p>
+
+<p>The payload app is stapled before signing its parent because it lives under the installer&#39;s sealed resources. Production installation copies the app with <code>ditto --rsrc --extattr --qtn --acl</code>; verification checks the copied app&#39;s signature, ticket and quarantine. Never change signed resource files afterward. Apple&#39;s <a href="https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution">packaging guide</a> describes container signing, stapling and distribution testing.</p>
+
+<h2 id="label-Credentials+and+CI">Credentials and CI<span><a href="#label-Credentials+and+CI">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The <code>apple-signing</code> GitHub environment is restricted to branch <code>main</code>. Store the following secrets there, with no repository-scoped Apple secret copies:</p>
+<ul><li>
+<p><code>APPLE_DEVELOPER_ID_P12_BASE64</code>: the password-protected identity, base64 encoded.</p>
+</li><li>
+<p><code>APPLE_DEVELOPER_ID_P12_PASSWORD</code>: its export password.</p>
+</li><li>
+<p><code>APPLE_NOTARY_KEY_P8</code>: the App Store Connect team API private key.</p>
+</li></ul>
+
+<p>Its non-secret variables are <code>APPLE_SIGNING_IDENTITY</code>, <code>APPLE_TEAM_ID</code>, <code>APPLE_NOTARY_KEY_ID</code>, and <code>APPLE_NOTARY_ISSUER_ID</code>. Optional <code>APPLE_NOTARY_TIMEOUT</code> defaults to <code>5m</code> per submission. The signing job has a 45-minute outer budget for three submissions, checkpoint transfers and packaging. This is a bounded wait, not a claim about Apple&#39;s turnaround time.</p>
+
+<p>PRs build and test ad hoc development artifacts without Apple credentials. After required main validation passes, a separate hosted macOS job imports the identity into a disposable private Keychain and signs the already-built installer. It does not recompile code with the signing key loaded. The wrapper removes temporary credentials on success, failure and cancellation. Publication consumes only the finalized notarized artifact. Missing credentials, rejection, stapling or policy failures stop publication with no ad hoc fallback.</p>
+
+<p>Before publication, separate fresh Apple Silicon and Intel jobs verify final checksums, signatures, tickets and app-copy policy, exercise the hardened queue and HTTPS gateway, and run the actual Homebrew installer with quarantine kept. The Homebrew test owns a private daemon and user directory, substitutes only its private launchctl fixture, and bounds installer descendants before cleanup. No Apple credential is passed to these acceptance jobs. Checkout precedes all artifact downloads so its workspace cleanup cannot erase the release inputs.</p>
+
+<p>GitHub recommends secret storage and disposable runner Keychains in its <a href="https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications">Apple certificate guide</a>. Environment branch rules protect secret access independently of workflow conditions, as described in <a href="https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments">managing environments</a>. The existing main protection and signed-commit policy continue to apply.</p>
+
+<p>Public submission receipts and exact signed intermediate archives are retained in CI checkpoints, separately from release downloads. Private keys and exported identities are excluded. Local credentials stay outside the checkout.</p>
+
+<h2 id="label-Resuming+a+pending+CI+submission">Resuming a pending CI submission<span><a href="#label-Resuming+a+pending+CI+submission">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The protected signing job uses <code>scripts/macos-resume.sh</code>; local one-shot <code>macos-signing.sh package</code> remains available. Each payload, installer and DMG stage persists an immutable checkpoint before uploading, immediately after recording its submission ID, and after waiting, including a failed wait. The checkpoint contains the original prepared installer, exact signed upload archives, their SHA-256 values, stage records and public Apple receipts. ZIP wrapping preserves executable modes and macOS resource forks.</p>
+
+<p>If Apple remains pending after the finite wait, publication stops. Later, open that original main-push run in GitHub Actions and choose <strong>Re-run failed jobs</strong>, or run the following with its numeric run ID:</p>
+
+<pre>gh run rerun RUN_ID --failed --repo Dunky13/agent-job-queue</pre>
+
+<p>The new runner restores the newest checkpoint from a previous attempt of that exact run. It checks the API&#39;s repository, main-push event, workflow, commit and build number, the artifact&#39;s digest and checkpoint checksum, then the state&#39;s team, version, source and archive hashes. It queries the existing submission and continues accepted stages without re-signing or re-uploading them. Accepted Apple logs must match the submission ID and exact archive hash. Only all three completed stages can export release assets. Fresh ARM and Intel acceptance jobs still precede publication and Homebrew delivery.</p>
+
+<p>This deliberately resumes the original run rather than dispatching a new build: GitHub retains its original commit, ref, actor privileges and run number. Final artifacts use attempt-specific names, and downstream jobs select the successful signing job&#39;s exact artifact. A retry of a failed acceptance or publication job can reuse that successful artifact. See GitHub&#39;s <a href="https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs">rerun rules</a> and <a href="https://docs.github.com/en/rest/actions/artifacts">artifact API</a>.</p>
+
+<p>Checkpoints are retained for 30 days. GitHub permits reruns within 30 days of the original run and limits a run to 50 attempts. Missing or expired state, invalid provenance, corruption and a changed signing team stop recovery; there is no fallback to an older checkpoint or a fresh upload. Use failed-job reruns instead of rebuilding a new main run to retry a pending submission.</p>
+
+<p>There is an unavoidable uncertain-outcome window if Apple receives an upload but the runner dies before persisting its ID. A restored pre-upload checkpoint without an ID refuses another upload. Inspect the preserved receipts and Apple&#39;s submission history with the original credentials before deciding how to recover. Automatic receipt import or duplicate resubmission is not provided. A rerun with no checkpoint also stops for reconciliation, even if signing never started. Rejected submissions remain failures. The job summary links the safe rerun action; no timer or privileged cross-workflow trigger is required.</p>
+
+<h2 id="label-Local+use">Local use<span><a href="#label-Local+use">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Ad hoc development remains the default:</p>
+
+<pre>agent-heavy run --label &quot;Agent Queue installer&quot; -- scripts/build-installer.sh</pre>
+
+<p>For Developer ID packaging, provide your installed identity, expected team, and an existing <code>notarytool</code> Keychain profile:</p>
+
+<pre>SIGNING_MODE=developer-id \
+APPLE_SIGNING_IDENTITY=&#39;Developer ID Application: YOUR NAME (YOURTEAMID)&#39; \
+APPLE_TEAM_ID=YOURTEAMID \
+NOTARY_KEYCHAIN_PROFILE=YOUR_PROFILE \
+agent-heavy run --label &quot;Agent Queue notarized installer&quot; -- scripts/build-installer.sh</pre>
+
+<p>The team placeholder must be replaced by the actual ten-character team ID. Alternatively use <code>NOTARY_KEY_FILE</code>, <code>NOTARY_KEY_ID</code>, and, for a team API key, <code>NOTARY_ISSUER_ID</code>. Profile and direct-key authentication cannot be mixed. <code>NOTARY_KEYCHAIN</code> selects a non-default profile Keychain, while <code>APPLE_SIGNING_KEYCHAIN</code> selects a signing Keychain. Paths are operator inputs, never committed private material. <code>NOTARY_LOG_DIR</code> must be outside <code>DIST_DIR</code>. Configuration is checked before compiling.</p>
+
+<p>To sign an already validated extracted installer without rebuilding it:</p>
+
+<pre>scripts/macos-signing.sh package &#39;prepared-installer/Agent Job Queue Installer.app&#39; dist &quot;$(cat VERSION)&quot;</pre>
+
+<p>Supply the same Developer ID environment for that command. Inspect a retained submission with <code>xcrun notarytool info SUBMISSION_ID --keychain-profile YOUR_PROFILE</code>. Do not submit the same pending build repeatedly to try to accelerate processing.</p>
+
+<h2 id="label-Distribution+and+acceptance">Distribution and acceptance<span><a href="#label-Distribution+and+acceptance">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Both the native installer and new Homebrew casks directly execute the signed Go controller. The cask preserves quarantine. Historical ad hoc casks remain unchanged until the next numbered release; the trusted tap helper validates their original cask as bounded data. Merge the companion trusted tap update before the source release, as documented in <a href="homebrew-delivery.md">Homebrew delivery</a>.</p>
+
+<p>Acceptance requires all four executable signatures, Apple acceptance and logs, valid stapled tickets, final ZIP extraction and mounted-DMG checks, successful <code>syspolicy_check distribution</code> for both app bundles, and actual packaged queue and HTTPS execution. Automated tests also exercise rejection, malformed responses, missing or conflicting configuration, wrong teams, cleanup and quarantine preservation.</p>
+
+<p>Use <code>codesign --verify --check-notarization</code> with an explicit <code>notarized</code> requirement for the standalone Go executables. An app-oriented <code>spctl</code> check does not establish the correct behavior for every non-app code type. The quarantined Homebrew test verifies both helpers&#39; notarization before exercising the actual signed installer entry. Apple documents these distinct checks in <a href="https://developer.apple.com/forums/thread/130560">Testing a Notarised Product</a>.</p>
+
+<p>Signing, notarization and Gatekeeper acceptance are distinct results. A normal first-open confirmation can still appear for a correctly notarized download. Apple&#39;s <a href="https://developer.apple.com/forums/thread/706442">trusted execution troubleshooting</a> recommends testing a quarantined download on a fresh Mac or restored VM, including offline behavior where supported. Local development-Mac checks do not establish clean-Mac or Intel runtime acceptance. Hosted Intel tests and clean-machine installation evidence must be reported separately.</p>
+
+<p>A complete standalone <a href="apple-signing.html">HTML version</a> accompanies this guide.</p>
+</main></body></html>

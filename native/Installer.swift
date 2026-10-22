@@ -7,7 +7,7 @@ enum InstallerActivity { static var running = false }
 
 @MainActor
 final class InstallerModel: ObservableObject {
-    @Published var output = "Install Agent Queue for your macOS account.\n\nIncludes its queue and HTTPS runtime for offline installation. Finish or cancel all existing jobs before the first legacy queue migration. Later embedded queue upgrades preserve running jobs and settings. Phone access stays off until you enable it.\n"
+    @Published var output = "Install Agent Queue for your macOS account.\n\nIncludes its queue and HTTPS runtime. macOS may need an internet connection for first-open verification. Finish or cancel all existing jobs before the first legacy queue migration. Later embedded queue upgrades preserve running jobs and settings. Phone access stays off until you enable it.\n"
     @Published var running = false
     @Published var completed = false
     private var process: Process?
@@ -20,11 +20,11 @@ final class InstallerModel: ObservableObject {
             return
         }
         let payload = resources.appendingPathComponent("payload")
-        let script = payload.appendingPathComponent("source/scripts/install-user.sh")
+        let controller = payload.appendingPathComponent("source/bin/agent-heavy")
         let task = Process()
         let stream = Pipe()
-        task.executableURL = URL(fileURLWithPath: "/bin/bash")
-        task.arguments = [script.path, "--payload", payload.path]
+        task.executableURL = controller
+        task.arguments = ["install", "--payload", payload.path]
         task.standardOutput = stream
         task.standardError = stream
         task.standardInput = FileHandle.nullDevice

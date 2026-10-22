@@ -305,15 +305,37 @@ func TestRefreshRejectsConflictingStaleAndUnsafeReleaseState(t *testing.T) {
 	}
 }
 
+func TestRenderedCaskRetainsQuarantine(t *testing.T) {
+	cask, err := renderCask(fixtureManifest(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unsafe := range []string{"preflight", "/usr/bin/xattr", "com.apple.quarantine", "source/scripts/install-user.sh"} {
+		if strings.Contains(cask, unsafe) {
+			t.Fatalf("rendered cask contains quarantine bypass: %s", unsafe)
+		}
+	}
+	if !strings.Contains(cask, `executable: "#{payload}/source/bin/agent-heavy"`) || !strings.Contains(cask, `args:       ["install", "--payload", payload]`) {
+		t.Fatal("rendered cask must enter through the signed Go installer")
+	}
+	if !strings.Contains(cask, "Developer ID signed and notarized") || !strings.Contains(cask, "Quarantine is retained") {
+		t.Fatal("rendered cask is missing notarized release provenance")
+	}
+}
+
 func TestRefreshHistoricalRubyIsComparedAsDataAndNeverExecuted(t *testing.T) {
-	for _, scenario := range []string{"upgrade", "same-build", "no-optional-digest", "unknown-current", "digest-mismatch", "declared-size", "actual-size", "duplicate", "unsupported-digest", "archive-first"} {
+	for _, scenario := range []string{"upgrade", "same-build", "legacy-quarantine-upgrade", "legacy-quarantine-same-build", "no-optional-digest", "unknown-current", "digest-mismatch", "declared-size", "actual-size", "duplicate", "unsupported-digest", "archive-first"} {
 		t.Run(scenario, func(t *testing.T) {
 			x := newRefreshFixture(t)
 			current := fixtureManifest(1)
-			if scenario == "same-build" {
+			sameBuild := scenario == "same-build" || scenario == "legacy-quarantine-same-build"
+			if sameBuild {
 				current = fixtureManifest(2)
 			}
 			historical := []byte("# Historical template, comparison only\nraise 'must never execute'\n")
+			if strings.HasPrefix(scenario, "legacy-quarantine-") {
+				historical = []byte("cask \"agent-job-queue\" do\n  preflight do\n    system_command \"/usr/bin/xattr\", args: [\"-dr\", \"com.apple.quarantine\", staged_path]\n  end\nend\n")
+			}
 			x.setHistorical(current.Tag, historical)
 			x.installCurrent(current, historical)
 			assets := x.source[current.Tag]["assets"].([]any)
@@ -351,11 +373,17 @@ func TestRefreshHistoricalRubyIsComparedAsDataAndNeverExecuted(t *testing.T) {
 			if wantFailure && len(x.publications) != 0 {
 				t.Fatal("published invalid historical state")
 			}
-			if !wantFailure && scenario != "same-build" && len(x.publications) != 1 {
+			if !wantFailure && !sameBuild && len(x.publications) != 1 {
 				t.Fatal("template migration blocked upgrade")
 			}
-			if scenario == "same-build" && len(x.publications) != 0 {
+			if sameBuild && len(x.publications) != 0 {
 				t.Fatal("rewrote same immutable build")
+			}
+			if sameBuild {
+				installed, err := os.ReadFile(filepath.Join(x.f.root, "Casks", "agent-job-queue.rb"))
+				if err != nil || !bytes.Equal(installed, historical) || !strings.Contains(x.output.String(), "template change awaits a newer app release") {
+					t.Fatalf("historical same-build cask was not preserved: %v", err)
+				}
 			}
 			if scenario == "archive-first" {
 				for _, download := range x.downloads {

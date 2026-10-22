@@ -37,12 +37,19 @@ advertise installation until a first validated refresh has published a cask.
 After publication the fully qualified command selects/trusts only this cask:
   brew install --cask dunky13/agent-job-queue/agent-job-queue
 Homebrew 7 explicitly trusts a fully qualified item on install; no whole-tap trust
-or quarantine bypass is required. The downloaded build is ad hoc signed and is
-not notarized, so macOS may require normal user approval before opening the app.
+or quarantine bypass is required. New main releases are Developer ID signed and
+notarized; the trusted cask retains quarantine for macOS assessment. Publication
+must pass the source release signing, notarization and Gatekeeper checks.
+Historical ad hoc builds and their casks remain unchanged until a newer release.
+The refresh helper compares historical Ruby only as bounded data and never runs
+it. Local development packages can remain ad hoc signed. Offline first launch
+of the standalone Go executables has not been verified.
 
-Install is automatic: Homebrew prepares dependencies, the vendor installer sets
-up private support/services and opens the menu app, and Homebrew links both CLI
-commands. Uninstall removes its command links, menu app and menu login plist.
+Install is automatic: Homebrew runs the signed Go controller directly with
+install --payload, which sets up private support/services and opens the menu app.
+Homebrew links both CLI commands. The real DSL fixture checks the direct binary
+entry. Its quarantined mode verifies staged attribute preservation without
+executing unsigned fixture code; it is not notarized-release acceptance proof. Uninstall removes its command links, menu app and menu login plist.
 Shared per-user backend, independent queue daemon, operator commands, jobs,
 credentials and enabled remote access are retained, including on brew upgrade.
 Disable remote access in settings before uninstall if its listener should stop.
