@@ -89,6 +89,23 @@ are withheld; a child failure refreshes this diagnostic without replacing the
 child's exit status. This check establishes identity selection, while the
 subsequent signature and Apple-chain verification remain required.
 
+Signing and verification operations emit fixed begin/success/failure markers
+with the original tool exit status. Preparation also marks credential
+configuration and installer restoration, so a failure can be attributed to
+one operation without tracing command arguments. The markers do not include
+paths, credential selectors or command arguments. Inventory `ready` means
+one valid matching identity was enumerated; it does not establish successful
+private-key use by `codesign`.
+
+The macOS test suite includes a native probe that creates a new synthetic
+identity in a disposable private Keychain, signs a copied system executable
+with its explicit fingerprint, and verifies the certificate embedded in that
+signature. A unique identity prevents an existing operator identity from
+satisfying lookup. It uses no production credentials, notarization uploads,
+trust overrides or search-list changes and checks cleanup and unchanged host
+Keychain settings. This probe is separate from Developer ID acceptance and
+never executes its signed target.
+
 Before publication, separate fresh Apple Silicon and Intel jobs verify final
 checksums, signatures, tickets and app-copy policy, exercise the hardened queue
 and HTTPS gateway, and run the actual Homebrew installer with quarantine kept.
