@@ -78,3 +78,122 @@ esac
 		})
 	}
 }
+
+func TestDiskImageVerificationSelectsOnlyCompleteDistributionLayouts(t *testing.T) {
+	script, err := filepath.Abs("../../scripts/test-dmg.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		layout, command, argument, bundle string
+	}{
+		{"drag", "verify-app", "--app", "Agent Queue.app"},
+		{"legacy", "verify-installer", "--installer", "Agent Job Queue Installer.app"},
+		{"missing apps", "", "", ""},
+		{"mixed", "", "", ""},
+		{"missing link", "", "", ""},
+		{"wrong link", "", "", ""},
+		{"relative link", "", "", ""},
+		{"newline link", "", "", ""},
+		{"link directory", "", "", ""},
+		{"legacy link", "", "", ""},
+		{"symlink app", "", "", ""},
+		{"dangling installer", "", "", ""},
+		{"extra app", "", "", ""},
+		{"hidden app", "", "", ""},
+		{"uppercase app", "", "", ""},
+		{"missing helper", "", "", ""},
+		{"non executable helper", "", "", ""},
+	} {
+		t.Run(test.layout, func(t *testing.T) {
+			root := t.TempDir()
+			events := filepath.Join(root, "events")
+			record := filepath.Join(root, "mountpoint")
+			testTool(t, root, "hdiutil", `printf 'hdiutil|%s\n' "$*" >> "$DMG_TEST_EVENTS"
+case "$1" in
+verify) exit 0;;
+attach)
+  case "$*" in *'-readonly -nobrowse -noautoopen -mountpoint '*) ;; *) exit 91;; esac
+  while [ "$1" != '-mountpoint' ]; do shift; done
+  shift
+  mountpoint=$1
+  printf '%s' "$mountpoint" > "$DMG_TEST_RECORD"
+  [ "$DMG_TEST_LAYOUT" != 'missing apps' ] || exit 0
+  if [ "$DMG_TEST_LAYOUT" = legacy ] || [ "$DMG_TEST_LAYOUT" = 'legacy link' ] || [ "$DMG_TEST_LAYOUT" = mixed ]; then
+    for file in 'Contents/MacOS/Installer' \
+      'Contents/Resources/payload/Agent Queue.app/Contents/MacOS/AgentQueue' \
+      'Contents/Resources/payload/source/bin/agent-heavy' \
+      'Contents/Resources/payload/source/bin/agent-remote'; do
+      target="$mountpoint/Agent Job Queue Installer.app/$file"
+      mkdir -p "${target%/*}"
+      printf 'fixture' > "$target"
+      chmod 700 "$target"
+    done
+    if [ "$DMG_TEST_LAYOUT" = legacy ]; then exit 0; fi
+    if [ "$DMG_TEST_LAYOUT" = 'legacy link' ]; then ln -s /Applications "$mountpoint/Applications"; exit 0; fi
+  fi
+  app="$mountpoint/Agent Queue.app"
+  for file in 'Contents/MacOS/AgentQueue' \
+    'Contents/Resources/payload/source/bin/agent-heavy' \
+    'Contents/Resources/payload/source/bin/agent-remote'; do
+    target="$app/$file"
+    mkdir -p "${target%/*}"
+    printf 'fixture' > "$target"
+    chmod 700 "$target"
+  done
+  case "$DMG_TEST_LAYOUT" in
+    'missing link') ;;
+    'wrong link') ln -s /tmp "$mountpoint/Applications";;
+    'relative link') ln -s Applications "$mountpoint/Applications";;
+    'newline link') target=$(printf '/Applications\n.'); ln -s "${target%.}" "$mountpoint/Applications";;
+    'link directory') mkdir "$mountpoint/Applications";;
+    *) ln -s /Applications "$mountpoint/Applications";;
+  esac
+  case "$DMG_TEST_LAYOUT" in
+    'symlink app') mv "$app" "$mountpoint/app-target"; ln -s app-target "$app";;
+    'dangling installer') ln -s missing "$mountpoint/Agent Job Queue Installer.app";;
+    'extra app') mkdir "$mountpoint/Other.app";;
+    'hidden app') mkdir "$mountpoint/.Other.app";;
+    'uppercase app') mkdir "$mountpoint/Other.APP";;
+    'missing helper') rm "$app/Contents/Resources/payload/source/bin/agent-remote";;
+    'non executable helper') chmod 600 "$app/Contents/Resources/payload/source/bin/agent-heavy";;
+  esac
+  exit 0;;
+detach) exit 0;;
+*) exit 99;;
+esac
+`)
+			testTool(t, root, "go", `printf 'go' >> "$DMG_TEST_EVENTS"
+for argument in "$@"; do printf '|%s' "$argument" >> "$DMG_TEST_EVENTS"; done
+printf '\n' >> "$DMG_TEST_EVENTS"
+`)
+			cmd := exec.Command("/bin/bash", script, "fixture.dmg")
+			cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"), "DMG_TEST_EVENTS="+events, "DMG_TEST_RECORD="+record, "DMG_TEST_LAYOUT="+test.layout)
+			output, runErr := cmd.CombinedOutput()
+			mount, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatal(err, string(output))
+			}
+			work := filepath.Dir(string(mount))
+			t.Cleanup(func() { _ = os.RemoveAll(work) }) // Only a simulated mount.
+			recorded, err := os.ReadFile(events)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log := string(recorded)
+			if !strings.Contains(log, "hdiutil|detach "+string(mount)+"\n") {
+				t.Fatalf("verification did not detach: %s", log)
+			}
+			if _, err := os.Stat(work); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("detached fixture retained temporary state: %v", err)
+			}
+			if test.command == "" {
+				if runErr == nil || strings.Contains(log, "go|") {
+					t.Fatalf("malformed layout reached verification: %v: %s\n%s", runErr, output, log)
+				}
+			} else if runErr != nil || !strings.Contains(log, "go|run|-p|2|./cmd/queue-tool|"+test.command+"|"+test.argument+"|"+filepath.Join(string(mount), test.bundle)+"\n") {
+				t.Fatalf("wrong layout verification command: %v: %s\n%s", runErr, output, log)
+			}
+		})
+	}
+}

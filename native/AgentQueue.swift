@@ -175,7 +175,7 @@ private final class QueueReadCancellation: @unchecked Sendable {
 
 enum QueueClient {
     enum Controller: String, Sendable { case heavy = "agent-heavy", remote = "agent-remote" }
-    enum Budget: Sendable { case normal, updates }
+    enum Budget: Sendable { case normal, updates, setup }
     // Private executable/deadline injection keeps transport tests off installed state.
     struct Transport: Sendable {
         let executable: URL
@@ -183,7 +183,8 @@ enum QueueClient {
     }
 
     static func run(_ arguments: [String], controller: Controller = .heavy, input: Data? = nil,
-                    budget: Budget = .normal, transport: Transport? = nil) async throws -> Data {
+                    budget: Budget = .normal, transport: Transport? = nil,
+                    onOutput: (@Sendable (Data) -> Void)? = nil) async throws -> Data {
         // Only known, discardable reads observe task cancellation. Accepted changes
         // keep their original response/deadline and are never retried or rolled back.
         let discardable = input == nil && (arguments.first == "status" ||
@@ -194,7 +195,7 @@ enum QueueClient {
             try await withCheckedThrowingContinuation { continuation in
                 DispatchQueue.global(qos: .utility).async {
                     do { continuation.resume(returning: try runBlocking(arguments, controller: controller,
-                        input: input, budget: budget, cancellation: cancellation, transport: transport)) }
+                        input: input, budget: budget, cancellation: cancellation, transport: transport, onOutput: onOutput)) }
                     catch { continuation.resume(throwing: error) }
                 }
             }
@@ -207,11 +208,13 @@ enum QueueClient {
         // A verified update includes a bounded download and signature checks. The
         // backend has a 120-second aggregate deadline; normal queue I/O is unchanged.
         if budget == .updates && controller == .heavy && arguments.first == "updates" { return 130 }
+        if budget == .setup { return 330 }
         return arguments.first == "status" ? 8 : (controller == .remote ? 35 : 25)
     }
 
     private static func runBlocking(_ arguments: [String], controller: Controller, input: Data?, budget: Budget,
-                                    cancellation: QueueReadCancellation?, transport: Transport?) throws -> Data {
+                                    cancellation: QueueReadCancellation?, transport: Transport?,
+                                    onOutput: (@Sendable (Data) -> Void)?) throws -> Data {
         try cancellation?.check()
         guard (input?.count ?? 0) <= 16_384 else { throw ClientError.message("Controller input exceeds the private-pipe limit.") }
         let output = Pipe()
@@ -262,12 +265,16 @@ enum QueueClient {
         let timeout = transport?.timeout ?? timeout(for: arguments, controller: controller, budget: budget)
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         var response = Data()
-        let captureLimit = 2_097_152
+        let captureLimit = budget == .setup ? 32_768 : 2_097_152
+        var lastOutputDelivery = 0.0
         var buffer = [UInt8](repeating: 0, count: 16_384)
         var observedChildExit = false
         while true {
             try cancellation?.check()
             if ProcessInfo.processInfo.systemUptime >= deadline {
+                if budget == .setup {
+                    throw ClientError.message("Setup did not finish within \(Int(timeout)) seconds. Quit and reopen Agent Queue, or retry setup.\n" + String(decoding: response.suffix(8_000), as: UTF8.self))
+                }
                 if budget == .updates {
                     throw ClientError.message("The update operation did not finish within \(Int(timeout)) seconds. Check whether the installer opened, then check for updates before retrying.")
                 }
@@ -276,13 +283,18 @@ enum QueueClient {
             // Bound each read, including the one that detects overflow. No output
             // is written to disk and retained response bytes never exceed the cap.
             let count = read(output.fileHandleForReading.fileDescriptor, &buffer,
-                             min(buffer.count, captureLimit - response.count + 1))
+                             budget == .setup ? buffer.count : min(buffer.count, captureLimit - response.count + 1))
             let readError = count < 0 ? errno : 0
             if count > 0 {
-                guard count <= captureLimit - response.count else {
+                guard budget == .setup || count <= captureLimit - response.count else {
                     throw ClientError.message("The queue response exceeds the 2 MB display limit.")
                 }
                 response.append(contentsOf: buffer.prefix(count))
+                if response.count > captureLimit { response.removeFirst(response.count - captureLimit) }
+                if let onOutput, ProcessInfo.processInfo.systemUptime - lastOutputDelivery >= 0.1 {
+                    onOutput(response)
+                    lastOutputDelivery = ProcessInfo.processInfo.systemUptime
+                }
             } else if count < 0 && readError != EAGAIN && readError != EINTR {
                 throw ClientError.message("Could not read the private controller response.")
             }
@@ -310,14 +322,27 @@ enum QueueClient {
                 observedChildExit = true
                 continue
             }
-            if count <= 0 { Thread.sleep(forTimeInterval: 0.01) }
+            if count < 0 && readError == EAGAIN {
+                // Wake as soon as the child writes again. Fixed sleeps can be
+                // coalesced at utility QoS and repeatedly stall a blocked writer.
+                // The bounded wait still checks cancellation and the deadline.
+                var descriptor = pollfd(fd: output.fileHandleForReading.fileDescriptor,
+                                        events: Int16(POLLIN), revents: 0)
+                if poll(&descriptor, 1, 10) < 0 && errno != EINTR {
+                    throw ClientError.message("Could not wait for the private controller response.")
+                }
+            } else if count == 0 {
+                // EOF may precede child exit. Avoid spinning on persistent HUP.
+                Thread.sleep(forTimeInterval: 0.01)
+            }
         }
         try cancellation?.check()
+        onOutput?(response)
         guard process.terminationStatus == 0 else {
             if arguments.first == "profiles", let failure = try? JSONDecoder().decode(QueueControllerFailure.self, from: response) {
                 throw ClientError.message(failure.error)
             }
-            let message = String(decoding: response.prefix(1_000), as: UTF8.self)
+            let message = String(decoding: budget == .setup ? Data(response.suffix(8_000)) : Data(response.prefix(1_000)), as: UTF8.self)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             throw ClientError.message(message.isEmpty ? "Queue command failed (\(process.terminationStatus))." : message)
         }
@@ -1667,7 +1692,62 @@ struct JobDetail: View {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private(set) var bootstrap: QueueBootstrapModel?
+    private(set) var setupWindow: NSWindow?
+    private var normalLaunchStarted = false
+    private var bootstrapEnvironment: QueueBootstrapEnvironment?
+    private var bootstrapExecutor: QueueBootstrapModel.Executor = QueueBootstrapModel.runInstaller
+
+    override init() { super.init() }
+
+    // The separate graphical fixture supplies a private bundle/home and an inert
+    // executor. Normal launch still follows the production path with --fixture.
+    init(environment: QueueBootstrapEnvironment, executor: @escaping QueueBootstrapModel.Executor) {
+        bootstrapEnvironment = environment
+        bootstrapExecutor = executor
+        super.init()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let environment = bootstrapEnvironment ?? .current()
+        do { try environment.validateDiagnostics() }
+        catch { diagnostic(error.localizedDescription); exit(EXIT_FAILURE) }
+        let bootstrap = QueueBootstrapModel(environment: environment, execute: bootstrapExecutor) { [weak self] in
+            guard let self else { return }
+            self.setupWindow?.close()
+            self.setupWindow = nil
+            self.finishLaunching()
+        }
+        self.bootstrap = bootstrap
+        // Inspection never initializes AppRuntime or reads queue state. The setup
+        // menu exposes only Quit until the running payload has been installed.
+        bootstrap.onSetupRequired = { [weak self] in self?.showSetupWindow() }
+        bootstrap.start()
+    }
+
+    private func showSetupWindow() {
+        guard setupWindow == nil, let bootstrap else { return }
+        let main = NSMenu()
+        let application = NSMenuItem()
+        let menu = NSMenu(title: "Agent Queue")
+        menu.addItem(withTitle: "Quit Agent Queue", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        application.submenu = menu
+        main.addItem(application)
+        NSApp.mainMenu = main
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 410),
+            styleMask: [.titled, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "Set up Agent Queue"
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: QueueBootstrapView(model: bootstrap))
+        setupWindow = window
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    private func finishLaunching() {
+        guard !normalLaunchStarted else { return }
+        normalLaunchStarted = true
         NSApp.mainMenu = makeMainMenu()
         AppRuntime.menuBarController = QueueMenuBarController(store: AppRuntime.store)
         AppRuntime.store.start()
@@ -1811,6 +1891,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         AppRuntime.menuBarController?.tearDown()
         AppRuntime.menuBarController = nil
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        bootstrap?.isRunning == true ? .terminateCancel : .terminateNow
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

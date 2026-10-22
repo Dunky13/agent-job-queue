@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -227,6 +228,132 @@ func TestUpdatesInstalledVersionOfflineAndLegacy(t *testing.T) {
 	result, err = updateInstalled(f.root, f.app)
 	if err != nil || result["build"] != nil || result["bundleBuild"] != "0" {
 		t.Fatalf("untracked %v %v", result, err)
+	}
+}
+
+func TestUpdatesInstalledVersionUsesRegisteredApp(t *testing.T) {
+	f := installTestFixture(t)
+	f.appBundle(t)
+	if err := f.run(t); err != nil {
+		t.Fatal(err)
+	}
+	install := f.installer
+	app := filepath.Join(install.home, "Applications/Registered Agent Queue.app")
+	if err := os.Rename(install.app, app); err != nil {
+		t.Fatal(err)
+	}
+	install.app = app
+	if err := install.serviceDefinitions(false); err != nil {
+		t.Fatal(err)
+	}
+	before := installBundleSnapshot(t, app)
+	result, err := updateInstalled("", "")
+	if err != nil || result["build"] != 123 {
+		t.Fatalf("registered installed version not resolved: %v %v", result, err)
+	}
+	if code := UpdatesMain([]string{"version", "--json"}); code != 0 {
+		t.Fatalf("version CLI cannot resolve the registered bundle: %d", code)
+	}
+	// A default update client must resolve the same bundle before fetching releases.
+	client := NewUpdateClient("", "", "")
+	client.download = func(context.Context, string, int64, string) ([]byte, error) { return []byte("[]"), nil }
+	status, err := client.Check()
+	if err != nil || obj(status["installed"])["build"] != 123 {
+		t.Fatalf("update client cannot resolve registered version: %v %v", status, err)
+	}
+	if after := installBundleSnapshot(t, app); !reflect.DeepEqual(before, after) {
+		t.Fatal("version resolution mutated the registered app")
+	}
+}
+
+func TestUpdatesRegisteredAppRejectsUnsafeRegistration(t *testing.T) {
+	for _, kind := range []string{"label", "command", "program", "argument", "downloads", "traversal", "symlink-app", "symlink-parent", "symlink-plist", "writable-plist", "hardlink-plist", "invalid-plist", "symlink-marker", "writable-marker", "writable-bundle"} {
+		t.Run(kind, func(t *testing.T) {
+			f := installTestFixture(t)
+			f.appBundle(t)
+			if err := f.run(t); err != nil {
+				t.Fatal(err)
+			}
+			install := f.installer
+			filename := filepath.Join(install.launch, "io.went.agent-queue.plist")
+			definition, err := updatePlist(filename)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "label", "command", "program", "argument", "downloads", "traversal":
+				args := []string{"/usr/bin/open", "-a", install.app}
+				switch kind {
+				case "label":
+					definition["Label"] = "operator.service"
+				case "command":
+					args[0] = "/operator/open"
+				case "program":
+					definition["Program"] = "/operator/open"
+				case "argument":
+					args = append(args, "--unexpected")
+				case "downloads":
+					args[2] = filepath.Join(install.home, "Downloads/Agent Queue.app")
+				case "traversal":
+					args[2] = install.home + "/Downloads/../Applications/Agent Queue.app"
+				}
+				definition["ProgramArguments"] = args
+				if err := install.writePlist(filename, definition); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink-app", "symlink-parent", "symlink-plist", "symlink-marker", "hardlink-plist":
+				target := filename
+				switch kind {
+				case "symlink-app":
+					target = install.app
+				case "symlink-parent":
+					target = install.launch
+				case "symlink-marker":
+					target = filepath.Join(install.root, "build-info.json")
+				}
+				outside := filepath.Join(install.home, "outside")
+				if err := os.Rename(target, outside); err != nil {
+					t.Fatal(err)
+				}
+				link := os.Symlink
+				if kind == "hardlink-plist" {
+					link = os.Link
+				}
+				if err := link(outside, target); err != nil {
+					t.Fatal(err)
+				}
+			case "writable-plist", "writable-marker", "writable-bundle":
+				if kind == "writable-marker" {
+					filename = filepath.Join(install.root, "build-info.json")
+				} else if kind == "writable-bundle" {
+					filename = filepath.Join(install.app, "Contents/Resources/build-info.json")
+				}
+				if err := os.Chmod(filename, 0666); err != nil {
+					t.Fatal(err)
+				}
+			case "invalid-plist":
+				integrationTestWrite(t, filename, []byte("not a plist"))
+			}
+			if result, err := updateInstalled("", ""); err == nil {
+				t.Fatalf("unsafe registration or metadata accepted: %v", result)
+			}
+		})
+	}
+}
+
+func TestUpdatesDefaultAppLegacyFallback(t *testing.T) {
+	f := installTestFixture(t)
+	if result, err := updateInstalled("", ""); err != nil || result["displayVersion"] != "Not installed" {
+		t.Fatalf("uninstalled default lookup failed: %v %v", result, err)
+	}
+	if err := f.run(t); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(f.installer.launch, "io.went.agent-queue.plist")); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := updateInstalled("", ""); err != nil || result["build"] != 123 {
+		t.Fatalf("legacy default app fallback failed: %v %v", result, err)
 	}
 }
 

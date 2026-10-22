@@ -15,7 +15,7 @@ import (
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("Expected check-source, check-commits, render-cask, verify-release, or notarize")
+		return errors.New("Expected check-source, check-commits, render-cask, verify-release, verify-installer, verify-app, or notarize")
 	}
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
@@ -51,6 +51,12 @@ func run(args []string) error {
 			return err
 		}
 		return tooling.ShiftFixture(*input, *output)
+	case "verify-app":
+		app := flags.String("app", "", "standalone app with embedded source payload")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		return tooling.VerifyApp(*app)
 	case "verify-installer":
 		installer := flags.String("installer", "", "extracted installer app")
 		if err := flags.Parse(args[1:]); err != nil {

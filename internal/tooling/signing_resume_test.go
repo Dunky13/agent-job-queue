@@ -59,6 +59,44 @@ func (f resumeFixture) step(t *testing.T, operation, stage string, extra ...stri
 	return f.command(t, extra, operation, f.state, stage, "0.1.0")
 }
 
+func TestMacOSResumeDragInstallRetainsAppPayloadAndShortcut(t *testing.T) {
+	f := newResumeFixture(t)
+	f.embedAppSupport(t)
+	// Recreate the initial archive so the checkpoint owns the self-contained app.
+	if err := os.RemoveAll(f.state); err != nil {
+		t.Fatal(err)
+	}
+	f.command(t, nil, "init", f.installer, f.state, "0.1.0")
+	for _, stage := range []string{"payload", "installer", "dmg"} {
+		for _, operation := range []string{"prepare", "submit", "finish"} {
+			f.step(t, operation, stage)
+		}
+	}
+	record := f.recorded(t)
+	if !strings.Contains(record, "Agent Queue.app/Contents/Resources/payload/source/bin/agent-heavy") {
+		t.Fatalf("resumed release did not sign embedded helpers: %s", record)
+	}
+	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
+		t.Fatalf("resumed release lost the drag-install layout: %s", record)
+	}
+}
+
+func TestMacOSResumeRejectsDeclaredMissingPayload(t *testing.T) {
+	f := newResumeFixture(t)
+	app := filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app")
+	if err := os.WriteFile(filepath.Join(app, "Contents/Info.plist"), []byte(`{"AgentQueueEmbeddedPayload":"true"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(f.state); err != nil {
+		t.Fatal(err)
+	}
+	f.command(t, nil, "init", f.installer, f.state, "0.1.0")
+	f.reject(t, nil, "declares an embedded setup payload but it is missing", "prepare", f.state, "payload", "0.1.0")
+	if _, err := os.Stat(filepath.Join(f.state, "stages/payload.json")); !os.IsNotExist(err) {
+		t.Fatalf("missing payload created a prepared signing stage: %v", err)
+	}
+}
+
 func (f resumeFixture) reject(t *testing.T, extra []string, want string, arguments ...string) {
 	t.Helper()
 	output, err := f.run(t, extra, arguments...)
@@ -731,7 +769,7 @@ if [[ ${0##*/} == ditto ]]; then
   if [[ $1 == -x ]]; then mkdir -p "$4"; tar -xf "$3" -C "$4";
   elif [[ $1 == -c ]]; then
     shift $(($# - 2)); tar -cf "$2" -C "$(dirname "$1")" "$(basename "$1")"
-  else cp -R "$1" "$2"; fi
+  else shift $(($# - 2)); cp -R "$1" "$2"; fi
   exit
 fi
 if [[ ${0##*/} == xcrun && $1:$2 == notarytool:submit ]]; then
