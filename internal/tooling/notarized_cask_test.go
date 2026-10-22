@@ -65,7 +65,9 @@ func TestNotarizedHomebrew(t *testing.T) {
 	// spctl's execute assessment is intended for top-level application bundles.
 	requirement := fmt.Sprintf("=anchor apple generic and certificate leaf[subject.OU] = \"%s\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and notarized", team)
 	run("/usr/bin/codesign", "--verify", "--strict", "--all-architectures", "--check-notarization", "--test-requirement", requirement, executable)
-	run("/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", payload, filepath.Join(fixture, "payload"))
+	// A payload-only copy creates an incomplete enclosing .app. Gatekeeper can
+	// hold its nested executable before Go main, even when that binary is trusted.
+	run("/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", installer, filepath.Join(fixture, "Agent Job Queue Installer.app"))
 	metadata, err := os.ReadFile(filepath.Join(payload, "source/build-info.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -168,7 +170,7 @@ func TestNotarizedHomebrewRejectsUnsignedPayload(t *testing.T) {
 		t.Skip("Homebrew is unavailable")
 	}
 	fixture, home, environment, owner := notarizedCaskFixture(t, "AAAAAAAAAA")
-	binary := filepath.Join(fixture, "payload/source/bin/agent-heavy")
+	binary := filepath.Join(fixture, "Agent Job Queue Installer.app/Contents/Resources/payload/source/bin/agent-heavy")
 	if err := os.MkdirAll(filepath.Dir(binary), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +192,58 @@ func TestNotarizedHomebrewRejectsUnsignedPayload(t *testing.T) {
 	for _, name := range []string{filepath.Join(home, "unsigned-executed"), filepath.Join(fixture, "Caskroom"), filepath.Join(fixture, "calls")} {
 		if _, err := os.Stat(name); !os.IsNotExist(err) {
 			t.Fatalf("unsigned rejection executed or staged content: %s (%v)", filepath.Base(name), err)
+		}
+	}
+}
+
+// Recreate the former payload-only fixture using genuinely notarized code. Its
+// incomplete outer bundle must fail before staging or starting the installer,
+// rather than timing out in Gatekeeper before the nested Go program starts.
+func TestNotarizedHomebrewRejectsIncompleteInstaller(t *testing.T) {
+	payload := os.Getenv("AGENT_QUEUE_TEST_NOTARIZED_PAYLOAD")
+	if payload == "" {
+		t.Skip("final notarized release payload not supplied")
+	}
+	team := os.Getenv("APPLE_TEAM_ID")
+	if runtime.GOOS != "darwin" || !filepath.IsAbs(payload) || !regexp.MustCompile(`^[A-Z0-9]{10}$`).MatchString(team) {
+		t.Fatal("notarized runtime requires macOS, an absolute payload and APPLE_TEAM_ID")
+	}
+	brew, err := exec.LookPath("brew")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture, home, environment, owner := notarizedCaskFixture(t, team)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	incompletePayload := filepath.Join(fixture, "Agent Job Queue Installer.app/Contents/Resources/payload")
+	copy, err := owner.start(ctx, environment, nil, "/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", payload, incompletePayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := copy.wait(); err != nil {
+		t.Fatalf("copy notarized payload: %v\n%s", err, output)
+	}
+	// Establish that the failure is the enclosure, not an unsigned Go binary.
+	requirement := fmt.Sprintf("=anchor apple generic and certificate leaf[subject.OU] = \"%s\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and notarized", team)
+	verify, err := owner.start(ctx, environment, nil, "/usr/bin/codesign", "--verify", "--strict", "--all-architectures", "--check-notarization", "--test-requirement", requirement, filepath.Join(incompletePayload, "source/bin/agent-heavy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := verify.wait(); err != nil {
+		t.Fatalf("nested binary is not notarized: %v\n%s", err, output)
+	}
+	cask := notarizedFixtureCask(t, fixture, "0.1.0")
+	command, err := owner.start(ctx, environment, nil, brew, "ruby", "--", "../../packaging/homebrew/test-cask.rb", cask, fixture, "--quarantined-runtime")
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := command.wait()
+	if err == nil || !strings.Contains(string(output), "failed Developer ID/notarization verification") {
+		t.Fatalf("incomplete installer enclosure was not rejected: %v\n%s", err, output)
+	}
+	for _, name := range []string{filepath.Join(home, ".local/share/agent-heavy"), filepath.Join(fixture, "Caskroom"), filepath.Join(fixture, "calls")} {
+		if _, err := os.Stat(name); !os.IsNotExist(err) {
+			t.Fatalf("incomplete installer rejection executed or staged content: %s (%v)", filepath.Base(name), err)
 		}
 	}
 }

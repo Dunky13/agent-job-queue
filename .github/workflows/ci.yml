@@ -282,7 +282,7 @@ jobs:
           mkdir prepared-signed-installer
           ditto -x -k "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" prepared-signed-installer
           export AGENT_QUEUE_TEST_NOTARIZED_PAYLOAD="$PWD/prepared-signed-installer/Agent Job Queue Installer.app/Contents/Resources/payload"
-          go test -p 2 -parallel 2 ./internal/tooling -run '^TestNotarizedHomebrew$' -count=1 -v -timeout 3m
+          go test -p 2 -parallel 2 ./internal/tooling -run '^TestNotarizedHomebrew' -count=1 -v -timeout 3m
 
   publish:
     name: Publish main installer

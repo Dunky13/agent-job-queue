@@ -4,7 +4,7 @@
 <body id="top"><main>
 <h1 id="label-Apple+notarization+handoff">Apple notarization handoff<span><a href="#label-Apple+notarization+handoff">&para;</a> <a href="#top">&uarr;</a></span></h1>
 
-<p>Observed on 2026-10-21. This is the evidence record for the Developer ID and notarization change; the <a href="../apple-signing.md">signing guide</a> contains the full research, source links, configuration and operator commands.</p>
+<p>Observed on 2026-10-22. This is the evidence record for the Developer ID and notarization change; the <a href="../apple-signing.md">signing guide</a> contains the full research, source links, configuration and operator commands.</p>
 
 <h2 id="label-Implemented+behavior">Implemented behavior<span><a href="#label-Implemented+behavior">&para;</a> <a href="#top">&uarr;</a></span></h2>
 
@@ -31,7 +31,9 @@
 <p>Wrong or missing configuration, unsafe credential paths, rejected or malformed  notarizations, failed signatures/staples, output checksums, secret cleanup and  cancellation have automated regression coverage.</p>
 </li></ul>
 
-<p>Actual notarized Homebrew execution is an opt-in acceptance test. The default ad hoc fixture is rejected before staging or executing content; data-only quarantine tests do not claim notarized runtime proof. Fresh hosted ARM/Intel jobs run the real acceptance test only after Apple accepts the final artifacts. Clean-Mac offline first launch remains unverified; standalone binaries cannot carry stapled tickets.</p>
+<p>The actual final notarized native app also launched with quarantine retained, rendered its isolated Learned Workloads fixture and exited normally. Final ZIP checksums, extracted signatures and stapled tickets, Gatekeeper distribution checks, mounted-DMG checks, packaged private queue work and HTTPS passed.</p>
+
+<p>Actual notarized Homebrew execution is an opt-in acceptance test. Its first end-to-end run exposed an incomplete enclosing app in the test fixture; the faithful full-installer fixture subsequently completed with quarantine retained. The complete final acceptance batch passed: real Homebrew installation finished in 8.87 seconds, all 204 staged entries retained quarantine and the additional fixture attribute, and the private queue daemon remained healthy. Unsigned content, a genuinely notarized payload inside an incomplete outer installer, and timeout/normal-exit/cancellation descendant cleanup also passed. Tooling, delivery and standalone tap race tests passed. The default ad hoc fixture is rejected before staging or executing content; data-only quarantine tests do not claim notarized runtime proof. Fresh hosted ARM/Intel acceptance jobs remain main-only and have not run for this local artifact. Clean-Mac offline first launch remains unverified; standalone binaries cannot carry stapled tickets.</p>
 
 <h2 id="label-Issues+found+during+validation">Issues found during validation<span><a href="#label-Issues+found+during+validation">&para;</a> <a href="#top">&uarr;</a></span></h2>
 
@@ -45,11 +47,21 @@
 
 <p>The latest pre-change main run passed all required validation but failed publication because checkout cleaned the previously downloaded <code>dist</code> assets. The signing change puts checkout before downloads and adds a workflow regression. That prior release was not published successfully.</p>
 
+<p>The first final notarized Homebrew test copied only the payload into an otherwise incomplete <code>Agent Job Queue Installer.app</code> directory. macOS blocked its signed controller in <code>dyld</code> before Go started. Copying the complete signed and stapled installer instead made the same real Homebrew install finish in 11 seconds, with the original 60-second deadline and quarantine preserved on every staged entry. The fixture now checks the enclosing installer before and after staging, and rejects the former incomplete enclosure before execution. No backend change, quarantine removal or deadline increase was needed.</p>
+
+<p>Independent review caught that the new opt-in incomplete-installer regression was excluded by the final artifact job&#39;s exact test selector. Both hosted architectures now run all <code>TestNotarizedHomebrew</code> cases with the finalized payload. Workflow lint passed, and independent Sol 6.1 high re-review found no remaining actionable findings in this repair. Cross-provider review was not available and is not claimed.</p>
+
 <h2 id="label-Apple+submission+state">Apple submission state<span><a href="#label-Apple+submission+state">&para;</a> <a href="#top">&uarr;</a></span></h2>
 
-<p>Payload submission <code>0602c2b7-fbe6-4aec-ac69-6a0100026a9a</code> was uploaded at 2026-10-21 13:54 UTC. Apple reports <strong>In Progress</strong>. Acceptance, payload stapling, outer-installer/DMG notarization and final Gatekeeper acceptance are pending. A successful signature or upload is not notarization acceptance.</p>
+<p>Apple accepted all three submissions, and each downloaded log reports no issues:</p>
 
-<p>The original account-setup probe from the separate signing thread was also still processing when checked. This does not establish a cause for Apple&#39;s delay. Submission identifiers and diagnostics are retained outside release artifacts. Inspect pending submissions before retrying. Nothing from this change has been merged, published or installed into the operator&#39;s live queue.</p>
+<p>| Stage | Submission | Uploaded (UTC) | Result | | — | — | — | — | | Payload | <code>0602c2b7-fbe6-4aec-ac69-6a0100026a9a</code> | 2026-10-21 13:54 | Accepted | | Installer | <code>f9b9ac22-b490-4dc0-b0f0-a456860bd011</code> | 2026-10-21 15:25 | Accepted | | DMG | <code>c8a0a5f7-e289-4621-b5e4-5f673943b870</code> | 2026-10-22 03:16 | Accepted |</p>
+
+<p>The installer&#39;s first local six-hour wait expired while Apple continued processing. Observation resumed against the same submission. Before resuming packaging, all eight architecture-specific payload code hashes matched Apple&#39;s accepted log, and the retained installer ZIP hash matched Apple&#39;s accepted installer log. No duplicate payload or installer upload was needed. App and installer tickets were stapled before their enclosing artifacts were sealed; final checksums were generated after the DMG was stapled.</p>
+
+<p>This is a local test artifact with null commit/build identity, not a production release candidate. A production release must embed its reviewed commit and build identity before signing, then pass its own notarization and fresh hosted acceptance. The current CI default wait remains 30 minutes; durable cross-run resumption is a recommended follow-up to handle Apple&#39;s longer processing, and is not implemented by this change. A timeout still prevents publication.</p>
+
+<p>Submission identifiers and diagnostics are retained outside release artifacts. Inspect pending submissions before retrying. Nothing from this change has been merged, published or installed into the operator&#39;s live queue.</p>
 
 <p>A complete standalone <a href="apple-notarization.html">HTML version</a> accompanies this handoff.</p>
 </main></body></html>

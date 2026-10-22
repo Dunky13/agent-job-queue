@@ -91,9 +91,10 @@ runtime_fixture = ARGV[2] == "--quarantined-runtime"
 fixture_command = SystemCommand
 raise "Runtime mode requires a private fixture" if runtime_fixture && !ARGV[1]
 
-def verify_runtime_payload(payload, team, command)
+def verify_runtime_installer(installer, team, command)
+  payload = installer/"Contents/Resources/payload"
   requirement = "=anchor apple generic and certificate leaf[subject.OU] = \"#{team}\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and notarized"
-  [payload/"source/bin/agent-heavy", payload/"source/bin/agent-remote", payload/"Agent Queue.app"].each do |code|
+  [installer, payload/"source/bin/agent-heavy", payload/"source/bin/agent-remote", payload/"Agent Queue.app"].each do |code|
     command.run!("/usr/bin/codesign", args: ["--verify", "--strict", "--all-architectures", "--check-notarization", "--test-requirement", requirement, code])
   end
 rescue ErrorDuringExecution => e
@@ -126,7 +127,7 @@ if ARGV[1]
 
     FixtureSystemCommand.configure(fixture)
     fixture_command = FixtureSystemCommand
-    verify_runtime_payload(fixture/"payload", team, fixture_command)
+    verify_runtime_installer(fixture/"Agent Job Queue Installer.app", team, fixture_command)
     ENV.keys.grep(/\A(?:AGENT_HEAVY_|PUEUE_)/).each { |key| ENV.delete(key) }
   end
   ENV.update(environment)
@@ -168,7 +169,9 @@ if ARGV[1]
 
   FileUtils.mkdir_p(cask.staged_path/"Agent Job Queue Installer.app/Contents/Resources")
   if runtime_fixture
-    fixture_command.run!("/usr/bin/ditto", args: ["--rsrc", "--extattr", "--qtn", "--acl", fixture/"payload", payload])
+    # Gatekeeper assesses the enclosing app before its nested Go executable
+    # starts. Retain the actual signed installer, including its stapled ticket.
+    fixture_command.run!("/usr/bin/ditto", args: ["--rsrc", "--extattr", "--qtn", "--acl", fixture/"Agent Job Queue Installer.app", cask.staged_path/"Agent Job Queue Installer.app"])
   else
     FileUtils.cp_r(fixture/"payload", payload)
   end
@@ -186,7 +189,7 @@ if ARGV[1]
     }
   end
   # Recheck the actual quarantined staged bytes before their first execution.
-  verify_runtime_payload(payload, team, fixture_command) if runtime_fixture
+  verify_runtime_installer(cask.staged_path/"Agent Job Queue Installer.app", team, fixture_command) if runtime_fixture
   if !fixture_attributes || runtime_fixture
     installer.install_phase(command: fixture_command)
     fixture_installer_executed = true
