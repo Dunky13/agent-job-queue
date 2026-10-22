@@ -195,6 +195,53 @@ func TestMacOSCheckpointSelectsLatestNumericAttemptAndSlot(t *testing.T) {
 	}
 }
 
+func TestMacOSCheckpointInitialStateCanPrepareFirstSubmissionAfterRestore(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("snapshot uses native ditto")
+	}
+	checkpoint := newCheckpointFixture(t)
+	resume := newResumeFixture(t, "GITHUB_SHA="+checkpointSHA, "GITHUB_REPOSITORY=owner/project",
+		"GITHUB_RUN_ID=123", "GITHUB_RUN_NUMBER=45")
+	if err := os.Rename(resume.state, checkpoint.state); err != nil {
+		t.Fatal(err)
+	}
+	resume.state = checkpoint.state
+	snapshot := filepath.Join(checkpoint.root, "initial-snapshot")
+	if output, err := checkpoint.run(t, []string{"GITHUB_RUN_ATTEMPT=1"}, "snapshot", checkpoint.state, snapshot); err != nil {
+		t.Fatalf("initial snapshot: %v: %s", err, output)
+	}
+	inner, err := os.ReadFile(filepath.Join(snapshot, "checkpoint.zip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoint.inventory(t, checkpoint.artifactBytes(t, 1000, 1, 0, checkpointEnvelope(t, inner, "")))
+	if err := os.Rename(checkpoint.state, filepath.Join(checkpoint.root, "original-state")); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := checkpoint.run(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "restore", checkpoint.state); err != nil {
+		t.Fatalf("restore before any signing or upload: %v: %s", err, output)
+	}
+	resume.command(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "verify-state", resume.state, "0.1.0")
+	resume.step(t, "prepare", "payload", "GITHUB_RUN_ATTEMPT=2")
+	resume.step(t, "submit", "payload", "GITHUB_RUN_ATTEMPT=2")
+	if strings.Count(resume.recorded(t), "xcrun|notarytool|submit|") != 1 {
+		t.Fatal("initial checkpoint recovery must make exactly its first submission")
+	}
+}
+
+func TestMacOSCheckpointDoesNotFallBackToInitialStateAfterSubmission(t *testing.T) {
+	f := newCheckpointFixture(t)
+	initial := f.artifact(t, 1000, 10, 0)
+	submitted := f.artifact(t, 1002, 10, 2)
+	submitted["expired"] = true
+	f.inventory(t, initial, submitted)
+	f.reject(t, "Newest checkpoint expired")
+	calls, _ := os.ReadFile(filepath.Join(f.root, "calls"))
+	if strings.Contains(string(calls), "/zip") {
+		t.Fatal("expired submitted state fell back to initial state and could duplicate an upload")
+	}
+}
+
 func TestMacOSCheckpointRequiresTrustedContext(t *testing.T) {
 	for _, environment := range []string{"GITHUB_ACTIONS=false", "GITHUB_EVENT_NAME=workflow_dispatch", "GITHUB_EVENT_NAME=pull_request_target", "GITHUB_REF=refs/heads/feature", "GITHUB_SHA=bad", "GITHUB_REPOSITORY=bad", "GITHUB_RUN_ID=0", "GITHUB_RUN_NUMBER=01", "GITHUB_RUN_ATTEMPT=-1"} {
 		t.Run(environment, func(t *testing.T) {

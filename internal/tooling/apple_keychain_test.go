@@ -12,9 +12,30 @@ import (
 	"time"
 )
 
+const appleSigningTestSHA1 = "0123456789ABCDEF0123456789ABCDEF01234567"
+const appleSigningTestName = "Developer ID Application: Test (TESTTEAM01)"
+
+func appleSigningInventories(t *testing.T, root, matching, valid string) {
+	t.Helper()
+	for name, content := range map[string]string{
+		"identities":       "Policy: Code Signing\n  Matching identities\n" + matching + "\n  Valid identities only\n" + valid,
+		"valid-identities": valid,
+	} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func appleSigningInventoryRow(hash, name string) string {
+	return "  1) " + hash + " \"" + name + "\"\n"
+}
+
 func appleSigningFixture(t *testing.T) (string, []string) {
 	t.Helper()
 	root := t.TempDir()
+	row := appleSigningInventoryRow(appleSigningTestSHA1, appleSigningTestName)
+	appleSigningInventories(t, root, row+"     1 identities found\n", row+"     1 valid identities found\n")
 	testTool(t, root, "mktemp", `printf 'mktemp\n' >> "$KEYCHAIN_TEST_ROOT/calls"
 exec /usr/bin/mktemp "$@"
 `)
@@ -42,6 +63,18 @@ import)
   [ "$1" = "$(dirname "$(cat "$KEYCHAIN_TEST_ROOT/keychain")")/developer-id.p12" ] || exit 99
   [ "$2" = '-k' ] && [ "$3" = "$(cat "$KEYCHAIN_TEST_ROOT/keychain")" ] || exit 99
   [ "$last" = /usr/bin/codesign ] || exit 99;;
+find-identity)
+  [ "$last" = "$(cat "$KEYCHAIN_TEST_ROOT/keychain")" ] || exit 99
+  case "$*" in
+  '-p codesigning '*) inventory=identities;;
+  '-v -p codesigning '*) inventory=valid-identities;;
+  *) exit 99;;
+  esac
+  if [ "${KEYCHAIN_TEST_FAIL:-}" = "$inventory" ]; then
+    printf '%s' 'sensitive identity query error must be suppressed' >&2
+    exit 17
+  fi
+  cat "$KEYCHAIN_TEST_ROOT/$inventory";;
 delete-keychain)
   [ "$1" = "$(cat "$KEYCHAIN_TEST_ROOT/keychain")" ] || exit 99
   if [ "${KEYCHAIN_TEST_FAIL:-}" != delete-keychain ]; then rm -f "$1"; fi;;
@@ -59,8 +92,8 @@ fi
 		"APPLE_DEVELOPER_ID_P12_BASE64=encoded-test-certificate",
 		"APPLE_DEVELOPER_ID_P12_PASSWORD=test-certificate-password",
 		"APPLE_NOTARY_KEY_P8=test-api-private-key",
-		"APPLE_SIGNING_IDENTITY=Developer ID Application: Test (TESTTEAM)",
-		"APPLE_TEAM_ID=TESTTEAM",
+		"APPLE_SIGNING_IDENTITY=" + appleSigningTestName,
+		"APPLE_TEAM_ID=TESTTEAM01",
 		"APPLE_NOTARY_KEY_ID=TESTKEY",
 		"APPLE_NOTARY_ISSUER_ID=test-issuer",
 	}
@@ -109,7 +142,7 @@ func assertAppleSigningRemoved(t *testing.T, root string) {
 	}
 	for _, operation := range strings.Fields(string(calls)) {
 		switch operation {
-		case "mktemp", "base64", "openssl", "create-keychain", "unlock-keychain", "set-keychain-settings", "import", "set-key-partition-list", "delete-keychain":
+		case "mktemp", "base64", "openssl", "create-keychain", "unlock-keychain", "set-keychain-settings", "import", "set-key-partition-list", "find-identity", "delete-keychain":
 		default:
 			t.Fatalf("unexpected host keychain operation: %s", operation)
 		}
@@ -175,6 +208,92 @@ func TestAppleSigningRequiresCompleteConfiguration(t *testing.T) {
 	}
 }
 
+func TestAppleSigningSelectsOnlyTheConfiguredValidIdentity(t *testing.T) {
+	for _, selector := range []string{appleSigningTestName, appleSigningTestSHA1, strings.ToLower(appleSigningTestSHA1)} {
+		t.Run(selector, func(t *testing.T) {
+			root, env := appleSigningFixture(t)
+			env = append(env, "APPLE_SIGNING_IDENTITY="+selector)
+			code, output := appleSigningExitCode(t, appleSigningCommand(t, env, "/bin/bash", "-c", `
+set -eu
+[ "$APPLE_SIGNING_IDENTITY" = 0123456789ABCDEF0123456789ABCDEF01234567 ]
+printf child > "$KEYCHAIN_TEST_ROOT/child"
+`))
+			if code != 0 || !strings.Contains(output, "classification=ready") {
+				t.Fatalf("identity was not resolved before the child: %d %s", code, output)
+			}
+			if _, err := os.Stat(filepath.Join(root, "child")); err != nil {
+				t.Fatalf("resolved identity did not reach child: %v", err)
+			}
+			assertAppleSigningRemoved(t, root)
+		})
+	}
+}
+
+func TestAppleSigningRejectsUnusableImportedIdentitiesBeforeChild(t *testing.T) {
+	row := appleSigningInventoryRow(appleSigningTestSHA1, appleSigningTestName)
+	other := appleSigningInventoryRow("89ABCDEF0123456789ABCDEF0123456789ABCDEF", appleSigningTestName)
+	empty := "     0 identities found\n"
+	emptyValid := "     0 valid identities found\n"
+	for _, test := range []struct {
+		name, selector, matching, valid, failure, classification string
+	}{
+		{"missing", appleSigningTestName, empty, emptyValid, "", "absent"},
+		{"different valid identity is not a fallback", appleSigningTestSHA1, other + "     1 identities found\n", other + "     1 valid identities found\n", "", "absent"},
+		{"certificate without private key", appleSigningTestSHA1, empty, emptyValid, "", "absent"},
+		{"expired", appleSigningTestName, strings.TrimSuffix(row, "\n") + " (CSSMERR_TP_CERT_EXPIRED)\n     1 identities found\n", emptyValid, "", "invalid"},
+		{"untrusted", appleSigningTestName, row + "     1 identities found\n", emptyValid, "", "invalid"},
+		{"ambiguous names", appleSigningTestName, row + other + "     2 identities found\n", row + other + "     2 valid identities found\n", "", "ambiguous"},
+		{"duplicate fingerprint", appleSigningTestSHA1, row + row + "     2 identities found\n", row + row + "     2 valid identities found\n", "", "ambiguous"},
+		{"partial name", "Developer ID Application: Test", row + "     1 identities found\n", row + "     1 valid identities found\n", "", "absent"},
+		{"wrong team", appleSigningTestSHA1, appleSigningInventoryRow(appleSigningTestSHA1, "Developer ID Application: Untrusted (OTHERTEAM1)") + "     1 identities found\n", appleSigningInventoryRow(appleSigningTestSHA1, "Developer ID Application: Untrusted (OTHERTEAM1)") + "     1 valid identities found\n", "", "wrong-team"},
+		{"wrong certificate type", appleSigningTestSHA1, appleSigningInventoryRow(appleSigningTestSHA1, "Apple Development: Untrusted (TESTTEAM01)") + "     1 identities found\n", appleSigningInventoryRow(appleSigningTestSHA1, "Apple Development: Untrusted (TESTTEAM01)") + "     1 valid identities found\n", "", "wrong-type"},
+		{"inconsistent valid fingerprint", appleSigningTestName, row + "     1 identities found\n", other + "     1 valid identities found\n", "", "inconsistent"},
+		{"malformed inventory", appleSigningTestName, row + "     2 identities found\n", row + "     1 valid identities found\n", "", "malformed-inventory"},
+		{"malformed valid inventory", appleSigningTestName, row + "     1 identities found\n", row + "     2 valid identities found\n", "", "malformed-inventory"},
+		{"injected certificate name", appleSigningTestSHA1, appleSigningInventoryRow(appleSigningTestSHA1, "private-untrusted-name\n::error::untrusted-output") + "     1 identities found\n", emptyValid, "", "malformed-inventory"},
+		{"matching query failure", appleSigningTestName, row + "     1 identities found\n", row + "     1 valid identities found\n", "identities", "query-failed"},
+		{"valid query failure", appleSigningTestName, row + "     1 identities found\n", row + "     1 valid identities found\n", "valid-identities", "query-failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, env := appleSigningFixture(t)
+			appleSigningInventories(t, root, test.matching, test.valid)
+			env = append(env, "APPLE_SIGNING_IDENTITY="+test.selector, "KEYCHAIN_TEST_FAIL="+test.failure)
+			code, output := appleSigningExitCode(t, appleSigningCommand(t, env, "/bin/bash", "-c", `printf child > "$KEYCHAIN_TEST_ROOT/child"`))
+			if code == 0 || !strings.Contains(output, "classification="+test.classification) {
+				t.Fatalf("unusable identity was not classified: %d %s", code, output)
+			}
+			if _, err := os.Stat(filepath.Join(root, "child")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("child ran with unusable identity: %v", err)
+			}
+			for _, forbidden := range []string{"sensitive identity query error", "private-untrusted-name", "::error::untrusted-output", "Untrusted", "test-certificate-password"} {
+				if strings.Contains(output, forbidden) {
+					t.Fatalf("private or untrusted diagnostic leaked: %s", output)
+				}
+			}
+			assertAppleSigningRemoved(t, root)
+		})
+	}
+}
+
+func TestAppleSigningRechecksIdentityAfterChildFailure(t *testing.T) {
+	for _, test := range []struct{ name, change, classification string }{
+		{"no longer valid", `printf '     0 valid identities found\n' > "$KEYCHAIN_TEST_ROOT/valid-identities"`, "invalid matching=1 valid=0"},
+		{"query fails", `rm "$KEYCHAIN_TEST_ROOT/valid-identities"`, "query-failed matching=unknown valid=unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root, env := appleSigningFixture(t)
+			code, output := appleSigningExitCode(t, appleSigningCommand(t, env, "/bin/bash", "-c", test.change+"\nexit 23\n"))
+			if code != 23 || !strings.Contains(output, "phase=child-failure classification="+test.classification) {
+				t.Fatalf("child failure lost its status or safe updated diagnostic: %d %s", code, output)
+			}
+			if strings.Contains(output, root) {
+				t.Fatalf("failed diagnostic exposed a private path: %s", output)
+			}
+			assertAppleSigningRemoved(t, root)
+		})
+	}
+}
+
 func TestAppleSigningOwnsOnlyTemporaryCredentials(t *testing.T) {
 	for _, test := range []struct {
 		name, failure, childStatus string
@@ -193,6 +312,7 @@ func TestAppleSigningOwnsOnlyTemporaryCredentials(t *testing.T) {
 			child := `
 set -eu
 [ "$SIGNING_MODE" = developer-id ]
+[ "$APPLE_SIGNING_IDENTITY" = 0123456789ABCDEF0123456789ABCDEF01234567 ]
 [ "$APPLE_SIGNING_KEYCHAIN" = "$(cat "$KEYCHAIN_TEST_ROOT/keychain")" ]
 [ "$NOTARY_KEY_ID" = TESTKEY ] && [ "$NOTARY_ISSUER_ID" = test-issuer ]
 [ "$(cat "$NOTARY_KEY_FILE")" = test-api-private-key ]

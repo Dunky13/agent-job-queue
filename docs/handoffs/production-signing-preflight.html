@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Production signing preflight follow-up</title>
+<style>html{color-scheme:light dark;font:17px/1.65 system-ui,sans-serif}body{margin:0 auto;max-width:76ch;padding:2rem 1.25rem 5rem}h1,h2{line-height:1.25}h2{margin-top:2rem}a{color:#3478d4}pre{padding:1rem;overflow:auto;border:1px solid #8886;border-radius:.5rem}code{font-size:.88em}li{margin:.5rem 0}h1 span,h2 span{display:none}@media print{body{max-width:none;padding:0}pre{white-space:pre-wrap;overflow-wrap:anywhere}}</style>
+<body id="top"><main>
+<h1 id="label-Production+signing+preflight+follow-up">Production signing preflight follow-up<span><a href="#label-Production+signing+preflight+follow-up">&para;</a> <a href="#top">&uarr;</a></span></h1>
+
+<p>Observed on 2026-10-22. This follow-up prepares a narrow change after the first production signing attempt. It requires a new human merge approval; the prior approval covered tap PR 4 and source PR 15, which are already merged.</p>
+
+<h2 id="label-Proven+production+outcome">Proven production outcome<span><a href="#label-Proven+production+outcome">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Source PR 15 merged as <code>85df85392aef69a5b089e57a2209b5af7be38658</code> after tap PR 4 merged as <code>c64c0a3de8d7190afd74dc902830cadb3772e6c9</code>. Both merge signatures and author-matching DCO trailers were verified, and their trees matched the reviewed heads.</p>
+
+<p>Main <a href="https://github.com/Dunky13/agent-job-queue/actions/runs/39739825063">run 39739825063</a>, build 48, passed all eight validation jobs. The protected signing job failed in its first payload preparation at 07:32 UTC with the codesign message <code>The specified item could not be found in the keychain.</code> It had completed credential import and reached the signing child. Submission, receipt and wait steps were skipped. The only uploaded artifact was the validated ad hoc installer. No Apple upload, notarized production artifact, publication or Homebrew delivery occurred.</p>
+
+<p>No failed-job rerun was attempted: this run has no surviving checkpoint and the existing restore guard correctly refuses a fresh start on a later attempt. The scheduled observer was disabled while this follow-up is prepared.</p>
+
+<h2 id="label-Diagnosis+and+limits">Diagnosis and limits<span><a href="#label-Diagnosis+and+limits">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The same existing credentials were imported into a fresh private Keychain locally. Both the configured certificate name and its SHA-1 signed and verified the actual universal controller successfully. The exact credential wrapper and resumable payload preparation also passed. Neither test uploaded to Apple or changed the host&#39;s default Keychain or search list.</p>
+
+<p>Source inspection found no lost identity variable or missing quoted Keychain argument. These checks do not reproduce the hosted failure or establish its root cause. In particular, neither a name-only lookup problem nor a missing issuer is proven. Apple&#39;s <a href="https://developer.apple.com/documentation/technotes/tn3161-inside-code-signing-certificates">code-signing certificate guidance</a> requires a usable identity and trust chain; GitHub&#39;s <a href="https://github.com/actions/runner-images/blob/7d634bd45ab574eeb0718d83954a4e0e8007cebe/images/macos/scripts/build/configure-machine.sh">image setup</a> intends to install Developer ID G2. Image source is not a readback of the failed runner&#39;s certificate inventory.</p>
+
+<h2 id="label-Changes">Changes<span><a href="#label-Changes">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The credential wrapper now queries the full and valid code-signing identity inventories in its own temporary Keychain before invoking the child. Selection requires exactly the configured full name or case-insensitive fingerprint, validity, Developer ID Application type and the expected team. The child receives the resolved uppercase SHA-1. An absent, invalid, ambiguous, wrong-team or inconsistent selection fails closed without choosing another certificate.</p>
+
+<p>Diagnostics print fixed classifications and counts, plus the selected public fingerprint and team only for a ready identity. Raw inventory names, command errors, passwords and private keys are not printed. A failed child refreshes the inventory classification and keeps its original exit code. Host search lists, default Keychains, trust settings and signing requirements are unchanged.</p>
+
+<p>The workflow also retains an initial <code>s00</code> snapshot after state verification and before credential setup. The snapshot permits recovery from a first import or preparation failure without losing the reviewed installer. If a stage already has prepared bytes without a durable ID, its existing ambiguity guard still refuses resubmission. Missing state, expired submission checkpoints, corruption, provenance mismatch and rejected submissions remain failures. There is no fallback from a known expired submission checkpoint to the initial snapshot.</p>
+
+<p>This closes the observed pre-sign recovery gap and makes the next hosted identity failure distinguishable. It does not claim that the original hosted signing error is already fixed. The next approved main run must provide that evidence before production publication can be certified. The failed build&#39;s workflow cannot acquire these changes through a rerun of its old commit.</p>
+
+<h2 id="label-Validation+contract">Validation contract<span><a href="#label-Validation+contract">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Tests first reproduced the missing initial-checkpoint behavior and the lack of identity preflight at the actual wrapper seam. Coverage includes exact names, both fingerprint cases, missing/invalid/ambiguous/wrong-team/type identities, malformed or failed inventory queries, no alternate valid-certificate fallback, safe diagnostics, child exit-code preservation and all existing credential custody, process-group cleanup and cancellation checks.</p>
+
+<p>Checkpoint integration restores the initial state into a new attempt and makes exactly its first submission using private tools. Existing tests still reject unknown upload outcomes, prior prepared state without an ID and missing state. Workflow tests require the initial immutable upload before any signing stage; an expired submission checkpoint cannot fall back to <code>s00</code>.</p>
+
+<p>Local mocked recovery tests, real credential-import/signing checks, exact-head hosted CI, independent review and post-merge production proof must be reported separately. No operator installation is authorized. The standing <a href="../apple-signing.md">signing guide</a> contains the recovery commands and trust boundaries. A standalone <a href="production-signing-preflight.html">HTML version</a> accompanies this handoff.</p>
+
+<h2 id="label-Completed+local+checks">Completed local checks<span><a href="#label-Completed+local+checks">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The queued lint batch passed, and the complete tooling race suite passed in 89.150 seconds. All existing Apple-signing cleanup and cancellation checks remain enabled. The revised wrapper&#39;s real private-Keychain preflight reported exactly one matching valid identity; universal controller signing and the exact resumable payload preparation passed. Temporary credentials were removed and the host&#39;s default Keychain and search list were unchanged. No Apple upload was made.</p>
+
+<p>Independent Sol 6.1 high review found no blocking source-level findings in the wrapper, initial checkpoint, regression coverage or documentation. Bash 3.2 syntax and ShellCheck passed. Cross-provider review was unavailable and skipped. Exact-head hosted PR validation remains separate from the protected main-only signing path; this local evidence does not certify a hosted repair.</p>
+</main></body></html>

@@ -78,6 +78,17 @@ removes temporary credentials on success, failure and cancellation. Publication
 consumes only the finalized notarized artifact. Missing credentials, rejection,
 stapling or policy failures stop publication with no ad hoc fallback.
 
+Before invoking a signing child, the wrapper checks both the matching and valid
+code-signing identity inventories in its owned Keychain. It requires exactly
+one configured full certificate name or fingerprint, a Developer ID Application
+name and the expected team. It passes the resolved SHA-1 to the child. Missing,
+invalid, ambiguous or inconsistent identities fail before signing. Public
+diagnostics contain fixed classifications, matching/valid counts and, on
+success, the selected fingerprint and team. Raw inventories and tool errors
+are withheld; a child failure refreshes this diagnostic without replacing the
+child's exit status. This check establishes identity selection, while the
+subsequent signature and Apple-chain verification remain required.
+
 Before publication, separate fresh Apple Silicon and Intel jobs verify final
 checksums, signatures, tickets and app-copy policy, exercise the hardened queue
 and HTTPS gateway, and run the actual Homebrew installer with quarantine kept.
@@ -103,6 +114,9 @@ The protected signing job uses `scripts/macos-resume.sh`; local one-shot
 `macos-signing.sh package` remains available. Each payload, installer and DMG
 stage persists an immutable checkpoint before uploading, immediately after
 recording its submission ID, and after waiting, including a failed wait.
+An initial `s00` checkpoint precedes credential setup and signing, so an import
+or first preparation failure still leaves verified recovery state. It permits
+the first submission on a later attempt only when no stage upload was prepared.
 The checkpoint contains the original prepared installer, exact signed upload
 archives, their SHA-256 values, stage records and public Apple receipts.
 ZIP wrapping preserves executable modes and macOS resource forks.
@@ -144,7 +158,8 @@ without an ID refuses another upload. Inspect the preserved receipts and
 Apple's submission history with the original credentials before deciding how
 to recover. Automatic receipt import or duplicate resubmission is not provided.
 A rerun with no checkpoint also stops for reconciliation, even if signing
-never started. Rejected submissions remain failures. The job summary links the
+never started. Runs created before the initial-checkpoint change do not gain
+that checkpoint retroactively. Rejected submissions remain failures. The job summary links the
 safe rerun action; no timer or privileged cross-workflow trigger is required.
 
 ## Local use

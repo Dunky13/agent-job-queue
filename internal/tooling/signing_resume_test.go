@@ -15,7 +15,7 @@ type resumeFixture struct {
 	state string
 }
 
-func newResumeFixture(t *testing.T) resumeFixture {
+func newResumeFixture(t *testing.T, extra ...string) resumeFixture {
 	t.Helper()
 	f := newSigningFixture(t)
 	var err error
@@ -28,6 +28,7 @@ func newResumeFixture(t *testing.T) resumeFixture {
 	}
 	f.environment = append(f.environment, signingProductionEnvironment()...)
 	f.environment = append(f.environment, "GITHUB_SHA="+strings.Repeat("a", 40), "GITHUB_REPOSITORY=fixture/queue", "GITHUB_RUN_ID=1234", "GITHUB_RUN_NUMBER=21", "GITHUB_RUN_ATTEMPT=1", "SIGNING_TEST_ROOT="+f.root)
+	f.environment = append(f.environment, extra...)
 	fixture := resumeFixture{signingFixture: f, state: filepath.Join(f.root, "state")}
 	fixture.command(t, nil, "init", f.installer, fixture.state, "0.1.0")
 	return fixture
