@@ -236,6 +236,15 @@ jobs:
         run: scripts/macos-resume.sh init 'prepared-installer/Agent Job Queue Installer.app' notarization-state "$(cat VERSION)"
       - name: Verify restored build identity and signed archives
         run: scripts/macos-resume.sh verify-state notarization-state "$(cat VERSION)"
+      - name: Snapshot state before credential setup
+        run: scripts/macos-checkpoint.sh snapshot notarization-state "$RUNNER_TEMP/checkpoint-initial"
+      - name: Retain initial recovery state before signing
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Apple-notarization-${{ github.run_id }}-a${{ github.run_attempt }}-s00
+          path: ${{ runner.temp }}/checkpoint-initial/*
+          if-no-files-found: error
+          retention-days: 30
       - name: Notarize the installed payload
         uses: ./.github/actions/notarization-stage
         with:

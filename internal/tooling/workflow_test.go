@@ -139,3 +139,51 @@ func TestNotarizationUsesTrustedAttemptScopedArtifacts(t *testing.T) {
 		}
 	}
 }
+
+func TestNotarizationPersistsInitialStateBeforeCredentials(t *testing.T) {
+	body, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Run             string            `yaml:"run"`
+				Uses            string            `yaml:"uses"`
+				If              string            `yaml:"if"`
+				ContinueOnError bool              `yaml:"continue-on-error"`
+				With            map[string]string `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(body, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	verified, snapshotted, persisted, stageSeen := false, false, false, false
+	for _, step := range workflow.Jobs["notarize"].Steps {
+		if strings.Contains(step.Run, "macos-resume.sh verify-state") {
+			verified = true
+		}
+		if strings.Contains(step.Run, "macos-checkpoint.sh snapshot") {
+			if !verified {
+				t.Fatal("initial state must be verified before snapshotting")
+			}
+			snapshotted = true
+		}
+		if strings.HasSuffix(step.With["name"], "-s00") {
+			if !snapshotted || !strings.HasPrefix(step.Uses, "actions/upload-artifact@") || step.With["if-no-files-found"] != "error" || step.With["retention-days"] != "30" || step.With["overwrite"] == "true" || step.If != "" || step.ContinueOnError {
+				t.Fatal("a required immutable initial checkpoint must precede credential setup")
+			}
+			persisted = true
+		}
+		if step.Uses == "./.github/actions/notarization-stage" {
+			if !persisted {
+				t.Fatal("signing can fail before any recoverable state is retained")
+			}
+			stageSeen = true
+		}
+	}
+	if !stageSeen || !persisted {
+		t.Fatal("workflow lacks initial checkpoint or signing stages")
+	}
+}

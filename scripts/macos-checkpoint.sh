@@ -125,7 +125,7 @@ checkpoint_restore() {
   jq -s -e --arg run "$GITHUB_RUN_ID" --arg sha "$GITHUB_SHA" --argjson attempt "$GITHUB_RUN_ATTEMPT" '
     [.[] | select(.name|startswith("Apple-notarization-"))] |
     ([.[].name]|length) == ([.[].name]|unique|length) and all(.[];
-      (.name|test("^Apple-notarization-" + $run + "-a[1-9][0-9]{0,14}-s0[1-9]$")) and
+      (.name|test("^Apple-notarization-" + $run + "-a[1-9][0-9]{0,14}-s0[0-9]$")) and
       (.name|capture("-a(?<attempt>[0-9]+)-s").attempt|tonumber) <= $attempt and
       (.workflow_run.id|tostring) == $run and .workflow_run.head_branch == "main" and .workflow_run.head_sha == $sha)
   ' "$temporary/artifacts.jsonl" >/dev/null || checkpoint_error 'Mixed or malformed checkpoint provenance.'
