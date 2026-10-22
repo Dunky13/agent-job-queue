@@ -67,9 +67,12 @@ struct TransportTests {
                 _ = try await QueueClient.run(arguments(scenario, marker), transport: transport)
                 throw ClientError.message("Oversized response succeeded")
             } catch {
-                try check(error.localizedDescription.contains("2 MB display limit") &&
-                    ProcessInfo.processInfo.systemUptime - start < 1 && childIsGone(marker),
-                    "Oversized \(scenario) stops before the stalled child deadline and reaps it")
+                let elapsed = ProcessInfo.processInfo.systemUptime - start
+                try check(error.localizedDescription.contains("2 MB display limit"),
+                    "Oversized \(scenario) reports the display limit: \(error.localizedDescription)")
+                try check(childIsGone(marker), "Oversized \(scenario) reaps the private controller")
+                try check(elapsed < 1,
+                    "Oversized \(scenario) stops before the stalled child deadline (elapsed \(elapsed)s)")
             }
         }
         let exact = try await QueueClient.run(arguments("exact", temporary.appendingPathComponent("exact")), transport: transport)
@@ -119,6 +122,20 @@ struct TransportTests {
             throw ClientError.message("Failed controller succeeded")
         } catch {
             try check(error.localizedDescription == "Useful controller diagnostic", "Bounded stderr preserves controller diagnostics")
+        }
+        for _ in 0..<5 {
+            let setup = try await QueueClient.run(arguments("setup-output", temporary.appendingPathComponent("setup-output"), mutation: true),
+                budget: .setup, transport: transport)
+            try check(setup.count == 32_768 && String(decoding: setup, as: UTF8.self).hasSuffix("final setup bytes"),
+                "Verbose setup output stays bounded and preserves the macOS child-exit tail")
+        }
+        do {
+            _ = try await QueueClient.run(arguments("setup-failure", temporary.appendingPathComponent("setup-failure"), mutation: true),
+                budget: .setup, transport: transport)
+            throw ClientError.message("Failed setup succeeded")
+        } catch {
+            try check(error.localizedDescription.utf8.count <= 8_000 && error.localizedDescription.hasSuffix("final setup bytes"),
+                "Setup failure retains the actionable bounded stderr tail")
         }
         do {
             _ = try await QueueClient.run(["profiles", "show", "--stub", "profile-failure", temporary.appendingPathComponent("profile-failure").path], transport: transport)
@@ -190,6 +207,11 @@ struct TransportTests {
         let bytes = Data(repeating: 65, count: 16_384)
         switch scenario {
         case "empty": return
+        case "setup-output", "setup-failure":
+            for _ in 0..<140 { try FileHandle.standardError.write(contentsOf: bytes) }
+            try FileHandle.standardError.write(contentsOf: Data("final setup bytes".utf8))
+            if scenario == "setup-failure" { exit(3) }
+            return
         case "final":
             try FileHandle.standardOutput.write(contentsOf: Data("final response".utf8))
             return

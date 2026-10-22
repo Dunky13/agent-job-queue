@@ -198,7 +198,7 @@ macos_verify_code() {
 macos_sign_code() {
   local path=$1 identifier=${2:-} operation=${3:-code}
   case "$operation" in
-    code|agent-heavy|agent-remote|app|installer) ;;
+    code|agent-heavy|agent-remote|app-agent-heavy|app-agent-remote|app|installer) ;;
     *) macos_signing_error 'Unknown signing operation.'; return 1 ;;
   esac
   local arguments=(--force --sign -)
@@ -260,13 +260,68 @@ macos_assess_app() {
 }
 
 macos_verify_installer_code() {
-  local installer=$1 payload="$1/Contents/Resources/payload" name
+  local installer=$1 payload="$1/Contents/Resources/payload" name embedded
+  embedded="$payload/Agent Queue.app/Contents/Resources/payload/source"
+  macos_app_payload_mode "$payload/Agent Queue.app" || return
   for name in agent-heavy agent-remote; do
     macos_verify_code "$payload/source/bin/$name" || return
+    if [[ $MACOS_APP_EMBEDDED == 1 ]]; then
+      macos_verify_code "$embedded/bin/$name" || return
+    fi
   done
   macos_verify_code "$payload/Agent Queue.app" || return
   macos_verify_code "$installer" || return
   codesign --verify --strict --deep "$installer"
+}
+
+# Old retained build artifacts lack self-contained menu apps. Keep their custom
+# installer packaging intact when newer distribution automation replays them.
+macos_app_payload_mode() {
+  local app=$1 payload="$1/Contents/Resources/payload" name
+  MACOS_APP_EMBEDDED=0
+  if [[ -L $payload ]]; then
+    macos_signing_error 'The menu app setup payload must not be a symlink.'; return 1;
+  fi
+  if [[ ! -e $payload ]]; then
+    if plutil -extract AgentQueueEmbeddedPayload raw -o - "$app/Contents/Info.plist" >/dev/null 2>&1; then
+      macos_signing_error 'The menu app declares an embedded setup payload but it is missing.'; return 1;
+    fi
+    return 0
+  fi
+  for name in "$payload" "$payload/source" "$payload/source/bin"; do
+    [[ -d $name && ! -L $name ]] || {
+      macos_signing_error 'The menu app setup payload is incomplete or linked.'; return 1;
+    }
+  done
+  [[ -f "$payload/source/build-info.json" && ! -L "$payload/source/build-info.json" ]] || {
+    macos_signing_error 'The menu app setup payload is incomplete.'; return 1;
+  }
+  for name in agent-heavy agent-remote; do
+    [[ -f "$payload/source/bin/$name" && ! -L "$payload/source/bin/$name" && -x "$payload/source/bin/$name" ]] || {
+      macos_signing_error 'The menu app setup helper is missing or not executable.'; return 1;
+    }
+  done
+  MACOS_APP_EMBEDDED=1
+}
+
+macos_sign_app_helpers() {
+  local app=$1 source="$1/Contents/Resources/payload/source" name
+  macos_app_payload_mode "$app" || return
+  [[ $MACOS_APP_EMBEDDED == 1 ]] || return 0
+  for name in agent-heavy agent-remote; do
+    macos_sign_code "$source/bin/$name" "io.went.agent-queue.$name" "app-$name" || return
+  done
+}
+
+macos_disk_image_source() {
+  local installer=$1 directory=$2 app="$1/Contents/Resources/payload/Agent Queue.app"
+  MACOS_DISK_IMAGE_SOURCE=$installer
+  macos_app_payload_mode "$app" || return
+  [[ $MACOS_APP_EMBEDDED == 1 ]] || return 0
+  mkdir "$directory" || return
+  ditto --rsrc --extattr --qtn --acl "$app" "$directory/Agent Queue.app" || return
+  ln -s /Applications "$directory/Applications" || return
+  MACOS_DISK_IMAGE_SOURCE=$directory
 }
 
 macos_verify_installer_distribution() {
@@ -317,6 +372,7 @@ macos_package_installer() (
   for name in agent-heavy agent-remote; do
     macos_sign_code "$payload/source/bin/$name" "io.went.agent-queue.$name" "$name" || return
   done
+  macos_sign_app_helpers "$app" || return
   macos_sign_code "$app" '' app || return
   if [[ $SIGNING_MODE == developer-id ]]; then
     # Apple's custom installer workflow requires the installed product to be
@@ -339,9 +395,10 @@ macos_package_installer() (
   macos_verify_installer_code "$installer" || return
   ditto -c -k --sequesterRsrc --keepParent "$installer" "$staging/$base.zip" || return
   if [[ $build_dmg == 1 ]]; then
+    macos_disk_image_source "$installer" "$staging/image" || return
     sync || return
     hdiutil create -verbose -nospotlight -fs HFS+ -volname 'Agent Job Queue' \
-      -srcfolder "$installer" -ov -format UDZO "$staging/$base.dmg" || return
+      -srcfolder "$MACOS_DISK_IMAGE_SOURCE" -ov -format UDZO "$staging/$base.dmg" || return
     if [[ $SIGNING_MODE == developer-id ]]; then
       local image_signing_arguments=(--force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --identifier io.went.agent-queue.disk-image)
       [[ -z ${APPLE_SIGNING_KEYCHAIN:-} ]] || image_signing_arguments+=(--keychain "$APPLE_SIGNING_KEYCHAIN")

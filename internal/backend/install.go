@@ -28,6 +28,7 @@ type installer struct {
 	identity                                              BuildInfo
 	serviceSlot                                           string
 	testing                                               bool
+	appBundle                                             bool
 	command                                               func(context.Context, []string) ([]byte, error)
 }
 
@@ -284,31 +285,220 @@ func installReadInfo(filename string) (BuildInfo, error) {
 	return ValidateBuildInfo(raw)
 }
 
+func (install *installer) validateAppPath() error {
+	if err := installValidateAppPath(install.home, install.app); err != nil {
+		return err
+	}
+	if install.payload != filepath.Join(install.app, "Contents/Resources/payload") {
+		return errors.New("App bundle payload must be embedded in Contents/Resources/payload")
+	}
+	return nil
+}
+
+func installValidateAppPath(home, app string) error {
+	if !integrationValidPath(app) || filepath.Clean(app) != app || !strings.HasSuffix(filepath.Base(app), ".app") {
+		return errors.New("App bundle must be a direct application in /Applications or your home Applications directory")
+	}
+	parent := filepath.Dir(app)
+	if parent != "/Applications" && parent != filepath.Join(home, "Applications") {
+		return errors.New("Move Agent Queue to /Applications or your home Applications directory before setup")
+	}
+	return nil
+}
+
+// Open every parent without following symlinks. Root ownership is permitted only
+// for immutable bundle resources, never for installed private state or locks.
+// /Applications is an Apple-managed shared parent and must not be chmodded.
+func installPayloadParent(root, filename string, bundled bool) (*os.File, error) {
+	if !integrationValidPath(root) || filepath.Clean(root) != root || !integrationValidPath(filename) || filepath.Clean(filename) != filename || !strings.HasPrefix(filename, root+string(filepath.Separator)) {
+		return nil, errors.New("Installer read escapes its canonical payload boundary")
+	}
+	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	current := ""
+	for _, part := range strings.Split(strings.TrimPrefix(filepath.Dir(filename), "/"), "/") {
+		current += "/" + part
+		child, err := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		_ = unix.Close(fd)
+		if err != nil {
+			return nil, err
+		}
+		fd = child
+		var info unix.Stat_t
+		if err := unix.Fstat(fd, &info); err != nil {
+			_ = unix.Close(fd)
+			return nil, err
+		}
+		inside := current == root || strings.HasPrefix(current, root+"/")
+		owner := info.Uid == uint32(os.Getuid()) || (info.Uid == 0 && (!inside || bundled))
+		sharedTemporary := !inside && info.Uid == 0 && uint32(info.Mode)&unix.S_ISVTX != 0
+		sharedApplications := !inside && current == "/Applications" && info.Uid == 0 && uint32(info.Mode)&0002 == 0
+		if !owner || (uint32(info.Mode)&0022 != 0 && !sharedTemporary && !sharedApplications) {
+			_ = unix.Close(fd)
+			return nil, errors.New("Installer payload has unsafe parent ownership or permissions")
+		}
+	}
+	return os.NewFile(uintptr(fd), filepath.Dir(filename)), nil
+}
+
+func installReadPayload(root, filename string, limit int64, bundled bool) ([]byte, error) {
+	parent, err := installPayloadParent(root, filename, bundled)
+	if err != nil {
+		return nil, err
+	}
+	defer parent.Close()
+	fd, err := unix.Openat(int(parent.Fd()), filepath.Base(filename), unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), filename)
+	defer file.Close()
+	var info unix.Stat_t
+	if err := unix.Fstat(fd, &info); err != nil {
+		return nil, err
+	}
+	if uint32(info.Mode)&unix.S_IFMT != unix.S_IFREG || (info.Uid != uint32(os.Getuid()) && !(bundled && info.Uid == 0)) || uint32(info.Mode)&0022 != 0 || info.Nlink != 1 {
+		return nil, errors.New("Installer payload has unsafe ownership, permissions, or file type")
+	}
+	before := integrationStatIdentity(&info)
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errors.New("Installer payload exceeds its size limit")
+	}
+	if err := unix.Fstat(fd, &info); err != nil {
+		return nil, err
+	}
+	if before != integrationStatIdentity(&info) {
+		return nil, errors.New("Installer payload changed during inspection")
+	}
+	return data, nil
+}
+
+func (install *installer) readPayload(filename string, limit int64) ([]byte, error) {
+	root := install.payload
+	if install.appBundle {
+		root = install.app
+	}
+	return installReadPayload(root, filename, limit, install.appBundle)
+}
+
+func installValidatePayloadTree(root string, bundled bool) error {
+	count := 0
+	var total int64
+	return filepath.WalkDir(root, func(filename string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		count++
+		if count > 10000 {
+			return errors.New("Application payload exceeds its file limit")
+		}
+		if entry.IsDir() {
+			parent, err := installPayloadParent(root, filepath.Join(filename, ".installer-probe"), bundled)
+			if err != nil {
+				return err
+			}
+			return parent.Close()
+		}
+		if !entry.Type().IsRegular() {
+			return errors.New("Application payload contains a symlink or special file")
+		}
+		parent, err := installPayloadParent(root, filename, bundled)
+		if err != nil {
+			return err
+		}
+		var info unix.Stat_t
+		err = unix.Fstatat(int(parent.Fd()), filepath.Base(filename), &info, unix.AT_SYMLINK_NOFOLLOW)
+		parent.Close()
+		if err != nil {
+			return err
+		}
+		if uint32(info.Mode)&unix.S_IFMT != unix.S_IFREG || (info.Uid != uint32(os.Getuid()) && !(bundled && info.Uid == 0)) || uint32(info.Mode)&0022 != 0 || info.Nlink != 1 {
+			return errors.New("Installer payload has unsafe ownership, permissions, or file type")
+		}
+		total += info.Size
+		if info.Size > updateMaxArchive || total > updateMaxExpanded {
+			return errors.New("Application payload exceeds its size limit")
+		}
+		return nil
+	})
+}
+
 func (install *installer) validatePayload() error {
-	for _, file := range []string{"source/bin/agent-heavy", "source/bin/agent-remote", "source/build-info.json", "Agent Queue.app/Contents/Resources/build-info.json", "Agent Queue.app/Contents/Info.plist"} {
-		info, err := os.Lstat(filepath.Join(install.payload, file))
+	if !install.appBundle {
+		// Classic installer sources may have a system alias above the payload
+		// (for example macOS temporary storage). Establish its canonical boundary
+		// first; every path inside that boundary still rejects symlinks.
+		if !integrationValidPath(install.payload) {
+			return errors.New("Installer payload must be an absolute path without traversal")
+		}
+		payload, err := filepath.EvalSymlinks(install.payload)
+		if err != nil {
+			return err
+		}
+		install.payload = payload
+	}
+	app := filepath.Join(install.payload, "Agent Queue.app")
+	boundary := install.payload
+	if install.appBundle {
+		if err := install.validateAppPath(); err != nil {
+			return err
+		}
+		app = install.app
+		boundary = app
+		if exists, err := updateExists(filepath.Join(install.payload, "Agent Queue.app")); err != nil {
+			return err
+		} else if exists {
+			return errors.New("App bundle payload must not contain a recursive Agent Queue.app")
+		}
+	}
+	if err := installValidatePayloadTree(boundary, install.appBundle); err != nil {
+		return err
+	}
+	for _, filename := range []string{filepath.Join(install.payload, "source/bin/agent-heavy"), filepath.Join(install.payload, "source/bin/agent-remote"), filepath.Join(app, "Contents/MacOS/AgentQueue")} {
+		if _, err := install.readPayload(filename, updateMaxArchive); err != nil {
+			return err
+		}
+		info, err := os.Lstat(filename)
 		if err != nil || !info.Mode().IsRegular() {
 			return errors.New("Incomplete installer payload")
 		}
-		if strings.Contains(file, "/bin/") && info.Mode().Perm()&0111 == 0 {
+		if info.Mode().Perm()&0111 == 0 {
 			return errors.New("Installer backend binaries must be executable")
 		}
 	}
-	identity, err := installReadInfo(filepath.Join(install.payload, "source/build-info.json"))
+	raw, err := install.readPayload(filepath.Join(install.payload, "source/build-info.json"), 16384)
+	if err != nil {
+		return err
+	}
+	identity, err := ValidateBuildInfo(raw)
 	if err != nil {
 		return err
 	}
 	install.identity = identity
-	bundled, err := installReadInfo(filepath.Join(install.payload, "Agent Queue.app/Contents/Resources/build-info.json"))
+	raw, err = install.readPayload(filepath.Join(app, "Contents/Resources/build-info.json"), 16384)
+	if err != nil {
+		return err
+	}
+	bundled, err := ValidateBuildInfo(raw)
 	if err != nil {
 		return err
 	}
 	if !identity.Equal(bundled) {
 		return errors.New("Installer app and support build identities differ")
 	}
-	info, err := updatePlist(filepath.Join(install.payload, "Agent Queue.app/Contents/Info.plist"))
+	raw, err = install.readPayload(filepath.Join(app, "Contents/Info.plist"), 16384)
 	if err != nil {
 		return err
+	}
+	var info map[string]any
+	if _, err := plist.Unmarshal(raw, &info); err != nil {
+		return errors.New("Installer app metadata is invalid")
 	}
 	build := "0"
 	if identity.Build != nil {
@@ -317,7 +507,11 @@ func (install *installer) validatePayload() error {
 	if info["CFBundleIdentifier"] != "io.went.agent-queue" || info["CFBundleShortVersionString"] != identity.Version || info["CFBundleVersion"] != build {
 		return errors.New("Installer app version differs from its build identity")
 	}
-	for _, marker := range []string{filepath.Join(install.root, "build-info.json"), filepath.Join(install.root, "install-in-progress.json"), filepath.Join(install.app, "Contents/Resources/build-info.json")} {
+	markers := []string{filepath.Join(install.root, "build-info.json"), filepath.Join(install.root, "install-in-progress.json")}
+	if !install.appBundle {
+		markers = append(markers, filepath.Join(install.app, "Contents/Resources/build-info.json"))
+	}
+	for _, marker := range markers {
 		exists, err := updateExists(marker)
 		if err != nil {
 			return err
@@ -412,6 +606,51 @@ func installConfigCallback(node *yaml.Node) (string, error) {
 		return "", errors.New("Queue configuration lacks an explicit callback")
 	}
 	return callback.Value, nil
+}
+
+// Match literal spellings only, without interpreting shell syntax. In particular,
+// double quotes are equivalent only when the path contains no shell expansions
+// or escapes. installQuote also handles literal apostrophes in installed paths.
+func installCallbackPathSpellings(path string) []string {
+	spellings := []string{installQuote(path), "'" + strings.ReplaceAll(path, "'", "'\"'\"'") + "'"}
+	if !strings.ContainsAny(path, "\\\"$`\r\n") {
+		spellings = append(spellings, "\""+path+"\"")
+	}
+	return spellings
+}
+
+func (install *installer) standardCleanupCallback(callback string) bool {
+	const suffix = " cleanup {{ id }}"
+	if !strings.HasSuffix(callback, suffix) {
+		return false
+	}
+	invocation := strings.TrimSuffix(callback, suffix)
+	if slices.Contains(installCallbackPathSpellings(filepath.Join(install.root, "bin/agent-heavy")), invocation) {
+		return true
+	}
+	// The legacy installer used a venv and Homebrew Python 3.12. Retain only
+	// these and standard Python 3 locations on Apple Silicon and Intel Macs;
+	// arbitrary basenames, wrappers, Cellar paths and flags are not equivalent.
+	interpreters := []string{
+		filepath.Join(install.root, ".venv/bin/python"),
+		filepath.Join(install.root, ".venv/bin/python3"),
+		filepath.Join(install.root, ".venv/bin/python3.12"),
+		"python3", "python3.12", "/usr/bin/python3",
+		"/opt/homebrew/bin/python3", "/opt/homebrew/bin/python3.12",
+		"/usr/local/bin/python3", "/usr/local/bin/python3.12",
+		"/opt/homebrew/opt/python@3.12/bin/python3.12",
+		"/usr/local/opt/python@3.12/bin/python3.12",
+	}
+	for _, interpreter := range interpreters {
+		for _, executable := range installCallbackPathSpellings(interpreter) {
+			for _, script := range installCallbackPathSpellings(filepath.Join(install.root, "agent_heavy.py")) {
+				if invocation == executable+" "+script {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func installDecodeLegacySnapshot(raw []byte) (Object, error) {
@@ -556,7 +795,7 @@ func (install *installer) queueMigration(ctx context.Context, node *yaml.Node) (
 	if err != nil {
 		return false, err
 	}
-	if callback != installQuote(filepath.Join(install.root, ".venv/bin/python"))+" "+installQuote(filepath.Join(install.root, "agent_heavy.py"))+" cleanup {{ id }}" && callback != installQuote(filepath.Join(install.root, "bin/agent-heavy"))+" cleanup {{ id }}" {
+	if !install.standardCleanupCallback(callback) {
 		return false, errors.New("Existing queue callback is customized; preserve its behavior before migrating the queue")
 	}
 	tasks, err := install.tasks(ctx, node, install.loaded(ctx, "io.went.agent-heavy"))
@@ -850,7 +1089,7 @@ func (install *installer) pythonMigration(ctx context.Context, node *yaml.Node) 
 	if !old {
 		return false, nil
 	}
-	if node != nil && callback != installQuote(filepath.Join(install.root, ".venv/bin/python"))+" "+installQuote(filepath.Join(install.root, "agent_heavy.py"))+" cleanup {{ id }}" && callback != installQuote(filepath.Join(install.root, "bin/agent-heavy"))+" cleanup {{ id }}" {
+	if node != nil && !install.standardCleanupCallback(callback) {
 		return false, errors.New("Existing queue callback is customized. Preserve its behavior and replace its Python invocation before retrying the installer")
 	}
 	// A retry may find the new daemon already published and Python files still
@@ -1090,7 +1329,7 @@ func (install *installer) stopLegacy(ctx context.Context, node *yaml.Node) error
 }
 
 func (install *installer) copyFile(source, destination string, mode os.FileMode) error {
-	raw, err := updateReadOwned(source, updateMaxArchive)
+	raw, err := install.readPayload(source, updateMaxArchive)
 	if err != nil {
 		return err
 	}
@@ -1098,6 +1337,10 @@ func (install *installer) copyFile(source, destination string, mode os.FileMode)
 }
 
 func installCopyTree(source, destination string) error {
+	return installCopyPayloadTree(source, destination, source, false)
+}
+
+func installCopyPayloadTree(source, destination, boundary string, bundled bool) error {
 	if err := installDirectory(destination); err != nil {
 		return err
 	}
@@ -1130,7 +1373,7 @@ func installCopyTree(source, destination string) error {
 		if info.Size() > updateMaxArchive || total > updateMaxExpanded {
 			return errors.New("Application payload exceeds its size limit")
 		}
-		raw, err := updateReadOwned(filename, updateMaxArchive)
+		raw, err := installReadPayload(boundary, filename, updateMaxArchive, bundled)
 		if err != nil {
 			return err
 		}
@@ -1196,7 +1439,11 @@ func (install *installer) support() error {
 	if exists, err := updateExists(licenses); err != nil {
 		return err
 	} else if exists {
-		if err := installCopyTree(licenses, filepath.Join(install.root, "licenses")); err != nil {
+		boundary := install.payload
+		if install.appBundle {
+			boundary = install.app
+		}
+		if err := installCopyPayloadTree(licenses, filepath.Join(install.root, "licenses"), boundary, install.appBundle); err != nil {
 			return err
 		}
 	}
@@ -1347,6 +1594,53 @@ func (install *installer) removeLegacy() error {
 	return nil
 }
 
+func (install *installer) publishApp(ctx context.Context) error {
+	staging := filepath.Join(install.home, "Applications/.Agent Queue.installing.app")
+	previous := filepath.Join(install.home, "Applications/.Agent Queue.previous.app")
+	for _, directory := range []string{staging, previous} {
+		if exists, err := updateExists(directory); err != nil {
+			return err
+		} else if exists {
+			if err := updatePrivateDirectory(directory); err != nil {
+				return err
+			}
+			if err := os.RemoveAll(directory); err != nil {
+				return err
+			}
+		}
+	}
+	if err := install.copyApp(ctx, filepath.Join(install.payload, "Agent Queue.app"), staging); err != nil {
+		return err
+	}
+	if !install.testing {
+		_, _ = install.run(ctx, "/usr/bin/osascript", "-e", `tell application id "io.went.agent-queue" to quit`)
+	}
+	appExists, err := updateExists(install.app)
+	if err != nil {
+		return err
+	}
+	if appExists {
+		if err := installDirectory(install.app); err != nil {
+			return err
+		}
+		if err := os.Rename(install.app, previous); err != nil {
+			return err
+		}
+	}
+	if err := os.Rename(staging, install.app); err != nil {
+		if appExists {
+			_ = os.Rename(previous, install.app)
+		}
+		return err
+	}
+	if appExists {
+		if err := os.RemoveAll(previous); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (install *installer) execute(ctx context.Context) error {
 	if !install.testing && runtime.GOOS != "darwin" {
 		return errors.New("Agent Job Queue requires macOS")
@@ -1354,7 +1648,11 @@ func (install *installer) execute(ctx context.Context) error {
 	if err := install.validatePayload(); err != nil {
 		return err
 	}
-	for _, directory := range []string{install.root, install.state, install.config, filepath.Join(install.home, ".local/bin"), filepath.Join(install.home, "Applications"), install.launch} {
+	directories := []string{install.root, install.state, install.config, filepath.Join(install.home, ".local/bin"), install.launch}
+	if !install.appBundle {
+		directories = append(directories, filepath.Join(install.home, "Applications"))
+	}
+	for _, directory := range directories {
 		if err := installDirectory(directory); err != nil {
 			return err
 		}
@@ -1369,7 +1667,7 @@ func (install *installer) execute(ctx context.Context) error {
 	previousApp := filepath.Join(install.home, "Applications/.Agent Queue.previous.app")
 	if appExists, err := updateExists(install.app); err != nil {
 		return err
-	} else if !appExists {
+	} else if !install.appBundle && !appExists {
 		if backupExists, err := updateExists(previousApp); err != nil {
 			return err
 		} else if backupExists {
@@ -1524,46 +1822,8 @@ func (install *installer) execute(ctx context.Context) error {
 	if !ready {
 		return errors.New("The queue daemon did not become ready. Inspect the private daemon log")
 	}
-	staging := filepath.Join(install.home, "Applications/.Agent Queue.installing.app")
-	previous := filepath.Join(install.home, "Applications/.Agent Queue.previous.app")
-	for _, directory := range []string{staging, previous} {
-		if exists, err := updateExists(directory); err != nil {
-			return err
-		} else if exists {
-			if err := updatePrivateDirectory(directory); err != nil {
-				return err
-			}
-			if err := os.RemoveAll(directory); err != nil {
-				return err
-			}
-		}
-	}
-	if err := install.copyApp(ctx, filepath.Join(install.payload, "Agent Queue.app"), staging); err != nil {
-		return err
-	}
-	if !install.testing {
-		_, _ = install.run(ctx, "/usr/bin/osascript", "-e", `tell application id "io.went.agent-queue" to quit`)
-	}
-	appExists, err := updateExists(install.app)
-	if err != nil {
-		return err
-	}
-	if appExists {
-		if err := installDirectory(install.app); err != nil {
-			return err
-		}
-		if err := os.Rename(install.app, previous); err != nil {
-			return err
-		}
-	}
-	if err := os.Rename(staging, install.app); err != nil {
-		if appExists {
-			_ = os.Rename(previous, install.app)
-		}
-		return err
-	}
-	if appExists {
-		if err := os.RemoveAll(previous); err != nil {
+	if !install.appBundle {
+		if err := install.publishApp(ctx); err != nil {
 			return err
 		}
 	}
@@ -1609,7 +1869,7 @@ func (install *installer) execute(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !install.testing {
+	if !install.testing && !install.appBundle {
 		if _, err := install.run(ctx, "/usr/bin/open", "-a", install.app); err != nil {
 			return err
 		}
@@ -1618,8 +1878,8 @@ func (install *installer) execute(ctx context.Context) error {
 }
 
 func InstallMain(args []string) int {
-	if len(args) != 2 || args[0] != "--payload" || !filepath.IsAbs(args[1]) {
-		fmt.Fprintln(os.Stderr, "Usage: agent-heavy install --payload DIRECTORY")
+	if len(args) != 2 || (args[0] != "--payload" && args[0] != "--app-bundle") || !filepath.IsAbs(args[1]) {
+		fmt.Fprintln(os.Stderr, "Usage: agent-heavy install --payload DIRECTORY | --app-bundle ABSOLUTE_APP_PATH")
 		return 2
 	}
 	home, err := os.UserHomeDir()
@@ -1638,13 +1898,18 @@ func InstallMain(args []string) int {
 		path = tools + string(os.PathListSeparator) + path
 	}
 	install := &installer{home: home, payload: args[1], root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: filepath.Join(home, "Applications/Agent Queue.app"), path: path, testing: testing}
+	if args[0] == "--app-bundle" {
+		install.appBundle = true
+		install.app = args[1]
+		install.payload = filepath.Join(install.app, "Contents/Resources/payload")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	if err := install.execute(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Agent Queue installer: %v\n", err)
 		return 1
 	}
-	fmt.Println("Installed Agent Queue. The queue remains private; phone access is off until enabled in settings.")
+	fmt.Println("Installed Agent Queue. Your queue is private; manage optional phone access in settings.")
 	fmt.Printf("CLI: %s\n", filepath.Join(home, ".local/bin/agent-heavy"))
 	return 0
 }

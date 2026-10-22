@@ -45,18 +45,20 @@ Each successfully published main installer triggers and verifies its Homebrew de
 
 Uninstalling the cask removes the menu app and Homebrew command links. It preserves the queue daemon, running jobs, private backend, data, credentials, and any enabled remote service. Disable remote access in settings or with `agent-remote disable` first if you want it stopped.
 
-### Installer app
+### Drag to Applications
 
 1. Use macOS 15 or later on an Apple Silicon or Intel Mac.
-2. Download the installer ZIP or DMG from [Releases](https://github.com/Dunky13/agent-job-queue/releases). Successful main CI builds trigger distribution; a prerelease appears after notarization and both architecture checks pass. CI runs also retain the installer as an artifact for 30 days.
-3. Open **Agent Job Queue Installer.app**, then choose **Install**. The installer displays progress and any errors in its window.
-4. The app appears in your menu bar. Add your local bin directory to your shell's `PATH` to use `agent-heavy` by name.
+2. Download the DMG from [Releases](https://github.com/Dunky13/agent-job-queue/releases), then open it. Successful main CI builds trigger distribution; a prerelease appears after notarization and both architecture checks pass. CI runs also retain the installer as an artifact for 30 days.
+3. Drag **Agent Queue.app** onto **Applications**, then open it from Applications. You can also copy it to your own Applications folder. Opening it from the disk image shows instructions to move it first.
+4. On first launch, the app sets up your private queue and login services. It displays progress and lets you retry if setup fails. Once setup finishes, the app appears in your menu bar. Add your local bin directory to your shell's `PATH` to use `agent-heavy` by name.
 
-The installer includes prebuilt universal executables and a Go queue daemon. The Go remote service embeds Caddy's HTTPS and authentication modules. Homebrew, Pueue, Python, uv, Xcode, and a Go toolchain are not required on the installed Mac. It installs into your user account without `sudo`. The payload is self-contained, but first-launch Gatekeeper assessment can require Apple connectivity. Offline first launch of the standalone Go executables has not been verified.
+The ZIP remains available for the updater, Homebrew, and per-user installation. Extract it, open **Agent Job Queue Installer.app**, and choose **Install**. Older disk images also contain this installer app.
+
+The app includes prebuilt universal executables and a Go queue daemon. The Go remote service embeds Caddy's HTTPS and authentication modules. Homebrew, Pueue, Python, uv, Xcode, and a Go toolchain are not required on the installed Mac. Backend setup runs in your user account without `sudo`; Finder may ask for permission to copy the app into the shared Applications folder. The payload is self-contained, but first-launch Gatekeeper assessment can require Apple connectivity. Offline first launch of the standalone Go executables has not been verified.
 
 The notarized release pipeline signs the installer, menu app and executable payload with Developer ID, submits the release to Apple, and staples tickets to the app bundles and DMG. Historical releases and local development packages can remain ad hoc signed. Installer checksums identify the downloaded bytes; they do not establish notarization.
 
-Upgrades of the embedded Go queue preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. The native app and Go support binaries are replaced atomically.
+Upgrades of the embedded Go queue preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. Quit the menu app before replacing it in Finder, then open the new copy to update its per-user backend. First-launch setup leaves that app bundle in place. The ZIP installer continues to replace the menu app atomically in your user Applications folder.
 
 For the first upgrade from Pueue, finish all running and waiting jobs first. If migrating from the Python backend, also disable remote access in the old app. The installer refuses an unsafe migration before replacing support files, then replaces the drained private daemon and resource controller. Completed job IDs, logs, learning history, operator settings, and remote credentials are retained. Previously installed Homebrew packages are left alone because other software may use them.
 

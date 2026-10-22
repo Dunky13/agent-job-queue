@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"slices"
 	"strconv"
@@ -552,6 +553,233 @@ func TestInstallerUpgradePreservesPrivateDataAndExistingDaemon(t *testing.T) {
 		if len(args) > 1 && args[0] == "launchctl" && (args[1] == "bootout" || (args[1] == "kickstart" && strings.HasSuffix(args[len(args)-1], "/io.went.agent-heavy"))) {
 			t.Fatalf("upgrade stopped working queue: %v", args)
 		}
+	}
+}
+
+func TestInstallerLegacyHomebrewPythonCallbackMigratesAndRetries(t *testing.T) {
+	f := installTestFixture(t)
+	f.legacy(t)
+	install := f.installer
+	configuration := install.freshConfig()
+	configuration["daemon"].(Object)["callback"] = "/opt/homebrew/bin/python3 " + installQuote(filepath.Join(install.root, "agent_heavy.py")) + " cleanup {{ id }}"
+	configuration["client"].(Object)["custom-option"] = "preserve me"
+	integrationTestWrite(t, filepath.Join(install.config, "pueue.yml"), mustMetadataJSON(t, configuration))
+	f.tasks = Object{"17": Object{"status": Object{"Done": Object{"result": "Success"}}, "command": "completed fixture job"}}
+	private := filepath.Join(install.state, "jobs/private-job.json")
+	integrationTestWrite(t, private, []byte("preserved private state"))
+	if err := f.run(t); err != nil {
+		t.Fatalf("standard Homebrew Python cleanup callback rejected: %v", err)
+	}
+	config, err := installConfig(filepath.Join(install.config, "pueue.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback, err := installConfigCallback(config)
+	if err != nil || callback != installQuote(filepath.Join(install.root, "bin/agent-heavy"))+" cleanup {{ id }}" {
+		t.Fatalf("cleanup callback was not migrated: %q %v", callback, err)
+	}
+	if installYAMLValue(installYAMLValue(config, "client"), "custom-option").Value != "preserve me" {
+		t.Fatal("custom configuration lost")
+	}
+	snapshot, err := ReadPrivate(filepath.Join(install.state, "legacy-queue-import.json"))
+	if err != nil || text(obj(obj(snapshot["tasks"])["17"])["command"]) != "completed fixture job" {
+		t.Fatalf("completed queue history lost: %v %v", snapshot, err)
+	}
+	if err := f.run(t); err != nil {
+		t.Fatalf("retry failed after callback migration: %v", err)
+	}
+	if string(integrationTestRead(t, private)) != "preserved private state" {
+		t.Fatal("private state changed")
+	}
+}
+
+func TestInstallerStandardCleanupCallbackSpellings(t *testing.T) {
+	for _, interpreter := range []string{
+		".venv/bin/python", ".venv/bin/python3", ".venv/bin/python3.12",
+		"python3", "python3.12", "/usr/bin/python3",
+		"/opt/homebrew/bin/python3", "/opt/homebrew/bin/python3.12",
+		"/usr/local/bin/python3", "/usr/local/bin/python3.12",
+		"/opt/homebrew/opt/python@3.12/bin/python3.12",
+		"/usr/local/opt/python@3.12/bin/python3.12",
+		"bin/agent-heavy",
+	} {
+		for _, quoting := range []string{"canonical", "single", "double", "mixed"} {
+			t.Run(interpreter+"/"+quoting, func(t *testing.T) {
+				f := installTestFixture(t)
+				if interpreter == "bin/agent-heavy" {
+					// Exercise the queue-only preflight independently of Python retirement.
+					f.externalGoQueue(t)
+				} else {
+					f.legacy(t)
+				}
+				install := f.installer
+				executable := interpreter
+				if strings.HasPrefix(interpreter, ".venv/") || interpreter == "bin/agent-heavy" {
+					executable = filepath.Join(install.root, interpreter)
+				}
+				script := filepath.Join(install.root, "agent_heavy.py")
+				switch quoting {
+				case "canonical":
+					executable, script = installQuote(executable), installQuote(script)
+				case "single":
+					executable, script = "'"+executable+"'", "'"+script+"'"
+				case "double":
+					executable, script = "\""+executable+"\"", "\""+script+"\""
+				case "mixed":
+					executable, script = "'"+executable+"'", "\""+script+"\""
+				}
+				callback := executable + " " + script + " cleanup {{ id }}"
+				if interpreter == "bin/agent-heavy" {
+					callback = executable + " cleanup {{ id }}"
+				}
+				config := install.freshConfig()
+				config["daemon"].(Object)["callback"] = callback
+				integrationTestWrite(t, filepath.Join(install.config, "pueue.yml"), mustMetadataJSON(t, config))
+				if err := f.run(t); err != nil {
+					t.Fatalf("standard callback %q rejected: %v", callback, err)
+				}
+				if _, err := updateInstalled(install.root, install.app); err != nil {
+					t.Fatalf("standard callback migration incomplete: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestInstallerCustomCleanupCallbacksRejectBeforeTransaction(t *testing.T) {
+	for _, phase := range []string{"python", "queue"} {
+		for _, change := range []string{
+			"semicolon", "and", "or", "pipe", "background", "newline", "redirect", "input", "comment",
+			"substitution", "backticks", "wrapper", "assignment", "flag", "extra-argument", "changed-command",
+			"changed-template", "quoted-template", "quoted-command", "escaped-command", "other-script", "other-interpreter", "unknown-version", "cellar-interpreter", "unterminated-quote",
+		} {
+			t.Run(phase+"/"+change, func(t *testing.T) {
+				f := installTestFixture(t)
+				if phase == "python" {
+					f.legacy(t)
+				} else {
+					f.externalGoQueue(t)
+				}
+				install := f.installer
+				invocation := installQuote(filepath.Join(install.root, "bin/agent-heavy"))
+				if phase == "python" {
+					invocation = "/opt/homebrew/bin/python3 " + installQuote(filepath.Join(install.root, "agent_heavy.py"))
+				}
+				callback := invocation + " cleanup {{ id }}"
+				switch change {
+				case "semicolon":
+					callback += "; operator-hook"
+				case "and":
+					callback += " && operator-hook"
+				case "or":
+					callback += " || operator-hook"
+				case "pipe":
+					callback += " | operator-hook"
+				case "background":
+					callback += " &"
+				case "newline":
+					callback += "\noperator-hook"
+				case "redirect":
+					callback += " >/tmp/operator-log"
+				case "input":
+					callback += " </tmp/operator-input"
+				case "comment":
+					callback += " # operator annotation"
+				case "substitution":
+					callback = "$(operator-hook)" + callback
+				case "backticks":
+					callback = "`operator-hook`" + callback
+				case "wrapper":
+					callback = "env " + callback
+				case "assignment":
+					callback = "PYTHONPATH=/operator " + callback
+				case "flag":
+					if phase == "python" {
+						callback = strings.Replace(callback, "python3 ", "python3 -B ", 1)
+					} else {
+						callback = strings.Replace(callback, " cleanup", " --verbose cleanup", 1)
+					}
+				case "extra-argument":
+					callback += " extra"
+				case "changed-command":
+					callback = strings.Replace(callback, " cleanup", " scheduler", 1)
+				case "changed-template":
+					callback = strings.Replace(callback, "{{ id }}", "{{ task_id }}", 1)
+				case "quoted-template":
+					callback = strings.Replace(callback, "{{ id }}", "'{{ id }}'", 1)
+				case "quoted-command":
+					callback = strings.Replace(callback, " cleanup", " 'cleanup'", 1)
+				case "escaped-command":
+					callback = strings.Replace(callback, " cleanup", ` clean\up`, 1)
+				case "other-script":
+					callback = "/opt/homebrew/bin/python3 " + installQuote(filepath.Join(install.root, "custom.py")) + " cleanup {{ id }}"
+				case "other-interpreter":
+					callback = "/operator/bin/python3 " + installQuote(filepath.Join(install.root, "agent_heavy.py")) + " cleanup {{ id }}"
+				case "unknown-version":
+					callback = "python3.99 " + installQuote(filepath.Join(install.root, "agent_heavy.py")) + " cleanup {{ id }}"
+				case "cellar-interpreter":
+					callback = "/opt/homebrew/Cellar/python@3.12/3.12.1/bin/python3.12 " + installQuote(filepath.Join(install.root, "agent_heavy.py")) + " cleanup {{ id }}"
+				case "unterminated-quote":
+					callback = "'" + callback
+				}
+				configuration := install.freshConfig()
+				configuration["daemon"].(Object)["callback"] = callback
+				configPath := filepath.Join(install.config, "pueue.yml")
+				raw := mustMetadataJSON(t, configuration)
+				integrationTestWrite(t, configPath, raw)
+				private := filepath.Join(install.state, "jobs/operator-state.json")
+				integrationTestWrite(t, private, []byte("operator state"))
+				err := f.run(t)
+				if err == nil || !strings.Contains(err.Error(), "callback is customized") {
+					t.Fatalf("custom callback not rejected: %q %v", callback, err)
+				}
+				if !bytes.Equal(raw, integrationTestRead(t, configPath)) || string(integrationTestRead(t, private)) != "operator state" {
+					t.Fatal("rejected callback changed config bytes or private state")
+				}
+				for _, filename := range []string{filepath.Join(install.root, "install-in-progress.json"), filepath.Join(install.state, "legacy-queue-import.json")} {
+					if _, err := os.Stat(filename); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("rejected callback published transaction: %s %v", filename, err)
+					}
+				}
+				for _, args := range f.calls {
+					if len(args) < 2 || args[0] != "launchctl" || args[1] != "print" {
+						t.Fatalf("rejected callback invoked a command beyond service inspection: %v", args)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestInstallerCleanupCallbackLiteralInstalledPaths(t *testing.T) {
+	for _, name := range []string{"plain", "literal-shell-characters", "unsafe-double-quotes"} {
+		t.Run(name, func(t *testing.T) {
+			f := installTestFixture(t)
+			install := f.installer
+			install.root = filepath.Join(filepath.Dir(install.home), "plain-root")
+			if name != "plain" {
+				install.root += " ' $literal `literal` \\"
+			}
+			f.legacy(t)
+			script := installQuote(filepath.Join(install.root, "agent_heavy.py"))
+			if name == "unsafe-double-quotes" {
+				// Tokenization alone would hide expansions inside this quoted path.
+				script = "\"" + filepath.Join(install.root, "agent_heavy.py") + "\""
+			}
+			config := install.freshConfig()
+			config["daemon"].(Object)["callback"] = "python3 " + script + " cleanup {{ id }}"
+			configPath := filepath.Join(install.config, "pueue.yml")
+			raw := mustMetadataJSON(t, config)
+			integrationTestWrite(t, configPath, raw)
+			err := f.run(t)
+			if name == "unsafe-double-quotes" {
+				if err == nil || !strings.Contains(err.Error(), "callback is customized") || !bytes.Equal(raw, integrationTestRead(t, configPath)) {
+					t.Fatalf("unsafe quoted callback was not preserved: %v", err)
+				}
+			} else if err != nil {
+				t.Fatalf("literal installed path rejected: %v", err)
+			}
+		})
 	}
 }
 
@@ -1170,6 +1398,9 @@ func TestInstallerLegacyUnrelatedExternalSlotMayRemainOccupied(t *testing.T) {
 func TestInstallerLegacyRetryAfterEmbeddedPublication(t *testing.T) {
 	f := installTestFixture(t)
 	f.legacy(t)
+	config := f.installer.freshConfig()
+	config["daemon"].(Object)["callback"] = `"/opt/homebrew/opt/python@3.12/bin/python3.12" "` + filepath.Join(f.installer.root, "agent_heavy.py") + `" cleanup {{ id }}`
+	integrationTestWrite(t, filepath.Join(f.installer.config, "pueue.yml"), mustMetadataJSON(t, config))
 	f.fail = "bootstrap "
 	if err := f.run(t); err == nil {
 		t.Fatal("fixture publication failure accepted")
@@ -1593,11 +1824,21 @@ func TestInstallerRetirementRefusesSymlinkParentsAndWritableSource(t *testing.T)
 // The release smoke script supplies its extracted payload. This test exercises
 // the actual universal binaries and native app distributed to users.
 func TestInstallerPackagedPayload(t *testing.T) {
+	installTestPackaged(t, false)
+}
+
+func TestInstallerPackagedAppBundle(t *testing.T) {
+	installTestPackaged(t, true)
+}
+
+func installTestPackaged(t *testing.T, appBundle bool) {
+	t.Helper()
 	payload := os.Getenv("AGENT_QUEUE_TEST_INSTALLER_PAYLOAD")
-	if payload == "" {
+	appSource := os.Getenv("AGENT_QUEUE_TEST_APP_BUNDLE")
+	if payload == "" && (!appBundle || appSource == "") {
 		t.Skip("release payload not supplied")
 	}
-	if !filepath.IsAbs(payload) {
+	if payload != "" && !filepath.IsAbs(payload) {
 		t.Fatal("release payload must be absolute")
 	}
 	f := installTestFixture(t)
@@ -1619,6 +1860,27 @@ func TestInstallerPackagedPayload(t *testing.T) {
 	install.config = filepath.Join(home, ".config/agent-heavy")
 	install.launch = filepath.Join(home, "Library/LaunchAgents")
 	install.app = filepath.Join(home, "Applications/Agent Queue.app")
+	var appBefore map[string]installBundleEntry
+	if appBundle {
+		if appSource == "" {
+			appSource = filepath.Join(payload, "Agent Queue.app")
+		}
+		if !filepath.IsAbs(appSource) {
+			t.Fatal("release app must be absolute")
+		}
+		if err := os.Mkdir(filepath.Dir(install.app), 0700); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		output, err := exec.CommandContext(ctx, "/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", appSource, install.app).CombinedOutput()
+		cancel()
+		if err != nil {
+			t.Fatalf("copy packaged app into private home: %v: %s", err, output)
+		}
+		install.appBundle = true
+		install.payload = filepath.Join(install.app, "Contents/Resources/payload")
+		appBefore = installBundleSnapshot(t, install.app)
+	}
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
 	}
@@ -1648,6 +1910,20 @@ func TestInstallerPackagedPayload(t *testing.T) {
 	environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
 	environment["PACKAGED_TEST_VALUE"] = "fixture-env"
 	childEnv := envList(environment)
+	if appBundle {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		command := exec.CommandContext(ctx, filepath.Join(home, ".local/bin/agent-heavy"), "version", "--json")
+		command.Env = childEnv
+		output, err := command.CombinedOutput()
+		cancel()
+		if err != nil {
+			t.Fatalf("packaged self-installed version could not resolve app registration: %v: %s", err, output)
+		}
+		var version Object
+		if err := json.Unmarshal(output, &version); err != nil || version["version"] != install.identity.Version {
+			t.Fatalf("packaged self-installed version mismatch: %v %v", version, err)
+		}
+	}
 	start := func(name string, args ...string) *exec.Cmd {
 		t.Helper()
 		log, err := os.Create(filepath.Join(home, name+".log"))
@@ -1697,6 +1973,13 @@ func TestInstallerPackagedPayload(t *testing.T) {
 	}
 	if info, err := os.Lstat(QueueDatabasePath(install.state)); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
 		t.Fatalf("packaged queue database is not a private regular file: %v %v", info, err)
+	}
+	if appBundle {
+		// Re-run setup with the real packaged daemon live, then exercise a job
+		// through that same daemon and scheduler below.
+		if err := f.run(t); err != nil {
+			t.Fatalf("packaged app setup could not retry with a live daemon: %v", err)
+		}
 	}
 	if _, err := os.Stat(filepath.Join(install.config, "pueue.yml")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("packaged upgrade or daemon generated legacy queue configuration")
@@ -1757,5 +2040,11 @@ func TestInstallerPackagedPayload(t *testing.T) {
 		if len(args) > 1 && args[0] == "launchctl" && args[1] == "bootout" {
 			t.Fatal("Go upgrade restarted its daemon")
 		}
+	}
+	if appBundle {
+		if after := installBundleSnapshot(t, install.app); !reflect.DeepEqual(appBefore, after) {
+			t.Fatal("packaged self-install or retry mutated the application")
+		}
+		assertInstallerNoAppCommands(t, f)
 	}
 }

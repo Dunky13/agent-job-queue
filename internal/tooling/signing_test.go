@@ -134,6 +134,81 @@ func (f signingFixture) recorded(t *testing.T) string {
 	return string(data)
 }
 
+func (f signingFixture) embedAppSupport(t *testing.T) string {
+	t.Helper()
+	source := filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app/Contents/Resources/payload/source")
+	if err := os.MkdirAll(filepath.Join(source, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"agent-heavy", "agent-remote"} {
+		if err := os.WriteFile(filepath.Join(source, "bin", name), []byte("embedded fixture helper"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(source, "build-info.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return source
+}
+
+func TestMacOSSigningDragInstallSignsEmbeddedHelpersBeforeApp(t *testing.T) {
+	f := newSigningFixture(t)
+	source := f.embedAppSupport(t)
+	if output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3"); err != nil {
+		t.Fatalf("drag packaging failed: %v: %s", err, output)
+	}
+	record := f.recorded(t)
+	app := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(source))))
+	seal := strings.Index(record, "|"+app+"\n")
+	for _, name := range []string{"agent-heavy", "agent-remote"} {
+		sign := strings.Index(record, "|"+filepath.Join(source, "bin", name)+"\n")
+		if sign < 0 || seal < sign || !strings.Contains(record, "|--identifier|io.went.agent-queue."+name+"|") {
+			t.Fatalf("embedded helper was not signed before sealing the app: %s", record)
+		}
+	}
+	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
+		t.Fatalf("disk image did not contain the standalone app and Applications shortcut: %s", record)
+	}
+}
+
+func TestMacOSSigningRejectsPartialEmbeddedSetupWithoutPublishing(t *testing.T) {
+	f := newSigningFixture(t)
+	source := f.embedAppSupport(t)
+	if err := os.Remove(filepath.Join(source, "bin/agent-remote")); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3"); err == nil || !strings.Contains(output, "setup helper is missing") {
+		t.Fatalf("partial embedded setup was packaged: %v: %s", err, output)
+	}
+	if entries, err := os.ReadDir(f.destination); !os.IsNotExist(err) && (err != nil || len(entries) != 0) {
+		t.Fatalf("failed drag package published artifacts: %v: %v", entries, err)
+	}
+}
+
+func TestMacOSSigningRejectsDeclaredMissingAndLinkedPayload(t *testing.T) {
+	for _, linked := range []bool{false, true} {
+		t.Run(fmt.Sprint("linked=", linked), func(t *testing.T) {
+			f := newSigningFixture(t)
+			app := filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app")
+			if err := os.WriteFile(filepath.Join(app, "Contents/Info.plist"), []byte(`{"AgentQueueEmbeddedPayload":"true"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if linked {
+				if err := os.MkdirAll(filepath.Join(app, "Contents/Resources"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink("missing", filepath.Join(app, "Contents/Resources/payload")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3")
+			if err == nil || !strings.Contains(output, "menu app") || strings.Contains(f.recorded(t), "notarytool|submit") {
+				t.Fatalf("missing or linked setup fell back to legacy: %v: %s", err, output)
+			}
+		})
+	}
+}
+
 func TestMacOSSigningPackagesInsideOutAndHashesStapledBytes(t *testing.T) {
 	f := newSigningFixture(t)
 	keychain := filepath.Join(f.root, "signing.keychain-db")
@@ -469,13 +544,29 @@ case "$tool" in
     printf '%s\n' "$value"
     ;;
   ditto)
+    if [[ $1 != -c && $1 != -x ]]; then
+      shift $(($# - 2))
+      exec /bin/cp -R "$1" "$2"
+    fi
     shift $(($# - 2))
     printf 'archive' > "$2"
     if [[ -f $1/.stub-staple ]]; then printf ' stapled' >> "$2"; fi
     if [[ -f "$1/Contents/Resources/payload/Agent Queue.app/.stub-staple" ]]; then printf ' payload-stapled' >> "$2"; fi
     ;;
   hdiutil)
-    if [[ $1 == create ]]; then printf 'disk image' > "$last"; fi
+    if [[ $1 == create ]]; then
+      source_next=0
+      for argument in "$@"; do
+        if [[ $source_next == 1 ]]; then image_source=$argument; source_next=0; fi
+        if [[ $argument == -srcfolder ]]; then source_next=1; fi
+      done
+      if [[ -d "$image_source/Agent Queue.app" ]]; then
+        [[ -L "$image_source/Applications" && $(readlink "$image_source/Applications") == /Applications ]]
+        [[ ! -e "$image_source/Agent Job Queue Installer.app" ]]
+        printf 'disk-image-layout|Agent Queue.app|Applications->/Applications\n' >> "$SIGNING_TEST_EVENTS"
+      fi
+      printf 'disk image' > "$last"
+    fi
     ;;
   syspolicy_check) [[ $failure != syspolicy ]] || exit 22;;
   spctl) [[ $failure != gatekeeper ]] || exit 23;;

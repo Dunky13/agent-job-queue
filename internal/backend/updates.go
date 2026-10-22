@@ -127,7 +127,11 @@ func updateInstalled(root, app string) (Object, error) {
 		root = filepath.Join(integrationHome(), ".local/share/agent-heavy")
 	}
 	if app == "" {
-		app = filepath.Join(integrationHome(), "Applications/Agent Queue.app")
+		var err error
+		app, err = updateRegisteredApp()
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := updateCompleted(root); err != nil {
 		return nil, err
@@ -140,6 +144,74 @@ func updateInstalled(root, app string) (Object, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+func updateRegisteredApp() (string, error) {
+	home := integrationHome()
+	fallback := filepath.Join(home, "Applications/Agent Queue.app")
+	filename := filepath.Join(home, "Library/LaunchAgents/io.went.agent-queue.plist")
+	parent, err := integrationParent(filename, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return fallback, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer parent.Close()
+	raw, identity, err := integrationRead(parent, filepath.Base(filename))
+	if err != nil {
+		return "", err
+	}
+	if identity == nil {
+		return fallback, nil
+	}
+	var definition Object
+	if len(raw) > 16384 {
+		return "", errors.New("App launch agent exceeds its size limit")
+	}
+	if _, err := plist.Unmarshal(raw, &definition); err != nil || definition["Label"] != "io.went.agent-queue" {
+		return "", errors.New("App launch agent has invalid registration metadata")
+	}
+	args, err := stringsFrom(definition["ProgramArguments"])
+	if err != nil || len(args) != 3 || args[0] != "/usr/bin/open" || args[1] != "-a" {
+		return "", errors.New("App launch agent has an unexpected application command")
+	}
+	if program, present := definition["Program"]; present && program != args[0] {
+		return "", errors.New("App launch agent Program differs from its expected executable")
+	}
+	if err := installValidateAppPath(home, args[2]); err != nil {
+		return "", err
+	}
+	// This opens but never creates or changes the app directory. It rejects
+	// symlinks in the full path, including the Applications parent.
+	bundle, err := installPayloadParent(args[2], filepath.Join(args[2], ".version-probe"), true)
+	if err != nil {
+		return "", err
+	}
+	if err := bundle.Close(); err != nil {
+		return "", err
+	}
+	return args[2], nil
+}
+
+func updateReadApp(app, filename string) ([]byte, error) {
+	if installValidateAppPath(integrationHome(), app) == nil {
+		return installReadPayload(app, filename, 16384, true)
+	}
+	// Explicit development and archive paths retain their current-owner policy.
+	return updateReadOwned(filename, 16384)
+}
+
+func updateAppPlist(app string) (map[string]any, error) {
+	raw, err := updateReadApp(app, filepath.Join(app, "Contents/Info.plist"))
+	if err != nil {
+		return nil, err
+	}
+	var value map[string]any
+	if _, err := plist.Unmarshal(raw, &value); err != nil {
+		return nil, errors.New("Installed version metadata is invalid")
+	}
+	return value, nil
 }
 
 func updateInstalledIdentity(root, app string) (Object, error) {
@@ -157,7 +229,7 @@ func updateInstalledIdentity(root, app string) (Object, error) {
 		if err != nil {
 			return nil, errors.New("Installed version metadata is invalid")
 		}
-		data, err = updateReadOwned(bundled, 16384)
+		data, err = updateReadApp(app, bundled)
 		if err != nil {
 			return nil, err
 		}
@@ -168,7 +240,7 @@ func updateInstalledIdentity(root, app string) (Object, error) {
 		if !info.Equal(bundle) {
 			return nil, errors.New("App and controller versions differ. Complete installation before checking for updates")
 		}
-		plist, err := updatePlist(filepath.Join(app, "Contents/Info.plist"))
+		plist, err := updateAppPlist(app)
 		if err != nil {
 			return nil, err
 		}
@@ -205,7 +277,7 @@ func updateInstalledIdentity(root, app string) (Object, error) {
 	if !exists {
 		return Object{"version": nil, "build": nil, "bundleBuild": nil, "commit": nil, "tracked": false, "displayVersion": "Not installed"}, nil
 	}
-	plist, err := updatePlist(plistPath)
+	plist, err := updateAppPlist(app)
 	if err != nil {
 		return nil, err
 	}

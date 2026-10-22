@@ -60,6 +60,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
+<key>AgentQueueEmbeddedPayload</key><true/>
 </dict></plist>
 PLIST
 cat > "$installer/Contents/Info.plist" <<PLIST
@@ -77,4 +78,8 @@ cat > "$installer/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 plutil -lint "$app/Contents/Info.plist" "$installer/Contents/Info.plist"
+# The menu app also carries its own setup payload so a Finder copy is complete.
+# Copy only source support, never the app or its enclosing installer.
+mkdir -p "$app/Contents/Resources/payload"
+ditto "$payload/source" "$app/Contents/Resources/payload/source"
 macos_package_installer "$installer" "$destination" "$version"

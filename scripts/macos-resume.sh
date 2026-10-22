@@ -182,6 +182,7 @@ prepare_stage() {
       for name in agent-heavy agent-remote; do
         macos_sign_code "$payload/source/bin/$name" "io.went.agent-queue.$name" "$name"
       done
+      macos_sign_app_helpers "$app"
       macos_sign_code "$app" '' app
       archive "$payload" "$submitted_archive"
       ;;
@@ -195,9 +196,10 @@ prepare_stage() {
       rm -rf "$state/work/Agent Job Queue Installer.app"
       ditto -x -k "$state/completed/installer.zip" "$state/work"
       macos_verify_installer_distribution "$installer"
+      macos_disk_image_source "$installer" "$state/work/image"
       sync
       hdiutil create -verbose -nospotlight -fs HFS+ -volname 'Agent Job Queue' \
-        -srcfolder "$installer" -ov -format UDZO "$submitted_archive"
+        -srcfolder "$MACOS_DISK_IMAGE_SOURCE" -ov -format UDZO "$submitted_archive"
       image_signing_arguments=(--force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --identifier io.went.agent-queue.disk-image)
       [[ -z ${APPLE_SIGNING_KEYCHAIN:-} ]] || image_signing_arguments+=(--keychain "$APPLE_SIGNING_KEYCHAIN")
       macos_signing_operation sign-dmg codesign "${image_signing_arguments[@]}" "$submitted_archive"

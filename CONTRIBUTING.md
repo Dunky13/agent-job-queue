@@ -39,6 +39,8 @@ Core and HTTPS acceptance tests launch temporary private daemons, directories, c
 
 The disk-image check requires the DMG explicitly, mounts it read-only at a private mountpoint, and verifies the enclosed installer signatures, executable permissions, universal architectures, and build identities. A failed detach fails validation and retains its temporary directory. Packaging flushes staged files and disables indexing on its HFS+ image; verbose image-creation diagnostics remain available if macOS reports resource contention.
 
+New disk images contain the self-contained `Agent Queue.app` and an `Applications` shortcut. The app embeds only the source support payload, with no recursive app bundle. First launch from the shared or user Applications folder installs its private backend in place. The installer ZIP retains its existing custom-installer layout for updater and Homebrew compatibility. Disk-image verification also supports retained legacy installer images. Validate a standalone app with `go run -p 2 ./cmd/queue-tool verify-app --app APP_PATH`.
+
 Local installer builds use ad hoc development signatures by default. Main CI validates and retains the universal installer. A separate main-only distribution workflow consumes that exact build, requires Developer ID signing, payload-first Apple notarization, stapled app and DMG tickets, and fresh Apple Silicon and Intel acceptance before publication and Homebrew delivery. Distribution fixes can process a retained build with newer trusted main automation. PRs receive no Apple secrets. See [Apple signing and notarization](docs/apple-signing.md) for credential custody, recovery commands and acceptance evidence. Never remove quarantine to make a notarized release pass.
 
 The native regression tests are headless. For menu-bar gestures, a logged-in graphical macOS session is also needed:
@@ -49,6 +51,14 @@ bash native/tests/run-menu-bar-ui-tests.sh build/menu-bar-verification.json
 ```
 
 The runner builds a private fixture app and sends AppKit events through the actual status button, menus, and window handlers. It records `skippedChecks` when macOS declines foreground activation. `--require-foreground` fails those unavailable checks. It cleans up its own fixture and preserves the installed app and clipboard.
+
+First-launch setup decisions and retries are included in the headless native suite. In a logged-in graphical session, verify the production setup window, failed setup, Retry button, and transition to the simulated queue:
+
+```sh
+agent-heavy run --label "First-launch UI checks" -- bash native/tests/run-bootstrap-ui-tests.sh build/bootstrap-ui-verification
+```
+
+This runner uses temporary app and home directories and an injected setup executor. It writes verification results, screenshots, and a self-contained HTML view into the output directory without installing or changing the real queue.
 
 ## Preview and screenshots
 
