@@ -1,6 +1,6 @@
 # Apple signing and notarization
 
-Research checked against Apple and GitHub primary documentation on 2026-10-21.
+Research checked against Apple and GitHub primary documentation on 2026-10-22.
 This guide describes the release implementation and its acceptance criteria.
 It does not certify an artifact while Apple is still processing it.
 
@@ -66,8 +66,8 @@ the following secrets there, with no repository-scoped Apple secret copies:
 
 Its non-secret variables are `APPLE_SIGNING_IDENTITY`, `APPLE_TEAM_ID`,
 `APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_ISSUER_ID`. Optional
-`APPLE_NOTARY_TIMEOUT` defaults to `30m` per submission. The signing job has a
-120-minute outer budget for three submissions and packaging. This is a bounded
+`APPLE_NOTARY_TIMEOUT` defaults to `5m` per submission. The signing job has a
+45-minute outer budget for three submissions, checkpoint transfers and packaging. This is a bounded
 wait, not a claim about Apple's turnaround time.
 
 PRs build and test ad hoc development artifacts without Apple credentials.
@@ -93,9 +93,59 @@ conditions, as described in
 [managing environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments).
 The existing main protection and signed-commit policy continue to apply.
 
-Public submission receipts are retained separately from release artifacts.
-Private keys, exported identities and temporary upload archives are never
-included in published downloads. Local credentials stay outside the checkout.
+Public submission receipts and exact signed intermediate archives are retained
+in CI checkpoints, separately from release downloads. Private keys and exported
+identities are excluded. Local credentials stay outside the checkout.
+
+## Resuming a pending CI submission
+
+The protected signing job uses `scripts/macos-resume.sh`; local one-shot
+`macos-signing.sh package` remains available. Each payload, installer and DMG
+stage persists an immutable checkpoint before uploading, immediately after
+recording its submission ID, and after waiting, including a failed wait.
+The checkpoint contains the original prepared installer, exact signed upload
+archives, their SHA-256 values, stage records and public Apple receipts.
+ZIP wrapping preserves executable modes and macOS resource forks.
+
+If Apple remains pending after the finite wait, publication stops. Later,
+open that original main-push run in GitHub Actions and choose **Re-run failed
+jobs**, or run the following with its numeric run ID:
+
+```sh
+gh run rerun RUN_ID --failed --repo Dunky13/agent-job-queue
+```
+
+The new runner restores the newest checkpoint from a previous attempt of
+that exact run. It checks the API's repository, main-push event, workflow,
+commit and build number, the artifact's digest and checkpoint checksum, then
+the state's team, version, source and archive hashes. It queries the existing
+submission and continues accepted stages without re-signing or re-uploading
+them. Accepted Apple logs must match the submission ID and exact archive hash.
+Only all three completed stages can export release assets. Fresh ARM and Intel
+acceptance jobs still precede publication and Homebrew delivery.
+
+This deliberately resumes the original run rather than dispatching a new build:
+GitHub retains its original commit, ref, actor privileges and run number.
+Final artifacts use attempt-specific names, and downstream jobs select the
+successful signing job's exact artifact. A retry of a failed acceptance or
+publication job can reuse that successful artifact. See GitHub's
+[rerun rules](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs)
+and [artifact API](https://docs.github.com/en/rest/actions/artifacts).
+
+Checkpoints are retained for 30 days. GitHub permits reruns within 30 days of
+the original run and limits a run to 50 attempts. Missing or expired state,
+invalid provenance, corruption and a changed signing team stop recovery; there
+is no fallback to an older checkpoint or a fresh upload. Use failed-job reruns
+instead of rebuilding a new main run to retry a pending submission.
+
+There is an unavoidable uncertain-outcome window if Apple receives an upload
+but the runner dies before persisting its ID. A restored pre-upload checkpoint
+without an ID refuses another upload. Inspect the preserved receipts and
+Apple's submission history with the original credentials before deciding how
+to recover. Automatic receipt import or duplicate resubmission is not provided.
+A rerun with no checkpoint also stops for reconciliation, even if signing
+never started. Rejected submissions remain failures. The job summary links the
+safe rerun action; no timer or privileged cross-workflow trigger is required.
 
 ## Local use
 

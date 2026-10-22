@@ -13,6 +13,16 @@ and the final signed DMG receive validated stapled tickets before final hashes
 and release metadata are generated. Publication also waits for fresh ARM and
 Intel artifact acceptance jobs. There is no unsigned publication fallback.
 
+Protected CI also retains immutable checkpoints of the signed bytes and Apple
+submission receipts before and after each upload and after each finite wait.
+Re-running failed jobs on the original main-push run restores the exact build
+and continues existing submission IDs. The default wait is five minutes per
+stage. A pending submission blocks publication without losing the build.
+Run, repository, source, team, version and archive hashes are checked before
+resuming. Unknown upload outcomes and missing or expired state fail closed.
+The [signing guide](../apple-signing.md#resuming-a-pending-ci-submission)
+documents recovery commands and the 30-day retention boundary.
+
 New casks keep quarantine and directly run the signed Go controller. The native
 installer uses the same Go entry. The companion tap update must merge before
 the source change. Historical paired cask/manifest records are preserved until
@@ -47,6 +57,19 @@ The host default Keychain and search list were identical before and afterward.
 - Wrong or missing configuration, unsafe credential paths, rejected or malformed
   notarizations, failed signatures/staples, output checksums, secret cleanup and
   cancellation have automated regression coverage.
+- Resumption regressions cover finite timeouts, exact archive and submission ID
+  reuse across attempts, ambiguous uploads, malformed IDs, interrupted stapling,
+  Apple log binding, diagnostics, metadata mismatch and archive corruption.
+  Checkpoint tests cover provenance, numeric attempt ordering, missing/expired
+  state, both digests, pagination, unsafe archives, locks and mode/xattr transfer.
+- A real Developer ID-signed universal payload survived a checkpoint round-trip
+  with identical archive bytes and valid signatures for both architectures.
+  Restoring a pre-upload snapshot without an ID refused a duplicate upload.
+  That check simulated GitHub transport and made no new Apple submission.
+- The final tooling, delivery and tap race tests passed. Independent Sol 6.1
+  high review found no remaining actionable issues in the resume engine, store,
+  composite action, workflow and test changes. The protected hosted signing
+  and recovery path remains main-only and has not run on this PR.
 
 The actual final notarized native app also launched with quarantine retained,
 rendered its isolated Learned Workloads fixture and exited normally. Final ZIP
@@ -104,6 +127,13 @@ every staged entry. The fixture now checks the enclosing installer before and
 after staging, and rejects the former incomplete enclosure before execution.
 No backend change, quarantine removal or deadline increase was needed.
 
+The new checkpoint mode test initially assumed creating a file with mode
+`0755` would override a private process umask. Reproduction showed the fixture
+was already `0700` before snapshotting and remained `0700` after restore.
+The test now explicitly establishes and checks `0755` before transfer, then
+requires the same mode and attribute afterward. It passes under both `022`
+and `077` umasks and race detection; the broad race suite subsequently passed.
+
 Independent review caught that the new opt-in incomplete-installer regression
 was excluded by the final artifact job's exact test selector. Both hosted
 architectures now run all `TestNotarizedHomebrew` cases with the finalized
@@ -134,9 +164,9 @@ final checksums were generated after the DMG was stapled.
 This is a local test artifact with null commit/build identity, not a production
 release candidate. A production release must embed its reviewed commit and
 build identity before signing, then pass its own notarization and fresh hosted
-acceptance. The current CI default wait remains 30 minutes; durable cross-run
-resumption is a recommended follow-up to handle Apple's longer processing,
-and is not implemented by this change. A timeout still prevents publication.
+acceptance. CI now retains the original signed build and submission IDs across
+runner attempts; rerunning failed jobs continues the same submissions. A
+timeout still prevents publication until acceptance and runtime checks pass.
 
 Submission identifiers and diagnostics are retained outside release artifacts.
 Inspect pending submissions before retrying. Nothing from this change has been

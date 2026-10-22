@@ -1,0 +1,96 @@
+name: Durable Apple notarization stage
+description: Preserve signed bytes and upload receipts before waiting for Apple.
+inputs:
+  stage:
+    description: payload, installer or dmg
+    required: true
+  prepared-slot:
+    description: Ordered checkpoint slot before submission
+    required: true
+  submitted-slot:
+    description: Ordered checkpoint slot after submission
+    required: true
+  finished-slot:
+    description: Ordered checkpoint slot after waiting
+    required: true
+  certificate:
+    description: Protected Developer ID PKCS12 data
+    required: true
+  certificate-password:
+    description: Protected PKCS12 password
+    required: true
+  notary-key:
+    description: Protected notarization API key
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Prepare exact signed archive
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+        APPLE_DEVELOPER_ID_P12_BASE64: ${{ inputs.certificate }}
+        APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ inputs.certificate-password }}
+        APPLE_NOTARY_KEY_P8: ${{ inputs.notary-key }}
+      run: scripts/with-apple-signing.sh scripts/macos-resume.sh prepare notarization-state "$STAGE" "$(cat VERSION)"
+    - name: Snapshot before submission
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+      run: scripts/macos-checkpoint.sh snapshot notarization-state "$RUNNER_TEMP/checkpoint-$STAGE-prepared"
+    - name: Persist before submission
+      id: prepared-upload
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: Apple-notarization-${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.prepared-slot }}
+        path: ${{ runner.temp }}/checkpoint-${{ inputs.stage }}-prepared/*
+        if-no-files-found: error
+        retention-days: 30
+    - name: Submit once or reuse the existing submission
+      id: submit
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+        APPLE_DEVELOPER_ID_P12_BASE64: ${{ inputs.certificate }}
+        APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ inputs.certificate-password }}
+        APPLE_NOTARY_KEY_P8: ${{ inputs.notary-key }}
+      run: scripts/with-apple-signing.sh scripts/macos-resume.sh submit notarization-state "$STAGE" "$(cat VERSION)"
+    - name: Snapshot submission receipt
+      id: submitted-snapshot
+      if: always() && steps.prepared-upload.outcome == 'success' && steps.submit.outcome != 'skipped'
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+      run: scripts/macos-checkpoint.sh snapshot notarization-state "$RUNNER_TEMP/checkpoint-$STAGE-submitted"
+    - name: Persist submission before waiting
+      if: always() && steps.submitted-snapshot.outcome == 'success'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: Apple-notarization-${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.submitted-slot }}
+        path: ${{ runner.temp }}/checkpoint-${{ inputs.stage }}-submitted/*
+        if-no-files-found: error
+        retention-days: 30
+    - name: Wait for acceptance and staple
+      id: finish
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+        APPLE_DEVELOPER_ID_P12_BASE64: ${{ inputs.certificate }}
+        APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ inputs.certificate-password }}
+        APPLE_NOTARY_KEY_P8: ${{ inputs.notary-key }}
+      run: scripts/with-apple-signing.sh scripts/macos-resume.sh finish notarization-state "$STAGE" "$(cat VERSION)"
+    - name: Snapshot acceptance or pending state
+      id: finished-snapshot
+      if: always() && steps.finish.outcome != 'skipped'
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+      run: scripts/macos-checkpoint.sh snapshot notarization-state "$RUNNER_TEMP/checkpoint-$STAGE-finished"
+    - name: Persist acceptance or pending state
+      if: always() && steps.finished-snapshot.outcome == 'success'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: Apple-notarization-${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.finished-slot }}
+        path: ${{ runner.temp }}/checkpoint-${{ inputs.stage }}-finished/*
+        if-no-files-found: error
+        retention-days: 30

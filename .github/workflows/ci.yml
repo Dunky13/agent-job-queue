@@ -122,6 +122,8 @@ jobs:
     name: Universal installer
     runs-on: macos-15
     timeout-minutes: 20
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -152,10 +154,13 @@ jobs:
       - name: Upload installer and checksums
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: Agent-Job-Queue-Installer
+          name: Agent-Job-Queue-Installer-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
           retention-days: 30
+      - name: Record validated installer artifact
+        id: artifact-name
+        run: printf 'name=Agent-Job-Queue-Installer-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
   ci-required:
     name: ci-required
@@ -180,10 +185,20 @@ jobs:
     needs: [ci-required, installer]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
     environment: apple-signing
+    env:
+      APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
+      NOTARY_TIMEOUT: ${{ vars.APPLE_NOTARY_TIMEOUT || '5m' }}
     outputs:
       team_id: ${{ steps.apple-team.outputs.team_id }}
+      artifact_name: ${{ steps.final-artifact-name.outputs.name }}
     steps:
       - name: Record the expected public Apple team identifier
         id: apple-team
@@ -199,28 +214,60 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Restore the latest checkpoint for this exact main build
+        id: restore
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/macos-checkpoint.sh restore notarization-state
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: steps.restore.outputs.restored == 'false'
         with:
-          name: Agent-Job-Queue-Installer
+          name: ${{ needs.installer.outputs.artifact_name }}
           path: validated-installer
       - name: Verify and extract the validated installer
+        if: steps.restore.outputs.restored == 'false'
         run: |
           (cd validated-installer && shasum -a 256 -c ./*.zip.sha256)
           mkdir -p prepared-installer
           ditto -x -k "validated-installer/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" prepared-installer
           go run -p 2 ./cmd/queue-tool verify-installer --installer 'prepared-installer/Agent Job Queue Installer.app'
-      - name: Sign, notarize and staple payload, installer and disk image
-        env:
-          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
-          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
-          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
-          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
-          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-          APPLE_NOTARY_KEY_ID: ${{ vars.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ vars.APPLE_NOTARY_ISSUER_ID }}
-          NOTARY_LOG_DIR: ${{ runner.temp }}/notary-logs
-          NOTARY_TIMEOUT: ${{ vars.APPLE_NOTARY_TIMEOUT || '30m' }}
-        run: scripts/with-apple-signing.sh scripts/macos-signing.sh package 'prepared-installer/Agent Job Queue Installer.app' dist "$(cat VERSION)"
+      - name: Initialize durable signing state
+        if: steps.restore.outputs.restored == 'false'
+        run: scripts/macos-resume.sh init 'prepared-installer/Agent Job Queue Installer.app' notarization-state "$(cat VERSION)"
+      - name: Verify restored build identity and signed archives
+        run: scripts/macos-resume.sh verify-state notarization-state "$(cat VERSION)"
+      - name: Notarize the installed payload
+        uses: ./.github/actions/notarization-stage
+        with:
+          stage: payload
+          prepared-slot: '01'
+          submitted-slot: '02'
+          finished-slot: '03'
+          certificate: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          certificate-password: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          notary-key: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+      - name: Notarize the enclosing installer
+        uses: ./.github/actions/notarization-stage
+        with:
+          stage: installer
+          prepared-slot: '04'
+          submitted-slot: '05'
+          finished-slot: '06'
+          certificate: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          certificate-password: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          notary-key: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+      - name: Notarize the distribution disk image
+        uses: ./.github/actions/notarization-stage
+        with:
+          stage: dmg
+          prepared-slot: '07'
+          submitted-slot: '08'
+          finished-slot: '09'
+          certificate: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          certificate-password: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          notary-key: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+      - name: Export only completed notarized assets
+        run: scripts/macos-resume.sh export notarization-state dist "$(cat VERSION)"
       - name: Generate final immutable manifest and Homebrew cask
         run: |
           go run -p 2 ./cmd/queue-tool render-cask \
@@ -230,18 +277,23 @@ jobs:
       - name: Upload notarized installer and final checksums
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: Agent-Job-Queue-Notarized-Installer
+          name: Agent-Job-Queue-Notarized-Installer-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
           retention-days: 30
-      - name: Retain public notarization submission receipts
+      - name: Record final artifact identity
+        id: final-artifact-name
+        run: printf 'name=Agent-Job-Queue-Notarized-Installer-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Explain retained state and safe recovery
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: Apple-notarization-receipts
-          path: ${{ runner.temp }}/notary-logs/**
-          if-no-files-found: ignore
-          retention-days: 30
+        run: |
+          {
+            printf '### Apple notarization attempt %s\n\n' "$GITHUB_RUN_ATTEMPT"
+            printf 'Checkpoints retain signed archives and public submission receipts for 30 days.\n\n'
+            printf 'After a pending submission finishes, use **Re-run failed jobs** on this run.\n\n'
+            printf 'CLI command: gh run rerun %s --failed --repo %s\n\n' "$GITHUB_RUN_ID" "$GITHUB_REPOSITORY"
+            printf 'No pending or rejected artifact is published. Missing state or an uncertain upload stops recovery for manual reconciliation.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   notarized-tests:
     name: Notarized distribution (${{ matrix.os }})
@@ -263,7 +315,7 @@ jobs:
           cache: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: Agent-Job-Queue-Notarized-Installer
+          name: ${{ needs.notarize.outputs.artifact_name }}
           path: dist
       - name: Verify final checksums, signatures, tickets and production app copy
         env:
@@ -302,7 +354,7 @@ jobs:
           cache: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: Agent-Job-Queue-Notarized-Installer
+          name: ${{ needs.notarize.outputs.artifact_name }}
           path: dist
       - name: Publish immutable main build
         env:
@@ -331,7 +383,7 @@ jobs:
 
   homebrew-sync:
     name: Verify Homebrew delivery
-    needs: [publish]
+    needs: [publish, notarize]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -347,7 +399,7 @@ jobs:
           cache: true
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: Agent-Job-Queue-Notarized-Installer
+          name: ${{ needs.notarize.outputs.artifact_name }}
           path: dist
       - name: Require Homebrew dispatch configuration
         env:
