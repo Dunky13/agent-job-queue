@@ -1,15 +1,23 @@
 package tooling
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -79,6 +87,318 @@ func (f resumeFixture) mutate(t *testing.T, relative string, change func(map[str
 		t.Fatal(err)
 	}
 }
+
+func newRESTResumeFixture(t *testing.T) resumeFixture {
+	t.Helper()
+	f := newResumeFixture(t)
+	key := filepath.Join(f.root, "synthetic-notary.p8")
+	if err := os.WriteFile(key, []byte("synthetic fixture key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tool := filepath.Join(f.root, "tools", "queue-tool")
+	testTool(t, filepath.Dir(tool), filepath.Base(tool), resumeRESTTestTool)
+	f.environment = append(f.environment, "NOTARY_KEYCHAIN_PROFILE=", "NOTARY_KEY_FILE="+key, "NOTARY_KEY_ID=TESTKEY", "NOTARY_ISSUER_ID=00000000-0000-0000-0000-000000000001", "QUEUE_NOTARY_TOOL="+tool)
+	return f
+}
+
+func TestMacOSResumeRESTAuthenticationPrecedesPreparation(t *testing.T) {
+	f := newRESTResumeFixture(t)
+	f.reject(t, []string{"SIGNING_TEST_FAILURE=rest-preflight"}, "operation=notary-authentication phase=failure status=33", "prepare", f.state, "payload", "0.1.0")
+	events := f.recorded(t)
+	if !strings.Contains(events, "queue-tool|notarize|preflight") || strings.Contains(events, "codesign|--force|") || strings.Contains(events, "ditto|-x|") {
+		t.Fatalf("authentication did not stop preparation: %s", events)
+	}
+	if _, err := os.Stat(filepath.Join(f.state, "stages/payload.json")); !os.IsNotExist(err) {
+		t.Fatalf("authentication failure created a prepared stage: %v", err)
+	}
+}
+
+func TestMacOSResumeRESTRequiresPrebuiltClient(t *testing.T) {
+	for _, kind := range []string{"missing", "relative", "nonexistent", "nonexecutable"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newRESTResumeFixture(t)
+			var tool string
+			switch kind {
+			case "relative":
+				tool = "tools/queue-tool"
+			case "nonexistent":
+				tool = filepath.Join(f.root, "missing-client")
+			case "nonexecutable":
+				tool = filepath.Join(f.root, "synthetic-notary.p8")
+			}
+			f.reject(t, []string{"QUEUE_NOTARY_TOOL=" + tool}, "prebuilt notarization client", "prepare", f.state, "payload", "0.1.0")
+			if events := f.recorded(t); strings.Contains(events, "codesign|--force|") || strings.Contains(events, "xcrun|notarytool|") || strings.Contains(events, "rest-create|") {
+				t.Fatalf("missing client reached signing or notarization: %s", events)
+			}
+		})
+	}
+}
+
+func TestMacOSResumeRESTPreservesSubmissionCustodyAcrossFailures(t *testing.T) {
+	for _, test := range []struct{ failure, phase string }{{"rest-preflight", "prepared"}, {"rest-before-id", "uploading"}, {"rest-after-id", "submitted"}} {
+		t.Run(test.failure, func(t *testing.T) {
+			f := newRESTResumeFixture(t)
+			f.step(t, "prepare", "payload")
+			archive := filepath.Join(f.state, "archives/payload.zip")
+			original, err := os.ReadFile(archive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("/bin/bash", f.script, "submit", f.state, "payload", "0.1.0")
+			cmd.Env = append(append([]string{}, f.environment...), "SIGNING_TEST_FAILURE="+test.failure)
+			output, err := cmd.Output()
+			var exitError *exec.ExitError
+			if !errors.As(err, &exitError) {
+				t.Fatalf("failed REST submission succeeded: %s", output)
+			}
+			if test.phase == "submitted" {
+				var result struct{ ID, Status string }
+				if err := json.Unmarshal(output, &result); err != nil || result.ID != "00000000-0000-0000-0000-000000000001" || result.Status != "In Progress" {
+					t.Fatalf("post-create failure lost public stdout: %s (%v)", output, err)
+				}
+			} else if len(output) != 0 {
+				t.Fatalf("failure without a known ID emitted success stdout: %s", output)
+			}
+			data, err := os.ReadFile(filepath.Join(f.state, "stages/payload.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var record struct{ Phase, SubmissionID string }
+			var value map[string]string
+			if err := json.Unmarshal(data, &value); err != nil {
+				t.Fatal(err)
+			}
+			record.Phase, record.SubmissionID = value["phase"], value["submission_id"]
+			if record.Phase != test.phase || (record.SubmissionID != "") != (test.phase == "submitted") {
+				t.Fatalf("REST failure lost custody: %s", data)
+			}
+			switch test.phase {
+			case "prepared":
+				if strings.Contains(f.recorded(t), "rest-create|") {
+					t.Fatal("failed preflight reached submission creation")
+				}
+			case "uploading":
+				for _, attempt := range []string{"1", "2"} {
+					f.reject(t, []string{"GITHUB_RUN_ATTEMPT=" + attempt}, "unknown outcome", "submit", f.state, "payload", "0.1.0")
+				}
+				unchanged, err := os.ReadFile(filepath.Join(f.state, "stages/payload.json"))
+				if err != nil || string(unchanged) != string(data) {
+					t.Fatal("unknown submission record changed on refused retries")
+				}
+			case "submitted":
+				f.step(t, "prepare", "payload", "GITHUB_RUN_ATTEMPT=2")
+				f.step(t, "submit", "payload", "GITHUB_RUN_ATTEMPT=2")
+				f.step(t, "finish", "payload", "GITHUB_RUN_ATTEMPT=2")
+				if events := f.recorded(t); strings.Count(events, "queue-tool|notarize|wait|") != 1 || strings.Count(events, "queue-tool|notarize|log|") != 1 {
+					t.Fatalf("known submission was not queried on resume: %s", events)
+				}
+			}
+			if after, err := os.ReadFile(archive); err != nil || string(after) != string(original) {
+				t.Fatal("REST failure or retry changed immutable signed bytes")
+			}
+			events := f.recorded(t)
+			if strings.Contains(events, "xcrun|notarytool|") || strings.Count(events, "rest-create|") > 1 || strings.Count(events, "codesign|--force|") != 3 {
+				t.Fatalf("REST path repeated signing/create or used native notarization: %s", events)
+			}
+		})
+	}
+}
+
+func TestMacOSResumeRESTRequiresExactAcceptedLog(t *testing.T) {
+	for _, failure := range []string{"", "waitid", "loghash", "logid", "logstatus", "payload-log", "payload-rejected", "payload-timeout"} {
+		t.Run("result="+failure, func(t *testing.T) {
+			f := newRESTResumeFixture(t)
+			f.step(t, "prepare", "payload")
+			f.step(t, "submit", "payload")
+			output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "finish", f.state, "payload", "0.1.0")
+			if (failure == "") != (err == nil) {
+				t.Fatalf("unexpected REST acceptance: %v %s", err, output)
+			}
+			events := f.recorded(t)
+			if strings.Contains(events, "xcrun|notarytool|") || failure != "" && strings.Contains(events, "xcrun|stapler|staple|") {
+				t.Fatalf("REST result bypassed policy or used native notarization: %s", events)
+			}
+		})
+	}
+}
+
+func TestMacOSResumeRESTFinishesAllStagesWithBoundReceipts(t *testing.T) {
+	f := newRESTResumeFixture(t)
+	for i, stage := range []string{"payload", "installer", "dmg"} {
+		output := f.step(t, "prepare", stage)
+		remaining := output
+		for _, operation := range []string{"configure-credentials", "notary-authentication", "restore-installer"} {
+			for _, phase := range []string{"begin", "success status=0"} {
+				marker := "operation=" + operation + " phase=" + phase
+				index := strings.Index(remaining, marker)
+				if index < 0 {
+					t.Fatalf("missing ordered operation %q: %s", marker, output)
+				}
+				remaining = remaining[index+len(marker):]
+			}
+		}
+		f.step(t, "submit", stage)
+		f.step(t, "finish", stage)
+		f.command(t, nil, "verify-state", f.state, "0.1.0")
+		archive := stage + ".zip"
+		if stage == "dmg" {
+			archive = "dmg.dmg"
+		}
+		data, err := os.ReadFile(filepath.Join(f.state, "archives", archive))
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(data)
+		for _, name := range []string{stage + ".json", stage + ".log.json"} {
+			data, err := os.ReadFile(filepath.Join(f.state, "receipts", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var receipt struct{ JobID, SHA256, Status string }
+			if err := json.Unmarshal(data, &receipt); err != nil || receipt.JobID != fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1) || receipt.SHA256 != hex.EncodeToString(hash[:]) || receipt.Status != "Accepted" || strings.Contains(string(data), "privateAuthentication") {
+				t.Fatalf("unbound or unsanitized REST receipt: %s (%v)", data, err)
+			}
+		}
+	}
+	f.command(t, nil, "export", f.state, f.destination, "0.1.0")
+	events := f.recorded(t)
+	for _, event := range []string{"queue-tool|notarize|preflight", "rest-create|", "queue-tool|notarize|wait|", "queue-tool|notarize|log|", "xcrun|stapler|staple|"} {
+		if strings.Count(events, event) != 3 {
+			t.Fatalf("expected three %s events: %s", event, events)
+		}
+	}
+	if strings.Contains(events, "xcrun|notarytool|") || strings.Count(events, "codesign|--force|") != 5 || !strings.Contains(events, "spctl|--assess|") {
+		t.Fatalf("REST completion skipped policy or repeated signing: %s", events)
+	}
+}
+
+func TestMacOSResumeRESTTimeoutCompatibility(t *testing.T) {
+	for _, timeout := range []string{"300", "86400", "5m", "24h"} {
+		t.Run(timeout, func(t *testing.T) {
+			f := newRESTResumeFixture(t)
+			env := "NOTARY_TIMEOUT=" + timeout
+			f.step(t, "prepare", "payload", env)
+			f.step(t, "submit", "payload", env)
+			f.step(t, "finish", "payload", env)
+			expected := timeout
+			if timeout == "300" || timeout == "86400" {
+				expected += "s"
+			}
+			if !strings.Contains(f.recorded(t), "|--timeout|"+expected+"\n") {
+				t.Fatalf("timeout was not normalized for REST: %s", f.recorded(t))
+			}
+		})
+	}
+	for _, timeout := range []string{"86401", "1441m", "25h", strings.Repeat("9", 40)} {
+		t.Run("oversized-"+timeout, func(t *testing.T) {
+			f := newRESTResumeFixture(t)
+			f.reject(t, []string{"NOTARY_TIMEOUT=" + timeout}, "at most 24h", "prepare", f.state, "payload", "0.1.0")
+			if events := f.recorded(t); strings.Contains(events, "queue-tool|notarize|") || strings.Contains(events, "codesign|--force|") {
+				t.Fatalf("invalid timeout reached signing or authentication: %s", events)
+			}
+		})
+	}
+}
+
+func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T) {
+	f := newRESTResumeFixture(t)
+	f.step(t, "prepare", "payload")
+	f.step(t, "submit", "payload")
+	tool := filepath.Join(f.root, "tools", "queue-tool-real")
+	build := exec.Command("go", "build", "-p", "2", "-o", tool, "../../cmd/queue-tool")
+	build.Env = signingTestEnvironment()
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build actual notarization CLI: %v\n%s", err, output)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "synthetic-notary.p8"), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Refuse CONNECT locally, before TLS or any provider request. Both commands
+	// must reach this proxy, proving real key/output parsing accepted the same
+	// temporary paths used by the shell, including macOS system parent aliases.
+	var connects atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.Host != "appstoreconnect.apple.com:443" || r.Header.Get("Authorization") != "" {
+			t.Errorf("unexpected proxy request: %s %s", r.Method, r.Host)
+		}
+		connects.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	output, err := f.run(t, []string{
+		"QUEUE_NOTARY_TOOL=" + tool, "NOTARY_KEY_ID=TESTKEY001",
+		"NOTARY_TIMEOUT=300",
+		"HTTPS_PROXY=" + proxy.URL, "HTTP_PROXY=" + proxy.URL, "ALL_PROXY=", "NO_PROXY=",
+		"https_proxy=" + proxy.URL, "http_proxy=" + proxy.URL, "all_proxy=", "no_proxy=",
+	}, "finish", f.state, "payload", "0.1.0")
+	if err == nil || connects.Load() != 2 || strings.Count(output, "notarization: request_failed") != 2 || !strings.Contains(output, "submission 00000000-0000-0000-0000-000000000001 is preserved") {
+		t.Fatalf("real CLI did not reach both wait and log transport safely: connects=%d, %v\n%s", connects.Load(), err, output)
+	}
+	if strings.Contains(f.recorded(t), "xcrun|notarytool|") {
+		t.Fatal("real CLI failure fell back to native notarization")
+	}
+	f.command(t, nil, "verify-state", f.state, "0.1.0")
+}
+
+// This trusted mock models only the CLI/state seam. Native tools and provider
+// calls remain simulated; the Go client's separate tests cover real durability.
+const resumeRESTTestTool = `set -euo pipefail
+printf 'queue-tool' >> "$SIGNING_TEST_EVENTS"; printf '|%s' "$@" >> "$SIGNING_TEST_EVENTS"; printf '\n' >> "$SIGNING_TEST_EVENTS"
+[[ $1 == notarize ]] || exit 90
+operation=$2; shift 2
+archive= record= hash= id= output=
+while (($#)); do
+  case "$1" in
+    --archive) archive=$2;; --record) record=$2;; --sha256) hash=$2;;
+    --id) id=$2;; --output) output=$2;; --timeout) :;; *) exit 91;;
+  esac
+  shift 2
+done
+failure=${SIGNING_TEST_FAILURE:-}
+case "$operation" in
+  preflight) [[ $failure != rest-preflight ]] || exit 33; exit 0;;
+  submit)
+    [[ $failure != rest-preflight ]] || exit 33
+    [[ $(jq -r .phase "$record") == prepared && $(jq -r .archive_sha256 "$record") == "$hash" ]] || exit 92
+    jq '.phase="uploading"' "$record" > "$record.new"; mv "$record.new" "$record"
+    printf 'rest-create|\n' >> "$SIGNING_TEST_EVENTS"
+    [[ $failure != rest-before-id ]] || exit 34
+    case "$archive" in */payload.zip) number=1;; */installer.zip) number=2;; *.dmg) number=3;; *) exit 93;; esac
+    printf -v id '00000000-0000-0000-0000-%012d' "$number"
+    jq --arg id "$id" '.phase="submitted" | .submission_id=$id' "$record" > "$record.new"; mv "$record.new" "$record"
+    printf '%s' "$hash" > "$SIGNING_TEST_ROOT/hash.$number"
+    printf '{"id":"%s","status":"In Progress"}\n' "$id"
+    [[ $failure != rest-after-id ]] || exit 35
+    exit 0;;
+  wait|log)
+    case "$id" in *001) number=1; stage=payload;; *002) number=2; stage=installer;; *003) number=3; stage=dmg;; *) exit 94;; esac
+    status=Accepted
+    if [[ $operation == wait ]]; then
+      [[ $failure != "$stage-rejected" ]] || status=Invalid
+      [[ $failure != "$stage-timeout" ]] || status='In Progress'
+      [[ $failure != waitid ]] || id=00000000-0000-0000-0000-000000000009
+      printf '{"id":"%s","status":"%s"}\n' "$id" "$status"
+      [[ $failure != "$stage-timeout" ]] || exit 75
+    else
+      [[ $failure != "$stage-log" ]] || exit 19
+      [[ ! -e $output && ! -L $output ]] || exit 96
+      hash=$(cat "$SIGNING_TEST_ROOT/hash.$number")
+      [[ $failure != loghash ]] || hash=0000000000000000000000000000000000000000000000000000000000000000
+      [[ $failure != logid ]] || id=00000000-0000-0000-0000-000000000009
+      [[ $failure != logstatus ]] || status=Invalid
+      printf '{"jobId":"%s","sha256":"%s","status":"%s","issues":[],"privateAuthentication":"must never persist"}\n' "$id" "$hash" "$status" > "$output"
+    fi;;
+  *) exit 95;;
+esac
+`
 
 func TestMacOSResumePrepareReportsExactFailingOperation(t *testing.T) {
 	for _, test := range []struct {

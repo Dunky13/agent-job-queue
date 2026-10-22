@@ -1,20 +1,28 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/Dunky13/agent-job-queue/internal/notaryapi"
 	"github.com/Dunky13/agent-job-queue/internal/tooling"
 )
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("Expected check-source, check-commits, render-cask, or verify-release")
+		return errors.New("Expected check-source, check-commits, render-cask, verify-release, or notarize")
 	}
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
+	case "notarize":
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return notaryapi.Run(ctx, args[1:], os.Stdout)
 	case "shift-fixture":
 		input := flags.String("input", "", "public fixture input")
 		output := flags.String("output", "", "rebased output")

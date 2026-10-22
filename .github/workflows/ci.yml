@@ -72,8 +72,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Check shipped CLI and HTTPS dependencies
-        run: go run -p 2 golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./cmd/agent-heavy ./cmd/agent-remote
+      - name: Check CLI, HTTPS and release-tool dependencies
+        run: go run -p 2 golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./cmd/agent-heavy ./cmd/agent-remote ./cmd/queue-tool
 
   macos-tests:
     name: macOS tests (${{ matrix.os }})
@@ -214,6 +214,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: Build the notarization client before credential setup
+        env:
+          QUEUE_NOTARY_TOOL: ${{ runner.temp }}/queue-notary-tool
+        run: |
+          go build -p 2 -trimpath -o "$QUEUE_NOTARY_TOOL" ./cmd/queue-tool
+          printf 'QUEUE_NOTARY_TOOL=%s\n' "$QUEUE_NOTARY_TOOL" >> "$GITHUB_ENV"
       - name: Restore the latest checkpoint for this exact main build
         id: restore
         env:
@@ -230,7 +236,7 @@ jobs:
           (cd validated-installer && shasum -a 256 -c ./*.zip.sha256)
           mkdir -p prepared-installer
           ditto -x -k "validated-installer/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" prepared-installer
-          go run -p 2 ./cmd/queue-tool verify-installer --installer 'prepared-installer/Agent Job Queue Installer.app'
+          "$QUEUE_NOTARY_TOOL" verify-installer --installer 'prepared-installer/Agent Job Queue Installer.app'
       - name: Initialize durable signing state
         if: steps.restore.outputs.restored == 'false'
         run: scripts/macos-resume.sh init 'prepared-installer/Agent Job Queue Installer.app' notarization-state "$(cat VERSION)"
@@ -279,7 +285,7 @@ jobs:
         run: scripts/macos-resume.sh export notarization-state dist "$(cat VERSION)"
       - name: Generate final immutable manifest and Homebrew cask
         run: |
-          go run -p 2 ./cmd/queue-tool render-cask \
+          "$QUEUE_NOTARY_TOOL" render-cask \
             --archive "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" \
             --version "$(cat VERSION)" --tag "build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" \
             --commit "$GITHUB_SHA" --build "$GITHUB_RUN_NUMBER" --output dist

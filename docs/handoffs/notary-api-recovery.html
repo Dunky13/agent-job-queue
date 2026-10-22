@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Notary API recovery repair</title>
+<style>html{color-scheme:light dark;font:17px/1.65 system-ui,sans-serif}body{margin:0 auto;max-width:76ch;padding:2rem 1.25rem 5rem}h1,h2{line-height:1.25}h2{margin-top:2rem}a{color:#3478d4}pre{padding:1rem;overflow:auto;border:1px solid #8886;border-radius:.5rem}code{font-size:.88em}li{margin:.5rem 0}h1 span,h2 span{display:none}@media print{body{max-width:none;padding:0}pre{white-space:pre-wrap;overflow-wrap:anywhere}}</style>
+<body id="top"><main>
+<h1 id="label-Notary+API+recovery+repair">Notary API recovery repair<span><a href="#label-Notary+API+recovery+repair">&para;</a> <a href="#top">&uarr;</a></span></h1>
+
+<h2 id="label-Problem+and+scope">Problem and scope<span><a href="#label-Problem+and+scope">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Production <a href="https://github.com/Dunky13/agent-job-queue/actions/runs/39761705194">run 39761705194</a>, build 54, attempt 1, targets commit <code>ab2e066ae6886a0bf9e0aa99fef48ffa64f78cc9</code>. All eight validation jobs and Developer ID payload signing succeeded. Native <code>notarytool submit</code> then exited with <code>Trace/BPT trap: 5</code> before returning a submission ID. No notarized runtime acceptance, production publication or Homebrew delivery followed.</p>
+
+<p>The verified latest immutable checkpoint retains the signed payload ZIP with SHA-256 <code>84b53513edee9aa3cd9570456fd8417b7c2fb3592268f8d75bd1f23c85f96601</code>. Its stage is <code>uploading</code>, with an empty ID and no acceptance receipt. Authorized read-only Apple history and nearby log inspection found no matching archive. That bounded absence does not prove Apple received nothing. Build 54 stays blocked; this repair does not rewrite its checkpoint or rerun its upload.</p>
+
+<h2 id="label-Evidence+and+implementation+choice">Evidence and implementation choice<span><a href="#label-Evidence+and+implementation+choice">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Network-denied local probes of valid and malformed synthetic keys did not reproduce the native crash. The exact preserved ZIP and a harmless comparison ZIP also failed normally at the proven network-denial boundary. This does not establish complete archive preflight or the hosted crash&#39;s root cause. There is no verified Xcode-version or S3-acceleration workaround for this failure.</p>
+
+<p>The repair replaces the durable CI raw-key client path with Apple&#39;s supported <a href="https://developer.apple.com/documentation/notaryapi/submitting-software-for-notarization-over-the-web">Notary API</a>. Apple returns a submission ID and temporary S3 credentials before archive upload. The client persists that ID first, removing the native submission process from this CI path and reducing the ambiguity window. Local Keychain-profile and one-shot packaging commands keep their existing behavior.</p>
+
+<p>JWT authentication uses the existing <code>go-jose</code> dependency; upload uses the official AWS Go SDK. Production endpoints are fixed. Provider errors are reported as safe classifications rather than raw responses, tokens, signed URLs or private paths. API-key authentication is tested before signing with a read-only history request. The client is compiled before credentials are loaded.</p>
+
+<h2 id="label-Recovery+contract">Recovery contract<span><a href="#label-Recovery+contract">&para;</a> <a href="#top">&uarr;</a></span></h2>
+<ol><li>
+<p>Validate the exact six-field stage record, attempt and archive hash. Reject  a symlinked record or archive and serialize submit operations.</p>
+</li><li>
+<p>Authenticate before changing state. Write and sync <code>uploading</code> before one  create request. Do not retry an uncertain create response.</p>
+</li><li>
+<p>Persist a valid Apple ID as <code>submitted</code> before parsing upload details or  sending archive bytes. A persistence failure prevents upload. If an ID is  known, also print its public JSON on failure for operator evidence.</p>
+</li><li>
+<p>Upload the immutable archive once using the returned temporary credentials.  A failed or interrupted upload retains its ID and never creates another  submission automatically.</p>
+</li><li>
+<p>Resume by querying the recorded submission. Acceptance still requires the  exact ID and archive SHA-256 in Apple&#39;s log, then stapling and policy checks.  Payload, installer and DMG remain ordered; fresh ARM and Intel distribution  checks still precede publication and Homebrew delivery.</p>
+</li><li>
+<p>A legacy <code>uploading</code> stage with an empty ID, including build 54, remains a  manual-reconciliation failure. No checkpoint fallback or automatic receipt  import is added.</p>
+</li></ol>
+
+<p>The synced local ID survives a client failure and is retained by the following immutable CI snapshot. It cannot guarantee recovery if the entire runner is lost before that snapshot uploads. Temporary S3 credentials stay private and are not checkpointed. A known submission whose archive upload did not complete may therefore need operator resolution; querying it is safe, but does not prove that Apple has received or processed its bytes.</p>
+
+<h2 id="label-Validation+and+remaining+boundary">Validation and remaining boundary<span><a href="#label-Validation+and+remaining+boundary">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The native-path regression first failed against a private copy of the original script. The expanded shell tests pass for all three stages, public recovery ID output after failure, guarded unknown outcomes, missing or unusable clients, and mismatched wait IDs and acceptance logs. The complete focused resume suite passed in 58.043 seconds. A regression using the actual prebuilt CLI reached exactly two local CONNECT-rejecting proxy requests for wait and log, with no Apple request. It verifies ordinary macOS temporary key and output paths.</p>
+
+<p>The Go client race suite passed in 2.045 seconds. It covers JWT signature and claims, malformed keys, stage and hash validation, unknown create responses, single-create behavior, synced ID ordering, failed writes and uploads, the official S3 client&#39;s auth and checksum, redirects, bounded responses, timeouts, rejection, cancellation and private output paths. Broader tooling validation passed in 140.645 seconds, alongside lint. Independent review then identified two additional defects: an HTTP/2 transport could replay a create POST, and bare-second timeouts accepted by the native engine were rejected by Go&#39;s duration parser. Both were repaired before PR submission.</p>
+
+<p>Real TLS/ALPN HTTP/2 frame regressions reproduced two complete create POSTs and one upload on the original client for <code>PROTOCOL_ERROR</code>, <code>REFUSED_STREAM</code> and GOAWAY. Clearing the create request&#39;s <code>GetBody</code> now yields one POST, no upload, an unknown-outcome record and refusal on a later submit. HTTP/2 stays enabled, and a separate safe GET retry still succeeds. These focused HTTP/2 tests passed in 0.299 seconds, and the full serial API suite in 0.560 seconds.</p>
+
+<p>The timeout regression reproduced the actual CLI failure before the fix: <code>NOTARY_TIMEOUT=300</code> reached only one local proxy connection because wait rejected its argument. Normalization now passes the real CLI flow with two local connections. Explicit units, the 24-hour boundary and oversized integers are covered; unsupported budgets fail before signing or authentication. The focused timeout and actual-CLI tests passed in 9.523 seconds. Final queued lint, Go API race tests (2.092 seconds), complete tooling race tests (150.520 seconds), and Linux/macOS release-tool builds passed in shared queue job 834. The second independent Sol 6.1 high review verified both repairs and found no remaining actionable defects. Cross-provider review was unavailable and skipped; it is not counted as a clean review. Hosted PR checks remain a separate gate.</p>
+
+<p>The expanded vulnerability scan found no reachable vulnerabilities in the app helpers or release tool. It also reported one finding in an imported package and one in a required module whose vulnerable code was not called. Linux and macOS release-tool builds passed. One live read-only preflight authenticated successfully against Apple using the existing protected local team key. Its public key and issuer selectors match CI; that does not verify the contents of the hosted private-key secret. The temporary plaintext key was removed and exact before/after Keychain search-list and default settings matched. No submission was created and no archive was uploaded.</p>
+
+<p>Local unit and fixture results do not establish live S3 upload, Apple acceptance, hosted signing or production delivery. A new repair PR retains the human merge gate. After an approved merge, observation must target the new exact main run, head and build; build 54 cannot acquire these changes through a rerun. The existing production observer remains disabled at its unresolved submission boundary.</p>
+
+<p>The complete signing guide is <a href="../apple-signing.md">Markdown</a> and <a href="../apple-signing.html">standalone HTML</a>. This handoff also has a <a href="notary-api-recovery.html">standalone HTML version</a>.</p>
+</main></body></html>

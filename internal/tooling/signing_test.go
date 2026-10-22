@@ -16,7 +16,7 @@ func signingTestEnvironment(extra ...string) []string {
 	var environment []string
 	for _, entry := range os.Environ() {
 		name, _, _ := strings.Cut(entry, "=")
-		if name == "SIGNING_MODE" || strings.HasPrefix(name, "APPLE_") || strings.HasPrefix(name, "NOTARY_") || strings.HasPrefix(name, "SIGNING_TEST_") || name == "BUILD_DMG" {
+		if name == "SIGNING_MODE" || name == "QUEUE_NOTARY_TOOL" || strings.HasPrefix(name, "APPLE_") || strings.HasPrefix(name, "NOTARY_") || strings.HasPrefix(name, "SIGNING_TEST_") || name == "BUILD_DMG" {
 			continue
 		}
 		environment = append(environment, entry)
