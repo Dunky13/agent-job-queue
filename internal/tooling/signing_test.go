@@ -398,6 +398,14 @@ failure=${SIGNING_TEST_FAILURE:-}
 last=${!#}
 case "$tool" in
   codesign)
+    if [[ $1 == --force ]]; then
+      case "$failure:$last" in
+        payload-sign-heavy:*/agent-heavy) printf 'error: The specified item could not be found in the keychain.\n' >&2; exit 41;;
+        payload-sign-remote:*/agent-remote) exit 42;;
+        payload-sign-app:*/Agent\ Queue.app) exit 43;;
+      esac
+    fi
+    if [[ $1 == --verify && $failure == payload-verify-heavy && $last == */agent-heavy ]]; then exit 44; fi
     # codesign accepts an inline requirement only with the '=' prefix;
     # otherwise this argument must name a readable requirements file.
     requirement_next=0

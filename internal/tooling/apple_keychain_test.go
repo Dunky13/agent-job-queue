@@ -34,6 +34,7 @@ func appleSigningInventoryRow(hash, name string) string {
 func appleSigningFixture(t *testing.T) (string, []string) {
 	t.Helper()
 	root := t.TempDir()
+	appleSigningSearchListFixture(t, root)
 	row := appleSigningInventoryRow(appleSigningTestSHA1, appleSigningTestName)
 	appleSigningInventories(t, root, row+"     1 identities found\n", row+"     1 valid identities found\n")
 	testTool(t, root, "mktemp", `printf 'mktemp\n' >> "$KEYCHAIN_TEST_ROOT/calls"
@@ -54,8 +55,12 @@ printf '%s\n' "$operation" >> "$KEYCHAIN_TEST_ROOT/calls"
 last=
 for value in "$@"; do last=$value; done
 case "$operation" in
+list-keychains)
+  exec "$KEYCHAIN_TEST_ROOT/search-list-tool" "$@";;
 create-keychain)
   printf '%s' "$last" > "$KEYCHAIN_TEST_ROOT/keychain"
+  physical_parent=$(cd -P -- "${last%/*}" && pwd -P)
+  printf '%s/%s' "$physical_parent" "${last##*/}" > "$KEYCHAIN_TEST_ROOT/physical-keychain"
   touch "$last";;
 unlock-keychain|set-keychain-settings|set-key-partition-list)
   [ "$last" = "$(cat "$KEYCHAIN_TEST_ROOT/keychain")" ] || exit 99;;
@@ -77,7 +82,13 @@ find-identity)
   cat "$KEYCHAIN_TEST_ROOT/$inventory";;
 delete-keychain)
   [ "$1" = "$(cat "$KEYCHAIN_TEST_ROOT/keychain")" ] || exit 99
-  if [ "${KEYCHAIN_TEST_FAIL:-}" != delete-keychain ]; then rm -f "$1"; fi;;
+  if [ "${KEYCHAIN_TEST_FAIL:-}" != delete-keychain ]; then
+    rm -f "$1"
+    while IFS= read -r entry || [ -n "$entry" ]; do
+      if [ "$entry" != "    \"$1\"" ] && [ "$entry" != "    \"$(cat "$KEYCHAIN_TEST_ROOT/physical-keychain")\"" ]; then printf '%s\n' "$entry"; fi
+    done < "$KEYCHAIN_TEST_ROOT/search-state" > "$KEYCHAIN_TEST_ROOT/search-state.new"
+    mv "$KEYCHAIN_TEST_ROOT/search-state.new" "$KEYCHAIN_TEST_ROOT/search-state"
+  fi;;
 *) exit 99;;
 esac
 if [ "${KEYCHAIN_TEST_FAIL:-}" = "$operation" ]; then
@@ -142,7 +153,7 @@ func assertAppleSigningRemoved(t *testing.T, root string) {
 	}
 	for _, operation := range strings.Fields(string(calls)) {
 		switch operation {
-		case "mktemp", "base64", "openssl", "create-keychain", "unlock-keychain", "set-keychain-settings", "import", "set-key-partition-list", "find-identity", "delete-keychain":
+		case "mktemp", "base64", "openssl", "create-keychain", "unlock-keychain", "set-keychain-settings", "import", "set-key-partition-list", "find-identity", "list-keychains", "delete-keychain":
 		default:
 			t.Fatalf("unexpected host keychain operation: %s", operation)
 		}
@@ -308,7 +319,7 @@ func TestAppleSigningOwnsOnlyTemporaryCredentials(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			root, env := appleSigningFixture(t)
 			env = append(env, "KEYCHAIN_TEST_FAIL="+test.failure, "KEYCHAIN_TEST_CHILD_STATUS="+test.childStatus,
-				"GITHUB_ACTIONS=true", "GITHUB_EVENT_NAME=push", "GITHUB_REF=refs/heads/main")
+				"GITHUB_ACTIONS=true", "GITHUB_EVENT_NAME=push", "GITHUB_REF=refs/heads/main", "RUNNER_ENVIRONMENT=github-hosted")
 			child := `
 set -eu
 [ "$SIGNING_MODE" = developer-id ]

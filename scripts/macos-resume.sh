@@ -100,12 +100,14 @@ verify_state() {
 configure_credentials() {
   SIGNING_MODE=developer-id
   NOTARY_TIMEOUT=${NOTARY_TIMEOUT:-5m}
-  macos_signing_configure
+  macos_signing_configure || return
   local name path
   for name in APPLE_SIGNING_KEYCHAIN NOTARY_KEYCHAIN NOTARY_KEY_FILE; do
     [[ -n ${!name:-} ]] || continue
-    path=$(macos_signing_canonical_path "${!name}")
-    case "$path/" in "$state/"*) fail 'Signing credentials must remain outside resumable state.' ;; esac
+    path=$(macos_signing_canonical_path "${!name}") || return
+    case "$path/" in
+      "$state/"*) macos_signing_error 'Signing credentials must remain outside resumable state.'; return 1 ;;
+    esac
   done
 }
 
@@ -116,36 +118,36 @@ require_stage() {
 }
 
 restore_installer() {
-  rm -rf "$state/work"
-  mkdir "$state/work"
-  ditto -x -k "$state/initial.zip" "$state/work"
+  rm -rf "$state/work" || return
+  mkdir "$state/work" || return
+  ditto -x -k "$state/initial.zip" "$state/work" || return
   installer="$state/work/Agent Job Queue Installer.app"
   payload="$installer/Contents/Resources/payload"
   app="$payload/Agent Queue.app"
 }
 
 prepare_stage() {
-  local previous name details image_signing_arguments
+  local previous name image_signing_arguments
   [[ ! -f $record ]] || { printf '%s already prepared.\n' "$stage"; return; }
   case "$stage" in payload) ;; installer) previous=payload ;; dmg) previous=installer ;; esac
   if [[ $stage != payload ]]; then
     [[ -f $state/stages/$previous.json && $(json_field "$state/stages/$previous.json" phase) == finished ]] ||
       fail 'The previous stage must be accepted and finished before preparing this stage.'
   fi
-  configure_credentials
-  restore_installer
+  macos_signing_operation configure-credentials configure_credentials
+  macos_signing_operation restore-installer restore_installer
   case "$stage" in
     payload)
       for name in agent-heavy agent-remote; do
-        macos_sign_code "$payload/source/bin/$name" "io.went.agent-queue.$name"
+        macos_sign_code "$payload/source/bin/$name" "io.went.agent-queue.$name" "$name"
       done
-      macos_sign_code "$app"
+      macos_sign_code "$app" '' app
       archive "$payload" "$submitted_archive"
       ;;
     installer)
       rm -rf "$payload"
       ditto -x -k "$state/completed/payload.zip" "$installer/Contents/Resources"
-      macos_sign_code "$installer"
+      macos_sign_code "$installer" '' installer
       archive "$installer" "$submitted_archive"
       ;;
     dmg)
@@ -157,10 +159,8 @@ prepare_stage() {
         -srcfolder "$installer" -ov -format UDZO "$submitted_archive"
       image_signing_arguments=(--force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --identifier io.went.agent-queue.disk-image)
       [[ -z ${APPLE_SIGNING_KEYCHAIN:-} ]] || image_signing_arguments+=(--keychain "$APPLE_SIGNING_KEYCHAIN")
-      codesign "${image_signing_arguments[@]}" "$submitted_archive"
-      codesign --verify --strict --test-requirement "$MACOS_SIGNING_REQUIREMENT" "$submitted_archive"
-      details=$(LC_ALL=C codesign --display --verbose=4 "$submitted_archive" 2>&1)
-      macos_verify_signer_details "$submitted_archive" "$details" 0
+      macos_signing_operation sign-dmg codesign "${image_signing_arguments[@]}" "$submitted_archive"
+      macos_signing_operation verify-dmg macos_verify_disk_image_code "$submitted_archive"
       ;;
   esac
   jq -n --arg stage "$stage" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg hash "$(sha256 "$submitted_archive")" '

@@ -7,6 +7,22 @@ macos_signing_error() {
   return 1
 }
 
+# Callers supply fixed operation labels, never paths or command arguments.
+# Wrapped shell functions must explicitly return each failure: an if condition
+# disables Bash errexit inside the called function as well as its descendants.
+macos_signing_operation() {
+  local operation=$1 status
+  shift
+  printf 'Apple signing operation: operation=%s phase=begin\n' "$operation" >&2
+  if "$@"; then
+    printf 'Apple signing operation: operation=%s phase=success status=0\n' "$operation" >&2
+  else
+    status=$?
+    printf 'Apple signing operation: operation=%s phase=failure status=%s\n' "$operation" "$status" >&2
+    return "$status"
+  fi
+}
+
 macos_signing_configure() {
   SIGNING_MODE=${SIGNING_MODE:-adhoc}
   MACOS_NOTARY_AUTH=()
@@ -180,15 +196,19 @@ macos_verify_code() {
 }
 
 macos_sign_code() {
-  local path=$1 identifier=${2:-}
+  local path=$1 identifier=${2:-} operation=${3:-code}
+  case "$operation" in
+    code|agent-heavy|agent-remote|app|installer) ;;
+    *) macos_signing_error 'Unknown signing operation.'; return 1 ;;
+  esac
   local arguments=(--force --sign -)
   if [[ $SIGNING_MODE == developer-id ]]; then
     arguments=(--force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --options runtime)
     [[ -z ${APPLE_SIGNING_KEYCHAIN:-} ]] || arguments+=(--keychain "$APPLE_SIGNING_KEYCHAIN")
   fi
   [[ -z $identifier ]] || arguments+=(--identifier "$identifier")
-  codesign "${arguments[@]}" "$path" || return
-  macos_verify_code "$path"
+  macos_signing_operation "sign-$operation" codesign "${arguments[@]}" "$path" || return
+  macos_signing_operation "verify-$operation" macos_verify_code "$path"
 }
 
 macos_notarize() {
@@ -258,11 +278,16 @@ macos_verify_installer_distribution() {
   macos_assess_app "$installer"
 }
 
-macos_verify_disk_image() {
+macos_verify_disk_image_code() {
   local image=$1 details
   codesign --verify --strict --test-requirement "$MACOS_SIGNING_REQUIREMENT" "$image" || return
   details=$(LC_ALL=C codesign --display --verbose=4 "$image" 2>&1) || return
-  macos_verify_signer_details "$image" "$details" 0 || return
+  macos_verify_signer_details "$image" "$details" 0
+}
+
+macos_verify_disk_image() {
+  local image=$1
+  macos_verify_disk_image_code "$image" || return
   xcrun stapler validate "$image" || return
   spctl --assess --type open --context context:primary-signature --verbose=2 "$image" || return
   hdiutil verify "$image"
@@ -290,9 +315,9 @@ macos_package_installer() (
     macos_signing_prepare_logs "$destination" || return
   fi
   for name in agent-heavy agent-remote; do
-    macos_sign_code "$payload/source/bin/$name" "io.went.agent-queue.$name" || return
+    macos_sign_code "$payload/source/bin/$name" "io.went.agent-queue.$name" "$name" || return
   done
-  macos_sign_code "$app" || return
+  macos_sign_code "$app" '' app || return
   if [[ $SIGNING_MODE == developer-id ]]; then
     # Apple's custom installer workflow requires the installed product to be
     # notarized first. Bare helper binaries receive tickets but cannot be stapled.
@@ -304,7 +329,7 @@ macos_package_installer() (
   fi
   # The payload is sealed as installer resources. Do not staple or otherwise
   # modify its contents after signing the parent installer.
-  macos_sign_code "$installer" || return
+  macos_sign_code "$installer" '' installer || return
   if [[ $SIGNING_MODE == developer-id ]]; then
     ditto -c -k --sequesterRsrc --keepParent "$installer" "$staging/installer.zip" || return
     macos_notarize installer "$staging/installer.zip" || return
@@ -320,11 +345,8 @@ macos_package_installer() (
     if [[ $SIGNING_MODE == developer-id ]]; then
       local image_signing_arguments=(--force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --identifier io.went.agent-queue.disk-image)
       [[ -z ${APPLE_SIGNING_KEYCHAIN:-} ]] || image_signing_arguments+=(--keychain "$APPLE_SIGNING_KEYCHAIN")
-      codesign "${image_signing_arguments[@]}" "$staging/$base.dmg" || return
-      codesign --verify --strict --test-requirement "$MACOS_SIGNING_REQUIREMENT" "$staging/$base.dmg" || return
-      local details
-      details=$(LC_ALL=C codesign --display --verbose=4 "$staging/$base.dmg" 2>&1) || return
-      macos_verify_signer_details "$staging/$base.dmg" "$details" 0 || return
+      macos_signing_operation sign-dmg codesign "${image_signing_arguments[@]}" "$staging/$base.dmg" || return
+      macos_signing_operation verify-dmg macos_verify_disk_image_code "$staging/$base.dmg" || return
       macos_notarize dmg "$staging/$base.dmg" || return
       macos_staple "$staging/$base.dmg" || return
       macos_verify_disk_image "$staging/$base.dmg" || return

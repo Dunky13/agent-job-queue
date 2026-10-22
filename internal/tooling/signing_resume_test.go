@@ -4,7 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -74,6 +77,95 @@ func (f resumeFixture) mutate(t *testing.T, relative string, change func(map[str
 	}
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMacOSResumePrepareReportsExactFailingOperation(t *testing.T) {
+	for _, test := range []struct {
+		name, failure, operation, next string
+		status                         int
+	}{
+		{"configuration", "configuration", "configure-credentials", "restore-installer", 1},
+		{"credential path", "credential-path", "configure-credentials", "restore-installer", 37},
+		{"credential inside state", "credential-inside-state", "configure-credentials", "restore-installer", 1},
+		{"restore", "payload-restore", "restore-installer", "sign-agent-heavy", 31},
+		{"first helper", "payload-sign-heavy", "sign-agent-heavy", "verify-agent-heavy", 41},
+		{"second helper", "payload-sign-remote", "sign-agent-remote", "verify-agent-remote", 42},
+		{"app", "payload-sign-app", "sign-app", "verify-app", 43},
+		{"verification", "payload-verify-heavy", "verify-agent-heavy", "sign-agent-remote", 44},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newResumeFixture(t)
+			environment := []string{"SIGNING_TEST_FAILURE=" + test.failure}
+			if test.failure == "configuration" {
+				environment = append(environment, "APPLE_SIGNING_IDENTITY=")
+			}
+			if test.failure == "credential-path" {
+				realpathTool, err := exec.LookPath("realpath")
+				if err != nil {
+					t.Fatal(err)
+				}
+				keychain := filepath.Join(f.root, "private.keychain-db")
+				if err := os.WriteFile(keychain, []byte("fixture"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				testTool(t, filepath.Join(f.root, "tools"), "realpath", `if [[ $2 == "$SIGNING_TEST_CREDENTIAL_PATH" ]]; then exit 37; fi
+exec "$SIGNING_TEST_REALPATH" "$@"
+`)
+				environment = append(environment, "APPLE_SIGNING_KEYCHAIN="+keychain, "SIGNING_TEST_CREDENTIAL_PATH="+keychain, "SIGNING_TEST_REALPATH="+realpathTool)
+			}
+			if test.failure == "credential-inside-state" {
+				keychain := filepath.Join(f.state, "private.keychain-db")
+				if err := os.WriteFile(keychain, []byte("fixture"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				environment = append(environment, "APPLE_SIGNING_KEYCHAIN="+keychain)
+			}
+			output, err := f.run(t, environment, "prepare", f.state, "payload", "0.1.0")
+			var exitError *exec.ExitError
+			if !errors.As(err, &exitError) || exitError.ExitCode() != test.status {
+				t.Fatalf("wanted original status %d, got %v: %s", test.status, err, output)
+			}
+			begin := "Apple signing operation: operation=" + test.operation + " phase=begin"
+			failed := fmt.Sprintf("Apple signing operation: operation=%s phase=failure status=%d", test.operation, test.status)
+			if !strings.Contains(output, begin) || !strings.Contains(output, failed) || strings.Index(output, begin) >= strings.Index(output, failed) {
+				t.Fatalf("missing ordered safe operation evidence: %s", output)
+			}
+			if test.failure == "payload-sign-heavy" && !strings.Contains(output, "error: The specified item could not be found in the keychain.") {
+				t.Fatalf("original tool diagnostic was lost: %s", output)
+			}
+			if strings.Contains(output, "operation="+test.operation+" phase=success") || strings.Contains(output, "operation="+test.next+" phase=begin") || strings.Contains(output, f.root) || strings.Contains(output, "Developer ID Application: Fixture") {
+				t.Fatalf("failure continued, claimed success, or exposed private arguments: %s", output)
+			}
+			for _, relative := range []string{"archives/payload.zip", "stages/payload.json", "stages/payload.json.new", "work", ".lock"} {
+				if _, err := os.Stat(filepath.Join(f.state, relative)); !os.IsNotExist(err) {
+					t.Fatalf("failed preparation retained %s: %v", relative, err)
+				}
+			}
+			record := f.recorded(t)
+			if strings.Contains(record, "xcrun|notarytool|submit|") || strings.Contains(record, "ditto|-c|-k|--sequesterRsrc|--keepParent|"+filepath.Join(f.state, "work")) {
+				t.Fatalf("failed preparation archived or submitted: %s", record)
+			}
+		})
+	}
+}
+
+func TestMacOSResumePrepareReportsSuccessAndDoesNotRepeatOnReuse(t *testing.T) {
+	f := newResumeFixture(t)
+	output := f.step(t, "prepare", "payload")
+	remaining := output
+	for _, operation := range []string{"configure-credentials", "restore-installer", "sign-agent-heavy", "verify-agent-heavy", "sign-agent-remote", "verify-agent-remote", "sign-app", "verify-app"} {
+		for _, phase := range []string{"begin", "success status=0"} {
+			marker := "Apple signing operation: operation=" + operation + " phase=" + phase
+			index := strings.Index(remaining, marker)
+			if index < 0 {
+				t.Fatalf("missing or unordered success marker %q: %s", marker, output)
+			}
+			remaining = remaining[index+len(marker):]
+		}
+	}
+	if output = f.step(t, "prepare", "payload"); strings.Contains(output, "Apple signing operation:") || !strings.Contains(output, "payload already prepared") {
+		t.Fatalf("reuse repeated preparation: %s", output)
 	}
 }
 
@@ -315,6 +407,7 @@ const resumeTestTools = `set -euo pipefail
 record_event() { printf '%s' "${0##*/}" >> "$SIGNING_TEST_EVENTS"; printf '|%s' "$@" >> "$SIGNING_TEST_EVENTS"; printf '\n' >> "$SIGNING_TEST_EVENTS"; }
 if [[ ${0##*/} == ditto ]]; then
   record_event "$@"
+  if [[ $1 == -x && ${SIGNING_TEST_FAILURE:-} == payload-restore ]]; then exit 31; fi
   if [[ $1 == -x ]]; then mkdir -p "$4"; tar -xf "$3" -C "$4";
   elif [[ $1 == -c ]]; then
     shift $(($# - 2)); tar -cf "$2" -C "$(dirname "$1")" "$(basename "$1")"
