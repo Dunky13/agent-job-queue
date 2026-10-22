@@ -102,9 +102,15 @@ identity in a disposable private Keychain, signs a copied system executable
 with its explicit fingerprint, and verifies the certificate embedded in that
 signature. A unique identity prevents an existing operator identity from
 satisfying lookup. It uses no production credentials, notarization uploads,
-trust overrides or search-list changes and checks cleanup and unchanged host
-Keychain settings. This probe is separate from Developer ID acceptance and
-never executes its signed target.
+trust overrides and checks cleanup and unchanged final Keychain settings.
+The hosted-runner wrapper temporarily appends its
+owned Keychain to the existing search list, then restores the original list;
+local runs keep the unlisted probe and never change search settings. Registration
+requires `GITHUB_ACTIONS=true` and `RUNNER_ENVIRONMENT=github-hosted`, rejecting
+self-hosted runners. The operator authorized this CI-only registration scope;
+the operator's local search list and trust settings remain untouched.
+The probe is separate from Developer ID acceptance
+and never executes its signed target.
 
 Before publication, separate fresh Apple Silicon and Intel jobs verify final
 checksums, signatures, tickets and app-copy policy, exercise the hardened queue

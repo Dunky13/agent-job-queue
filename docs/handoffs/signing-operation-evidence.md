@@ -51,7 +51,7 @@ the normal search list even with an explicit Keychain. This is a boundary to
 investigate, not evidence that a missing intermediate caused this failure.
 No trust, credentials, default Keychain or search list was changed to get green.
 
-## Change
+## Original diagnostic change at 7e03951
 
 Fixed operation markers distinguish credential configuration, installer
 restoration, each known helper/app/installer signing step and its verification,
@@ -103,3 +103,61 @@ production run still requires full Developer ID/notarization, fresh ARM/Intel
 runtime, publication and exact-build Homebrew delivery evidence. No operator
 installation is authorized. A [standalone HTML version](signing-operation-evidence.html)
 accompanies this handoff.
+
+## Hosted reproduction and approved CI boundary
+
+PR 17 head `7e03951a72e2e88f97226eb0db12a5cafcd70495` ran the unique-identity
+probe on macOS 15.7.9 in [run 39750558419](https://github.com/Dunky13/agent-job-queue/actions/runs/39750558419).
+Both [ARM job 119729779635](https://github.com/Dunky13/agent-job-queue/actions/runs/39750558419/job/119729779635)
+and [Intel job 119729779654](https://github.com/Dunky13/agent-job-queue/actions/runs/39750558419/job/119729779654)
+failed at the actual explicit-Keychain `codesign` invocation with
+`The specified item could not be found in the keychain.` Creation, import,
+authorization, explicit identity lookup and absence from default lookup had
+already passed. No cleanup or host-setting comparison failure was reported.
+
+This is a credential-free hosted reproduction of the error. It narrows the
+failure to native signing under the unlisted-identity condition, but does not
+yet prove which signing lookup or synthetic-certificate policy caused it.
+Search-list visibility is the leading hypothesis; certificate policy and
+OS-specific key access remain alternatives.
+
+GitHub's [Apple signing guidance](https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications)
+registers the signing Keychain in the runner search list. Its
+[variables reference](https://docs.github.com/en/actions/reference/workflows-and-actions/variables)
+documents `RUNNER_ENVIRONMENT=github-hosted`. The follow-up uses
+those platform boundaries to test registration while keeping the certificate,
+signing arguments and trust policy unchanged.
+
+The wrapper appends only the owned temporary Keychain after preserving the
+original ordered list, restores that list on success/failure/cancellation,
+then deletes owned credentials. It does not change default Keychains, trust
+settings, local operator search lists or self-hosted runners. The native probe
+uses the same registration helper only on disposable GitHub-hosted runners.
+Local validation uses mocked setters and the original unlisted native probe.
+
+The native probe also owns its signing process group. Cancellation sends TERM
+and bounds the wait and output pipes, then kills any remaining owned
+descendants before Keychain cleanup. A hard timeout can prevent Bash's EXIT
+trap from running; Go cleanup then deletes its owned Keychain, which removes
+that appended entry, and checks the exact final search list and default
+Keychain. Mock-only regressions cover normal completion, cancellation with a
+TERM-ignoring descendant holding output pipes, and a TERM-ignoring parent.
+The production credential wrapper already stops its child group before
+restoring settings and deleting credentials.
+
+Local validation passed: the complete tooling race suite took
+114.751 seconds, followed by final queued lint and targeted native/process
+race checks taking 11.972 seconds after the process-lifecycle correction.
+Mocked registration coverage includes partial writes, readback failures,
+conflicting additions, cancellation, empty/space-containing lists and reuse.
+Independent Sol 6.1 high review found no remaining blocking source findings.
+Cross-provider review remained unavailable and skipped. These results do not
+establish that real macOS 15 registration repairs signing.
+
+The observer instruction initially excluded `credential/search-list/trust
+overrides`. After reviewing the local patch, the operator approved the scoped
+exception with “As recommended”: activate registration only on disposable
+GitHub-hosted runners and validate updated PR 17. No operator-Mac or self-hosted
+settings changes, trust overrides, production uploads or merge are authorized
+by that exception. Exact-head hosted ARM and Intel results are still required.
+Do not weaken the test or bypass the separate human merge gate after validation.

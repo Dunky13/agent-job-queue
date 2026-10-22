@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -20,6 +23,10 @@ import (
 func TestMacOSCodesignUsesUniquePrivateKeychainIdentity(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("requires native macOS Keychain and codesign")
+	}
+	hosted := os.Getenv("GITHUB_ACTIONS") == "true"
+	if hosted && os.Getenv("RUNNER_ENVIRONMENT") != "github-hosted" {
+		t.Fatal("native Keychain registration requires a disposable GitHub-hosted runner")
 	}
 	root := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -107,9 +114,43 @@ func TestMacOSCodesignUsesUniquePrivateKeychainIdentity(t *testing.T) {
 	if err := os.WriteFile(target, input, 0700); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.CommandContext(ctx, "/usr/bin/codesign", "--force", "--sign", fingerprint, "--keychain", keychain, "--timestamp=none", "--options", "runtime", "--identifier", "io.went.agent-queue.synthetic-probe", target)
-	cmd.Env = signingTestEnvironment("PATH=/usr/bin:/bin:/usr/sbin:/sbin")
-	if output, err := cmd.CombinedOutput(); err != nil {
+	command := "/usr/bin/codesign"
+	arguments := []string{"--force", "--sign", fingerprint, "--keychain", keychain, "--timestamp=none", "--options", "runtime", "--identifier", "io.went.agent-queue.synthetic-probe", target}
+	if hosted {
+		// Only disposable hosted runners register the owned Keychain. Local
+		// runs retain the original unlisted-identity probe and never write host
+		// settings. Both modes verify the same unique embedded signer below.
+		module, err := filepath.Abs("../../scripts/macos-keychain-search.sh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		script := filepath.Join(root, "sign-with-owned-keychain.sh")
+		body := `#!/bin/bash
+set -euo pipefail
+umask 077
+source "$1"
+owned_keychain=$2
+shift 2
+finish() {
+  local status=$?
+  trap - EXIT
+  trap '' INT TERM
+  if ! macos_keychain_search_restore; then status=1; fi
+  exit "$status"
+}
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+macos_keychain_search_register "$owned_keychain"
+"$@"
+`
+		if err := os.WriteFile(script, []byte(body), 0700); err != nil {
+			t.Fatal(err)
+		}
+		arguments = append([]string{script, module, keychain, command}, arguments...)
+		command = "/bin/bash"
+	}
+	if output, err := runKeychainSigningProbe(ctx, signingTestEnvironment("PATH=/usr/bin:/bin:/usr/sbin:/sbin"), command, arguments...); err != nil {
 		t.Fatalf("unique explicit-Keychain codesign failed: %v; diagnostic: %s", err, output)
 	}
 	run("verify synthetic signature", "/usr/bin/codesign", "--verify", "--strict", "--all-architectures", target)
@@ -120,4 +161,32 @@ func TestMacOSCodesignUsesUniquePrivateKeychainIdentity(t *testing.T) {
 		t.Fatal("codesign did not use the unique synthetic identity")
 	}
 	// The probe signs but never executes its copied target or submits to Apple.
+}
+
+// Bound the entire native probe process group. Killing only its Bash parent
+// would skip restoration and could leave codesign holding output pipes open.
+func runKeychainSigningProbe(ctx context.Context, environment []string, command string, arguments ...string) (output []byte, result error) {
+	cmd := exec.CommandContext(ctx, command, arguments...)
+	cmd.Env = environment
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	// Give the shell's EXIT trap time to restore settings, then bound its wait
+	// and pipes even if a descendant ignores TERM. Always kill remaining owned
+	// descendants before the caller can delete its temporary Keychain.
+	cmd.WaitDelay = 5 * time.Second
+	defer func() {
+		if cmd.Process == nil {
+			return
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			result = errors.Join(result, fmt.Errorf("stop owned signing probe group: %w", err))
+		}
+	}()
+	return cmd.CombinedOutput()
 }

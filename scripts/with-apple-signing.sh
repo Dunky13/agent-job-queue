@@ -10,10 +10,16 @@ if [[ ${GITHUB_ACTIONS:-} == true ]] &&
   printf '%s\n' 'Apple signing requires a trusted push to main.' >&2
   exit 1
 fi
+if [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} != github-hosted ]]; then
+  printf '%s\n' 'Apple signing requires a GitHub-hosted runner.' >&2
+  exit 1
+fi
 if [[ $# == 0 ]]; then
   printf '%s\n' 'Usage: with-apple-signing.sh command [arguments...]' >&2
   exit 1
 fi
+# shellcheck source=scripts/macos-keychain-search.sh
+source "$(dirname -- "$0")/macos-keychain-search.sh"
 for variable in APPLE_DEVELOPER_ID_P12_BASE64 APPLE_DEVELOPER_ID_P12_PASSWORD \
   APPLE_NOTARY_KEY_P8 APPLE_SIGNING_IDENTITY APPLE_TEAM_ID \
   APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
@@ -130,6 +136,9 @@ cleanup() {
   local status=$1
   trap - EXIT
   trap '' INT TERM
+  if ! macos_keychain_search_restore; then
+    status=1
+  fi
   if [[ -n $keychain ]] && [[ $keychain_created == 1 || -e $keychain ]]; then
     if ! security delete-keychain "$keychain" >/dev/null 2>&1; then
       printf '%s\n' 'Could not delete the temporary Apple signing keychain.' >&2
@@ -202,6 +211,9 @@ if ! security unlock-keychain -p "$keychain_password" "$keychain" >/dev/null 2>&
     -k "$keychain_password" "$keychain" >/dev/null 2>&1; then
   printf '%s\n' 'Could not prepare the temporary Apple signing keychain.' >&2
   exit 1
+fi
+if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+  macos_keychain_search_register "$keychain" || exit 1
 fi
 check_signing_identity preflight || exit 1
 # The child needs only the imported key and API key file, never their raw input.
