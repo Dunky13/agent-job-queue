@@ -116,11 +116,12 @@ available and is not claimed.
 Apple accepted all three submissions, and each downloaded log reports no
 issues:
 
-| Stage | Submission | Uploaded (UTC) | Result |
-| --- | --- | --- | --- |
-| Payload | `0602c2b7-fbe6-4aec-ac69-6a0100026a9a` | 2026-10-21 13:54 | Accepted |
-| Installer | `f9b9ac22-b490-4dc0-b0f0-a456860bd011` | 2026-10-21 15:25 | Accepted |
-| DMG | `c8a0a5f7-e289-4621-b5e4-5f673943b870` | 2026-10-22 03:16 | Accepted |
+- Payload: `0602c2b7-fbe6-4aec-ac69-6a0100026a9a`, uploaded
+  2026-10-21 13:54 UTC, Accepted.
+- Installer: `f9b9ac22-b490-4dc0-b0f0-a456860bd011`, uploaded
+  2026-10-21 15:25 UTC, Accepted.
+- DMG: `c8a0a5f7-e289-4621-b5e4-5f673943b870`, uploaded
+  2026-10-22 03:16 UTC, Accepted.
 
 The installer's first local six-hour wait expired while Apple continued
 processing. Observation resumed against the same submission. Before resuming

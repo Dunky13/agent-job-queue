@@ -54,8 +54,13 @@
 <h2 id="label-Apple+submission+state">Apple submission state<span><a href="#label-Apple+submission+state">&para;</a> <a href="#top">&uarr;</a></span></h2>
 
 <p>Apple accepted all three submissions, and each downloaded log reports no issues:</p>
-
-<p>| Stage | Submission | Uploaded (UTC) | Result | | — | — | — | — | | Payload | <code>0602c2b7-fbe6-4aec-ac69-6a0100026a9a</code> | 2026-10-21 13:54 | Accepted | | Installer | <code>f9b9ac22-b490-4dc0-b0f0-a456860bd011</code> | 2026-10-21 15:25 | Accepted | | DMG | <code>c8a0a5f7-e289-4621-b5e4-5f673943b870</code> | 2026-10-22 03:16 | Accepted |</p>
+<ul><li>
+<p>Payload: <code>0602c2b7-fbe6-4aec-ac69-6a0100026a9a</code>, uploaded  2026-10-21 13:54 UTC, Accepted.</p>
+</li><li>
+<p>Installer: <code>f9b9ac22-b490-4dc0-b0f0-a456860bd011</code>, uploaded  2026-10-21 15:25 UTC, Accepted.</p>
+</li><li>
+<p>DMG: <code>c8a0a5f7-e289-4621-b5e4-5f673943b870</code>, uploaded  2026-10-22 03:16 UTC, Accepted.</p>
+</li></ul>
 
 <p>The installer&#39;s first local six-hour wait expired while Apple continued processing. Observation resumed against the same submission. Before resuming packaging, all eight architecture-specific payload code hashes matched Apple&#39;s accepted log, and the retained installer ZIP hash matched Apple&#39;s accepted installer log. No duplicate payload or installer upload was needed. App and installer tickets were stapled before their enclosing artifacts were sealed; final checksums were generated after the DMG was stapled.</p>
 
