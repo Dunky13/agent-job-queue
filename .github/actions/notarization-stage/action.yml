@@ -32,7 +32,7 @@ runs:
         APPLE_DEVELOPER_ID_P12_BASE64: ${{ inputs.certificate }}
         APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ inputs.certificate-password }}
         APPLE_NOTARY_KEY_P8: ${{ inputs.notary-key }}
-      run: scripts/with-apple-signing.sh scripts/macos-resume.sh prepare notarization-state "$STAGE" "$(cat VERSION)"
+      run: scripts/with-apple-signing.sh scripts/macos-resume.sh prepare notarization-state "$STAGE" "$BUILD_VERSION"
     - name: Snapshot before submission
       shell: bash
       env:
@@ -42,7 +42,7 @@ runs:
       id: prepared-upload
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: Apple-notarization-${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.prepared-slot }}
+        name: Apple-notarization-b${{ env.BUILD_RUN_ID }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.prepared-slot }}
         path: ${{ runner.temp }}/checkpoint-${{ inputs.stage }}-prepared/*
         if-no-files-found: error
         retention-days: 30
@@ -54,7 +54,7 @@ runs:
         APPLE_DEVELOPER_ID_P12_BASE64: ${{ inputs.certificate }}
         APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ inputs.certificate-password }}
         APPLE_NOTARY_KEY_P8: ${{ inputs.notary-key }}
-      run: scripts/with-apple-signing.sh scripts/macos-resume.sh submit notarization-state "$STAGE" "$(cat VERSION)"
+      run: scripts/with-apple-signing.sh scripts/macos-resume.sh submit notarization-state "$STAGE" "$BUILD_VERSION"
     - name: Snapshot submission receipt
       id: submitted-snapshot
       if: always() && steps.prepared-upload.outcome == 'success' && steps.submit.outcome != 'skipped'
@@ -66,7 +66,7 @@ runs:
       if: always() && steps.submitted-snapshot.outcome == 'success'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: Apple-notarization-${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.submitted-slot }}
+        name: Apple-notarization-b${{ env.BUILD_RUN_ID }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.submitted-slot }}
         path: ${{ runner.temp }}/checkpoint-${{ inputs.stage }}-submitted/*
         if-no-files-found: error
         retention-days: 30
@@ -78,7 +78,7 @@ runs:
         APPLE_DEVELOPER_ID_P12_BASE64: ${{ inputs.certificate }}
         APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ inputs.certificate-password }}
         APPLE_NOTARY_KEY_P8: ${{ inputs.notary-key }}
-      run: scripts/with-apple-signing.sh scripts/macos-resume.sh finish notarization-state "$STAGE" "$(cat VERSION)"
+      run: scripts/with-apple-signing.sh scripts/macos-resume.sh finish notarization-state "$STAGE" "$BUILD_VERSION"
     - name: Snapshot acceptance or pending state
       id: finished-snapshot
       if: always() && steps.finish.outcome != 'skipped'
@@ -90,7 +90,7 @@ runs:
       if: always() && steps.finished-snapshot.outcome == 'success'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: Apple-notarization-${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.finished-slot }}
+        name: Apple-notarization-b${{ env.BUILD_RUN_ID }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.finished-slot }}
         path: ${{ runner.temp }}/checkpoint-${{ inputs.stage }}-finished/*
         if-no-files-found: error
         retention-days: 30

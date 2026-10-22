@@ -28,6 +28,7 @@ type stageRecord struct {
 	Stage           string `json:"stage"`
 	Phase           string `json:"phase"`
 	PreparedAttempt string `json:"prepared_attempt"`
+	PreparedRunID   string `json:"prepared_run_id,omitempty"`
 	ArchiveSHA256   string `json:"archive_sha256"`
 	SubmissionID    string `json:"submission_id"`
 	CompletedSHA256 string `json:"completed_sha256"`
@@ -45,7 +46,14 @@ func readRecord(dir *os.File, name string) (stageRecord, error) {
 		return record, failure("invalid_record")
 	}
 	fields, err := recordFields(data)
-	if err != nil || len(fields) != 6 {
+	if err != nil || (len(fields) != 6 && len(fields) != 7) {
+		return record, failure("invalid_record")
+	}
+	if raw, ok := fields["prepared_run_id"]; ok {
+		if json.Unmarshal(raw, &record.PreparedRunID) != nil || !attemptPattern.MatchString(record.PreparedRunID) {
+			return record, failure("invalid_record")
+		}
+	} else if len(fields) != 6 {
 		return record, failure("invalid_record")
 	}
 	for _, key := range []string{"stage", "phase", "prepared_attempt", "archive_sha256", "submission_id", "completed_sha256"} {
@@ -75,7 +83,7 @@ func (a uploadAttributes) valid() bool {
 	return a.AccessKeyID != "" && a.SecretAccessKey != "" && a.SessionToken != "" && bucketPattern.MatchString(a.Bucket) && a.Object != ""
 }
 
-func (c *client) submit(ctx context.Context, archive, recordPath, hash, attempt string) (result, error) {
+func (c *client) submit(ctx context.Context, archive, recordPath, hash, attempt, run string) (result, error) {
 	r := result{}
 	if archive == "" || recordPath == "" || !hashPattern.MatchString(hash) || !attemptPattern.MatchString(attempt) {
 		return r, failure("invalid_arguments")
@@ -97,7 +105,7 @@ func (c *client) submit(ctx context.Context, archive, recordPath, hash, attempt 
 	}
 	// This check precedes all provider calls, including the authentication GET.
 	// In particular, legacy uploading+empty-ID records must never be resubmitted.
-	if record.Phase != "prepared" || record.SubmissionID != "" || record.CompletedSHA256 != "" || record.PreparedAttempt != attempt || record.ArchiveSHA256 != hash {
+	if record.Phase != "prepared" || record.SubmissionID != "" || record.CompletedSHA256 != "" || record.PreparedAttempt != attempt || record.ArchiveSHA256 != hash || (record.PreparedRunID != "" && record.PreparedRunID != run) || (run != "" && record.PreparedRunID == "") {
 		return r, failure("submission_refused")
 	}
 	f, err := openRegular(archive)

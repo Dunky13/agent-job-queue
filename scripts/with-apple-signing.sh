@@ -5,14 +5,40 @@ set -euo pipefail
 umask 077
 
 # Reject untrusted hosted jobs before inspecting credentials or invoking tools.
-if [[ ${GITHUB_ACTIONS:-} == true ]] &&
-  [[ ${GITHUB_EVENT_NAME:-} != push || ${GITHUB_REF:-} != refs/heads/main ]]; then
-  printf '%s\n' 'Apple signing requires a trusted push to main.' >&2
-  exit 1
-fi
-if [[ ${GITHUB_ACTIONS:-} == true && ${RUNNER_ENVIRONMENT:-} != github-hosted ]]; then
-  printf '%s\n' 'Apple signing requires a GitHub-hosted runner.' >&2
-  exit 1
+if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+  case "${GITHUB_EVENT_NAME:-}" in
+    push)
+      [[ ${GITHUB_REF:-} == refs/heads/main ]] || {
+        printf '%s\n' 'Apple signing requires a trusted push to main.' >&2
+        exit 1
+      }
+      ;;
+    workflow_run|workflow_dispatch)
+      # These values come from the protected source-verification job, not from
+      # downloaded build code. Keep the automation and source identities distinct.
+      # shellcheck source=scripts/distribution-common.sh
+      source "$(dirname -- "$0")/distribution-common.sh"
+      distribution_context
+      [[ ${GITHUB_REF_PROTECTED:-} == true &&
+        ${GITHUB_WORKFLOW_REF:-} == "$GITHUB_REPOSITORY/.github/workflows/distribution.yml@refs/heads/main" &&
+        ${AUTOMATION_SHA:-} == "$GITHUB_SHA" ]] || distribution_error 'Protected main distribution automation is required.'
+      for variable in BUILD_RUN_ID BUILD_RUN_NUMBER BUILD_RUN_ATTEMPT BUILD_ARTIFACT_ID; do
+        distribution_number "${!variable:-}" || distribution_error "Invalid $variable."
+      done
+      [[ ${BUILD_SHA:-} =~ ^[a-f0-9]{40}$ &&
+        ${BUILD_ARTIFACT_DIGEST:-} =~ ^sha256:[a-f0-9]{64}$ &&
+        ${BUILD_VERSION:-} =~ ^[A-Za-z0-9][A-Za-z0-9.+_-]*$ &&
+        ${BUILD_TAG:-} == "build-$BUILD_RUN_NUMBER-${BUILD_SHA:0:7}" ]] || distribution_error 'Verified original source artifact identity is required.'
+      ;;
+    *)
+      printf '%s\n' 'Apple signing requires a trusted push to main or protected main distribution.' >&2
+      exit 1
+      ;;
+  esac
+  [[ ${RUNNER_ENVIRONMENT:-} == github-hosted ]] || {
+    printf '%s\n' 'Apple signing requires a GitHub-hosted runner.' >&2
+    exit 1
+  }
 fi
 if [[ $# == 0 ]]; then
   printf '%s\n' 'Usage: with-apple-signing.sh command [arguments...]' >&2

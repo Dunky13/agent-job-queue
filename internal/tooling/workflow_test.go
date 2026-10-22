@@ -12,7 +12,7 @@ import (
 func TestWorkflowPreservesDownloadedArtifacts(t *testing.T) {
 	// Checkout cleans untracked and ignored workspace files by default. Main
 	// publication previously downloaded dist first, then deleted it at checkout.
-	body, err := os.ReadFile("../../.github/workflows/ci.yml")
+	body, err := os.ReadFile("../../.github/workflows/distribution.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestNotarizationPersistsReceiptsBeforeWaiting(t *testing.T) {
 }
 
 func TestNotarizationUsesTrustedAttemptScopedArtifacts(t *testing.T) {
-	body, err := os.ReadFile("../../.github/workflows/ci.yml")
+	body, err := os.ReadFile("../../.github/workflows/distribution.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,8 +111,8 @@ func TestNotarizationUsesTrustedAttemptScopedArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	signing := workflow.Jobs["notarize"]
-	if signing.If != "github.event_name == 'push' && github.ref == 'refs/heads/main'" || signing.Environment != "apple-signing" || signing.Permissions["actions"] != "read" {
-		t.Fatal("resumption must preserve the protected main push boundary and read-only artifact access")
+	if signing.If != "" || signing.Environment != "apple-signing" || signing.Permissions["actions"] != "read" {
+		t.Fatal("resumption must preserve the protected validated-source dependency and read-only artifact access")
 	}
 	var stages, slots []string
 	for _, step := range signing.Steps {
@@ -141,7 +141,7 @@ func TestNotarizationUsesTrustedAttemptScopedArtifacts(t *testing.T) {
 }
 
 func TestNotarizationPersistsInitialStateBeforeCredentials(t *testing.T) {
-	body, err := os.ReadFile("../../.github/workflows/ci.yml")
+	body, err := os.ReadFile("../../.github/workflows/distribution.yml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,5 +185,108 @@ func TestNotarizationPersistsInitialStateBeforeCredentials(t *testing.T) {
 	}
 	if !stageSeen || !persisted {
 		t.Fatal("workflow lacks initial checkpoint or signing stages")
+	}
+}
+
+func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
+	type step struct {
+		Uses, Run string
+		With      map[string]string
+	}
+	type job struct {
+		Needs       []string
+		Environment string
+		Permissions map[string]string
+		Steps       []step
+		Env         map[string]string
+	}
+	type flow struct {
+		On          map[string]any
+		Permissions map[string]string
+		Concurrency struct {
+			Group  string
+			Cancel any `yaml:"cancel-in-progress"`
+		}
+		Jobs map[string]job
+	}
+	read := func(name string) flow {
+		t.Helper()
+		data, err := os.ReadFile("../../.github/workflows/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var f flow
+		if err := yaml.Unmarshal(data, &f); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	ci, dist := read("ci.yml"), read("distribution.yml")
+	for _, name := range []string{"source", "notarize", "notarized-tests", "publish", "homebrew-sync"} {
+		if _, ok := ci.Jobs[name]; ok {
+			t.Errorf("CI still performs distribution: %s", name)
+		}
+	}
+	if _, ok := ci.Jobs["installer"]; !ok {
+		t.Fatal("CI lost installer validation")
+	}
+	if dist.Permissions["contents"] != "read" || dist.Permissions["actions"] != "read" || dist.Concurrency.Cancel != false || !strings.Contains(dist.Concurrency.Group, "inputs.build_run_id || github.event.workflow_run.id") {
+		t.Fatal("distribution lost read-only default or source-build serialization")
+	}
+	if !strings.HasPrefix(ci.Concurrency.Group, "ci-") || !strings.Contains(ci.Concurrency.Group, "github.run_id") || dist.Concurrency.Group != "ci-${{ inputs.build_run_id || github.event.workflow_run.id }}" {
+		t.Fatal("distribution must share the original main CI run's concurrency lock so legacy signing cannot overlap recovery")
+	}
+	for name, want := range map[string][]string{"notarize": {"source"}, "notarized-tests": {"source", "notarize"}, "publish": {"source", "notarize", "notarized-tests"}, "homebrew-sync": {"source", "publish", "notarize"}} {
+		if !reflect.DeepEqual(dist.Jobs[name].Needs, want) {
+			t.Errorf("%s gate topology: %v", name, dist.Jobs[name].Needs)
+		}
+	}
+	for name, j := range dist.Jobs {
+		if name == "notarize" {
+			if j.Environment != "apple-signing" {
+				t.Error("signing environment missing")
+			}
+		} else if j.Environment != "" {
+			t.Errorf("%s unnecessarily receives Apple environment", name)
+		}
+		if name != "publish" && j.Permissions["contents"] == "write" {
+			t.Errorf("%s can publish before acceptance", name)
+		}
+		for _, s := range j.Steps {
+			if strings.Contains(s.Run, "build-installer") || strings.Contains(s.Run, "cat VERSION") {
+				t.Errorf("%s rebuilds source or uses automation VERSION", name)
+			}
+			if strings.HasPrefix(s.Uses, "actions/checkout@") {
+				ref := "${{ needs.source.outputs.automation_sha }}"
+				if name == "source" {
+					ref = "${{ github.sha }}"
+				}
+				if s.With["ref"] != ref || s.With["persist-credentials"] != "false" {
+					t.Errorf("%s has unpinned or credentialed checkout: %v", name, s.With)
+				}
+			}
+			if strings.Contains(s.Run, "GITHUB_ENV") && strings.Contains(s.Run, "GITHUB_RUN_ID=") {
+				t.Fatal("distribution overwrites built-in execution identity")
+			}
+		}
+	}
+	if dist.Jobs["publish"].Permissions["contents"] != "write" {
+		t.Fatal("publication permissions missing")
+	}
+	body, err := os.ReadFile("../../.github/workflows/distribution.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, guard := range []string{"types: [completed]", "branches: [main]", "github.ref == 'refs/heads/main'", "github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.event == 'push'", "github.event.workflow_run.path == '.github/workflows/ci.yml'", "github.event.workflow_run.repository.full_name == github.repository", "github.event.workflow_run.head_repository.full_name == github.repository", "required: true", "--target \"$BUILD_SHA\"", "--commit \"$BUILD_SHA\"", "tag=\"$BUILD_TAG\""} {
+		if !strings.Contains(string(body), guard) {
+			t.Errorf("missing source/publication guard %s", guard)
+		}
+	}
+	action, err := os.ReadFile("../../.github/actions/notarization-stage/action.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(action), "cat VERSION") || !strings.Contains(string(action), "$BUILD_VERSION") || !strings.Contains(string(action), "env.BUILD_RUN_ID") {
+		t.Fatal("composite action lost explicit source identity")
 	}
 }

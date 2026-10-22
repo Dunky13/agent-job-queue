@@ -349,9 +349,15 @@ func TestInvalidPreparedStateNeverContactsProvider(t *testing.T) {
 }
 
 func TestSubmitDurableOrderingAndNoRecreation(t *testing.T) {
-	for _, kind := range []string{"success", "partial-upload", "malformed-attrs", "wrong-type-attrs", "persist-id-failure", "persist-intent-failure", "auth-failure"} {
+	for _, kind := range []string{"success", "run-owned", "partial-upload", "malformed-attrs", "wrong-type-attrs", "persist-id-failure", "persist-intent-failure", "auth-failure"} {
 		t.Run(kind, func(t *testing.T) {
 			f := makeFixture(t)
+			if kind == "run-owned" {
+				record := f.readRecord(t)
+				record.PreparedRunID = "333"
+				f.env["GITHUB_RUN_ID"] = "333"
+				f.writeRecord(t, record)
+			}
 			posts, gets, uploads, saves := 0, 0, 0, 0
 			c := f.client(func(req *http.Request) (*http.Response, error) {
 				if req.Method == "GET" {
@@ -419,7 +425,7 @@ func TestSubmitDurableOrderingAndNoRecreation(t *testing.T) {
 			}
 			out, err := f.command(context.Background(), f.submitArgs(), c)
 			switch kind {
-			case "success":
+			case "success", "run-owned":
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -440,7 +446,7 @@ func TestSubmitDurableOrderingAndNoRecreation(t *testing.T) {
 				t.Fatalf("posts=%d gets=%d", posts, gets)
 			}
 			wantUploads := 0
-			if kind == "success" || kind == "partial-upload" {
+			if kind == "success" || kind == "run-owned" || kind == "partial-upload" {
 				wantUploads = 1
 			}
 			if uploads != wantUploads {
@@ -461,6 +467,9 @@ func TestSubmitDurableOrderingAndNoRecreation(t *testing.T) {
 				if r := f.readRecord(t); r.Phase != "submitted" || r.SubmissionID != testID {
 					t.Fatalf("record: %+v", r)
 				}
+			}
+			if kind == "run-owned" && f.readRecord(t).PreparedRunID != "333" {
+				t.Fatal("submission state lost execution custody")
 			}
 			// Every created outcome, even a partial upload, must refuse resubmission before GET.
 			if wantPosts == 1 {
@@ -969,5 +978,44 @@ func TestPartialOfficialS3SendRetainsIDAndNeverRetries(t *testing.T) {
 	requireError(t, err, "submission_refused")
 	if posts != 1 || puts != 1 {
 		t.Fatal("retried a partial upload")
+	}
+}
+
+func TestSubmitExecutionCustodyPrecedesProviderCalls(t *testing.T) {
+	for _, variant := range []string{"matching run", "wrong run", "missing record run", "missing execution run"} {
+		t.Run(variant, func(t *testing.T) {
+			f := makeFixture(t)
+			record := f.readRecord(t)
+			record.PreparedRunID = "333"
+			f.env["GITHUB_RUN_ID"] = "333"
+			switch variant {
+			case "wrong run":
+				f.env["GITHUB_RUN_ID"] = "444"
+			case "missing record run":
+				record.PreparedRunID = ""
+			case "missing execution run":
+				delete(f.env, "GITHUB_RUN_ID")
+			}
+			f.writeRecord(t, record)
+			calls := 0
+			c := f.client(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if req.Method != "GET" {
+					t.Fatal("custody test must not create an Apple submission")
+				}
+				return response(req, http.StatusForbidden, `{"errors":[]}`), nil
+			})
+			_, err := f.command(context.Background(), f.submitArgs(), c)
+			if err == nil {
+				t.Fatal("expected preflight denial or custody refusal")
+			}
+			if variant == "matching run" {
+				if calls != 1 {
+					t.Fatalf("valid custody never reached preflight: %d", calls)
+				}
+			} else if calls != 0 {
+				t.Fatalf("invalid execution custody contacted provider %d times", calls)
+			}
+		})
 	}
 }

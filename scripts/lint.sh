@@ -15,5 +15,5 @@ while IFS= read -r -d '' path; do
   esac
   zsh -n "$path"
 done < <(git ls-files --cached --others --exclude-standard -z '*.sh')
-actionlint .github/workflows/ci.yml packaging/homebrew/.github/workflows/refresh.yml
+actionlint .github/workflows/ci.yml .github/workflows/distribution.yml packaging/homebrew/.github/workflows/refresh.yml
 ruby -c packaging/homebrew/test-cask.rb

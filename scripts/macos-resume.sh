@@ -20,6 +20,15 @@ identity() {
     ${GITHUB_RUN_ATTEMPT:-} =~ $number_pattern && $resume_version =~ $version_pattern ]] ||
     fail 'A valid version and exact GitHub run identity are required.'
   macos_signing_verification_configure "${APPLE_TEAM_ID:-}"
+  source_sha=${BUILD_SHA:-$GITHUB_SHA}
+  source_run=${BUILD_RUN_ID:-$GITHUB_RUN_ID}
+  source_number=${BUILD_RUN_NUMBER:-$GITHUB_RUN_NUMBER}
+  [[ $source_sha =~ $sha_pattern && $source_run =~ $number_pattern && $source_number =~ $number_pattern ]] || fail 'Invalid original build identity.'
+  if [[ -n ${BUILD_RUN_ID:-} ]]; then
+    [[ ${BUILD_RUN_ATTEMPT:-} =~ $number_pattern && ${BUILD_ARTIFACT_ID:-} =~ $number_pattern &&
+      ${BUILD_ARTIFACT_DIGEST:-} =~ ^sha256:[a-f0-9]{64}$ && ${BUILD_VERSION:-} == "$resume_version" ]] ||
+      fail 'Exact original source artifact identity and version are required.'
+  fi
 }
 
 lock_state() {
@@ -52,10 +61,15 @@ check_receipt() {
 verify_state() {
   local metadata="$state/metadata.json" stage phase previous=finished record hash
   [[ -f $metadata && ! -L $metadata ]] || fail 'State metadata is missing.'
-  jq -e --arg version "$resume_version" --arg team "$APPLE_TEAM_ID" --arg sha "$GITHUB_SHA" \
-    --arg repository "$GITHUB_REPOSITORY" --arg run "$GITHUB_RUN_ID" --arg number "$GITHUB_RUN_NUMBER" '
-    keys == ["initial_sha256", "repository", "run_id", "run_number", "schema", "source_sha", "team", "version"] and
-    .schema == 1 and .version == $version and .team == $team and .source_sha == $sha and
+  jq -e --arg version "$resume_version" --arg team "$APPLE_TEAM_ID" --arg sha "$source_sha" \
+    --arg repository "$GITHUB_REPOSITORY" --arg run "$source_run" --arg number "$source_number" \
+    --arg attempt "${BUILD_RUN_ATTEMPT:-}" --arg artifact "${BUILD_ARTIFACT_ID:-}" --arg digest "${BUILD_ARTIFACT_DIGEST:-}" '
+    (if .schema == 1 then
+      keys == ["initial_sha256", "repository", "run_id", "run_number", "schema", "source_sha", "team", "version"]
+    else .schema == 2 and
+      keys == ["artifact_digest", "artifact_id", "build_attempt", "initial_sha256", "repository", "run_id", "run_number", "schema", "source_sha", "team", "version"] and
+      .artifact_id == $artifact and .artifact_digest == $digest and .build_attempt == $attempt end) and
+    .version == $version and .team == $team and .source_sha == $sha and
     .repository == $repository and .run_id == $run and .run_number == $number and
     (.initial_sha256 | type == "string" and test("^[a-f0-9]{64}$"))
   ' "$metadata" >/dev/null || fail 'State metadata does not match this release, team, repository, commit and run.'
@@ -75,7 +89,9 @@ verify_state() {
     fi
     [[ $previous == finished && -f $record && ! -L $record ]] || fail 'State stages are out of order.'
     jq -e --arg stage "$stage" '
-      keys == ["archive_sha256", "completed_sha256", "phase", "prepared_attempt", "stage", "submission_id"] and
+      ((keys == ["archive_sha256", "completed_sha256", "phase", "prepared_attempt", "prepared_run_id", "stage", "submission_id"] and
+        (.prepared_run_id | type == "string" and test("^[1-9][0-9]*$"))) or
+       keys == ["archive_sha256", "completed_sha256", "phase", "prepared_attempt", "stage", "submission_id"]) and
       .stage == $stage and (.prepared_attempt | type == "string" and test("^[1-9][0-9]*$")) and
       (.archive_sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
       (.phase == "prepared" or .phase == "uploading" or .phase == "submitted" or .phase == "accepted" or .phase == "finished") and
@@ -188,8 +204,8 @@ prepare_stage() {
       macos_signing_operation verify-dmg macos_verify_disk_image_code "$submitted_archive"
       ;;
   esac
-  jq -n --arg stage "$stage" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg hash "$(sha256 "$submitted_archive")" '
-    {stage:$stage, phase:"prepared", prepared_attempt:$attempt, archive_sha256:$hash, submission_id:"", completed_sha256:""}
+  jq -n --arg stage "$stage" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg hash "$(sha256 "$submitted_archive")" '
+    {stage:$stage, phase:"prepared", prepared_run_id:$run, prepared_attempt:$attempt, archive_sha256:$hash, submission_id:"", completed_sha256:""}
   ' > "$record.new"
   mv "$record.new" "$record"
   rm -rf "$state/work"
@@ -199,7 +215,11 @@ submit_stage() {
   [[ -f $record ]] || fail 'Prepare this stage before submitting it.'
   [[ $(json_field "$record" phase) != uploading ]] || fail 'A previous upload has an unknown outcome; manual reconciliation is required, never resubmit.'
   [[ $(json_field "$record" phase) == prepared ]] || { printf '%s submission already recorded.\n' "$stage"; return; }
-  [[ $(json_field "$record" prepared_attempt) == "$GITHUB_RUN_ATTEMPT" ]] ||
+  # Legacy records were prepared by the source CI execution. Attempt numbers
+  # alone are not identities: every new distribution execution starts at one.
+  local prepared_run
+  prepared_run=$(jq -er --arg legacy "$source_run" '.prepared_run_id // $legacy' "$record")
+  [[ $prepared_run == "$GITHUB_RUN_ID" && $(json_field "$record" prepared_attempt) == "$GITHUB_RUN_ATTEMPT" ]] ||
     fail 'Prepared snapshot has no submission ID from an earlier attempt. Upload outcome is unknown; reconcile with Apple manually, never resubmit.'
   configure_credentials
   if [[ $MACOS_NOTARY_REST == 1 ]]; then
@@ -393,10 +413,12 @@ if [[ $command == init ]]; then
     [[ -f "$state/work/Agent Job Queue Installer.app/Contents/Resources/payload/$path" ]] || fail 'The complete installer payload is required.'
   done
   archive "$state/work/Agent Job Queue Installer.app" "$state/initial.zip"
-  jq -n --arg version "$resume_version" --arg team "$APPLE_TEAM_ID" --arg sha "$GITHUB_SHA" \
-    --arg repository "$GITHUB_REPOSITORY" --arg run "$GITHUB_RUN_ID" --arg number "$GITHUB_RUN_NUMBER" \
+  jq -n --arg version "$resume_version" --arg team "$APPLE_TEAM_ID" --arg sha "$source_sha" \
+    --arg repository "$GITHUB_REPOSITORY" --arg run "$source_run" --arg number "$source_number" \
+    --arg attempt "${BUILD_RUN_ATTEMPT:-}" --arg artifact "${BUILD_ARTIFACT_ID:-}" --arg digest "${BUILD_ARTIFACT_DIGEST:-}" \
     --arg hash "$(sha256 "$state/initial.zip")" '
-    {schema:1, version:$version, team:$team, source_sha:$sha, repository:$repository, run_id:$run, run_number:$number, initial_sha256:$hash}
+    {schema:1, version:$version, team:$team, source_sha:$sha, repository:$repository, run_id:$run, run_number:$number, initial_sha256:$hash} |
+    if $artifact != "" then . + {schema:2, build_attempt:$attempt, artifact_id:$artifact, artifact_digest:$digest} else . end
   ' > "$state/metadata.json"
   rm -rf "$state/work"
 else
