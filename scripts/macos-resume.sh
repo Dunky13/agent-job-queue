@@ -101,6 +101,28 @@ configure_credentials() {
   SIGNING_MODE=developer-id
   NOTARY_TIMEOUT=${NOTARY_TIMEOUT:-5m}
   macos_signing_configure || return
+  MACOS_NOTARY_REST=0
+  if [[ -n ${NOTARY_KEY_FILE:-} ]]; then
+    if [[ ${QUEUE_NOTARY_TOOL:-} != /* || ! -f ${QUEUE_NOTARY_TOOL:-} || ! -x ${QUEUE_NOTARY_TOOL:-} ]]; then
+      macos_signing_error 'Raw API keys require an executable prebuilt notarization client in QUEUE_NOTARY_TOOL.'
+      return 1
+    fi
+    # Native notarytool accepts bare seconds. Normalize only the REST path and
+    # reject its unsupported wait budget before signing or creating a submission.
+    local timeout_amount=${NOTARY_TIMEOUT%[smh]} timeout_unit=${NOTARY_TIMEOUT##*[0-9]} timeout_max
+    case "$timeout_unit" in
+      ''|s) timeout_max=86400 ;;
+      m) timeout_max=1440 ;;
+      h) timeout_max=24 ;;
+    esac
+    # The length guard short-circuits before arithmetic on oversized integers.
+    if (( ${#timeout_amount} > ${#timeout_max} )) || (( timeout_amount > timeout_max )); then
+      macos_signing_error 'Raw API notarization timeout must be at most 24h.'
+      return 1
+    fi
+    [[ -n $timeout_unit ]] || NOTARY_TIMEOUT="${timeout_amount}s"
+    MACOS_NOTARY_REST=1
+  fi
   local name path
   for name in APPLE_SIGNING_KEYCHAIN NOTARY_KEYCHAIN NOTARY_KEY_FILE; do
     [[ -n ${!name:-} ]] || continue
@@ -135,6 +157,9 @@ prepare_stage() {
       fail 'The previous stage must be accepted and finished before preparing this stage.'
   fi
   macos_signing_operation configure-credentials configure_credentials
+  if [[ $MACOS_NOTARY_REST == 1 ]]; then
+    macos_signing_operation notary-authentication "$QUEUE_NOTARY_TOOL" notarize preflight
+  fi
   macos_signing_operation restore-installer restore_installer
   case "$stage" in
     payload)
@@ -177,6 +202,13 @@ submit_stage() {
   [[ $(json_field "$record" prepared_attempt) == "$GITHUB_RUN_ATTEMPT" ]] ||
     fail 'Prepared snapshot has no submission ID from an earlier attempt. Upload outcome is unknown; reconcile with Apple manually, never resubmit.'
   configure_credentials
+  if [[ $MACOS_NOTARY_REST == 1 ]]; then
+    # The client preflights authentication before recording upload intent, then
+    # durably records Apple's ID before S3. Never premark or rewrite its record.
+    macos_signing_operation notary-submit "$QUEUE_NOTARY_TOOL" notarize submit \
+      --archive "$submitted_archive" --record "$record" --sha256 "$(json_field "$record" archive_sha256)"
+    return
+  fi
   local response submission id_pattern='^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$'
   response=$(mktemp)
   # Raw provider output stays outside the durable public state. Do not retain
@@ -227,10 +259,21 @@ finish_stage() {
     submission=$(json_field "$record" submission_id)
     response=$(mktemp)
     provider_log=$(mktemp)
-    xcrun notarytool wait "$submission" "${MACOS_NOTARY_AUTH[@]}" --timeout "$NOTARY_TIMEOUT" --output-format json > "$response" || wait_result=$?
+    if [[ $MACOS_NOTARY_REST == 1 ]]; then
+      "$QUEUE_NOTARY_TOOL" notarize wait --id "$submission" --timeout "$NOTARY_TIMEOUT" > "$response" || wait_result=$?
+    else
+      xcrun notarytool wait "$submission" "${MACOS_NOTARY_AUTH[@]}" --timeout "$NOTARY_TIMEOUT" --output-format json > "$response" || wait_result=$?
+    fi
     # Rejected submissions and Accepted submissions with warnings both carry
     # useful Apple diagnostics. Attempt the log even after a wait timeout.
-    xcrun notarytool log "$submission" "${MACOS_NOTARY_AUTH[@]}" "$provider_log" || log_result=$?
+    if [[ $MACOS_NOTARY_REST == 1 ]]; then
+      # Let the REST client create its private output, without depending on
+      # native notarytool's behavior of overwriting the mktemp placeholder.
+      rm "$provider_log"
+      "$QUEUE_NOTARY_TOOL" notarize log --id "$submission" --output "$provider_log" || log_result=$?
+    else
+      xcrun notarytool log "$submission" "${MACOS_NOTARY_AUTH[@]}" "$provider_log" || log_result=$?
+    fi
     if [[ $log_result == 0 ]]; then
       save_provider_log "$provider_log" || log_result=1
     fi
@@ -238,7 +281,8 @@ finish_stage() {
       rm -f "$response" "$provider_log"
       fail "$stage remains pending or failed; submission $submission is preserved with available Apple diagnostics."
     fi
-    if ! jq -e '.status == "Accepted"' "$response" >/dev/null; then
+    if ! jq -e --arg id "$submission" --arg rest "$MACOS_NOTARY_REST" \
+      '.status == "Accepted" and ($rest != "1" or .id == $id)' "$response" >/dev/null; then
       rm -f "$response" "$provider_log"
       fail "$stage was not Accepted; submission $submission and available Apple diagnostics are preserved."
     fi

@@ -136,6 +136,37 @@ Public submission receipts and exact signed intermediate archives are retained
 in CI checkpoints, separately from release downloads. Private keys and exported
 identities are excluded. Local credentials stay outside the checkout.
 
+## CI notarization client
+
+The resumable CI path uses a prebuilt Go client for Apple's
+[Notary API](https://developer.apple.com/documentation/notaryapi/submitting-software-for-notarization-over-the-web).
+It creates a submission, records the returned ID durably, then uploads the exact
+prepared archive using Apple's temporary S3 credentials. JWT signing uses
+`go-jose`; S3 upload uses the official AWS Go SDK. API authentication is checked
+with a read-only history request before signing or recording submission intent.
+History contents, JWTs, private keys and S3 credentials are never printed.
+
+CI builds `queue-tool` before loading credentials and passes its absolute
+executable path in `QUEUE_NOTARY_TOOL`. Direct API-key authentication in the
+resumable engine requires that binary and a team key with an issuer ID. There
+is no native-client fallback. Local Keychain-profile commands and one-shot
+packaging retain their existing `notarytool` path.
+The REST engine accepts bare-second timeout values such as `300` and explicit
+`s`, `m` or `h` units, with a maximum of 24 hours. It validates this budget before
+signing or creating a submission. The CI job's outer budget still applies.
+
+Each create request is attempted once. Before it, the client validates the
+stage, current attempt and archive hash, then records upload intent. Once
+Apple returns a valid ID, the client saves it before S3 upload. A failed upload
+with a recorded ID can only query that submission; it never creates another.
+An interrupted create request can still have an unknown result without an ID.
+That state requires manual reconciliation and refuses automatic resubmission.
+The local synced record becomes recoverable on another runner after the
+immutable checkpoint upload succeeds. Loss of the entire runner before that
+upload can still require reconciliation. Temporary S3 credentials are never
+checkpointed; an incomplete upload with a known ID may require operator
+resolution rather than an automatic retry.
+
 ## Resuming a pending CI submission
 
 The protected signing job uses `scripts/macos-resume.sh`; local one-shot
@@ -180,9 +211,10 @@ invalid provenance, corruption and a changed signing team stop recovery; there
 is no fallback to an older checkpoint or a fresh upload. Use failed-job reruns
 instead of rebuilding a new main run to retry a pending submission.
 
-There is an unavoidable uncertain-outcome window if Apple receives an upload
-but the runner dies before persisting its ID. A restored pre-upload checkpoint
-without an ID refuses another upload. Inspect the preserved receipts and
+There is an uncertain-outcome window if Apple creates a submission but the
+runner dies before persisting its ID. Older native-client checkpoints can
+also have an unknown upload outcome. A restored prepared or uploading stage
+without an ID refuses another create request. Inspect the preserved receipts and
 Apple's submission history with the original credentials before deciding how
 to recover. Automatic receipt import or duplicate resubmission is not provided.
 A rerun with no checkpoint also stops for reconciliation, even if signing
