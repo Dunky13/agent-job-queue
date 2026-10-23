@@ -175,7 +175,7 @@ resolution rather than an automatic retry.
 
 Ticket validation retries only a positively identified CloudKit connection loss:
 stapler exit 68 together with `NSURLErrorDomain -1005` and the exact Apple ticket lookup
-endpoint in the same diagnostic record. It permits three attempts, with two- and four-second delays. Invalid,
+endpoint in that error's own fields. It permits three attempts, with two- and four-second delays. Invalid,
 revoked, missing, or otherwise failed ticket checks remain fatal, as does an
 exhausted retry. This read-only retry never signs, staples, or submits code and
 never substitutes a local ticket for the required successful validation.

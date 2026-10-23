@@ -252,20 +252,48 @@ macos_notarize() {
 # Validation reads Apple's current ticket. Retry only the observed CloudKit
 # connection-loss failure, never missing, invalid or revoked ticket responses.
 macos_ticket_connection_lost() {
+  # Read only the outer UserInfo fields. Nested errors and quoted descriptions
+  # cannot supply the failing URL for the qualifying outer NSError.
   awk '
     function lookup(line, value) {
-      if (!match(line, /NSErrorFailingURLStringKey=[^[:space:]}]+/)) return 0
+      if (!match(line, /(^|[,[:space:]])NSErrorFailingURLStringKey=[^[:space:]}]+/)) return 0
       value = substr(line, RSTART, RLENGTH)
-      sub(/^NSErrorFailingURLStringKey=/, "", value)
+      sub(/^.*NSErrorFailingURLStringKey=/, "", value)
       sub(/,$/, "", value)
       return value == "https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup"
     }
+    function scan(line, i, c) {
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (quoted) {
+          if (escaped) escaped = 0
+          else if (c == "\\") escaped = 1
+          else if (c == "\"") quoted = 0
+          continue
+        } else if (c == "\"") { quoted = 1; continue }
+        else if (c == "{") depth++
+        else if (c == "}") {
+          depth--
+          if (depth == 0) {
+            if (lookup(own)) found = 1
+            active = 0
+            return
+          }
+        }
+        if (depth == 1) own = own c
+      }
+      own = own " "
+    }
     /^error is Error Domain=/ {
       active = ($0 ~ /^error is Error Domain=NSURLErrorDomain Code=-1005 /)
+      start = index($0, "UserInfo={")
+      active = active && start
+      depth = 1; quoted = 0; escaped = 0; own = ""
+      if (active) scan(substr($0, start + length("UserInfo={")))
+      next
     }
-    !/^error is Error Domain=/ && !/^[[:space:]]/ && !/^\),/ { active = 0 }
-    active && lookup($0) { found = 1 }
-    /}[[:space:]]*$/ { active = 0 }
+    active && (/^[[:space:]]/ || /^\),/) { scan($0); next }
+    { active = 0 }
     END { exit !found }
   ' "$1"
 }

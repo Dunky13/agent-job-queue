@@ -31,10 +31,10 @@ for required Intel acceptance or prove installation on the operator's Mac.
 
 One shared `macos_validate_ticket` helper handles every scripted validation
 call, including the quarantine-preserving production app-copy check. It retries
-only when exit 68, the specific URL-loading connection-loss code, and the exact
-Apple ticket lookup endpoint occur in the same diagnostic record. It allows three
-attempts with two- and four-second delays. Each attempt invokes the real `stapler validate`; only an
-actual successful exit permits progress.
+only on exit 68 when the specific URL-loading connection-loss error identifies
+the exact Apple ticket lookup endpoint in its own fields. It allows three
+attempts with two- and four-second delays. Each attempt invokes the real
+`stapler validate`; only an actual successful exit permits progress.
 
 Missing, invalid, revoked, unrelated, and unrecognized errors stop immediately.
 Exhaustion returns the final failure. Temporary output is removed after success
@@ -43,11 +43,11 @@ receipts, immutable artifact bytes, and publication gates remain unchanged.
 
 ## Verification and delivery
 
-The CLI fixture reproduced exit 68 before the fix. Twenty-eight installer and DMG
+The CLI fixture reproduced exit 68 before the fix. Thirty-four installer and DMG
 scenarios passed afterward: valid tickets, transient recovery, exhaustion,
 invalid/revoked tickets, unrelated domains/endpoints, URL suffixes, separate
-diagnostic records, multiline transport diagnostics, wrong exit codes, and an
-invalid ticket after connection loss. They check the attempt cap, backoff,
+diagnostic records, nested errors, quoted descriptions, multiline transport
+diagnostics, wrong exit codes, and an invalid ticket after connection loss. They check the attempt cap, backoff,
 temporary-file cleanup, and absence of signing or submission operations.
 
 Required hosted CI and source reviews must pass on the exact PR head. After
