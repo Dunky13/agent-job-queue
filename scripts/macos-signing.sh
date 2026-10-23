@@ -261,8 +261,9 @@ macos_ticket_connection_lost() {
       while (match(line, /(^|,)[[:space:]]*NSErrorFailingURLStringKey=/)) {
         line = substr(line, RSTART + RLENGTH)
         value = line
-        sub(/[[:space:]}].*$/, "", value)
-        sub(/,$/, "", value)
+        if (match(value, /,[[:space:]]*[[:alpha:]_][[:alnum:]_]*=/)) value = substr(value, 1, RSTART - 1)
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
         if (value != "https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup") return 0
         keys++
       }

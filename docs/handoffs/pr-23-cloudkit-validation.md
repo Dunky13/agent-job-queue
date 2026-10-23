@@ -43,9 +43,9 @@ receipts, immutable artifact bytes, and publication gates remain unchanged.
 
 ## Verification and delivery
 
-The CLI fixture reproduced exit 68 before the fix. Forty-eight installer and DMG
+The CLI fixture reproduced exit 68 before the fix. Fifty-six installer and DMG
 scenarios passed afterward: valid tickets, transient recovery, exhaustion,
-invalid/revoked tickets, unrelated domains/endpoints, URL suffixes, quoted/nested token boundaries, separate
+invalid/revoked tickets, unrelated domains/endpoints, URL suffixes, quoted/nested token boundaries, whitespace suffixes, separate
 diagnostic records, nested errors, misleading descriptions, duplicate URL fields, quoted
 dictionaries, multiline transport
 diagnostics, wrong exit codes, and an invalid ticket after connection loss. They check the attempt cap, backoff,

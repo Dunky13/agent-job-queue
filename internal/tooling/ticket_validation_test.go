@@ -27,6 +27,10 @@ func TestMacOSTicketValidationRetriesOnlyCloudKitConnectionLoss(t *testing.T) {
 			{"quoted-suffix", 68, 1, 0},
 			{"quoted-prefix", 68, 1, 0},
 			{"nested-suffix", 68, 1, 0},
+			{"spaced-quoted-suffix", 68, 1, 0},
+			{"spaced-nested-suffix", 68, 1, 0},
+			{"comma-suffix", 68, 1, 0},
+			{"padded-recovers", 0, 3, 2},
 			{"unrelated-record", 68, 1, 0},
 			{"nested-url", 68, 1, 0},
 			{"quoted-url", 68, 1, 0},
@@ -98,7 +102,7 @@ printf '%s\n' "$count" > "$SIGNING_TEST_TICKET_COUNTER"
 url=https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup
 case "$SIGNING_TEST_TICKET_OUTCOME" in
   valid) exit 0 ;;
-  recovers|multiline-recovers|nested-recovers|quoted-dictionary-recovers) if (( count > 2 )); then exit 0; fi ;;
+  recovers|multiline-recovers|nested-recovers|quoted-dictionary-recovers|padded-recovers) if (( count > 2 )); then exit 0; fi ;;
   persistent) ;;
   invalid) printf 'The validate action failed! Error 65.\n' >&2; exit 65 ;;
   revoked) printf 'The ticket has been revoked.\n' >&2; exit 77 ;;
@@ -110,6 +114,10 @@ case "$SIGNING_TEST_TICKET_OUTCOME" in
   quoted-suffix) url=$url'"-other"' ;;
   quoted-prefix) url='"other-"'$url ;;
   nested-suffix) url=$url'{other}' ;;
+  spaced-quoted-suffix) url=$url' "-other"' ;;
+  spaced-nested-suffix) url=$url' {other}' ;;
+  comma-suffix) url=$url,other ;;
+  padded-recovers) url="  $url  " ;;
   unrelated-record)
     printf 'error is Error Domain=NSURLErrorDomain Code=-1005 "The network connection was lost." UserInfo={NSErrorFailingURLStringKey=https://example.invalid/}\n' >&2
     printf 'error is Error Domain=NSCocoaErrorDomain Code=1 UserInfo={NSErrorFailingURLStringKey=%s}\n' "$url" >&2
