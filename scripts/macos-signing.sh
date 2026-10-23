@@ -253,7 +253,8 @@ macos_notarize() {
 # connection-loss failure, never missing, invalid or revoked ticket responses.
 macos_ticket_connection_lost() {
   # Read only the outer UserInfo fields. Nested errors and quoted descriptions
-  # cannot supply the failing URL for the qualifying outer NSError.
+  # cannot supply the failing URL for the qualifying outer NSError. Retain
+  # their delimiters so excluded content cannot join surrounding URL tokens.
   awk '
     function lookup(line, value, keys) {
       keys = 0
@@ -273,9 +274,16 @@ macos_ticket_connection_lost() {
         if (quoted) {
           if (escaped) escaped = 0
           else if (c == "\\") escaped = 1
-          else if (c == "\"") quoted = 0
+          else if (c == "\"") {
+            quoted = 0
+            if (depth == 1) own = own c
+          }
           continue
-        } else if (c == "\"") { quoted = 1; continue }
+        } else if (c == "\"") {
+          quoted = 1
+          if (depth == 1) own = own c
+          continue
+        }
         else if (depth == 0) {
           if ((i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/) &&
               substr(line, i, length("UserInfo={")) == "UserInfo={") {
@@ -284,7 +292,10 @@ macos_ticket_connection_lost() {
           }
           continue
         }
-        else if (c == "{") depth++
+        else if (c == "{") {
+          if (depth == 1) own = own c
+          depth++
+        }
         else if (c == "}") {
           depth--
           if (depth == 0) {

@@ -24,6 +24,9 @@ func TestMacOSTicketValidationRetriesOnlyCloudKitConnectionLoss(t *testing.T) {
 			{"other-endpoint", 68, 1, 0},
 			{"endpoint-suffix", 68, 1, 0},
 			{"endpoint-child", 68, 1, 0},
+			{"quoted-suffix", 68, 1, 0},
+			{"quoted-prefix", 68, 1, 0},
+			{"nested-suffix", 68, 1, 0},
 			{"unrelated-record", 68, 1, 0},
 			{"nested-url", 68, 1, 0},
 			{"quoted-url", 68, 1, 0},
@@ -104,6 +107,9 @@ case "$SIGNING_TEST_TICKET_OUTCOME" in
   other-endpoint) url=https://example.invalid/ ;;
   endpoint-suffix) url=$url-other ;;
   endpoint-child) url=$url/other ;;
+  quoted-suffix) url=$url'"-other"' ;;
+  quoted-prefix) url='"other-"'$url ;;
+  nested-suffix) url=$url'{other}' ;;
   unrelated-record)
     printf 'error is Error Domain=NSURLErrorDomain Code=-1005 "The network connection was lost." UserInfo={NSErrorFailingURLStringKey=https://example.invalid/}\n' >&2
     printf 'error is Error Domain=NSCocoaErrorDomain Code=1 UserInfo={NSErrorFailingURLStringKey=%s}\n' "$url" >&2
