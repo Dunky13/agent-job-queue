@@ -44,10 +44,10 @@ receipts, immutable artifact bytes, and publication gates remain unchanged.
 
 ## Verification and delivery
 
-The CLI fixture reproduced exit 68 before the fix. Thirty-four installer and DMG
+The CLI fixture reproduced exit 68 before the fix. Thirty-eight installer and DMG
 scenarios passed afterward: valid tickets, transient recovery, exhaustion,
 invalid/revoked tickets, unrelated domains/endpoints, URL suffixes, separate
-diagnostic records, nested errors, quoted descriptions, multiline transport
+diagnostic records, nested errors, quoted descriptions and dictionaries, multiline transport
 diagnostics, wrong exit codes, and an invalid ticket after connection loss. They check the attempt cap, backoff,
 temporary-file cleanup, and absence of signing or submission operations.
 

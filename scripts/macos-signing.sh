@@ -271,6 +271,14 @@ macos_ticket_connection_lost() {
           else if (c == "\"") quoted = 0
           continue
         } else if (c == "\"") { quoted = 1; continue }
+        else if (depth == 0) {
+          if ((i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/) &&
+              substr(line, i, length("UserInfo={")) == "UserInfo={") {
+            depth = 1
+            i += length("UserInfo={") - 1
+          }
+          continue
+        }
         else if (c == "{") depth++
         else if (c == "}") {
           depth--
@@ -286,10 +294,8 @@ macos_ticket_connection_lost() {
     }
     /^error is Error Domain=/ {
       active = ($0 ~ /^error is Error Domain=NSURLErrorDomain Code=-1005 /)
-      start = index($0, "UserInfo={")
-      active = active && start
-      depth = 1; quoted = 0; escaped = 0; own = ""
-      if (active) scan(substr($0, start + length("UserInfo={")))
+      depth = 0; quoted = 0; escaped = 0; own = ""
+      if (active) scan($0)
       next
     }
     active && (/^[[:space:]]/ || /^\),/) { scan($0); next }
