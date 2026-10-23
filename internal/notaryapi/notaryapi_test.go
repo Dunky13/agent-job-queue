@@ -488,7 +488,7 @@ func TestDroppedAndTimedOutCreateIsOnePOST(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			f := makeFixture(t)
 			var posts atomic.Int32
-			release := make(chan struct{})
+			var timedOut atomic.Bool
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" {
 					fmt.Fprint(w, `{"data":[]}`)
@@ -503,11 +503,6 @@ func TestDroppedAndTimedOutCreateIsOnePOST(t *testing.T) {
 						return
 					}
 					_ = conn.Close()
-				case "timeout":
-					select {
-					case <-r.Context().Done():
-					case <-release:
-					}
 				case "malformed":
 					fmt.Fprint(w, `{"data":`)
 				case "invalid-id":
@@ -521,16 +516,32 @@ func TestDroppedAndTimedOutCreateIsOnePOST(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			defer close(release)
 			c := newClient(f.creds)
 			c.endpoint = server.URL
-			c.requestTimeout = 40 * time.Millisecond
+			if kind == "timeout" {
+				// Observe the POST before waiting for its real request deadline.
+				// A short deadline around socket setup can expire before dispatch
+				// on a busy host, leaving the ambiguous-create path untested.
+				c.requestTimeout = 40 * time.Millisecond
+				c.transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					if r.Method == http.MethodGet {
+						return response(r, http.StatusOK, `{"data":[]}`), nil
+					}
+					posts.Add(1)
+					<-r.Context().Done()
+					timedOut.Store(errors.Is(r.Context().Err(), context.DeadlineExceeded))
+					return nil, r.Context().Err()
+				})
+			}
 			_, err := f.command(context.Background(), f.submitArgs(), c)
 			if err == nil {
 				t.Fatal("create unexpectedly succeeded")
 			}
 			if posts.Load() != 1 {
 				t.Fatalf("POST count=%d", posts.Load())
+			}
+			if kind == "timeout" && !timedOut.Load() {
+				t.Fatal("create did not reach its request deadline")
 			}
 			r := f.readRecord(t)
 			if r.Phase != "uploading" || r.SubmissionID != "" {

@@ -1,0 +1,58 @@
+# PR 21: Deliver the standard callback migration fix
+
+## Outcome and scope
+
+The requested endpoint is a corrected public release and verified Homebrew
+delivery. Installing it on the operator's Mac is outside this task. Preserve the
+live queue, phone access settings, credentials, and callback configuration.
+
+Build 58 (`f892944dca4159ff125d2ad841661e1dfd36af96`) predates the standard
+cleanup callback matcher merged in PR 20
+(`0b5ec48c67bf4cb24cb758d48fb575f68871c889`). The cached build 58 installer
+reproduced the reported callback rejection in a temporary private home. Its
+configuration bytes stayed unchanged and no installation transaction marker
+was published. The existing Homebrew Python callback migration regression
+passes against the corrected source.
+
+## CI failure and repair
+
+[Main CI run 39866133093](https://github.com/Dunky13/agent-job-queue/actions/runs/39866133093)
+failed on Intel in `TestDroppedAndTimedOutCreateIsOnePOST/drop` with
+`POST count=0`. Its blanket 40 ms request deadline could expire during HTTP
+startup, before the create request reached the server.
+
+PR 21 retains real HTTP coverage for dropped connections, malformed responses,
+invalid IDs, server errors, and redirects using the normal client deadline.
+Only the timeout case uses a controlled transport: it observes the POST, waits
+for the actual 40 ms request deadline, and asserts `DeadlineExceeded`. All cases
+retain one-POST, durable unknown-outcome, and refused-resubmission assertions.
+Production request handling, deadlines, callback matching, and release gates
+are unchanged. Existing real HTTP/2 replay regressions remain in place.
+
+## Local evidence and review
+
+An ephemeral overlay adding 80 ms of transport startup delay reproduced the
+old `POST count=0` failure; the same delay passed after the repair. No overlay
+or diagnostic instrumentation is committed.
+
+Source portability, formatting, scoped Go vet, the complete notarization
+package with race detection, 50 race-enabled repetitions of the six-case create
+regression, and the installer suite passed. Separate standards and requirements
+reviews found no issues. Cross-provider review was unavailable and was not
+reported as clean.
+
+## Delivery verification
+
+Required hosted CI must pass for the exact PR head before merging. Verify the
+squash commit's cryptographic signature and author-matching DCO trailers. Main
+CI and Distribution then establish separate evidence for universal packaging,
+Developer ID signing, Apple notarization and stapling, Apple Silicon and Intel
+artifact acceptance, public publication, and exact Homebrew tap readback.
+
+Follow [Homebrew delivery](../homebrew-delivery.md) and
+[Apple signing and notarization](../apple-signing.md) for delivery and bounded
+recovery. A published release alone does not prove tap delivery or installation
+on the operator's Mac. Python migration still requires a drained legacy queue
+and disabled old phone access; preserve those installer checks.
+
+This handoff has a complete standalone [HTML version](pr-21-callback-release.html).
