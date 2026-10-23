@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PR 23: CloudKit validation handoff</title><body><pre style="white-space:pre-wrap;max-width:80ch;margin:2rem auto;font:16px/1.5 system-ui"># PR 23: Bound retries of CloudKit ticket connection loss
+
+## Requested endpoint and retained build
+
+Deliver the corrected callback migration release and verify Homebrew delivery.
+Continue from [PR 21](pr-21-callback-release.md) and
+[PR 22](pr-22-notarization-checkpoint.md). Do not install into the operator&#x27;s live
+queue or alter its callback, credentials, running jobs, or phone settings.
+
+[Build 66](https://github.com/Dunky13/agent-job-queue/actions/runs/39992645666)
+at `8ce8301559de024fbdf4b2c28fffe73955f009f9` passed main CI on attempt 2,
+retaining the universal installer produced by attempt 1. The initial Intel
+runner had multiple unrelated deadline misses; the unchanged retry and focused
+local race reproductions passed without changing timing thresholds.
+
+[Distribution 39996966992](https://github.com/Dunky13/agent-job-queue/actions/runs/39996966992)
+signed, notarized, and stapled all stages. Apple Silicon acceptance passed.
+Intel acceptance attempts 1 through 3 lost the CloudKit connection while
+validating installer or app tickets. The raw failure was stapler exit 68 with
+`NSURLErrorDomain Code=-1005` at Apple&#x27;s public ticket lookup endpoint.
+
+The retained ZIP and DMG passed their checksums. Independent local checks passed
+both architecture signatures, attached app and installer ticket validation,
+and public lookups of both architecture ticket records. The signed CLI accepted
+the original standard Homebrew Python callback in an isolated home, then stopped
+at the required enabled-phone-access gate. Configuration bytes stayed unchanged
+and no installation transaction marker appeared. These checks do not substitute
+for required Intel acceptance or prove installation on the operator&#x27;s Mac.
+
+## Repair and limits
+
+One shared `macos_validate_ticket` helper handles every scripted validation
+call, including the quarantine-preserving production app-copy check. It retries
+only when exit 68, the specific URL-loading connection-loss code, and the exact
+Apple ticket lookup endpoint all occur. It allows three attempts with two- and
+four-second delays. Each attempt invokes the real `stapler validate`; only an
+actual successful exit permits progress.
+
+Missing, invalid, revoked, unrelated, and unrecognized errors stop immediately.
+Exhaustion returns the final failure. Temporary output is removed after success
+or failure. Signing, stapling, notarization submissions, timeouts, accepted
+receipts, immutable artifact bytes, and publication gates remain unchanged.
+
+## Verification and delivery
+
+The CLI fixture reproduced exit 68 before the fix. Twenty installer and DMG
+scenarios passed afterward: valid tickets, transient recovery, exhaustion,
+invalid/revoked tickets, unrelated domains/endpoints, wrong exit codes, and an
+invalid ticket after connection loss. They check the attempt cap, backoff,
+temporary-file cleanup, and absence of signing or submission operations.
+
+Required hosted CI and source reviews must pass on the exact PR head. After
+merging and verifying the signed squash and matching DCO, use the documented
+automation-repair recovery path with original `build_run_id=39992645666`.
+Recovered stages must retain the original source and signed bytes; completed
+submissions are reused. See [Apple recovery](../apple-signing.md#resuming-a-pending-ci-submission).
+
+Successful Apple Silicon and Intel acceptance, public publication, and exact
+[Homebrew delivery](../homebrew-delivery.md) remain separate required proofs.
+An automatic newer main build can supersede delivery only through the same
+verified publication and tap contract.
+
+This handoff has a complete standalone [HTML version](pr-23-cloudkit-validation.html).
+</pre></body></html>
