@@ -255,12 +255,17 @@ macos_ticket_connection_lost() {
   # Read only the outer UserInfo fields. Nested errors and quoted descriptions
   # cannot supply the failing URL for the qualifying outer NSError.
   awk '
-    function lookup(line, value) {
-      if (!match(line, /(^|[,[:space:]])NSErrorFailingURLStringKey=[^[:space:]}]+/)) return 0
-      value = substr(line, RSTART, RLENGTH)
-      sub(/^.*NSErrorFailingURLStringKey=/, "", value)
-      sub(/,$/, "", value)
-      return value == "https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup"
+    function lookup(line, value, keys) {
+      keys = 0
+      while (match(line, /(^|,)[[:space:]]*NSErrorFailingURLStringKey=/)) {
+        line = substr(line, RSTART + RLENGTH)
+        value = line
+        sub(/[[:space:]}].*$/, "", value)
+        sub(/,$/, "", value)
+        if (value != "https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup") return 0
+        keys++
+      }
+      return keys == 1
     }
     function scan(line, i, c) {
       for (i = 1; i <= length(line); i++) {

@@ -28,6 +28,8 @@ func TestMacOSTicketValidationRetriesOnlyCloudKitConnectionLoss(t *testing.T) {
 			{"nested-url", 68, 1, 0},
 			{"quoted-url", 68, 1, 0},
 			{"quoted-dictionary", 68, 1, 0},
+			{"unquoted-description-url", 68, 1, 0},
+			{"duplicate-url", 68, 1, 0},
 			{"quoted-dictionary-recovers", 0, 3, 2},
 			{"nested-recovers", 0, 3, 2},
 			{"other-exit", 65, 1, 0},
@@ -114,6 +116,12 @@ case "$SIGNING_TEST_TICKET_OUTCOME" in
     exit 68 ;;
   quoted-dictionary)
     printf 'error is Error Domain=NSURLErrorDomain Code=-1005 "UserInfo={NSErrorFailingURLStringKey=%s}" UserInfo={NSErrorFailingURLStringKey=https://example.invalid/}\n' "$url" >&2
+    exit 68 ;;
+  unquoted-description-url)
+    printf 'error is Error Domain=NSURLErrorDomain Code=-1005 UserInfo={NSLocalizedDescription=Failed NSErrorFailingURLStringKey=%s, NSErrorFailingURLStringKey=https://example.invalid/}\n' "$url" >&2
+    exit 68 ;;
+  duplicate-url)
+    printf 'error is Error Domain=NSURLErrorDomain Code=-1005 UserInfo={NSErrorFailingURLStringKey=%s, NSErrorFailingURLStringKey=https://example.invalid/}\n' "$url" >&2
     exit 68 ;;
   other-exit) ;;
   invalid-after-loss) if (( count > 1 )); then printf 'Invalid ticket.\n' >&2; exit 65; fi ;;
