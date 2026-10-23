@@ -251,6 +251,25 @@ macos_notarize() {
 
 # Validation reads Apple's current ticket. Retry only the observed CloudKit
 # connection-loss failure, never missing, invalid or revoked ticket responses.
+macos_ticket_connection_lost() {
+  awk '
+    function lookup(line, value) {
+      if (!match(line, /NSErrorFailingURLStringKey=[^[:space:]}]+/)) return 0
+      value = substr(line, RSTART, RLENGTH)
+      sub(/^NSErrorFailingURLStringKey=/, "", value)
+      sub(/,$/, "", value)
+      return value == "https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup"
+    }
+    /^error is Error Domain=/ {
+      active = ($0 ~ /^error is Error Domain=NSURLErrorDomain Code=-1005 /)
+    }
+    !/^error is Error Domain=/ && !/^[[:space:]]/ && !/^\),/ { active = 0 }
+    active && lookup($0) { found = 1 }
+    /}[[:space:]]*$/ { active = 0 }
+    END { exit !found }
+  ' "$1"
+}
+
 macos_validate_ticket() (
   local output status attempt=1
   output=$(mktemp) || return
@@ -263,9 +282,7 @@ macos_validate_ticket() (
       status=$?
     fi
     cat "$output" || return
-    if [[ $status != 68 || $attempt -ge 3 ]] ||
-      ! grep -Fq 'Error Domain=NSURLErrorDomain Code=-1005 ' "$output" ||
-      ! grep -Fq 'https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup' "$output"; then
+    if [[ $status != 68 || $attempt -ge 3 ]] || ! macos_ticket_connection_lost "$output"; then
       return "$status"
     fi
     printf 'Apple ticket validation: CloudKit connection lost; retrying after %s seconds (attempt %s of 3).\n' "$((attempt * 2))" "$((attempt + 1))" >&2

@@ -70,7 +70,7 @@
 
 <h2 id="resuming-a-pending-ci-submission">Resuming a pending CI submission<span><a href="#resuming-a-pending-ci-submission">&para;</a> <a href="#top">&uarr;</a></span></h2>
 
-<p>Ticket validation retries only a positively identified CloudKit connection loss: stapler exit 68 together with <code>NSURLErrorDomain -1005</code> and the Apple ticket lookup endpoint. It permits three attempts, with two- and four-second delays. Invalid, revoked, missing, or otherwise failed ticket checks remain fatal, as does an exhausted retry. This read-only retry never signs, staples, or submits code and never substitutes a local ticket for the required successful validation.</p>
+<p>Ticket validation retries only a positively identified CloudKit connection loss: stapler exit 68 together with <code>NSURLErrorDomain -1005</code> and the exact Apple ticket lookup endpoint in the same diagnostic record. It permits three attempts, with two- and four-second delays. Invalid, revoked, missing, or otherwise failed ticket checks remain fatal, as does an exhausted retry. This read-only retry never signs, staples, or submits code and never substitutes a local ticket for the required successful validation.</p>
 
 <p>Build CI and distribution run independently. <code>ci.yml</code> validates and retains the universal installer. <code>distribution.yml</code> automatically follows a successful same-repository main-push CI run. It can also be dispatched manually from <code>main</code> with the original <code>build_run_id</code>, so a merged automation repair can process the retained installer without recompiling it.</p>
 
