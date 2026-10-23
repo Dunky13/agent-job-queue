@@ -249,9 +249,102 @@ macos_notarize() {
   }
 }
 
+# Validation reads Apple's current ticket. Retry only the observed CloudKit
+# connection-loss failure, never missing, invalid or revoked ticket responses.
+macos_ticket_connection_lost() {
+  # Read only the outer UserInfo fields. Nested errors and quoted descriptions
+  # cannot supply the failing URL for the qualifying outer NSError. Retain
+  # their delimiters so excluded content cannot join surrounding URL tokens.
+  awk '
+    function lookup(line, value, keys) {
+      keys = 0
+      while (match(line, /(^|,)[[:space:]]*NSErrorFailingURLStringKey=/)) {
+        line = substr(line, RSTART + RLENGTH)
+        value = line
+        if (match(value, /,[[:space:]]*[[:alpha:]_][[:alnum:]_]*=/)) value = substr(value, 1, RSTART - 1)
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        if (value != "https://api.apple-cloudkit.com/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup") return 0
+        keys++
+      }
+      return keys == 1
+    }
+    function scan(line, i, c) {
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        if (quoted) {
+          if (escaped) escaped = 0
+          else if (c == "\\") escaped = 1
+          else if (c == "\"") {
+            quoted = 0
+            if (depth == 1) own = own c
+          }
+          continue
+        } else if (c == "\"") {
+          quoted = 1
+          if (depth == 1) own = own c
+          continue
+        }
+        else if (depth == 0) {
+          if ((i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/) &&
+              substr(line, i, length("UserInfo={")) == "UserInfo={") {
+            depth = 1
+            i += length("UserInfo={") - 1
+          }
+          continue
+        }
+        else if (c == "{") {
+          if (depth == 1) own = own c
+          depth++
+        }
+        else if (c == "}") {
+          depth--
+          if (depth == 0) {
+            if (lookup(own)) found = 1
+            active = 0
+            return
+          }
+        }
+        if (depth == 1) own = own c
+      }
+      own = own " "
+    }
+    /^error is Error Domain=/ {
+      active = ($0 ~ /^error is Error Domain=NSURLErrorDomain Code=-1005 /)
+      depth = 0; quoted = 0; escaped = 0; own = ""
+      if (active) scan($0)
+      next
+    }
+    active && (/^[[:space:]]/ || /^\),/) { scan($0); next }
+    { active = 0 }
+    END { exit !found }
+  ' "$1"
+}
+
+macos_validate_ticket() (
+  local output status attempt=1
+  output=$(mktemp) || return
+  trap 'rm -f "$output"' EXIT
+  while :; do
+    if xcrun stapler validate "$1" > "$output" 2>&1; then
+      cat "$output" || return
+      return 0
+    else
+      status=$?
+    fi
+    cat "$output" || return
+    if [[ $status != 68 || $attempt -ge 3 ]] || ! macos_ticket_connection_lost "$output"; then
+      return "$status"
+    fi
+    printf 'Apple ticket validation: CloudKit connection lost; retrying after %s seconds (attempt %s of 3).\n' "$((attempt * 2))" "$((attempt + 1))" >&2
+    sleep "$((attempt * 2))" || return
+    attempt=$((attempt + 1))
+  done
+)
+
 macos_staple() {
   xcrun stapler staple "$1" || return
-  xcrun stapler validate "$1"
+  macos_validate_ticket "$1"
 }
 
 macos_assess_app() {
@@ -327,8 +420,8 @@ macos_disk_image_source() {
 macos_verify_installer_distribution() {
   local installer=$1 app="$1/Contents/Resources/payload/Agent Queue.app"
   macos_verify_installer_code "$installer" || return
-  xcrun stapler validate "$app" || return
-  xcrun stapler validate "$installer" || return
+  macos_validate_ticket "$app" || return
+  macos_validate_ticket "$installer" || return
   macos_assess_app "$app" || return
   macos_assess_app "$installer"
 }
@@ -343,7 +436,7 @@ macos_verify_disk_image_code() {
 macos_verify_disk_image() {
   local image=$1
   macos_verify_disk_image_code "$image" || return
-  xcrun stapler validate "$image" || return
+  macos_validate_ticket "$image" || return
   spctl --assess --type open --context context:primary-signature --verbose=2 "$image" || return
   hdiutil verify "$image"
 }

@@ -2,6 +2,8 @@
 # Verify final distribution bytes and the production app-copy boundary.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+# shellcheck source=scripts/macos-signing.sh
+source "$root/scripts/macos-signing.sh"
 if [[ $# != 3 ]]; then
   printf 'Usage: %s INSTALLER.zip INSTALLER.dmg EXPECTED_TEAM_ID\n' "$0" >&2
   exit 2
@@ -26,7 +28,7 @@ copied="$work/installed/Agent Queue.app"
 xattr -p com.apple.quarantine "$copied" >/dev/null
 codesign --verify --strict --deep --all-architectures \
   -R "=anchor apple generic and certificate leaf[subject.OU] = \"$team\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists" "$copied"
-xcrun stapler validate "$copied"
+macos_validate_ticket "$copied"
 syspolicy_check distribution "$copied" --verbose
 "$root/scripts/macos-signing.sh" verify-dmg "$image" "$team"
 bash "$root/scripts/test-dmg.sh" "$image"
