@@ -67,6 +67,12 @@ func TestNotarizationPersistsReceiptsBeforeWaiting(t *testing.T) {
 		if step.ContinueOnError {
 			t.Fatal("notarization must stop after failed signing, persistence or Apple acceptance")
 		}
+		if strings.Contains(step.Run, "macos-resume.sh prepare ") && step.ID != "prepare" {
+			t.Fatal("preparation must expose its outcome for failure checkpointing")
+		}
+		if step.ID == "finished-snapshot" && step.If != "always() && steps.prepare.outcome != 'skipped'" {
+			t.Fatal("the final checkpoint must run after every attempted preparation, including failure before submission")
+		}
 		for _, operation := range []string{"prepare", "submit", "finish"} {
 			if strings.Contains(step.Run, "macos-resume.sh "+operation+" ") {
 				if step.If != "" {

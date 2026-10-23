@@ -26,6 +26,7 @@ runs:
   using: composite
   steps:
     - name: Prepare exact signed archive
+      id: prepare
       shell: bash
       env:
         STAGE: ${{ inputs.stage }}
@@ -79,14 +80,14 @@ runs:
         APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ inputs.certificate-password }}
         APPLE_NOTARY_KEY_P8: ${{ inputs.notary-key }}
       run: scripts/with-apple-signing.sh scripts/macos-resume.sh finish notarization-state "$STAGE" "$BUILD_VERSION"
-    - name: Snapshot acceptance or pending state
+    - name: Snapshot latest state after the stage attempt
       id: finished-snapshot
-      if: always() && steps.finish.outcome != 'skipped'
+      if: always() && steps.prepare.outcome != 'skipped'
       shell: bash
       env:
         STAGE: ${{ inputs.stage }}
       run: scripts/macos-checkpoint.sh snapshot notarization-state "$RUNNER_TEMP/checkpoint-$STAGE-finished"
-    - name: Persist acceptance or pending state
+    - name: Persist latest state after the stage attempt
       if: always() && steps.finished-snapshot.outcome == 'success'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
