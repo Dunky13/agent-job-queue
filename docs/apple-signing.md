@@ -201,7 +201,11 @@ reuse the existing artifact.
 The protected signing job uses `scripts/macos-resume.sh`; local one-shot
 `macos-signing.sh package` remains available. Each payload, installer and DMG
 stage persists an immutable checkpoint before uploading, immediately after
-recording its submission ID, and after waiting, including a failed wait. An
+recording its submission ID, and after every attempted preparation, including
+failures before submission and failed waits. The last snapshot retains the
+latest available state even when preparation never reaches its first upload.
+Missing required checkpoints still stop recovery; this does not authorize an
+older state after an uncertain attempt. An
 initial `s00` checkpoint precedes credential setup and signing. Checkpoints
 contain the original prepared installer, exact signed upload archives, their
 SHA-256 values, stage records and public Apple receipts. ZIP wrapping preserves

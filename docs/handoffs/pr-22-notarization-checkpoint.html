@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PR 22: Notarization checkpoint handoff</title><body><pre style="white-space:pre-wrap;max-width:80ch;margin:2rem auto;font:16px/1.5 system-ui"># PR 22: Preserve state after failed notarization preparation
+
+## Requested endpoint
+
+Deliver a corrected public release and verify Homebrew delivery for the standard
+legacy callback migration fix. This continues [PR 21](pr-21-callback-release.md).
+The operator&#x27;s installed queue, phone settings, credentials, and callback are
+outside the installation scope.
+
+## Evidence and cause
+
+[Main build 63](https://github.com/Dunky13/agent-job-queue/actions/runs/39985921234)
+passed all checks at `9ced4ba8f30f6c8733deb3d92df362fbc8986fa3`.
+[Distribution run 39987932768](https://github.com/Dunky13/agent-job-queue/actions/runs/39987932768)
+accepted and stapled the payload and enclosing installer. Disk-image preparation
+then failed while revalidating an app ticket: Apple CloudKit lost the connection
+with `NSURLErrorDomain -1005`, and stapler returned Error 68.
+
+The failed-job retry stopped with `Newest stage checkpoint is missing`. The
+original action only retained its final checkpoint when the wait/staple step
+ran. Preparation had failed before submission, leaving the previous stage&#x27;s
+checkpoint. The restore guard correctly refused that older state because an
+entered stage without a current checkpoint cannot prove absence of newer work.
+
+## Repair and safety boundary
+
+Preparation now exposes a stable `prepare` outcome. The final immutable snapshot
+and upload run after any attempted preparation, including failure before
+submission. A skipped stage creates no new checkpoint. The final snapshot still
+runs after failed submission or waiting, retaining available intent and receipts.
+
+No failure is converted to success. Submission still requires all preceding
+steps to succeed; waiting still requires a durable receipt. Restore selection,
+missing-checkpoint rejection, exact build binding, signatures, credentials, and
+ambiguous-upload refusal are unchanged. Partial or invalid saved state can still
+fail verification, and interrupted runners can still require reconciliation.
+
+Build 63 remains unpublished. Its missing checkpoint is not invented, deleted,
+replaced, or bypassed. A fresh validated main build will carry both the callback
+fix and this persistence repair.
+
+## Verification and delivery
+
+The existing lifecycle regression was extended to require the preparation
+outcome and an unconditional final snapshot after any attempted preparation.
+It failed before the repair and passed afterward. Broader tooling tests cover
+stage receipts, exact signed-byte custody, missing checkpoints, uncertain
+uploads, and fail-closed recovery. Required hosted CI must pass on the exact PR
+head before merging.
+
+Verify the signed squash and matching DCO. Then separately establish main CI,
+Developer ID signing, Apple acceptance and stapling, both architecture acceptance
+jobs, public release assets, and exact Homebrew tap readback. Follow
+[Homebrew delivery](../homebrew-delivery.md) and
+[Apple signing and notarization](../apple-signing.md).
+
+This handoff has a complete standalone [HTML version](pr-22-notarization-checkpoint.html).
+</pre></body></html>
