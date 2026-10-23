@@ -1,6 +1,6 @@
 # Contributing
 
-Use Go 1.26.10+, Node.js 24+, macOS 15+, and Xcode command-line tools. Building the native apps and the Darwin resource sampler requires the macOS SDK. The distributed installer includes universal Apple Silicon and Intel binaries, so installed users need neither Xcode nor a Go toolchain. Python and uv are not used.
+Use Go 1.26.10+, Node.js 26.12.1+, macOS 15+, and Xcode command-line tools. Building the native apps and the Darwin resource sampler requires the macOS SDK. The distributed installer includes universal Apple Silicon and Intel binaries, so installed users need neither Xcode nor a Go toolchain. Python and uv are not used.
 
 ```sh
 brew install go actionlint shellcheck
