@@ -332,7 +332,10 @@ CI gate. The protected environment stays main-only without recurring reviewers.
 Publication creates a private draft, binds its entire candidate inventory in the
 draft notes, and uploads without overwriting assets. It verifies exact remote
 inventory, source/tag identity and downloaded bytes before exposure. GitHub
-release immutability must be enabled and readable immediately before publication. The same complete assets are checked again
+release immutability is enabled as repository policy. Published release metadata
+must confirm immutability, alongside the exact inventory and byte readback. The
+workflow uses its existing contents-write Actions token; no additional App or
+administration credential is required. The same complete assets are checked again
 after publication. An existing identical public release is verified read-only;
 a conflicting draft, tag or asset fails closed. Unfinished provider uploads are
 retained for explicit reconciliation. Homebrew delivery remains a separate

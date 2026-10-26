@@ -47,6 +47,15 @@ strict checks. Conditions and existing bypass actors were preserved. Repository
 release immutability changed from disabled to enabled. The `apple-signing`
 environment and its single `main` branch policy were read back unchanged.
 
+Hosted run `40359959686`, job `121702406855`, showed that an additional live
+repository-policy read would need Administration read privileges. That added
+check and App proposal exceeded the original handoff's draft-first, exact-byte
+publication requirement and were withdrawn. The temporary empty `release-policy`
+environment was removed after confirming it had no secrets or variables. No
+new credentials were provisioned. Existing publication and Homebrew credentials
+remain in use; GitHub immutability stays enabled and published-release metadata
+and bytes are verified.
+
 ## Qualification state
 
 The complete finite local validation passed on the pre-review implementation
@@ -57,10 +66,16 @@ regressions, universal installer build, private installation and mounted DMG
 verification. Focused recovery, receipt, publication and toolchain failure tests
 also pass. These local installer artifacts use development signatures.
 
+Repair batch 2039 failed while its shell sources were still being edited,
+including a transient `fy_state: command not found` diagnostic. Its failure is
+retained; final repair validation must run against frozen source.
+
 The first independent review reported five findings. Repairs bind retry
 classification to the current invocation and successful credential cleanup,
 reject malformed later polls, checkpoint export-time ticket failures, pace
-continuations and check live immutability before exposure. Final repair
+continuations. The extra Administration-read preflight was withdrawn under the
+accepted scope; exact-byte publication and published immutable metadata remain
+required. Final repair
 validation and independent re-check remain pending.
 
 The first hosted PR run, `40356788074`, passed universal packaging, commit policy,

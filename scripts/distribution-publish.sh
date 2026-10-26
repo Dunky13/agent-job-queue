@@ -204,10 +204,6 @@ jq -S 'sort_by(.id) | map({id,name,size,state})' "$temporary/remote" > "$tempora
 jq -S 'sort_by(.id) | map({id,name,size,state})' "$temporary/verified-inventory" > "$temporary/previous-inventory"
 cmp -s "$temporary/current-inventory" "$temporary/previous-inventory" || fail 'Release assets changed during verification.'
 if [[ $draft == true ]]; then
-  # Read live policy before changing visibility. An unreadable or disabled
-  # setting leaves this candidate private, even if uploads already completed.
-  api "$repository/immutable-releases" > "$temporary/immutability"
-  jq -e '.enabled == true' "$temporary/immutability" >/dev/null || fail 'Repository release immutability is disabled; candidate remains a draft.'
   api "$repository/releases/$release_id" --method PATCH -F draft=false -F prerelease=true -f make_latest=false > "$temporary/published"
 fi
 # The publication request can have succeeded despite a lost response. Fail now
