@@ -8,7 +8,7 @@ Original incident evidence and the build-58/build-94 comparison are recorded in 
 
 ## PR integration and release authorization
 
-The user subsequently authorized pushing this implementation, resolving conflicts, getting [PR 41](https://github.com/Dunky13/agent-job-queue/pull/41) green, merging it and completing the signed release. Integration preserves main commit `5ab7db8` and its approved-repair and unattended-release changes alongside explicit-only setup. Integrated validation is running through queue job 2161 and the PR's required Apple Silicon/Intel CI matrices. The completed local evidence below records the earlier implementation snapshot; it does not certify the integrated or published artifact.
+The user subsequently authorized pushing this implementation, resolving conflicts, getting [PR 41](https://github.com/Dunky13/agent-job-queue/pull/41) green, merging it and completing the signed release. Integration preserves main commit `5ab7db8` and its approved-repair and unattended-release changes alongside explicit-only setup. Queue job 2161 passed the complete integrated local validation pipeline, including Go race tests, native tests, universal packaging, actual private installed-runtime acceptance and DMG verification. Required Apple Silicon/Intel hosted CI and signed publication remain separate gates. The detailed local evidence below records the earlier implementation snapshot.
 
 Published build 118 uses source `5ab7db8`, which does not contain this PR's native Service Management adapter or bundle-owned service packaging. Its reported SentinelOne alert therefore does not qualify the changed implementation. The authoritative detection and a protected retest of the eventual signed candidate are still required to establish SentinelOne acceptance.
 
@@ -23,6 +23,16 @@ The published commit and failed witness are retained. Re-running the same SHA ca
 PR 42 run `40398515127`, Intel tooling job `121837837447`, reached the unchanged 12-minute package timeout after 720.078 seconds. The active stapling-retry parent had run for 89 seconds; its current subcase had run for one second. Other parallel tests were still queued. This was an aggregate workload failure, and `ci-required` correctly failed too. The failed job log remains the witness; no assertion failure or green result is inferred from it.
 
 The full tooling package now runs as two deterministic inventory shards on each architecture. Enumeration includes every top-level test, example and fuzz seed, rejects malformed, duplicate, partial or empty inventory, and assigns each executable name exactly once. Top-level selection keeps all subtests. Benchmarks remain excluded as in the prior command. Both shards retain race detection, two package/test workers, the 12-minute package timeout and the 20-minute job limit. The required aggregate job still requires the entire tooling matrix. Regression fixtures verify coverage, deterministic membership, exact flags, failure propagation and refusal before testing invalid input. No product code, release trust check or timeout is relaxed.
+
+Queue job 2162 passed the actual two-shard runner locally: 85 and 84 top-level tests, in 203.965 and 175.657 seconds respectively, with race detection and the original worker limits. Hosted results for both architectures remain required.
+
+### Packaged setup refusal recovery
+
+Universal-installer job `121857014460` in run `40403882465` passed packaging, signatures, Homebrew validation and packaged payload installation, then the app-bundle fixture hit the installer's safe kernel busy-lock refusal. This fixture performs a second installation while its real private resource controller is running. Its original one-attempt assumption differed from the explicit-refusal contract already exercised by the removal fixture.
+
+The package fixture now permits at most three attempts within its original single 30-second deadline. Only `EWOULDBLOCK` or `EAGAIN` with an absent prior pending marker, unchanged installation records and wrappers (including inode, mode and content), and an intact native-call history with no mutation can be retried. Any accepted mutation, retained pending state, uncertain witness, non-kernel error or cancellation fails immediately. Regression cases cover each refusal boundary and the attempt limit. Production locking and installation behavior are unchanged; the failed hosted witness is retained.
+
+Queue job 2163 passed lint, the focused refusal race tests, complete packaged installer acceptance and DMG verification with exit 0. The packaged payload and app-bundle tests passed in 9.09 and 6.62 seconds; the actual private outer-installer lifecycle passed under race in 67.459 seconds. The disk image detached successfully. These checks reuse the unchanged development artifact; native lifecycle calls remain injected, and fresh hosted CI is still required.
 
 Requirements carried into implementation:
 

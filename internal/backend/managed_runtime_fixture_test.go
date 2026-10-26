@@ -2,15 +2,107 @@ package backend
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 )
+
+type packagedSetupFile struct {
+	present bool
+	mode    os.FileMode
+	inode   uint64
+	digest  [32]byte
+}
+
+func packagedSetupWitness(install *installer) (map[string]packagedSetupFile, error) {
+	witness := map[string]packagedSetupFile{}
+	for _, filename := range []string{
+		filepath.Join(install.root, "installation.json"), filepath.Join(install.root, "build-info.json"),
+		filepath.Join(install.root, "install-in-progress.json"), filepath.Join(install.root, "publication-custody.json"),
+		filepath.Join(install.home, ".local/bin/agent-heavy"), filepath.Join(install.home, ".local/bin/agent-remote"),
+	} {
+		info, err := os.Lstat(filename)
+		if errors.Is(err, os.ErrNotExist) {
+			witness[filename] = packagedSetupFile{}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return nil, errors.New("unsupported private setup file identity")
+		}
+		raw, err := appservices.ReadFile(install.home, filename, 4*1024*1024, false)
+		if err != nil {
+			return nil, err
+		}
+		witness[filename] = packagedSetupFile{true, info.Mode(), stat.Ino, sha256.Sum256(raw)}
+	}
+	return witness, nil
+}
+
+// Only a kernel busy refusal with unchanged installation custody and no native
+// mutation can be retried. The caller's original deadline spans every attempt.
+func runPackagedSetup(ctx context.Context, fixture *installFixture, execute func(context.Context) error) (int, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return attempt, err
+		}
+		before, err := packagedSetupWitness(fixture.installer)
+		if err != nil {
+			return attempt, err
+		}
+		beforeCalls := make([][]string, len(fixture.calls))
+		for index, args := range fixture.calls {
+			beforeCalls[index] = slices.Clone(args)
+		}
+		calls := len(beforeCalls)
+		err = execute(ctx)
+		if err == nil || !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			return attempt, err
+		}
+		after, witnessError := packagedSetupWitness(fixture.installer)
+		pending := filepath.Join(fixture.installer.root, "install-in-progress.json")
+		if witnessError != nil || before[pending].present || !reflect.DeepEqual(before, after) {
+			return attempt, fmt.Errorf("busy setup changed or retained mutation custody; no retry: %w", errors.Join(err, witnessError))
+		}
+		if len(fixture.calls) < calls {
+			return attempt, fmt.Errorf("busy setup lost its action witness; no retry: %w", err)
+		}
+		for index, args := range beforeCalls {
+			if !slices.Equal(args, fixture.calls[index]) {
+				return attempt, fmt.Errorf("busy setup changed its action witness; no retry: %w", err)
+			}
+		}
+		for _, args := range fixture.calls[calls:] {
+			if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" ||
+				len(args) > 1 && args[1] == "--prepare-app-replacement" ||
+				len(args) > 1 && args[0] == "launchctl" && args[1] != "print" {
+				return attempt, fmt.Errorf("busy setup accepted a service mutation; no retry: %w", err)
+			}
+		}
+		if attempt == 2 {
+			return attempt, fmt.Errorf("packaged setup remained busy within its original attempt bounds: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return attempt, ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	panic("unreachable packaged setup attempts")
+}
 
 // Only native lifecycle and OS ownership readback are simulated. Readiness and
 // drain snapshots come from the actual packaged canonical helper and private DB.
