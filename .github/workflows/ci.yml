@@ -95,11 +95,12 @@ jobs:
         run: bash scripts/test-go-runtime.sh
 
   tooling-tests:
-    name: Tooling tests (${{ matrix.os }})
+    name: Tooling tests (${{ matrix.os }}, shard ${{ matrix.shard }}/2)
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15, macos-15-intel]
+        shard: [1, 2]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -110,8 +111,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Full Go tooling and installer regressions
-        run: go test -p 2 -parallel 2 -race -v ./internal/tooling -timeout 12m
+      - name: Complete tooling and installer regression shard
+        run: bash scripts/test-go-tooling.sh '${{ matrix.shard }}'
 
   native-tests:
     name: Native tests (${{ matrix.os }})

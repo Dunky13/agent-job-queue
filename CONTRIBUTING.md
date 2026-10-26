@@ -17,6 +17,8 @@ agent-heavy run --label "Agent Queue validation" -- bash scripts/validate.sh
 
 The batch checks source portability, Go formatting and vet, known reachable Go vulnerabilities, shell and workflow lint, Go race tests, standalone trusted tap tests, Linux compilation of CI tools, browser schema and interaction tests, native regressions, and the universal installer. Hosted CI runs separate required runtime, tooling/installer, and native test matrices on Apple Silicon and Intel Macs. Each keeps its 20-minute job budget; Go tests retain race detection, two package/test workers and the 12-minute test timeout. The runtime adapter dynamically enumerates the original Go scope and excludes only `internal/tooling`, which runs completely in its own matrix. Tooling emits per-test timings for timeout diagnosis. All matrices remain required by `ci-required`.
 
+The tooling matrix uses two deterministic shards on each architecture, invoked with `bash scripts/test-go-tooling.sh 1` and `bash scripts/test-go-tooling.sh 2`. Their complete discovered test, example and fuzz-seed inventory is partitioned exactly once; malformed or incomplete enumeration fails before testing. Every shard remains required, with the same race detection, worker limits and time budgets.
+
 For focused development, these commands use only this checkout and private fixtures:
 
 ```sh
