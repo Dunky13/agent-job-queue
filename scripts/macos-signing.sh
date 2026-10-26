@@ -249,8 +249,8 @@ macos_notarize() {
   }
 }
 
-# Validation reads Apple's current ticket. Retry only the observed CloudKit
-# connection-loss failure, never missing, invalid or revoked ticket responses.
+# Stapling and validation both fetch Apple's current ticket. Retry only the
+# observed CloudKit connection loss, never missing, invalid or revoked tickets.
 macos_ticket_connection_lost() {
   # Read only the outer UserInfo fields. Nested errors and quoted descriptions
   # cannot supply the failing URL for the qualifying outer NSError. Retain
@@ -321,29 +321,38 @@ macos_ticket_connection_lost() {
   ' "$1"
 }
 
-macos_validate_ticket() (
-  local output status attempt=1
+macos_ticket_operation() (
+  local operation=$1 target=$2 output status attempt=1 delay=5 max_attempts=6
   output=$(mktemp) || return
   trap 'rm -f "$output"' EXIT
   while :; do
-    if xcrun stapler validate "$1" > "$output" 2>&1; then
+    if xcrun stapler "$operation" "$target" > "$output" 2>&1; then
       cat "$output" || return
       return 0
     else
       status=$?
     fi
     cat "$output" || return
-    if [[ $status != 68 || $attempt -ge 3 ]] || ! macos_ticket_connection_lost "$output"; then
+    if [[ $status != 68 ]] || ! macos_ticket_connection_lost "$output"; then
       return "$status"
     fi
-    printf 'Apple ticket validation: CloudKit connection lost; retrying after %s seconds (attempt %s of 3).\n' "$((attempt * 2))" "$((attempt + 1))" >&2
-    sleep "$((attempt * 2))" || return
+    if [[ $attempt -ge $max_attempts ]]; then
+      printf 'Apple ticket %s: CloudKit connection lost; exhausted %s attempts.\n' "$operation" "$max_attempts" >&2
+      return "$status"
+    fi
+    printf 'Apple ticket %s: CloudKit connection lost; retrying after %s seconds (attempt %s of %s).\n' "$operation" "$delay" "$((attempt + 1))" "$max_attempts" >&2
+    sleep "$delay" || return
     attempt=$((attempt + 1))
+    delay=$((delay * 2))
   done
 )
 
+macos_validate_ticket() {
+  macos_ticket_operation validate "$1"
+}
+
 macos_staple() {
-  xcrun stapler staple "$1" || return
+  macos_ticket_operation staple "$1" || return
   macos_validate_ticket "$1"
 }
 
