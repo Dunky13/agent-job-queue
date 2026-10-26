@@ -33,11 +33,11 @@ This is a custom installer that copies another app and standalone helpers.
 Apple explicitly requires payload notarization before assembling such an
 installer. Our additional DMG distribution also receives its own ticket:
 
-1. Sign the two Go helpers in both the outer payload and the menu app's embedded setup payload, then sign the menu app. Submit the complete payload ZIP.
+1. Sign the two Go helpers in both the outer controller payload and the menu app's `Contents/MacOS`, then sign the menu app. Submit the complete payload ZIP. Managed service definitions remain in the app's `Contents/Library/LaunchAgents` and use `BundleProgram`.
 2. Require acceptance, fetch the log, then staple and validate the menu app.
 3. Sign the outer installer, submit its ZIP, require acceptance, and staple it.
 4. Recreate the distribution ZIP with the stapled installer inside it.
-5. Copy the stapled, self-contained menu app into a DMG with an Applications shortcut, sign the DMG, notarize it, and staple it. Retained older builds without an embedded setup payload keep their original installer DMG layout.
+5. Package the stapled explicit installer in the managed DMG, sign the DMG, notarize it, and staple it. Retained historical drag-to-Applications images keep their original layout and verification path.
 6. Generate final checksums and Homebrew metadata after all byte changes.
 
 Hosted Apple submissions use `Agent-Job-Queue-Payload-VERSION-build-N-SHA-universal.zip`,
@@ -56,7 +56,7 @@ first launch of the complete installed product remains a separate test.
 These requirements come from Apple's
 [custom notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
-The menu app carries its own source payload for first-launch setup after a Finder copy. Its helpers are signed before sealing the app; setup never modifies the installed bundle. The ZIP remains a custom installer for existing updater and Homebrew consumers. The DMG contains the same app, copied with its signature, ticket and quarantine preserved.
+The menu app carries support metadata and documents without duplicate helper binaries. Explicit setup can use its canonical bundled helpers; ordinary first launch only checks installation and approval state. Helpers are signed before sealing the app, and in-place setup never modifies the installed bundle. Both managed ZIP and DMG deliver the explicit installer, preserving signatures, tickets and quarantine. Homebrew delivers that installer and command links; runtime installation occurs explicitly outside its hook sandbox.
 
 The payload app is stapled before signing its parent because it lives under
 the installer's sealed resources. Production installation copies the app with

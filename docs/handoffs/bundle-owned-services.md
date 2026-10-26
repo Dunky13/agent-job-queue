@@ -6,6 +6,12 @@ The user authorized local implementation of explicit installation, read-only ord
 
 Original incident evidence and the build-58/build-94 comparison are recorded in the [SentinelOne investigation](sentinelone-detection-investigation.md).
 
+## PR integration and release authorization
+
+The user subsequently authorized pushing this implementation, resolving conflicts, getting [PR 41](https://github.com/Dunky13/agent-job-queue/pull/41) green, merging it and completing the signed release. Integration preserves main commit `5ab7db8` and its approved-repair and unattended-release changes alongside explicit-only setup. Integrated validation is running through queue job 2161 and the PR's required Apple Silicon/Intel CI matrices. The completed local evidence below records the earlier implementation snapshot; it does not certify the integrated or published artifact.
+
+Published build 118 uses source `5ab7db8`, which does not contain this PR's native Service Management adapter or bundle-owned service packaging. Its reported SentinelOne alert therefore does not qualify the changed implementation. The authoritative detection and a protected retest of the eventual signed candidate are still required to establish SentinelOne acceptance.
+
 Requirements carried into implementation:
 
 - Installation and upgrades perform setup explicitly. Opening an incomplete app shows instructions without rewriting files or automatically retrying recovery.
@@ -60,7 +66,7 @@ The private packaged acceptance test exposed a shutdown race after the review ro
 
 ## Validation and remaining qualification
 
-Local implementation and validation are complete. Both permitted review rounds have finished, and their findings are fixed and regression-tested. No commit, push, release, Apple submission, real service registration or affected-Mac repair was performed. Completed evidence:
+At the initial local handoff, implementation and validation were complete. Both permitted review rounds had finished, and their findings were fixed and regression-tested. No commit, push, release, Apple submission, real service registration or affected-Mac repair had been performed at that checkpoint. Subsequent PR/release work is described above. Completed evidence for that local snapshot:
 
 | Boundary | Evidence | Result |
 | --- | --- | --- |

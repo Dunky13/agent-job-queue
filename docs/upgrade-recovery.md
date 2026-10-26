@@ -4,7 +4,7 @@ Normal app launch checks installation and background-service authorization witho
 
 ## Approve repair once
 
-Choose **Repair and continue** to approve the verified repairs needed for startup in one step. Setup restores missing standard service files, runs verified cleanup for completed jobs, starts a verified stopped service, and disables phone access when migration requires it. Credentials and trusted certificates are preserved. Phone access remains off until enabled again in settings. Lost custom startup settings cannot be recovered from missing files.
+In explicit setup, choose **Repair and continue** to approve the verified repairs in one step. Setup restores missing standard service files, runs verified cleanup for completed jobs, starts a verified stopped service, and disables phone access when migration requires it. Ordinary startup cannot approve or run these repairs. Credentials and trusted certificates are preserved. Phone access remains off until enabled again in settings. Lost custom startup settings cannot be recovered from missing files.
 
 After approval, setup rechecks ownership before each operation, waits for active work, and continues through installation and readback automatically. **Stop waiting** cancels waiting and revokes that approval. An accepted repair is allowed to finish. A failed repair, repeated operation without progress, unknown ownership, custom configuration, or deliberately paused/stashed work stops the automatic flow for review. Approval never authorizes cancelling jobs, resuming held work, or replacing a custom callback.
 
