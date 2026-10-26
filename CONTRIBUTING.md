@@ -52,7 +52,7 @@ bash native/tests/run-menu-bar-ui-tests.sh build/menu-bar-verification.json
 
 The runner builds a private fixture app and sends AppKit events through the actual status button, menus, and window handlers. It records `skippedChecks` when macOS declines foreground activation. `--require-foreground` fails those unavailable checks. It cleans up its own fixture and preserves the installed app and clipboard.
 
-First-launch setup decisions, retries, and phone access recovery are included in the headless native suite. In a logged-in graphical session, verify the production setup window, failed setup, Disable phone access and continue action, ordinary Retry button, and transition to the simulated queue:
+First-launch setup decisions, retries, and guided upgrade recovery are included in the headless native suite. The read-only preflight lists blockers together and offers bounded waiting, reviewed job cancellation, verified cleanup and service startup, phone access disablement, and guided configuration repairs. See [guided upgrade recovery](docs/upgrade-recovery.md) for the action and controller contracts. In a logged-in graphical session, verify the production setup window, failed setup, Disable phone access and continue action, ordinary Retry button, and transition to the simulated queue:
 
 ```sh
 agent-heavy run --label "First-launch UI checks" -- bash native/tests/run-bootstrap-ui-tests.sh build/bootstrap-ui-verification

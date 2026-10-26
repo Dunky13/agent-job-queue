@@ -140,7 +140,7 @@ func (install *installer) commandEnvironment(args []string) []string {
 	environment := envMap()
 	environment["PATH"] = install.path
 	environment["HOMEBREW_NO_AUTO_UPDATE"] = "1"
-	if slices.Equal(args, []string{filepath.Join(install.payload, "source/bin/agent-remote"), "disable"}) {
+	if slices.Equal(args, []string{filepath.Join(install.payload, "source/bin/agent-remote"), "disable"}) || len(args) > 0 && args[0] == "pueue" {
 		// Recovery targets this installation, including when launched from a
 		// developer shell with private remote-controller fixture overrides.
 		for key := range environment {
@@ -193,8 +193,8 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 			return nil, fmt.Errorf("Installer command %s timed out", filepath.Base(args[0]))
 		}
 		var exited *exec.ExitError
-		if slices.Equal(args, []string{"launchctl", "print", install.domain() + "/io.went.agent-remote"}) && errors.As(err, &exited) &&
-			installRemoteServiceAbsent(output.Bytes(), exited.ExitCode()) {
+		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && strings.HasPrefix(args[2], install.domain()+"/") && errors.As(err, &exited) &&
+			installServiceAbsent(output.Bytes(), exited.ExitCode(), strings.TrimPrefix(args[2], install.domain()+"/")) {
 			return nil, errInstallServiceNotLoaded
 		}
 		return nil, fmt.Errorf("Installer command %s failed: %w", filepath.Base(args[0]), err)
@@ -203,7 +203,14 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 }
 
 func installRemoteServiceAbsent(output []byte, exitCode int) bool {
-	expected := fmt.Sprintf("Bad request.\nCould not find service \"io.went.agent-remote\" in domain for user gui: %d", os.Getuid())
+	return installServiceAbsent(output, exitCode, "io.went.agent-remote")
+}
+
+func installServiceAbsent(output []byte, exitCode int, label string) bool {
+	if !slices.Contains([]string{"io.went.agent-remote", "io.went.agent-heavy", "io.went.agent-resources"}, label) {
+		return false
+	}
+	expected := fmt.Sprintf("Bad request.\nCould not find service \"%s\" in domain for user gui: %d", label, os.Getuid())
 	return exitCode == 113 && strings.TrimSpace(string(output)) == expected
 }
 
@@ -606,6 +613,10 @@ func installConfig(filename string) (*yaml.Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	return installDecodeConfig(raw)
+}
+
+func installDecodeConfig(raw []byte) (*yaml.Node, error) {
 	var node yaml.Node
 	decoder := yaml.NewDecoder(bytes.NewReader(raw))
 	if err := decoder.Decode(&node); err != nil {
@@ -1782,6 +1793,9 @@ func (install *installer) execute(ctx context.Context) error {
 	if err := install.validateServices(); err != nil {
 		return err
 	}
+	if err := install.validateLoadedServices(ctx); err != nil {
+		return err
+	}
 	slot := install.serviceSlot
 	migration, err := install.pythonMigration(ctx, node)
 	if errors.Is(err, errInstallLegacyPhoneAccess) && install.disablePhoneAccess {
@@ -1841,6 +1855,11 @@ func (install *installer) execute(ctx context.Context) error {
 	if !remoteWasEnabled {
 		remoteNeedsCleanup, err = install.disabledRemoteCleanup(ctx)
 		if err != nil {
+			return err
+		}
+	}
+	if remoteWasEnabled || remoteNeedsCleanup {
+		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
 			return err
 		}
 	}
@@ -1936,6 +1955,9 @@ func (install *installer) execute(ctx context.Context) error {
 		}
 	}
 	if remoteWasEnabled {
+		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
+			return err
+		}
 		// The new remote executable reconciles recorded process ownership, stops
 		// its old API/gateway/supervisor, and restores enabled access with the
 		// existing credentials and private CA. Never leave an external gateway
@@ -1944,6 +1966,9 @@ func (install *installer) execute(ctx context.Context) error {
 			return fmt.Errorf("Remote access migration did not finish; retry this installer to preserve enabled access: %w", err)
 		}
 	} else if remoteNeedsCleanup {
+		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
+			return err
+		}
 		if _, err := install.run(ctx, filepath.Join(install.root, "bin/agent-remote"), "migrate"); err != nil {
 			return fmt.Errorf("Disabled remote service cleanup did not finish; retry this installer: %w", err)
 		}
@@ -1972,11 +1997,14 @@ func (install *installer) execute(ctx context.Context) error {
 }
 
 func InstallMain(args []string) int {
-	disablePhoneAccess := false
-	if len(args) == 3 && args[2] == "--disable-phone-access" {
-		disablePhoneAccess = true
-		args = args[:2]
+	options, optionErr := installParseOptions(args)
+	if optionErr != nil {
+		fmt.Fprintln(os.Stderr, optionErr)
+		return 2
 	}
+	args = options.target
+	disablePhoneAccess := false
+	disablePhoneAccess = options.disablePhoneAccess
 	if len(args) != 2 || (args[0] != "--payload" && args[0] != "--app-bundle") || !filepath.IsAbs(args[1]) {
 		fmt.Fprintln(os.Stderr, "Usage: agent-heavy install --payload DIRECTORY | --app-bundle ABSOLUTE_APP_PATH [--disable-phone-access]")
 		return 2
@@ -2004,6 +2032,19 @@ func InstallMain(args []string) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+	if options.preflight || options.recovery != "" {
+		if options.recovery != "" {
+			if err := install.recover(ctx, options.recovery, options.jobID, options.revision); err != nil {
+				fmt.Fprintf(os.Stderr, "Agent Queue recovery: %v\n", err)
+				return 1
+			}
+		}
+		if err := installWritePreflight(install.preflight(ctx)); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	}
 	if err := install.execute(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Agent Queue installer: %v\n", err)
 		if errors.Is(err, errInstallLegacyPhoneAccess) {

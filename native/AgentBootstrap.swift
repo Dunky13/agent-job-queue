@@ -321,28 +321,117 @@ enum QueueBootstrapDecision: Equatable, Sendable {
     case install(QueueBootstrapRequest, String)
 }
 
+struct QueueBootstrapAction: Codable, Equatable, Sendable, Identifiable {
+    let id: String
+    let title: String
+    let destructive: Bool
+    static let executable = Set(["cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback"])
+    static let navigation = Set(["wait", "review-jobs", "review-configuration", "reveal", "download-release", "move-app"])
+    var needsConfirmation: Bool { destructive || ["cancel-job", "reset-callback"].contains(id) }
+}
+
+struct QueueBootstrapJob: Codable, Equatable, Sendable, Identifiable {
+    let id: Int
+    let label: String
+    let status: String
+}
+
+struct QueueBootstrapIssue: Codable, Equatable, Sendable, Identifiable {
+    let id: String
+    let title: String
+    let detail: String
+    var path: String? = nil
+    let actions: [QueueBootstrapAction]
+    var jobs: [QueueBootstrapJob]? = nil
+}
+
+struct QueueBootstrapReport: Codable, Equatable, Sendable {
+    let schemaVersion: Int
+    let issues: [QueueBootstrapIssue]
+    var revision: String? = nil
+
+    static let clear = Self(schemaVersion: 1, issues: [])
+
+    static func decode(_ data: Data) throws -> Self {
+        guard data.count <= 32_768 else { throw ClientError.message("Setup preflight exceeded its response limit.") }
+        let report = try JSONDecoder().decode(Self.self, from: data)
+        guard report.schemaVersion == 1, report.issues.count <= 24,
+              Set(report.issues.map(\.id)).count == report.issues.count,
+              report.revision == nil || report.revision?.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
+            throw ClientError.message("Setup preflight returned an unsupported or invalid report.")
+        }
+        for issue in report.issues {
+            guard issue.id.range(of: "^[a-z][a-z0-9-]{0,79}$", options: .regularExpression) != nil,
+                  Self.validText(issue.title, limit: 240), Self.validText(issue.detail, limit: 8_000, multiline: true),
+                  issue.actions.count <= 12, Set(issue.actions.map(\.id)).count == issue.actions.count,
+                  (issue.jobs?.count ?? 0) <= 25 else {
+                throw ClientError.message("Setup preflight returned an invalid issue.")
+            }
+            if let path = issue.path {
+                guard path.hasPrefix("/"), Self.validText(path, limit: Int(PATH_MAX)),
+                      !path.split(separator: "/").contains(".."), !path.split(separator: "/").contains(".") else {
+                    throw ClientError.message("Setup preflight returned an invalid path.")
+                }
+            }
+            for action in issue.actions {
+                guard QueueBootstrapAction.executable.union(QueueBootstrapAction.navigation).contains(action.id),
+                      Self.validText(action.title, limit: 160) else {
+                    throw ClientError.message("Setup preflight returned an unsupported action.")
+                }
+            }
+            if let jobs = issue.jobs {
+                guard Set(jobs.map(\.id)).count == jobs.count,
+                      jobs.allSatisfy({ $0.id >= 0 && Self.validText($0.label, limit: 512) && Self.validText($0.status, limit: 80) }) else {
+                    throw ClientError.message("Setup preflight returned invalid jobs.")
+                }
+            }
+        }
+        return report
+    }
+
+    private static func validText(_ value: String, limit: Int, multiline: Bool = false) -> Bool {
+        !value.isEmpty && value.utf8.count <= limit && value.unicodeScalars.allSatisfy {
+            !CharacterSet.controlCharacters.contains($0) || (multiline && ($0 == "\n" || $0 == "\t"))
+        }
+    }
+}
+
 @MainActor
 final class QueueBootstrapModel: ObservableObject {
     typealias Executor = @Sendable (QueueBootstrapRequest, @escaping @Sendable (Data) -> Void) async throws -> Data
-    enum Phase { case idle, checking, installing, failed, complete }
+    enum Phase { case idle, checking, reviewing, waiting, recovering, installing, failed, complete }
     @Published private(set) var phase = Phase.idle
     @Published private(set) var message = "Checking setup…"
     @Published private(set) var output = ""
+    @Published private(set) var issues: [QueueBootstrapIssue] = []
+    @Published private(set) var reviewedIssueID: String?
     @Published private(set) var canDisablePhoneAccess = false
     private static let phoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
-    var isRunning: Bool { phase == .checking || phase == .installing }
+    var isRunning: Bool { [.checking, .waiting, .recovering, .installing].contains(phase) }
+    var canStopWaiting: Bool { phase == .waiting || phase == .checking }
     var onSetupRequired: (() -> Void)?
+    private let environment: QueueBootstrapEnvironment
     private let inspect: @Sendable () throws -> QueueBootstrapDecision
     private let execute: Executor
     private let completed: @MainActor () -> Void
+    private let waitInterval: Duration
+    private let waitLimit: Int
     private var attempt = 0
+    private var operation: Task<Void, Never>?
+    private var request: QueueBootstrapRequest?
+    private var revision: String?
+    private var legacyPhoneAccess = false
 
     init(environment: QueueBootstrapEnvironment,
          execute: @escaping Executor = QueueBootstrapModel.runInstaller,
+         waitInterval: Duration = .seconds(2), waitLimit: Int = 60,
          completed: @escaping @MainActor () -> Void) {
+        self.environment = environment
         inspect = { try environment.inspect() }
         self.execute = execute
         self.completed = completed
+        self.waitInterval = waitInterval
+        self.waitLimit = max(1, min(waitLimit, 300))
     }
 
     nonisolated static func runInstaller(_ request: QueueBootstrapRequest,
@@ -353,80 +442,349 @@ final class QueueBootstrapModel: ObservableObject {
 
     @discardableResult func start(disablePhoneAccess: Bool = false) -> Task<Void, Never>? {
         guard !isRunning, phase != .complete else { return nil }
+        if disablePhoneAccess && !legacyPhoneAccess {
+            guard let issue = issues.first(where: { $0.actions.contains(where: { $0.id == "disable-phone-access" }) }) else { return nil }
+            return perform(actionID: "disable-phone-access", issueID: issue.id, confirmed: true)
+        }
         guard !disablePhoneAccess || canDisablePhoneAccess else { return nil }
-        canDisablePhoneAccess = false
-        phase = .checking
-        message = "Checking setup…"
-        output = ""
-        attempt += 1
-        let currentAttempt = attempt
-        return Task { [self] in
+        let current = begin(.checking, message: "Checking installation requirements…")
+        issues = []
+        request = nil
+        let task = Task { [self] in
             do {
-                let decision = try await Task.detached(priority: .utility, operation: inspect).value
+                let decision = try await inspectDecision(current)
                 if case let .install(request, reason) = decision {
-                    let request = QueueBootstrapRequest(executable: request.executable,
-                        arguments: request.arguments + (disablePhoneAccess ? ["--disable-phone-access"] : []))
-                    message = disablePhoneAccess ? "Disabling phone access and continuing setup…" : reason
-                    phase = .installing
+                    self.request = request
                     onSetupRequired?()
-                    let result = try await execute(request) { [weak self] data in
-                        Task { @MainActor [weak self] in
-                            guard let self, self.attempt == currentAttempt, self.phase == .installing else { return }
-                            self.output = String(decoding: data.suffix(8_000), as: UTF8.self)
-                        }
+                    if disablePhoneAccess {
+                        legacyPhoneAccess = false
+                        try await install(QueueBootstrapRequest(executable: request.executable,
+                            arguments: request.arguments + ["--disable-phone-access"]), reason: reason, current: current)
+                    } else if try await preflight(request, current: current) {
+                        try await install(request, reason: reason, current: current)
                     }
-                    output = String(decoding: result.suffix(8_000), as: UTF8.self)
-                    let verified = try await Task.detached(priority: .utility, operation: inspect).value
-                    guard verified == .ready else {
-                        throw ClientError.message("Setup exited before the installation was complete. Review the output and retry.")
+                } else {
+                    finish(current)
+                }
+            } catch { await fail(error, current: current) }
+        }
+        operation = task
+        return task
+    }
+
+    @discardableResult func perform(actionID: String, issueID: String, jobID: Int? = nil, confirmed: Bool = false) -> Task<Void, Never>? {
+        guard !isRunning, phase != .complete, let issue = issues.first(where: { $0.id == issueID }),
+              let action = issue.actions.first(where: { $0.id == actionID }), QueueBootstrapAction.executable.contains(actionID),
+              !action.needsConfirmation || confirmed else { return nil }
+        let needsJob = actionID == "cancel-job" || actionID == "cleanup-job"
+        guard !needsJob || (jobID != nil && issue.jobs?.contains(where: { $0.id == jobID }) == true),
+              needsJob || jobID == nil else { return nil }
+        let approvedRevision = revision
+        if actionID == "reset-callback" && (reviewedIssueID != issueID || approvedRevision == nil) { return nil }
+        let current = begin(.recovering, message: action.title + "…")
+        let task = Task { [self] in
+            do {
+                let decision = try await inspectDecision(current)
+                guard case let .install(request, reason) = decision else { finish(current); return }
+                self.request = request
+                var arguments = request.arguments + ["--recover", actionID]
+                if let jobID { arguments += ["--job-id", String(jobID)] }
+                if actionID == "reset-callback", let approvedRevision { arguments += ["--expected-revision", approvedRevision] }
+                let data = try await execute(.init(executable: request.executable, arguments: arguments)) { _ in }
+                _ = try QueueBootstrapReport.decode(data)
+                guard attempt == current else { return }
+                if try await preflight(request, current: current) {
+                    try await install(request, reason: reason, current: current)
+                }
+            } catch { await fail(error, current: current) }
+        }
+        operation = task
+        return task
+    }
+
+    @discardableResult func waitAndContinue() -> Task<Void, Never>? {
+        guard !isRunning, phase != .complete, issues.contains(where: { $0.actions.contains(where: { $0.id == "wait" }) }) else { return nil }
+        let current = begin(.waiting, message: "Waiting for the installation requirements to clear…")
+        let task = Task { [self] in
+            do {
+                for index in 0..<waitLimit {
+                    if index > 0 { try await Task.sleep(for: waitInterval) }
+                    let decision = try await inspectDecision(current)
+                    guard case let .install(request, reason) = decision else { finish(current); return }
+                    self.request = request
+                    if try await preflight(request, current: current, waiting: true) {
+                        try await install(request, reason: reason, current: current)
+                        return
+                    }
+                    guard issues.allSatisfy({ $0.actions.contains(where: { $0.id == "wait" }) }) else {
+                        phase = .reviewing
+                        message = "Some requirements need your attention before setup can continue."
+                        return
                     }
                 }
-                phase = .complete
-                completed()
-            } catch {
-                phase = .failed
-                let lines = error.localizedDescription.components(separatedBy: .newlines)
-                canDisablePhoneAccess = lines.contains(Self.phoneAccessRecovery)
-                message = canDisablePhoneAccess ? "Phone access must be disabled to continue setup." : "Agent Queue setup could not finish."
-                output = String(lines.filter { $0 != Self.phoneAccessRecovery }.joined(separator: "\n").suffix(8_000))
-                onSetupRequired?()
+                guard attempt == current else { return }
+                phase = .reviewing
+                message = "Setup is still waiting. Review the requirements or wait again."
+            } catch { await fail(error, current: current) }
+        }
+        operation = task
+        return task
+    }
+
+    func cancelWaiting() {
+        guard canStopWaiting else { return }
+        attempt += 1
+        operation?.cancel()
+        operation = nil
+        phase = issues.isEmpty ? .failed : .reviewing
+        message = "Setup check stopped. You can continue when you are ready."
+    }
+
+    func review(_ issueID: String) {
+        guard !isRunning, issues.contains(where: { $0.id == issueID }) else { return }
+        reviewedIssueID = issueID
+    }
+
+    func canPerform(_ action: QueueBootstrapAction, issue: QueueBootstrapIssue) -> Bool {
+        !isRunning && (action.id != "reset-callback" || (reviewedIssueID == issue.id && revision != nil))
+    }
+
+    func reveal(_ issue: QueueBootstrapIssue) {
+        guard !isRunning, issues.contains(issue), let path = issue.path else { return }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        let permitted = url.path == environment.home.path || url.path.hasPrefix(environment.home.path + "/") ||
+            url.path == environment.app.path || url.path.hasPrefix(environment.app.path + "/")
+        guard permitted else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func showApplications() {
+        NSWorkspace.shared.open(environment.systemApplications)
+    }
+
+    func downloadRelease() {
+        if let url = URL(string: "https://github.com/Dunky13/agent-job-queue/releases") { NSWorkspace.shared.open(url) }
+    }
+
+    private func begin(_ next: Phase, message: String) -> Int {
+        attempt += 1
+        phase = next
+        self.message = message
+        output = ""
+        reviewedIssueID = nil
+        canDisablePhoneAccess = false
+        return attempt
+    }
+
+    private func inspectDecision(_ current: Int) async throws -> QueueBootstrapDecision {
+        let result = try await Task.detached(priority: .utility, operation: inspect).value
+        guard attempt == current else { throw CancellationError() }
+        if phase == .checking || phase == .waiting { try Task.checkCancellation() }
+        return result
+    }
+
+    private func preflight(_ request: QueueBootstrapRequest, current: Int, waiting: Bool = false) async throws -> Bool {
+        let data = try await execute(.init(executable: request.executable,
+            arguments: request.arguments + ["--preflight", "--json"])) { _ in }
+        guard attempt == current else { throw CancellationError() }
+        try Task.checkCancellation()
+        let report = try QueueBootstrapReport.decode(data)
+        issues = report.issues
+        revision = report.revision
+        canDisablePhoneAccess = issues.contains(where: { $0.actions.contains(where: { $0.id == "disable-phone-access" }) })
+        if !issues.isEmpty {
+            if !waiting { phase = .reviewing }
+            message = waiting ? "Waiting for the listed requirements to clear…" : "Review these requirements before continuing."
+            return false
+        }
+        return true
+    }
+
+    private func install(_ request: QueueBootstrapRequest, reason: String, current: Int) async throws {
+        guard attempt == current else { throw CancellationError() }
+        phase = .installing
+        message = reason
+        canDisablePhoneAccess = false
+        let result = try await execute(request) { [weak self] data in
+            Task { @MainActor [weak self] in
+                guard let self, self.attempt == current, self.phase == .installing else { return }
+                self.output = String(decoding: data.suffix(8_000), as: UTF8.self)
             }
         }
+        guard attempt == current else { return }
+        output = String(decoding: result.suffix(8_000), as: UTF8.self)
+        let verified = try await Task.detached(priority: .utility, operation: inspect).value
+        guard attempt == current else { return }
+        guard verified == .ready else { throw ClientError.message("Setup exited before the installation was complete. Review the output and retry.") }
+        finish(current)
     }
+
+    private func finish(_ current: Int) {
+        guard attempt == current, phase != .complete else { return }
+        phase = .complete
+        issues = []
+        canDisablePhoneAccess = false
+        completed()
+    }
+
+    private func fail(_ error: Error, current: Int) async {
+        guard attempt == current else { return }
+        let wasMutation = phase == .installing || phase == .recovering
+        let lines = error.localizedDescription.components(separatedBy: .newlines)
+        legacyPhoneAccess = lines.contains(Self.phoneAccessRecovery)
+        if wasMutation && !legacyPhoneAccess && !Task.isCancelled, let request {
+            issues = []
+            revision = nil
+            do {
+                let data = try await execute(.init(executable: request.executable,
+                    arguments: request.arguments + ["--preflight", "--json"])) { _ in }
+                guard attempt == current else { return }
+                try Task.checkCancellation()
+                let report = try QueueBootstrapReport.decode(data)
+                issues = report.issues
+                revision = report.revision
+            } catch {
+                guard attempt == current else { return }
+            }
+        }
+        guard attempt == current else { return }
+        phase = .failed
+        canDisablePhoneAccess = legacyPhoneAccess || issues.contains(where: { $0.actions.contains(where: { $0.id == "disable-phone-access" }) })
+        message = legacyPhoneAccess ? "Phone access must be disabled to continue setup." : "Agent Queue setup could not finish."
+        output = String(lines.filter { $0 != Self.phoneAccessRecovery }.joined(separator: "\n").suffix(8_000))
+        if !legacyPhoneAccess && request == nil {
+            if output.contains("Move Agent Queue to Applications") {
+                issues = [.init(id: "app-location", title: "Move Agent Queue to Applications", detail: "Quit this copy, copy Agent Queue.app into Applications using Finder, then open that copy. Existing apps will not be replaced automatically.",
+                    path: environment.app.path, actions: [.init(id: "move-app", title: "Open Applications", destructive: false)])]
+            } else if output.contains("payload") || output.contains("package metadata") {
+                issues = [.init(id: "payload-invalid", title: "Download a complete copy", detail: "Use the official release download, move the app to Applications, and open that copy.",
+                    actions: [.init(id: "download-release", title: "Download the correct release", destructive: false)])]
+            } else {
+                issues = [.init(id: "setup-path", title: "Review the setup diagnostic", detail: output,
+                    path: environment.home.path, actions: [.init(id: "reveal", title: "Show in Finder", destructive: false)])]
+            }
+        }
+        onSetupRequired?()
+    }
+}
+
+private struct QueueBootstrapPendingAction: Identifiable {
+    let issue: QueueBootstrapIssue
+    let action: QueueBootstrapAction
+    let jobID: Int?
+    var id: String { issue.id + ":" + action.id + ":" + String(jobID ?? -1) }
 }
 
 struct QueueBootstrapView: View {
     @ObservedObject var model: QueueBootstrapModel
+    @State private var pending: QueueBootstrapPendingAction?
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Set up Agent Queue", systemImage: "square.stack.3d.up").font(.title2.bold())
-            Text("Setup is automatic for your macOS account. Manage optional phone access in settings.")
+            Text("Setup is automatic for your macOS account. Review any requirements below before continuing.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {
                 if model.isRunning { ProgressView().controlSize(.small) }
                 Text(model.message).font(.headline)
             }
-            if model.canDisablePhoneAccess {
+            if model.canDisablePhoneAccess && model.issues.isEmpty {
                 Text("Your credentials and configuration will be preserved. You can enable phone access again in settings after setup.")
                     .font(.callout).foregroundStyle(.secondary)
             }
             ScrollView {
-                Text(model.output.isEmpty ? "Installing the queue backend and background services…" : model.output)
-                    .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                VStack(alignment: .leading, spacing: 18) {
+                    ForEach(model.issues) { issue in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(issue.title).font(.headline)
+                            Text(issue.detail).font(.callout).textSelection(.enabled)
+                            if let path = issue.path { Text(path).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled) }
+                            if let jobs = issue.jobs {
+                                ForEach(jobs) { job in
+                                    HStack(alignment: .top) {
+                                        VStack(alignment: .leading) {
+                                            Text("Job \(job.id): \(job.label)")
+                                            Text(job.status).font(.caption).foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        ForEach(issue.actions.filter { ["cancel-job", "cleanup-job"].contains($0.id) }) { action in
+                                            actionButton(action, issue: issue, jobID: job.id)
+                                        }
+                                    }
+                                }
+                            }
+                            ViewThatFits(in: .horizontal) {
+                                HStack {
+                                    ForEach(issue.actions.filter { !["cancel-job", "cleanup-job"].contains($0.id) }) { action in
+                                        actionButton(action, issue: issue)
+                                    }
+                                }.fixedSize(horizontal: true, vertical: false)
+                                VStack(alignment: .leading, spacing: 8) {
+                                    ForEach(issue.actions.filter { !["cancel-job", "cleanup-job"].contains($0.id) }) { action in
+                                        actionButton(action, issue: issue)
+                                    }
+                                }
+                            }
+                            if model.reviewedIssueID == issue.id && issue.actions.contains(where: { $0.id == "reset-callback" }) {
+                                Text("Review the current file before applying a change. Replacing the callback removes its custom behavior; setup saves the original before writing the standard cleanup callback.")
+                                    .font(.callout).foregroundStyle(.secondary)
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if !model.output.isEmpty || model.issues.isEmpty {
+                        Text(model.output.isEmpty ? "Checking the installation and background services…" : model.output)
+                            .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }.padding(12)
             }.background(.quaternary.opacity(0.35)).clipShape(RoundedRectangle(cornerRadius: 8))
             HStack {
+                if model.canStopWaiting { Button("Stop waiting") { model.cancelWaiting() } }
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }.disabled(model.isRunning)
-                if model.phase == .failed {
-                    if model.canDisablePhoneAccess {
+                if !model.isRunning && model.phase != .complete {
+                    if model.canDisablePhoneAccess && model.issues.isEmpty {
                         Button("Disable phone access and continue") { model.start(disablePhoneAccess: true) }
                             .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                     } else {
-                        Button("Retry") { model.start() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                        Button(model.issues.isEmpty ? "Retry" : "Check again") { model.start() }
+                            .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                     }
                 }
             }
         }.padding(24).frame(minWidth: 560, minHeight: 410)
+        .alert(item: $pending) { selected in
+            Alert(title: Text(selected.action.title),
+                  message: Text(confirmation(selected)),
+                  primaryButton: .destructive(Text(selected.action.title)) {
+                    model.perform(actionID: selected.action.id, issueID: selected.issue.id, jobID: selected.jobID, confirmed: true)
+                  }, secondaryButton: .cancel())
+        }
+    }
+
+    private func actionButton(_ action: QueueBootstrapAction, issue: QueueBootstrapIssue, jobID: Int? = nil) -> some View {
+        Button(action.title) {
+            switch action.id {
+            case "wait": model.waitAndContinue()
+            case "review-jobs": model.review(issue.id)
+            case "review-configuration":
+                model.review(issue.id)
+                model.reveal(issue)
+            case "reveal": model.reveal(issue)
+            case "move-app": model.showApplications()
+            case "download-release": model.downloadRelease()
+            default:
+                if action.needsConfirmation { pending = .init(issue: issue, action: action, jobID: jobID) }
+                else { model.perform(actionID: action.id, issueID: issue.id, jobID: jobID) }
+            }
+        }.disabled(!model.canPerform(action, issue: issue))
+    }
+
+    private func confirmation(_ selected: QueueBootstrapPendingAction) -> String {
+        switch selected.action.id {
+        case "cancel-job": return "Cancel job \(selected.jobID.map(String.init) ?? "")? Running work will be stopped and cannot be restored by setup."
+        case "reset-callback": return "Back up and replace the current callback with Agent Queue's standard cleanup callback? Its custom behavior will no longer run. The configuration revision will be checked again before changing it."
+        case "disable-phone-access": return "Disable phone access and continue setup? Credentials, configuration, and trusted certificates will be preserved. You can enable access again after setup."
+        default: return selected.issue.detail
+        }
     }
 }

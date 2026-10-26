@@ -189,7 +189,8 @@ enum QueueClient {
         // keep their original response/deadline and are never retried or rolled back.
         let discardable = input == nil && (arguments.first == "status" ||
             (controller == .heavy && arguments.first == "profiles" &&
-                ["list", "show"].contains(arguments.dropFirst().first ?? "")))
+                ["list", "show"].contains(arguments.dropFirst().first ?? "")) ||
+            (controller == .heavy && isSetupPreflight(arguments)))
         let cancellation = discardable ? QueueReadCancellation() : nil
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -202,6 +203,15 @@ enum QueueClient {
         } onCancel: {
             cancellation?.cancel()
         }
+    }
+
+    private static func isSetupPreflight(_ arguments: [String]) -> Bool {
+        // Only the complete read-only form is discardable. Additional recovery
+        // options can mutate state and must retain their accepted response.
+        arguments.count == 5 && arguments[0] == "install" &&
+            ["--app-bundle", "--payload"].contains(arguments[1]) &&
+            arguments[2].hasPrefix("/") && !arguments[2].contains("\0") &&
+            Array(arguments.suffix(2)) == ["--preflight", "--json"]
     }
 
     static func timeout(for arguments: [String], controller: Controller = .heavy, budget: Budget = .normal) -> TimeInterval {

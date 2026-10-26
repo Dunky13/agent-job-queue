@@ -334,7 +334,9 @@ struct BootstrapTests {
         await unmarkedFailure.start()?.value
         try check(!unmarkedFailure.canDisablePhoneAccess,
             "Similar prose and embedded marker text cannot enable the recovery action")
-        let incomplete = QueueBootstrapModel(environment: noMutation.environment, execute: { _, _ in Data() }) {
+        let incomplete = QueueBootstrapModel(environment: noMutation.environment, execute: { request, _ in
+            request.arguments.contains("--preflight") ? try JSONEncoder().encode(QueueBootstrapReport.clear) : Data()
+        }) {
             completions += 1
         }
         await incomplete.start()?.value
@@ -346,6 +348,179 @@ struct BootstrapTests {
         await longFailure.start()?.value
         try check(longFailure.output.count <= 8_000 && longFailure.output.hasSuffix("actionable tail"),
             "Failure output stays bounded and retains the actionable tail")
+
+        let jobIssue = QueueBootstrapIssue(id: "legacy-jobs", title: "Existing jobs need attention", detail: "Finish or explicitly cancel these jobs before migrating.",
+            actions: [.init(id: "review-jobs", title: "Review jobs", destructive: false),
+                      .init(id: "cancel-job", title: "Cancel job", destructive: false),
+                      .init(id: "wait", title: "Wait and continue", destructive: false)],
+            jobs: [.init(id: 7, label: "Private fixture job", status: "Paused")])
+        let phoneIssue = QueueBootstrapIssue(id: "legacy-phone-access", title: "Disable phone access", detail: "Credentials and certificates will be preserved.",
+            actions: [.init(id: "disable-phone-access", title: "Disable phone access and continue", destructive: false)])
+        let multiple = QueueBootstrapReport(schemaVersion: 1, issues: [jobIssue, phoneIssue])
+        let summaryFixture = try fixture()
+        let summaryExecutor = BootstrapPreflightExecutorFixture(summaryFixture, report: multiple,
+            afterRecovery: .init(schemaVersion: 1, issues: [phoneIssue]))
+        var summaryCompletions = 0
+        let summary = QueueBootstrapModel(environment: summaryFixture.environment, execute: { request, output in
+            try await summaryExecutor.execute(request, output: output)
+        }) { summaryCompletions += 1 }
+        await summary.start()?.value
+        try check(summary.phase == .reviewing && summary.issues.count == 2 && summaryCompletions == 0 && !summary.isRunning,
+            "Preflight lists independent blockers together before any installation")
+        try check(summary.perform(actionID: "cancel-job", issueID: jobIssue.id, jobID: 7) == nil &&
+            summary.perform(actionID: "cancel-job", issueID: jobIssue.id, jobID: 8, confirmed: true) == nil &&
+            summary.perform(actionID: "unknown", issueID: jobIssue.id, confirmed: true) == nil,
+            "Local action allowlist, listed job identity and mandatory cancellation consent cannot be bypassed by report flags")
+        await summary.perform(actionID: "cancel-job", issueID: jobIssue.id, jobID: 7, confirmed: true)?.value
+        let summaryRequests = await summaryExecutor.requests
+        let summaryInstalls = await summaryExecutor.installations
+        try check(summary.phase == .reviewing && summary.issues == [phoneIssue] && summaryInstalls == 0 &&
+            summaryRequests.contains(where: { $0.arguments.suffix(4) == ["--recover", "cancel-job", "--job-id", "7"] }),
+            "Explicit job cancellation is followed by an independent preflight and leaves remaining blockers visible")
+        await summary.perform(actionID: "disable-phone-access", issueID: phoneIssue.id)?.value
+        // This fixture deliberately retains its phone blocker, proving actions do
+        // not infer permission to install from process success alone.
+        try check(summary.phase == .reviewing && summaryCompletions == 0,
+            "Successful recovery with a remaining blocker never starts the queue")
+
+        let staleFixture = try fixture()
+        let staleExecutor = BootstrapPreflightExecutorFixture(staleFixture, report: .init(schemaVersion: 1, issues: [phoneIssue]))
+        await staleExecutor.setStaleRecovery()
+        let stale = QueueBootstrapModel(environment: staleFixture.environment, execute: { request, output in
+            try await staleExecutor.execute(request, output: output)
+        }) { summaryCompletions += 1 }
+        await stale.start()?.value
+        await stale.perform(actionID: "disable-phone-access", issueID: phoneIssue.id)?.value
+        let staleInstalls = await staleExecutor.installations
+        try check(stale.phase == .reviewing && stale.issues == [phoneIssue] && staleInstalls == 0,
+            "An empty recovery response cannot bypass a fresh preflight that still reports a blocker")
+
+        let configIssue = QueueBootstrapIssue(id: "custom-callback", title: "Review custom callback", detail: "Back up the original and replace its custom behavior with the standard cleanup callback.",
+            actions: [.init(id: "review-configuration", title: "Review configuration", destructive: false),
+                      .init(id: "reset-callback", title: "Back up and replace callback", destructive: false)])
+        let configFixture = try fixture()
+        let revision = String(repeating: "a", count: 64)
+        let configExecutor = BootstrapPreflightExecutorFixture(configFixture, report: .init(schemaVersion: 1, issues: [configIssue], revision: revision))
+        let configModel = QueueBootstrapModel(environment: configFixture.environment, execute: { request, output in
+            try await configExecutor.execute(request, output: output)
+        }) { summaryCompletions += 1 }
+        await configModel.start()?.value
+        try check(configModel.perform(actionID: "reset-callback", issueID: configIssue.id, confirmed: true) == nil,
+            "Replacing a callback requires reviewing its current proposal first")
+        configModel.review(configIssue.id)
+        try check(configModel.perform(actionID: "reset-callback", issueID: configIssue.id) == nil,
+            "Callback replacement always requires explicit confirmation despite a false destructive field")
+        await configModel.perform(actionID: "reset-callback", issueID: configIssue.id, confirmed: true)?.value
+        let configRequests = await configExecutor.requests
+        try check(configModel.phase == .complete && configRequests.contains(where: {
+            $0.arguments.suffix(4) == ["--recover", "reset-callback", "--expected-revision", revision]
+        }), "Reviewed configuration recovery carries its exact approved revision and verifies installation")
+        let noRevisionFixture = try fixture()
+        let noRevisionExecutor = BootstrapPreflightExecutorFixture(noRevisionFixture, report: .init(schemaVersion: 1, issues: [configIssue]))
+        let noRevision = QueueBootstrapModel(environment: noRevisionFixture.environment, execute: { request, output in
+            try await noRevisionExecutor.execute(request, output: output)
+        }) { summaryCompletions += 1 }
+        await noRevision.start()?.value
+        noRevision.review(configIssue.id)
+        try check(noRevision.perform(actionID: "reset-callback", issueID: configIssue.id, confirmed: true) == nil,
+            "A callback proposal without a verified current revision can never be applied")
+
+        let repairIssue = QueueBootstrapIssue(id: "service-not-ready", title: "Queue service could not start", detail: "Review diagnostics and repair the stopped service.",
+            actions: [.init(id: "repair-service", title: "Repair service and continue", destructive: false)])
+        let failureFixture = try fixture()
+        let failureExecutor = BootstrapPreflightExecutorFixture(failureFixture, report: .clear)
+        await failureExecutor.failInstallation(with: .init(schemaVersion: 1, issues: [repairIssue]))
+        let freshFailure = QueueBootstrapModel(environment: failureFixture.environment, execute: { request, output in
+            try await failureExecutor.execute(request, output: output)
+        }) { summaryCompletions += 1 }
+        await freshFailure.start()?.value
+        try check(freshFailure.phase == .failed && freshFailure.issues == [repairIssue] && freshFailure.output.contains("could not become ready"),
+            "An install failure immediately refreshes available repairs while retaining its original diagnostic")
+        await freshFailure.perform(actionID: "repair-service", issueID: repairIssue.id)?.value
+        try check(freshFailure.phase == .complete, "Explicit stopped-service repair rechecks requirements and verifies normal setup")
+
+        let waitIssue = QueueBootstrapIssue(id: "installer-busy", title: "Another installation is running", detail: "Wait for it to finish.",
+            actions: [.init(id: "wait", title: "Wait and continue", destructive: false)])
+        let waitFixture = try fixture()
+        let waitExecutor = BootstrapPreflightExecutorFixture(waitFixture, report: .init(schemaVersion: 1, issues: [waitIssue]))
+        let waiting = QueueBootstrapModel(environment: waitFixture.environment, execute: { request, output in
+            try await waitExecutor.execute(request, output: output)
+        }, waitInterval: .milliseconds(1), waitLimit: 2) { summaryCompletions += 1 }
+        await waiting.start()?.value
+        await waitExecutor.holdPreflight()
+        let cancelledWait = waiting.waitAndContinue()
+        try await waitUntil { await waitExecutor.isHeld }
+        try check(waiting.phase == .waiting && waiting.start() == nil, "Waiting prevents duplicate setup attempts")
+        waiting.cancelWaiting()
+        await waitExecutor.update(.clear)
+        await waitExecutor.releasePreflight()
+        await cancelledWait?.value
+        let cancelledInstalls = await waitExecutor.installations
+        try check(waiting.phase == .reviewing && cancelledInstalls == 0,
+            "Stopping waiting prevents a late clean report from installing or completing startup")
+        await waiting.waitAndContinue()?.value
+        try check(waiting.phase == .complete, "Waiting continues into verified installation only after a fresh clean report")
+
+        let boundedFixture = try fixture()
+        let boundedExecutor = BootstrapPreflightExecutorFixture(boundedFixture, report: .init(schemaVersion: 1, issues: [waitIssue]))
+        let bounded = QueueBootstrapModel(environment: boundedFixture.environment, execute: { request, output in
+            try await boundedExecutor.execute(request, output: output)
+        }, waitInterval: .milliseconds(1), waitLimit: 2) { summaryCompletions += 1 }
+        await bounded.start()?.value
+        await bounded.waitAndContinue()?.value
+        let boundedChecks = await boundedExecutor.checks
+        try check(bounded.phase == .reviewing && boundedChecks == 3 && bounded.message.contains("still waiting"),
+            "Automatic waiting has a finite check budget and returns control without weakening a blocker")
+
+        let stoppedFixture = try fixture()
+        let stoppedExecutor = BootstrapPreflightExecutorFixture(stoppedFixture, report: .clear)
+        await stoppedExecutor.holdPreflight()
+        let stopped = QueueBootstrapModel(environment: stoppedFixture.environment, execute: { request, output in
+            try await stoppedExecutor.execute(request, output: output)
+        }) { summaryCompletions += 1 }
+        let stoppedCheck = stopped.start()
+        try await waitUntil { await stoppedExecutor.isHeld }
+        stopped.cancelWaiting()
+        await stoppedExecutor.releasePreflight()
+        await stoppedCheck?.value
+        let stoppedInstalls = await stoppedExecutor.installations
+        try check(stopped.phase == .failed && !stopped.isRunning && stoppedInstalls == 0,
+            "Stopping the initial read-only preflight fences its eventual clean response")
+
+        let moveFixture = try fixture("Downloads")
+        let moveCounter = BootstrapCountingExecutorFixture()
+        let moveModel = QueueBootstrapModel(environment: moveFixture.environment, execute: { request, output in
+            await moveCounter.execute(request, output: output)
+        }) { summaryCompletions += 1 }
+        await moveModel.start()?.value
+        let moveCalls = await moveCounter.calls
+        try check(moveModel.phase == .failed && moveModel.issues.first?.actions.first?.id == "move-app" && moveCalls == 0,
+            "An app outside Applications offers Finder guidance before executing any payload")
+
+        let wireFixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("fixtures/bootstrap-preflight.json")
+        let wireReport = try QueueBootstrapReport.decode(Data(contentsOf: wireFixture))
+        try check(wireReport.issues.count == 2 && wireReport.issues.first?.jobs?.first?.id == 8 &&
+            wireReport.issues.last?.actions.last?.id == "reset-callback" && wireReport.revision == String(repeating: "a", count: 64),
+            "The shared backend wire fixture decodes into native job actions and configuration revision")
+        let unicodeReport = QueueBootstrapReport(schemaVersion: 1, issues: [.init(id: "unicode-jobs", title: "Jobs",
+            detail: "Review the selected job.", actions: [], jobs: [.init(id: 8, label: String(repeating: "😀", count: 120), status: "Paused")])])
+        try check(try QueueBootstrapReport.decode(JSONEncoder().encode(unicodeReport)) == unicodeReport,
+            "Native reports accept the backend's bounded Unicode job labels without confusing bytes with characters")
+
+        for malformed in [Data(), Data(#"{"schemaVersion":2,"issues":[]}"#.utf8),
+                          Data(#"{"schemaVersion":1,"issues":[{"id":"unsafe","title":"Unsafe","detail":"Review","actions":[{"id":"execute-shell","title":"Continue","destructive":false}]}]}"#.utf8),
+                          Data(#"{"schemaVersion":1,"issues":[{"id":"jobs","title":"Jobs","detail":"Review","actions":[],"jobs":[{"id":-1,"label":"Invalid","status":"Queued"}]}]}"#.utf8)] {
+            let malformedFixture = try fixture()
+            let counter = BootstrapRawPreflightFixture(malformed)
+            let malformedModel = QueueBootstrapModel(environment: malformedFixture.environment, execute: { request, output in
+                await counter.execute(request, output: output)
+            }) { summaryCompletions += 1 }
+            await malformedModel.start()?.value
+            let calls = await counter.calls
+            try check(malformedModel.phase == .failed && calls == 1,
+                "Malformed preflight or unknown actions fail before any mutation")
+        }
     }
 
     @MainActor private static func waitUntil(_ predicate: () async -> Bool) async throws {

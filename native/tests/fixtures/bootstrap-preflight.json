@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "issues": [
+    {
+      "id": "legacy-jobs",
+      "title": "Review unfinished legacy jobs",
+      "detail": "A paused legacy job needs attention before migration.",
+      "actions": [
+        {
+          "id": "review-jobs",
+          "title": "Review jobs",
+          "destructive": false
+        },
+        {
+          "id": "cancel-job",
+          "title": "Cancel selected job",
+          "destructive": true
+        }
+      ],
+      "jobs": [
+        {
+          "id": 8,
+          "label": "Fixture build ⚙",
+          "status": "Paused"
+        }
+      ]
+    },
+    {
+      "id": "custom-callback",
+      "title": "Review the custom cleanup callback",
+      "detail": "Back up the current file before replacing its custom behavior with the standard cleanup callback.",
+      "actions": [
+        {
+          "id": "review-configuration",
+          "title": "Review configuration",
+          "destructive": false
+        },
+        {
+          "id": "reset-callback",
+          "title": "Back up and replace callback",
+          "destructive": true
+        }
+      ]
+    }
+  ]
+}
