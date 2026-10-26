@@ -65,6 +65,10 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
               ProcessInfo.processInfo.environment["CFFIXED_USER_HOME"] == privateHome else {
             throw ClientError.message("UI fixture requires --fixture, a temporary HOME and CFFIXED_USER_HOME from its runner.")
         }
+        if CommandLine.arguments.contains("--approved-repair") {
+            try await verifyApprovedRepair(notification)
+            return
+        }
         if CommandLine.arguments.contains("--preflight-summary") {
             try await verifyPreflight(notification)
             return
@@ -131,8 +135,12 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let phoneIssue = QueueBootstrapIssue(id: "legacy-phone-access", title: "Phone access needs to be disabled",
             detail: "Your credentials, configuration, and trusted certificates will be preserved. You can enable phone access again in settings after setup.",
             actions: [.init(id: "disable-phone-access", title: "Disable phone access and continue", destructive: false)])
+        let missingIssue = QueueBootstrapIssue(id: "service-definitions-missing", title: "Restore missing background service files",
+            detail: "The services are still running, but their startup files are missing. Setup can restore standard files after checking the loaded commands and installation paths. Lost custom startup settings cannot be recovered. Running services and jobs will stay active.",
+            actions: [.init(id: "restore-service-definitions", title: "Restore verified service files", destructive: true)])
         let executor = BootstrapPreflightExecutorFixture(fixture,
-            report: .init(schemaVersion: 1, issues: [waitingIssue, phoneIssue]))
+            report: .init(schemaVersion: 1, issues: [missingIssue, waitingIssue, phoneIssue]),
+            afterRecovery: .init(schemaVersion: 1, issues: [waitingIssue, phoneIssue]))
         let delegate = AppDelegate(environment: fixture.environment) { request, output in
             try await executor.execute(request, output: output)
         }
@@ -143,23 +151,26 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             throw ClientError.message("Preflight did not present its production setup window")
         }
         let initialInstalls = await executor.installations
-        try check(setup.isVisible && model.issues.count == 2 && initialInstalls == 0 && AppRuntime.menuBarController == nil,
+        try check(setup.isVisible && model.issues.count == 3 && initialInstalls == 0 && AppRuntime.menuBarController == nil,
             "Production preflight displays multiple independent blockers before installation")
         try check(delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "A blocked preflight permits quit without initializing the queue")
         try snapshot(setup, name: "01-preflight-summary")
 
-        setup.makeKeyAndOrderFront(nil)
-        guard let enter = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
-            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: setup.windowNumber, context: nil,
-            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36) else {
-            throw ClientError.message("Could not create the Check again fixture event")
-        }
-        if !setup.performKeyEquivalent(with: enter) { setup.sendEvent(enter) }
+        await model.start()?.value
         try await waitUntil { await executor.checks >= 2 && model.phase == .reviewing }
         let checkedMutations = await executor.mutations
-        try check(checkedMutations == 0 && model.issues.count == 2,
-            "The real Check again button refreshes every blocker without authorizing changes")
+        try check(checkedMutations == 0 && model.issues.count == 3,
+            "A read-only recheck refreshes every blocker without authorizing changes")
+
+        try check(model.perform(actionID: "restore-service-definitions", issueID: missingIssue.id) == nil,
+            "Missing service files cannot be restored without confirmation")
+        await model.perform(actionID: "restore-service-definitions", issueID: missingIssue.id, confirmed: true)?.value
+        let restoredInstalls = await executor.installations
+        try check(model.phase == .reviewing && model.issues == [waitingIssue, phoneIssue] && restoredInstalls == 0,
+            "Confirmed service file recovery preserves the setup window until other requirements are resolved")
+        try snapshot(setup, name: "01-service-files-restored")
+        await executor.updateAfterRecovery(.clear)
 
         await executor.update(.init(schemaVersion: 1, issues: [waitingIssue]))
         await model.start()?.value
@@ -184,11 +195,99 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
         let requests = await executor.requests
         let mutations = await executor.mutations
-        try check(mutations == 1 && requests.contains(where: { $0.arguments.suffix(2) == ["--recover", "disable-phone-access"] }) &&
+        try check(mutations == 2 && requests.contains(where: { $0.arguments.suffix(2) == ["--recover", "restore-service-definitions"] }) &&
+            requests.contains(where: { $0.arguments.suffix(2) == ["--recover", "disable-phone-access"] }) &&
             delegate.setupWindow == nil && AppRuntime.store.fixtureMode,
             "Explicit preflight recovery refreshes requirements, verifies installation, and continues simulated queue startup")
         guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Preflight recovery did not open its simulated queue") }
         try snapshot(queue, name: "04-normal-fixture-startup")
+    }
+
+    private func verifyApprovedRepair(_ notification: Notification) async throws {
+        let fixture = try BootstrapFixture(parent: temporary)
+        let busy = QueueBootstrapIssue(id: "installer-busy", title: "Another installation is running",
+            detail: "Setup will wait without changing its files.", actions: [.init(id: "wait", title: "Wait and continue", destructive: false)])
+        let missing = QueueBootstrapIssue(id: "service-definitions-missing", title: "Restore missing background service files",
+            detail: "The existing services and jobs will stay active while their verified startup files are restored.",
+            actions: [.init(id: "restore-service-definitions", title: "Restore verified service files", destructive: true)])
+        let phone = QueueBootstrapIssue(id: "legacy-phone-access", title: "Phone access needs to be disabled",
+            detail: "Credentials and trusted certificates are preserved. Phone access can be enabled again after setup.",
+            actions: [.init(id: "disable-phone-access", title: "Disable phone access and continue", destructive: false)])
+        let active = QueueBootstrapIssue(id: "legacy-jobs", title: "Waiting for existing work",
+            detail: "Running jobs will finish normally. Setup will continue automatically.",
+            actions: [.init(id: "wait", title: "Wait and continue", destructive: false)],
+            jobs: [.init(id: 7, label: "Fixture validation", status: "Running")])
+        let executor = BootstrapPreflightExecutorFixture(fixture,
+            report: .init(schemaVersion: 1, issues: [busy, missing, phone]))
+        await executor.queueRecoveryReports([.init(schemaVersion: 1, issues: [phone]), .init(schemaVersion: 1, issues: [active])])
+        let delegate = AppDelegate(environment: fixture.environment) { request, output in
+            try await executor.execute(request, output: output)
+        }
+        production = delegate
+        delegate.applicationDidFinishLaunching(notification)
+        try await waitUntil { delegate.bootstrap?.phase == .reviewing }
+        guard let setup = delegate.setupWindow, let model = delegate.bootstrap else {
+            throw ClientError.message("Approved repair did not present its production setup window")
+        }
+        try check(model.canRepairAndContinue && model.repairAndContinue() == nil,
+            "Known repairs are available but cannot begin without approval")
+        try sendReturn(to: setup)
+        try await waitUntil { self.alertButton("Repair and continue", for: setup) != nil }
+        guard let alert = setup.attachedSheet ?? NSApp.modalWindow,
+              let cancel = alertButton("Cancel", for: setup) else {
+            throw ClientError.message("Repair approval dialog did not expose its Cancel button")
+        }
+        try snapshot(alert, name: "01-repair-approval")
+        cancel.performClick(nil)
+        try await waitUntil { setup.attachedSheet == nil && NSApp.modalWindow == nil }
+        let declinedMutations = await executor.mutations
+        try check(declinedMutations == 0 && model.phase == .reviewing,
+            "Declining the actual approval dialog performs no repair")
+        try sendReturn(to: setup)
+        try await waitUntil { self.alertButton("Repair and continue", for: setup) != nil }
+        guard let approve = alertButton("Repair and continue", for: setup) else {
+            throw ClientError.message("Repair approval button disappeared")
+        }
+        approve.performClick(nil)
+        try await waitUntil { model.phase == .waiting }
+        let busyMutations = await executor.mutations
+        try check(busyMutations == 0 && model.canStopWaiting,
+            "One approval waits for an existing installer before changing anything")
+        try snapshot(setup, name: "02-approved-waiting")
+        await executor.update(.init(schemaVersion: 1, issues: [missing, phone]))
+        try await waitUntil { await executor.mutations == 2 && model.phase == .waiting }
+        try snapshot(setup, name: "03-repairs-complete-waiting")
+        await executor.update(.clear)
+        try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
+        let requests = await executor.requests
+        let installs = await executor.installations
+        try check(installs == 1 && requests.filter { $0.arguments.contains("--recover") }.count == 2 &&
+            requests.contains { $0.arguments.suffix(2) == ["--recover", "restore-service-definitions"] } &&
+            requests.contains { $0.arguments.suffix(2) == ["--recover", "disable-phone-access"] } &&
+            delegate.setupWindow == nil && AppRuntime.store.fixtureMode,
+            "One accepted dialog repairs, waits and verifies normal startup without further intervention")
+        guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Approved repair did not start the simulated queue") }
+        try snapshot(queue, name: "04-approved-startup")
+    }
+
+    private func sendReturn(to window: NSWindow) throws {
+        window.makeKeyAndOrderFront(nil)
+        guard let enter = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36) else {
+            throw ClientError.message("Could not create the approval fixture event")
+        }
+        if !window.performKeyEquivalent(with: enter) { window.sendEvent(enter) }
+    }
+
+    private func alertButton(_ title: String, for window: NSWindow) -> NSButton? {
+        func find(_ view: NSView) -> NSButton? {
+            if let button = view as? NSButton, button.title == title { return button }
+            for child in view.subviews { if let button = find(child) { return button } }
+            return nil
+        }
+        guard let alert = window.attachedSheet ?? NSApp.modalWindow, let content = alert.contentView else { return nil }
+        return find(content)
     }
 
     private func snapshot(_ window: NSWindow, name: String) throws {

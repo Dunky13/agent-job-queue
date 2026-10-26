@@ -49,6 +49,11 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
     --open-window --temporary "$temporary" --output "$output/preflight-summary" --preflight-summary
 [[ "$(plutil -extract passed raw -o - "$output/preflight-summary/verification.json")" == "true" ]]
+mkdir -p -- "$output/approved-repair"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --open-window --temporary "$temporary" --output "$output/approved-repair" --approved-repair
+[[ "$(plutil -extract passed raw -o - "$output/approved-repair/verification.json")" == "true" ]]
 {
   printf '# Bootstrap fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
   cat "$output/verification.json"
@@ -69,7 +74,15 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   printf '# Preflight summary fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
   cat "$output/preflight-summary/verification.json"
   printf '\n```\n\n'
-  for picture in 01-preflight-summary 02-waiting 03-wait-stopped 04-normal-fixture-startup; do
+  for picture in 01-preflight-summary 01-service-files-restored 02-waiting 03-wait-stopped 04-normal-fixture-startup; do
     printf '![%s](%s.png)\n\n' "$picture" "$picture"
   done
 } > "$output/preflight-summary/verification.md"
+{
+  printf '# Approved automatic repair verification\n\nProduction approval dialog and setup flow, disposable home and simulated queue.\n\n```json\n'
+  cat "$output/approved-repair/verification.json"
+  printf '\n```\n\n'
+  for picture in 01-repair-approval 02-approved-waiting 03-repairs-complete-waiting 04-approved-startup; do
+    printf '![%s](%s.png)\n\n' "$picture" "$picture"
+  done
+} > "$output/approved-repair/verification.md"

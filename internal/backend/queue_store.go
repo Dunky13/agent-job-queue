@@ -87,17 +87,33 @@ func ensureQueueSchema(db *sql.DB, create bool) error {
 }
 
 func queuePrivateFiles(path string) error {
+	return queuePrivateFilesInspect(path, os.Lstat)
+}
+
+func queuePrivateFilesInspect(path string, lstat func(string) (os.FileInfo, error)) error {
 	for _, suffix := range []string{"", "-journal", "-wal", "-shm"} {
-		info, err := os.Lstat(path + suffix)
-		if errors.Is(err, os.ErrNotExist) && suffix != "" {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("Queue database unavailable: %w", err)
-		}
-		st, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || !fileOwned(info, true) || st.Nlink != 1 {
-			return errors.New("Unsafe queue database or sidecar; work is held")
+		for attempt := 0; attempt < 3; attempt++ {
+			info, err := lstat(path + suffix)
+			if errors.Is(err, os.ErrNotExist) && suffix != "" {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("Queue database unavailable: %w", err)
+			}
+			st, ok := info.Sys().(*syscall.Stat_t)
+			if !ok || !fileOwned(info, true) {
+				return errors.New("Unsafe queue database or sidecar; work is held")
+			}
+			if st.Nlink == 1 {
+				break
+			}
+			// SQLite retires its private journal after committing. A pathname
+			// lookup can race that unlink and report the retired inode with no
+			// links. Reinspect its name; only absence or a fresh safe inode can
+			// pass. The main database and every other unsafe case still fail.
+			if suffix == "" || st.Nlink != 0 || attempt == 2 {
+				return errors.New("Unsafe queue database or sidecar; work is held")
+			}
 		}
 	}
 	return nil
