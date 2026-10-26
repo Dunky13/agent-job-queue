@@ -77,7 +77,7 @@ func TestManagedLifecycleOptionParsing(t *testing.T) {
 		if err != nil || options.prepareReplacement == options.unregisterServices || options.preflight || options.recovery != "" {
 			t.Fatalf("valid lifecycle request %v: %+v %v", args, options, err)
 		}
-		for _, extra := range [][]string{{"--preflight", "--json"}, {"--preflight"}, {"--json"}, {"--recover", "disable-phone-access"}, {"--disable-phone-access"}, {"--prepare-replacement"}, {"--unregister-services"}, {"--job-id", "1"}, {"--expected-revision", strings.Repeat("a", 64)}} {
+		for _, extra := range [][]string{{"--preflight", "--json"}, {"--preflight"}, {"--json"}, {"--recover", "disable-phone-access"}, {"--disable-phone-access"}, {"--repair-and-continue"}, {"--prepare-replacement"}, {"--unregister-services"}, {"--job-id", "1"}, {"--expected-revision", strings.Repeat("a", 64)}} {
 			if _, err := installParseOptions(append(slices.Clone(args), extra...)); err == nil {
 				t.Fatal("invalid lifecycle combination accepted", args, extra)
 			}

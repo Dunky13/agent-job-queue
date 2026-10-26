@@ -56,6 +56,18 @@ check_receipt() {
   jq -e --arg id "$(json_field "$record" submission_id)" --arg hash "$(json_field "$record" archive_sha256)" '
     .status == "Accepted" and .jobId == $id and .sha256 == $hash
   ' "$log" >/dev/null || fail "$stage accepted Apple log does not match its exact submission and archive."
+  check_log_name "$log" "$stage"
+}
+
+check_log_name() {
+  local log=$1 selected_stage=$2 expected legacy
+  expected=$(macos_notary_archive_name "$selected_stage" "$resume_version")
+  # Older, fully bound checkpoints used version-only names. Their UUID/hash and
+  # original-artifact checks remain mandatory when current automation resumes.
+  legacy=$(BUILD_RUN_ID='' macos_notary_archive_name "$selected_stage" "$resume_version")
+  jq -e --arg expected "$expected" --arg legacy "$legacy" '
+    (has("archiveFilename") | not) or .archiveFilename == $expected or .archiveFilename == $legacy
+  ' "$log" >/dev/null || fail 'Apple log archive filename does not match this product, version and stage.'
 }
 
 verify_state() {
@@ -111,6 +123,67 @@ verify_state() {
     fi
     previous=$phase
   done
+  if [[ -e $state/publication.json || -L $state/publication.json ]]; then verify_publication; fi
+}
+
+verify_publication() {
+  [[ -f $state/publication.json && ! -L $state/publication.json ]] || fail 'Retained publication evidence is unsafe.'
+  jq -s -e --slurpfile metadata "$state/metadata.json" \
+    --slurpfile payload "$state/stages/payload.json" --slurpfile installer "$state/stages/installer.json" \
+    --slurpfile dmg "$state/stages/dmg.json" --slurpfile payload_log "$state/receipts/payload.log.json" \
+    --slurpfile installer_log "$state/receipts/installer.log.json" --slurpfile dmg_log "$state/receipts/dmg.log.json" '
+    def toolchain_valid:
+      keys == ["automation_sha","go","host_architecture","macos_sdk","notarytool","os",
+        "runner_image","runner_image_version","schema","source_sha","swift","xcode","xcode_build"] and
+      all(to_entries[]; if .key == "schema" then .value == 1
+        else (.value | type == "string" and length > 0) end) and
+      (.host_architecture == "arm64" or .host_architecture == "x86_64");
+    def evidence_valid:
+      keys == ["automation_sha","execution_attempt","execution_id","logs","metadata","schema","stages","toolchain"] and
+    .schema == 1 and .metadata == $metadata[0] and
+    .stages == [$payload[0],$installer[0],$dmg[0]] and
+    all(.stages[]; .phase == "finished") and
+    .logs == [$payload_log[0],$installer_log[0],$dmg_log[0]] and
+    (.execution_id | type == "string" and test("^[1-9][0-9]*$")) and
+    (.execution_attempt | type == "string" and test("^[1-9][0-9]*$")) and
+    (.automation_sha | type == "string" and test("^[a-f0-9]{40}$")) and
+    (.toolchain | toolchain_valid) and .toolchain.source_sha == .metadata.source_sha and
+    .toolchain.automation_sha == .automation_sha;
+    ([$metadata,$payload,$installer,$dmg,$payload_log,$installer_log,$dmg_log] |
+      all(.[]; length == 1 and (.[0] | type == "object"))) and
+    length == 1 and all(.[]; type == "object" and evidence_valid)
+  ' "$state/publication.json" >/dev/null || fail 'Retained publication evidence does not match this exact completed candidate.'
+  # Only the producer's sorted serialization is retained. Parsing alone would
+  # discard earlier duplicate keys, leaving hidden bytes in the public asset.
+  cmp -s "$state/publication.json" <(jq -S . "$state/publication.json") ||
+    fail 'Retained publication evidence is not canonical JSON.'
+}
+
+publication_evidence() {
+  [[ -n ${BUILD_RUN_ID:-} && $(json_field "$state/metadata.json" schema) == 2 ]] ||
+    fail 'Publication evidence requires an artifact-bound CI candidate.'
+  local stage
+  for stage in payload installer dmg; do
+    [[ -f $state/stages/$stage.json && $(json_field "$state/stages/$stage.json" phase) == finished ]] ||
+      fail 'All stages must finish before retaining publication evidence.'
+  done
+  if [[ ! -e $state/publication.json && ! -L $state/publication.json ]]; then
+    [[ -f ${APPLE_TOOLCHAIN_RECEIPT:-} && ! -L ${APPLE_TOOLCHAIN_RECEIPT:-} ]] || fail 'The finalization toolchain receipt is required.'
+    jq -s -e 'length == 1 and (.[0] | type == "object")' "$APPLE_TOOLCHAIN_RECEIPT" >/dev/null ||
+      fail 'The finalization toolchain receipt must be one JSON object.'
+    jq -S -n --slurpfile metadata "$state/metadata.json" \
+      --slurpfile payload "$state/stages/payload.json" --slurpfile installer "$state/stages/installer.json" \
+      --slurpfile dmg "$state/stages/dmg.json" --slurpfile payload_log "$state/receipts/payload.log.json" \
+      --slurpfile installer_log "$state/receipts/installer.log.json" --slurpfile dmg_log "$state/receipts/dmg.log.json" \
+      --slurpfile toolchain "$APPLE_TOOLCHAIN_RECEIPT" --arg execution "$GITHUB_RUN_ID" \
+      --arg attempt "$GITHUB_RUN_ATTEMPT" --arg automation "$GITHUB_SHA" '
+      {schema:1,metadata:$metadata[0],stages:[$payload[0],$installer[0],$dmg[0]],
+       logs:[$payload_log[0],$installer_log[0],$dmg_log[0]],toolchain:$toolchain[0],
+       execution_id:$execution,execution_attempt:$attempt,automation_sha:$automation}
+    ' > "$state/publication.json.new"
+    mv "$state/publication.json.new" "$state/publication.json"
+  fi
+  verify_publication
 }
 
 configure_credentials() {
@@ -284,6 +357,9 @@ finish_stage() {
   phase=$(json_field "$record" phase)
   [[ $phase != prepared && $phase != uploading ]] || fail 'No submission ID exists for this prepared stage.'
   [[ $phase != finished ]] || { printf '%s already finished.\n' "$stage"; return; }
+  # An earlier transient must never authorize a retry of a later terminal error.
+  rm -f "$state/receipts/$stage.retry" "$state/receipts/$stage.status.json"
+  MACOS_TICKET_RECOVERY_FILE="$state/receipts/$stage.retry"
   if [[ $phase == submitted ]]; then
     configure_credentials
     submission=$(json_field "$record" submission_id)
@@ -293,6 +369,16 @@ finish_stage() {
       "$QUEUE_NOTARY_TOOL" notarize wait --id "$submission" --timeout "$NOTARY_TIMEOUT" > "$response" || wait_result=$?
     else
       xcrun notarytool wait "$submission" "${MACOS_NOTARY_AUTH[@]}" --timeout "$NOTARY_TIMEOUT" --output-format json > "$response" || wait_result=$?
+    fi
+    # Retain only allowlisted, UUID-bound provider status. Unknown/malformed
+    # responses provide no authority for the automatic observer to retry.
+    if jq -e --arg id "$submission" '
+      .id == $id and (.status == "In Progress" or .status == "Accepted" or
+        .status == "Invalid" or .status == "Rejected")
+    ' "$response" >/dev/null 2>&1; then
+      jq --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+        '{id, status} + (if .error == "timeout" then {error:"timeout"} else {} end) + {execution_id:$run,execution_attempt:$attempt}' \
+        "$response" > "$state/receipts/$stage.status.json"
     fi
     # Rejected submissions and Accepted submissions with warnings both carry
     # useful Apple diagnostics. Attempt the log even after a wait timeout.
@@ -312,7 +398,7 @@ finish_stage() {
       fail "$stage remains pending or failed; submission $submission is preserved with available Apple diagnostics."
     fi
     if ! jq -e --arg id "$submission" --arg rest "$MACOS_NOTARY_REST" \
-      '.status == "Accepted" and ($rest != "1" or .id == $id)' "$response" >/dev/null; then
+      '.status == "Accepted" and ($rest != "1" or .id == $id) and ((has("id") | not) or .id == $id)' "$response" >/dev/null; then
       rm -f "$response" "$provider_log"
       fail "$stage was not Accepted; submission $submission and available Apple diagnostics are preserved."
     fi
@@ -327,6 +413,7 @@ finish_stage() {
       rm -f "$response" "$provider_log"
       fail 'Apple log does not bind Accepted status to this exact submission ID and archive SHA-256.'
     fi
+    check_log_name "$provider_log" "$stage"
     if jq -e '.issues != null and (.issues | length > 0)' "$state/receipts/$stage.log.json" >/dev/null; then
       printf 'Apple reported issues for %s; inspect its retained Apple log before release.\n' "$stage" >&2
     fi
@@ -363,11 +450,14 @@ finish_stage() {
   fi
   jq --arg hash "$(sha256 "$completed")" '.phase="finished" | .completed_sha256=$hash' "$record" > "$record.new"
   mv "$record.new" "$record"
+  rm -f "$state/receipts/$stage.retry"
   rm -rf "$state/work"
 }
 
 export_assets() {
   local stage destination=$1 base="Agent-Job-Queue-Installer-$resume_version-universal"
+  rm -f "$state/receipts/dmg.retry"
+  MACOS_TICKET_RECOVERY_FILE="$state/receipts/dmg.retry"
   for stage in payload installer dmg; do
     [[ -f $state/stages/$stage.json && $(json_field "$state/stages/$stage.json" phase) == finished ]] ||
       fail 'All three stages must be Accepted and finished before publishing.'
@@ -388,6 +478,20 @@ export_assets() {
   rm -rf "$state/work"
 }
 
+bind_origin() {
+  [[ -n ${BUILD_RUN_ID:-} && ${QUEUE_NOTARY_TOOL:-} == /* && -x ${QUEUE_NOTARY_TOOL:-} ]] ||
+    fail 'Original artifact binding requires verified build context and the prebuilt trusted verifier.'
+  "$QUEUE_NOTARY_TOOL" verify-checkpoint-origin --original "$original_archive" --initial "$state/initial.zip"
+  if [[ $(json_field "$state/metadata.json" schema) == 1 ]]; then
+    # Metadata upgrade follows exact original-byte/mode/resource verification.
+    # The submitted archives, UUIDs and Apple receipts are never rewritten.
+    jq --arg attempt "$BUILD_RUN_ATTEMPT" --arg artifact "$BUILD_ARTIFACT_ID" --arg digest "$BUILD_ARTIFACT_DIGEST" '
+      . + {schema:2,build_attempt:$attempt,artifact_id:$artifact,artifact_digest:$digest}
+    ' "$state/metadata.json" > "$state/metadata.json.new"
+    mv "$state/metadata.json.new" "$state/metadata.json"
+  fi
+}
+
 command=${1:-}
 # Explicit version arguments ensure restored metadata cannot choose a release.
 case "$command" in
@@ -395,19 +499,23 @@ case "$command" in
     [[ $# == 4 ]] || fail 'Usage: macos-resume.sh init INSTALLER STATE VERSION'
     initial_installer=$2 state=$3 resume_version=$4
     ;;
-  verify-state)
-    [[ $# == 3 ]] || fail 'Usage: macos-resume.sh verify-state STATE VERSION'
+  verify-state|evidence)
+    [[ $# == 3 ]] || fail "Usage: macos-resume.sh $command STATE VERSION"
     state=$2 resume_version=$3
     ;;
-  prepare|submit|finish)
-    [[ $# == 4 ]] || fail 'Usage: macos-resume.sh {prepare|submit|finish} STATE STAGE VERSION'
+  begin|prepare|submit|finish)
+    [[ $# == 4 ]] || fail 'Usage: macos-resume.sh {begin|prepare|submit|finish} STATE STAGE VERSION'
     state=$2 stage=$3 resume_version=$4
     ;;
   export)
     [[ $# == 4 ]] || fail 'Usage: macos-resume.sh export STATE DESTINATION VERSION'
     state=$2 destination=$3 resume_version=$4
     ;;
-  *) fail 'Usage: macos-resume.sh {init|verify-state|prepare|submit|finish|export} ...' ;;
+  bind-origin)
+    [[ $# == 4 ]] || fail 'Usage: macos-resume.sh bind-origin STATE ORIGINAL_ARCHIVE VERSION'
+    state=$2 original_archive=$3 resume_version=$4
+    ;;
+  *) fail 'Usage: macos-resume.sh {init|verify-state|bind-origin|evidence|begin|prepare|submit|finish|export} ...' ;;
 esac
 identity
 state=$(macos_signing_canonical_path "$state")
@@ -437,10 +545,13 @@ else
   verify_state
   case "$command" in
     verify-state) ;;
+    begin) require_stage; rm -f "$state/receipts/$stage.retry" "$state/receipts/$stage.status.json" ;;
     prepare) require_stage; prepare_stage ;;
     submit) require_stage; submit_stage ;;
     finish) require_stage; finish_stage ;;
     export) export_assets "$destination" ;;
+    bind-origin) bind_origin ;;
+    evidence) publication_evidence ;;
   esac
   verify_state
 fi

@@ -386,6 +386,81 @@ func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T
 	f.command(t, nil, "verify-state", f.state, "0.1.0")
 }
 
+func TestMacOSResumeBindsLegacyStateOnlyAfterActualOriginVerification(t *testing.T) {
+	tool := filepath.Join(t.TempDir(), "queue-tool")
+	build := exec.Command("go", "build", "-p", "2", "-o", tool, "../../cmd/queue-tool")
+	build.Env = signingTestEnvironment()
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build origin verifier: %v: %s", err, output)
+	}
+	for _, variant := range []string{"verified legacy", "wrong original", "wrong source", "already bound"} {
+		t.Run(variant, func(t *testing.T) {
+			f := newResumeFixture(t)
+			f.step(t, "prepare", "payload")
+			f.step(t, "submit", "payload")
+			// Other resume fixtures use opaque tar bytes for the ditto seam.
+			// This boundary invokes the real ZIP verifier, so give it real ZIPs.
+			initial := checkpointZIP(t, checkpointEntry{
+				"Agent Job Queue Installer.app/Contents/MacOS/Installer", []byte("fixture executable"), 0o700,
+			})
+			if err := os.WriteFile(filepath.Join(f.state, "initial.zip"), initial, 0600); err != nil {
+				t.Fatal(err)
+			}
+			f.mutate(t, "metadata.json", func(v map[string]any) { v["initial_sha256"] = fmt.Sprintf("%x", sha256.Sum256(initial)) })
+			metadataPath := filepath.Join(f.state, "metadata.json")
+			originalMetadata, _ := os.ReadFile(metadataPath)
+			stagePath := filepath.Join(f.state, "stages/payload.json")
+			originalStage, _ := os.ReadFile(stagePath)
+			archivePath := filepath.Join(f.state, "archives/payload.zip")
+			originalArchive, _ := os.ReadFile(archivePath)
+			original := filepath.Join(f.root, "original.zip")
+			if variant == "wrong original" {
+				initial = []byte("not the original validated ZIP")
+			}
+			if err := os.WriteFile(original, initial, 0600); err != nil {
+				t.Fatal(err)
+			}
+			f.environment = append(f.environment, distributionResumeIdentity()...)
+			f.environment = append(f.environment, "QUEUE_NOTARY_TOOL="+tool)
+			if variant == "wrong source" {
+				f.environment = append(f.environment, "BUILD_SHA="+strings.Repeat("b", 40))
+			}
+			output, err := f.run(t, nil, "bind-origin", f.state, original, "0.1.0")
+			metadata, _ := os.ReadFile(metadataPath)
+			if variant == "wrong original" || variant == "wrong source" {
+				if err == nil || string(metadata) != string(originalMetadata) {
+					t.Fatalf("unverified legacy state was rebound: %v: %s", err, output)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("bind verified origin: %v: %s", err, output)
+			}
+			var bound struct {
+				Schema       int
+				Artifact     string `json:"artifact_id"`
+				Digest       string `json:"artifact_digest"`
+				BuildAttempt string `json:"build_attempt"`
+			}
+			if err := json.Unmarshal(metadata, &bound); err != nil || bound.Schema != 2 || bound.Artifact != "800" || bound.Digest != "sha256:"+strings.Repeat("d", 64) || bound.BuildAttempt != "1" {
+				t.Fatalf("incorrect legacy binding: %s (%v)", metadata, err)
+			}
+			if variant == "already bound" {
+				f.command(t, nil, "bind-origin", f.state, original, "0.1.0")
+				again, _ := os.ReadFile(metadataPath)
+				if string(again) != string(metadata) {
+					t.Fatal("repeated binding rewrote the accepted identity")
+				}
+			}
+			stage, _ := os.ReadFile(stagePath)
+			archive, _ := os.ReadFile(archivePath)
+			if string(stage) != string(originalStage) || string(archive) != string(originalArchive) {
+				t.Fatal("binding changed signed bytes or the submission record")
+			}
+		})
+	}
+}
+
 // This trusted mock models only the CLI/state seam. Native tools and provider
 // calls remain simulated; the Go client's separate tests cover real durability.
 const resumeRESTTestTool = `set -euo pipefail
@@ -424,6 +499,10 @@ case "$operation" in
       [[ $failure != "$stage-rejected" ]] || status=Invalid
       [[ $failure != "$stage-timeout" ]] || status='In Progress'
       [[ $failure != waitid ]] || id=00000000-0000-0000-0000-000000000009
+      if [[ $failure == "$stage-timeout" ]]; then
+        printf '{"id":"%s","status":"In Progress","error":"timeout"}\n' "$id"
+        exit 75
+      fi
       printf '{"id":"%s","status":"%s"}\n' "$id" "$status"
       [[ $failure != "$stage-timeout" ]] || exit 75
     else

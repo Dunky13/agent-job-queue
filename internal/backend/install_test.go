@@ -1026,7 +1026,7 @@ func TestInstallerConfiguredServiceSlotRemainsAuthoritative(t *testing.T) {
 				t.Fatal("health probe omitted the configured service slot")
 			}
 			integrationTestWrite(t, filepath.Join(slot, "agent-heavy.json"), []byte(`{"task_id":7,"pgid":123456}`))
-			if err := install.requireLegacyCleanup(); err == nil || !strings.Contains(err.Error(), "completed job cleanup") {
+			if err := install.requireLegacyCleanup(); !errors.Is(err, errInstallPendingCleanup) {
 				t.Fatalf("cleanup inspection ignored configured service slot: %v", err)
 			}
 		})
@@ -1346,7 +1346,7 @@ func TestInstallerLegacyDoneJobsRequireCompletedCleanup(t *testing.T) {
 				integrationTestWrite(t, filename, mustMetadataJSON(t, marker))
 			}
 			retained := integrationTestRead(t, filename)
-			if err := f.run(t); err == nil || !strings.Contains(err.Error(), "completed job cleanup") {
+			if err := f.run(t); !errors.Is(err, errInstallPendingCleanup) {
 				t.Fatalf("unfinished cleanup accepted: %v", err)
 			}
 			if !bytes.Equal(source, integrationTestRead(t, filepath.Join(install.root, "agent_heavy.py"))) || !bytes.Equal(retained, integrationTestRead(t, filename)) {
@@ -1377,7 +1377,7 @@ func TestInstallerLegacyLateReceiptPreventsPublication(t *testing.T) {
 		}
 		return command(ctx, args)
 	}
-	if err := f.run(t); err == nil || !strings.Contains(err.Error(), "completed job cleanup") {
+	if err := f.run(t); !errors.Is(err, errInstallPendingCleanup) {
 		t.Fatalf("late receipt was accepted: %v", err)
 	}
 	if !bytes.Equal(old, integrationTestRead(t, filepath.Join(install.root, "bin/agent-heavy"))) {

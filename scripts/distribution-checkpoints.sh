@@ -62,7 +62,7 @@ checkpoint_distribution_inventory() {
   jq -s -e --arg prefix "$prefix" --arg id "$id" --arg sha "$sha" --argjson attempt "$attempt" '
     [.[]|select(.name|startswith("Apple-notarization-"))] |
     ([.[].name]|length) == ([.[].name]|unique|length) and all(.[];
-      (.name|test("^" + $prefix + "-a[1-9][0-9]{0,14}-s0[0-9]$")) and
+      (.name|test("^" + $prefix + "-a[1-9][0-9]{0,14}-s(0[0-9]|10)$")) and
       (.name|capture("-a(?<attempt>[0-9]+)-s").attempt|tonumber) <= $attempt and
       (.workflow_run.id|tostring) == $id and .workflow_run.head_branch == "main" and .workflow_run.head_sha == $sha)
   ' "$temporary/inventory-$id" >/dev/null || checkpoint_error 'Mixed or malformed checkpoint provenance.'

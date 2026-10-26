@@ -1,6 +1,6 @@
 # Apple signing and notarization
 
-Research checked against Apple and GitHub primary documentation on 2026-10-22.
+Research checked against Apple and GitHub primary documentation on 2026-10-26.
 This guide describes the release implementation and its acceptance criteria.
 It does not certify an artifact while Apple is still processing it.
 
@@ -40,10 +40,11 @@ installer. Our additional DMG distribution also receives its own ticket:
 5. Copy the stapled, self-contained menu app into a DMG with an Applications shortcut, sign the DMG, notarize it, and staple it. Retained older builds without an embedded setup payload keep their original installer DMG layout.
 6. Generate final checksums and Homebrew metadata after all byte changes.
 
-Apple submissions use `Agent-Job-Queue-Payload-VERSION-universal.zip`,
-`Agent-Job-Queue-Installer-VERSION-universal.zip`, and
-`Agent-Job-Queue-Installer-VERSION-universal.dmg` so the project, version, and
-stage are visible in notarization history. Resumable checkpoints retain their
+Hosted Apple submissions use `Agent-Job-Queue-Payload-VERSION-build-N-SHA-universal.zip`,
+`Agent-Job-Queue-Installer-VERSION-build-N-SHA-universal.zip`, and
+`Agent-Job-Queue-Installer-VERSION-build-N-SHA-universal.dmg`. `N` is the original
+CI build number and `SHA` is its seven-character source prefix. Local packaging
+keeps version-only names. Product, version, build and stage are visible before upload. Resumable checkpoints retain their
 existing internal filenames; submission copies preserve the exact archive bytes
 and SHA-256. Already recorded submissions are resumed by ID without resubmitting.
 
@@ -282,15 +283,18 @@ Fresh Apple Silicon and Intel acceptance jobs still precede publication and
 Homebrew delivery. Final artifacts use execution-specific names; downstream
 jobs consume the successful signing job's exact artifact.
 
-Checkpoints and original CI artifacts are retained for 30 days. Missing or
+Checkpoints and original CI artifacts are retained for 90 days. Independent small
+receipt/diagnostic artifacts are also retained for 90 days. Successful releases
+include permanent `apple-notarization.json` evidence binding all three Accepted
+logs, submitted hashes, source metadata and final hashes. Missing or
 expired latest state, invalid provenance, corruption, a changed source artifact
 or signing team, rejection and an uncertain upload stop recovery. There is no
 fallback to older state or a fresh upload. Whole-runner loss before durable
 persistence can require provider reconciliation. Legacy checkpoints with an
 unknown upload outcome remain blocked; a new distribution run does not clear
 that uncertainty. Inspect preserved receipts and Apple's submission history
-with the original credentials before deciding how to recover. Automatic receipt
-import or duplicate resubmission is not provided.
+with the original credentials before deciding how to recover. Unknown uploads require operator reconciliation; automatic receipt import and
+duplicate resubmission are not provided.
 
 GitHub failed-job retries retain the original automation revision, ref and
 actor privileges, and are available for 30 days with at most 50 attempts.
@@ -298,6 +302,63 @@ Dispatching a new distribution run is the path for using a repaired workflow.
 See GitHub's [rerun rules](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs),
 [workflow-run trigger](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run)
 and [artifact API](https://docs.github.com/en/rest/actions/artifacts).
+
+## Automatic continuation and publication
+
+`Distribution recovery` observes completed distribution workflows and runs every
+15 minutes. It uses Actions write access to request a same-run failed-job retry;
+it has no Apple secrets or publication permission. A valid GitHub artifact
+digest, exact source/build/execution binding, newest checkpoint, and matching
+UUID/status/logs are required. Pending status must come from a finite REST wait
+timeout in the current invocation. The outer signing wrapper must separately
+prove that its temporary credentials were cleaned up successfully. Preparation
+clears inherited retry status before accessing credentials. Malformed or
+mismatched later polls cannot retain an earlier pending result. Only explicit pending provider status or the
+classified CloudKit connection-loss failure can retry signing. Rejection,
+missing or ambiguous custody, malformed evidence and acceptance failures stop.
+Delivery-only failures can retry after both architecture acceptance jobs passed.
+The first continuation can run immediately; later attempts wait at least 15
+minutes after completion. Automatic recovery stops at attempt 48 or a candidate
+age of seven days, with exact refusal details in the observer log and summary. The original build lock and UUID are retained through every retry. Export-time ticket verification has its
+own final checkpoint and classified continuation while preserving completed bytes.
+
+Build and signing jobs explicitly select Xcode 16.4 (16F6), verify that selection
+before credentials, and retain the actual SDK, Swift, Go, notary client and runner
+image identity. Hosted qualification is required for this pin; a local receipt
+from another Xcode is not its proof.
+
+Each required toolchain probe must exit successfully and return an identity
+before a receipt is written. A legacy checkpoint receives schema-2 artifact
+binding only after its existing source/run/team metadata is verified and the
+trusted verifier proves its initial archive matches the original CI archive's
+contents, modes and resource metadata. This upgrade changes neither signed
+archives nor submission records. Missing or mismatched origin proof blocks it.
+
+The channel remains numbered main-build prereleases, with `VERSION` as the
+product version and `build-N-SHA` as the immutable release identity. No stable
+version or updater trust authority changes. `ci-required` remains the aggregate
+CI gate. The protected environment stays main-only without recurring reviewers.
+
+The final candidate checkpoint retains `publication.json` before export. That
+file records the first finalization execution and toolchain, and later executions
+verify and reuse its exact bytes as `apple-notarization.json`. Per-attempt
+toolchain receipts remain separate. A whole-workflow rerun therefore preserves
+every public asset instead of regenerating execution-dependent audit bytes.
+Retained audit evidence must match the producer's sorted JSON serialization;
+unknown fields, multiple documents, incomplete toolchains and duplicate-key
+ambiguities fail verification before publication.
+
+Publication creates a private draft, binds its entire candidate inventory in the
+draft notes, and uploads without overwriting assets. It verifies exact remote
+inventory, source/tag identity and downloaded bytes before exposure. GitHub
+release immutability is enabled as repository policy. Published release metadata
+must confirm immutability, alongside the exact inventory and byte readback. The
+workflow uses its existing contents-write Actions token; no additional App or
+administration credential is required. The same complete assets are checked again
+after publication. An existing identical public release is verified read-only;
+a conflicting draft, tag or asset fails closed. Unfinished provider uploads are
+retained for explicit reconciliation. Homebrew delivery remains a separate
+exact-build gate using the existing narrowly scoped App token and trusted tap.
 
 ## Local use
 
@@ -369,4 +430,5 @@ including offline behavior where supported. Local development-Mac checks do
 not establish clean-Mac or Intel runtime acceptance. Hosted Intel tests and
 clean-machine installation evidence must be reported separately.
 
-A complete standalone [HTML version](apple-signing.html) accompanies this guide.
+The committed guide describes the source contract. Qualification handoffs record
+actual source, workflow, submission and public asset witnesses separately.

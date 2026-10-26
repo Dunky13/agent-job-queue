@@ -210,8 +210,11 @@ actor BootstrapPreflightExecutorFixture {
     private(set) var installations = 0
     private var report: QueueBootstrapReport
     private var afterRecovery: QueueBootstrapReport
+    private var recoveryReports: [QueueBootstrapReport] = []
     private var holdNext = false
     private var held: CheckedContinuation<Void, Never>?
+    private var holdNextRecovery = false
+    private var recoveryHeld: CheckedContinuation<Void, Never>?
     var failRecovery = false
     var returnOnlyClearedRecovery = false
     private var failedInstallationReport: QueueBootstrapReport?
@@ -234,7 +237,12 @@ actor BootstrapPreflightExecutorFixture {
         }
         if request.arguments.contains("--recover") {
             mutations += 1
+            if holdNextRecovery {
+                holdNextRecovery = false
+                await withCheckedContinuation { recoveryHeld = $0 }
+            }
             if failRecovery { throw ClientError.message("Fixture recovery failed ownership verification.") }
+            if !recoveryReports.isEmpty { afterRecovery = recoveryReports.removeFirst() }
             if !returnOnlyClearedRecovery { report = afterRecovery }
             return try JSONEncoder().encode(afterRecovery)
         }
@@ -249,9 +257,14 @@ actor BootstrapPreflightExecutorFixture {
     }
 
     func update(_ report: QueueBootstrapReport) { self.report = report }
+    func updateAfterRecovery(_ report: QueueBootstrapReport) { afterRecovery = report }
+    func queueRecoveryReports(_ reports: [QueueBootstrapReport]) { recoveryReports = reports }
     func holdPreflight() { holdNext = true }
     func releasePreflight() { held?.resume(); held = nil }
     var isHeld: Bool { held != nil }
+    func holdRecovery() { holdNextRecovery = true }
+    func releaseRecovery() { recoveryHeld?.resume(); recoveryHeld = nil }
+    var isRecoveryHeld: Bool { recoveryHeld != nil }
     func setFailure() { failRecovery = true }
     func setStaleRecovery() { returnOnlyClearedRecovery = true }
     func failInstallation(with report: QueueBootstrapReport) { failedInstallationReport = report }

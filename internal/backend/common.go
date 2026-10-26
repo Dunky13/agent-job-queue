@@ -339,6 +339,12 @@ type boundedOutput struct {
 	exceeded bool
 }
 
+func (b *boundedOutput) ReadFrom(reader io.Reader) (int64, error) {
+	// bytes.Buffer's promoted ReaderFrom would let io.Copy bypass Write and
+	// its capture limit. Keep the destination's only fast path bounded too.
+	return io.Copy(struct{ io.Writer }{b}, reader)
+}
+
 func (b *boundedOutput) Write(p []byte) (int, error) {
 	if b.Len()+len(p) > b.limit {
 		b.exceeded = true

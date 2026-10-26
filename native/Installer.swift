@@ -7,7 +7,7 @@ enum InstallerActivity { static var running = false }
 
 @MainActor
 final class InstallerModel: ObservableObject {
-    @Published var output = "Install Agent Queue for your macOS account.\n\nIncludes its queue and HTTPS runtime. macOS may need an internet connection for first-open verification. Finish or cancel all queued and running jobs before installation or an upgrade. Active work blocks changes to background services. Configuration, history and phone credentials are preserved. Manage optional phone access in settings.\n"
+    @Published var output = "Install Agent Queue for your macOS account.\n\nChoosing Install approves the verified setup repairs required to continue: restore missing standard service files, clean up completed jobs, start a verified stopped service, and disable phone access when migration requires it. Lost custom startup settings cannot be recovered. Credentials and trusted certificates will be preserved; phone access can be enabled again in settings. Unknown ownership or custom configuration still requires review.\n\nInstallation and managed upgrades wait for queued and running jobs to finish before changing background services. Includes its queue and HTTPS runtime. macOS may need an internet connection for first-open verification.\n"
     @Published var running = false
     @Published var completed = false
     private var process: Process?
@@ -28,7 +28,7 @@ final class InstallerModel: ObservableObject {
         let task = Process()
         let stream = Pipe()
         task.executableURL = controller
-        task.arguments = ["install", "--payload", payload.path]
+        task.arguments = ["install", "--payload", payload.path, "--repair-and-continue"]
         task.standardOutput = stream
         task.standardError = stream
         task.standardInput = FileHandle.nullDevice

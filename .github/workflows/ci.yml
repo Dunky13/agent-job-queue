@@ -91,8 +91,40 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Go unit, ownership, SQLite, real daemon, HTTPS, and installer regressions
-        run: go test -p 2 -parallel 2 -race ./cmd/... ./internal/... ./packaging/homebrew ./remote/static -timeout 12m
+      - name: Go unit, ownership, SQLite, real daemon, and HTTPS regressions
+        run: bash scripts/test-go-runtime.sh
+
+  tooling-tests:
+    name: Tooling tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Full Go tooling and installer regressions
+        run: go test -p 2 -parallel 2 -race -v ./internal/tooling -timeout 12m
+
+  native-tests:
+    name: Native tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Native regression tests
         run: bash scripts/test-native.sh
 
@@ -122,6 +154,10 @@ jobs:
     name: Universal installer
     runs-on: macos-15
     timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      EXPECTED_XCODE_VERSION: '16.4'
+      EXPECTED_XCODE_BUILD: 16F6
     outputs:
       artifact_name: ${{ steps.artifact-name.outputs.name }}
     steps:
@@ -133,7 +169,16 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Build macOS 15+ universal installer app
-        run: scripts/build-installer.sh
+        run: |
+          scripts/apple-toolchain.sh "$RUNNER_TEMP/build-toolchain.json"
+          scripts/build-installer.sh
+      - name: Retain credential-free build toolchain identity
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Apple-build-toolchain-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/build-toolchain.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Generate immutable release manifest and Homebrew cask
         run: |
           go run -p 2 ./cmd/queue-tool render-cask \
@@ -157,14 +202,14 @@ jobs:
           name: Agent-Job-Queue-Installer-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
       - name: Record validated installer artifact
         id: artifact-name
         run: printf 'name=Agent-Job-Queue-Installer-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
   ci-required:
     name: ci-required
-    needs: [commit-policy, lint, vulnerability-check, macos-tests, web-tests, installer]
+    needs: [commit-policy, lint, vulnerability-check, macos-tests, tooling-tests, native-tests, web-tests, installer]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

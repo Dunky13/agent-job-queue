@@ -81,6 +81,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, getenv func(strin
 		r, err = c.submit(ctx, archive, record, hash, getenv("GITHUB_RUN_ATTEMPT"), getenv("GITHUB_RUN_ID"))
 	case "wait":
 		r, err = c.wait(ctx, id, timeout)
+		if err != nil {
+			r.Error = stringError(err)
+		}
 	case "log":
 		return c.log(ctx, id, output)
 	}

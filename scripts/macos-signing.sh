@@ -9,6 +9,12 @@ macos_signing_error() {
 
 macos_notary_archive_name() {
   local stage=$1 version=$2
+  if [[ -n ${BUILD_RUN_ID:-} ]]; then
+    [[ ${BUILD_RUN_NUMBER:-} =~ ^[1-9][0-9]*$ && ${BUILD_SHA:-} =~ ^[a-f0-9]{40}$ ]] || {
+      macos_signing_error 'Submission names require the verified build number and commit.'; return 1;
+    }
+    version="$version-build-$BUILD_RUN_NUMBER-${BUILD_SHA:0:7}"
+  fi
   case "$stage" in
     payload) printf 'Agent-Job-Queue-Payload-%s-universal.zip\n' "$version" ;;
     installer) printf 'Agent-Job-Queue-Installer-%s-universal.zip\n' "$version" ;;
@@ -348,6 +354,9 @@ macos_ticket_operation() (
     fi
     if [[ $attempt -ge $max_attempts ]]; then
       printf 'Apple ticket %s: CloudKit connection lost; exhausted %s attempts.\n' "$operation" "$max_attempts" >&2
+      if [[ -n ${MACOS_TICKET_RECOVERY_FILE:-} ]]; then
+        printf 'ticket-connection-loss\n' > "$MACOS_TICKET_RECOVERY_FILE" || return 1
+      fi
       return "$status"
     fi
     printf 'Apple ticket %s: CloudKit connection lost; retrying after %s seconds (attempt %s of %s).\n' "$operation" "$delay" "$((attempt + 1))" "$max_attempts" >&2

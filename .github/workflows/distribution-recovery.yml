@@ -1,0 +1,39 @@
+name: Distribution recovery
+
+on:
+  workflow_run:
+    workflows: [Distribution]
+    types: [completed]
+    branches: [main]
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: distribution-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    name: Continue bound Apple submissions and exact delivery
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_run' ||
+       (github.event.workflow_run.path == '.github/workflows/distribution.yml' &&
+        github.event.workflow_run.repository.full_name == github.repository &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Observe and continue eligible retained candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/distribution-recover.sh

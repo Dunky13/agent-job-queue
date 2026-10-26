@@ -399,9 +399,9 @@ struct QueueBootstrapAction: Codable, Equatable, Sendable, Identifiable {
     let id: String
     let title: String
     let destructive: Bool
-    static let executable = Set(["cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback"])
+    static let executable = Set(["cancel-job", "cleanup-job", "repair-service", "restore-service-definitions", "disable-phone-access", "reset-callback"])
     static let navigation = Set(["wait", "review-jobs", "review-configuration", "reveal", "download-release", "move-app"])
-    var needsConfirmation: Bool { destructive || ["cancel-job", "reset-callback"].contains(id) }
+    var needsConfirmation: Bool { destructive || ["cancel-job", "reset-callback", "restore-service-definitions"].contains(id) }
 }
 
 struct QueueBootstrapJob: Codable, Equatable, Sendable, Identifiable {
@@ -497,6 +497,42 @@ final class QueueBootstrapModel: ObservableObject {
     private var request: QueueBootstrapRequest?
     private var revision: String?
     private var legacyPhoneAccess = false
+
+    private enum ApprovedRepairStep {
+        case recovery(String, Int?)
+        case wait
+    }
+
+    var canRepairAndContinue: Bool {
+        allowsInstallation && !isRunning && phase != .complete && !issues.isEmpty && issues.allSatisfy { Self.approvedRepairStep($0) != nil }
+    }
+
+    private static func approvedRepairStep(_ issue: QueueBootstrapIssue) -> ApprovedRepairStep? {
+        func has(_ id: String) -> Bool { issue.actions.contains { $0.id == id } }
+        switch issue.id {
+        case "service-definitions-missing":
+            return has("restore-service-definitions") ? .recovery("restore-service-definitions", nil) : nil
+        case "legacy-phone-access", "remote-migration":
+            return has("disable-phone-access") ? .recovery("disable-phone-access", nil) : nil
+        case "service-not-ready":
+            if has("repair-service") { return .recovery("repair-service", nil) }
+            return has("wait") ? .wait : nil
+        case "pending-cleanup":
+            if has("cleanup-job"), let job = issue.jobs?.first,
+               ["Cleanup pending", "Done"].contains(job.status) {
+                return .recovery("cleanup-job", job.id)
+            }
+            return has("wait") ? .wait : nil
+        case "legacy-jobs":
+            guard let jobs = issue.jobs, !jobs.isEmpty,
+                  jobs.allSatisfy({ ["Running", "Queued"].contains($0.status) }) else { return nil }
+            return has("wait") ? .wait : nil
+        case "installer-busy", "scheduling-busy", "remote-busy", "controller-stopping":
+            return has("wait") ? .wait : nil
+        default:
+            return nil
+        }
+    }
 
     init(environment: QueueBootstrapEnvironment,
          execute: @escaping Executor = QueueBootstrapModel.runInstaller,
@@ -598,6 +634,72 @@ final class QueueBootstrapModel: ObservableObject {
                 guard attempt == current else { return }
                 if try await preflight(request, current: current) {
                     try await install(request, reason: reason, current: current)
+                }
+            } catch { await fail(error, current: current) }
+        }
+        operation = task
+        return task
+    }
+
+    @discardableResult func repairAndContinue(confirmed: Bool = false) -> Task<Void, Never>? {
+        guard confirmed, canRepairAndContinue else { return nil }
+        let current = begin(.checking, message: "Checking the approved setup repairs…")
+        let task = Task { [self] in
+            var performed = Set<String>()
+            do {
+                while true {
+                    try Task.checkCancellation()
+                    let decision = try await inspectDecision(current)
+                    guard case let .install(request, reason) = decision else { finish(current); return }
+                    self.request = request
+                    if try await preflight(request, current: current, waiting: true) {
+                        try await install(request, reason: reason, current: current)
+                        return
+                    }
+                    guard issues.allSatisfy({ Self.approvedRepairStep($0) != nil }) else {
+                        phase = .reviewing
+                        message = "A requirement needs review. The approved automatic repair has stopped."
+                        return
+                    }
+                    let steps = issues.compactMap(Self.approvedRepairStep)
+                    let coordinationBusy = issues.contains { ["installer-busy", "scheduling-busy", "remote-busy", "controller-stopping"].contains($0.id) }
+                    var next: (String, Int?)?
+                    if !coordinationBusy {
+                        for priority in ["restore-service-definitions", "repair-service", "cleanup-job", "disable-phone-access"] {
+                            for case let .recovery(actionID, jobID) in steps where actionID == priority {
+                                next = (actionID, jobID)
+                                break
+                            }
+                            if next != nil { break }
+                        }
+                    }
+                    if let (actionID, jobID) = next {
+                        let key = actionID + ":" + (jobID.map(String.init) ?? "")
+                        guard performed.insert(key).inserted else {
+                            throw ClientError.message("The approved repair did not clear its setup requirement. No repair was repeated. Review the current requirements before approving another attempt.")
+                        }
+                        guard performed.count <= 128 else {
+                            throw ClientError.message("Setup reached its verified repair limit. Review the remaining requirements before approving another attempt.")
+                        }
+                        phase = .recovering
+                        message = issues.flatMap(\.actions).first(where: { $0.id == actionID })?.title.appending("…") ?? "Repairing setup…"
+                        var arguments = request.arguments + ["--recover", actionID]
+                        if let jobID { arguments += ["--job-id", String(jobID)] }
+                        let data = try await execute(.init(executable: request.executable, arguments: arguments)) { _ in }
+                        _ = try QueueBootstrapReport.decode(data)
+                        guard attempt == current else { return }
+                        phase = .checking
+                        message = "Checking the repaired installation…"
+                    } else {
+                        phase = .waiting
+                        message = "Waiting for queue work and setup requirements to finish. Setup will continue automatically."
+                        // Approval remains scoped to this task while normal work
+                        // finishes. Stop waiting cancels the read-only polling and
+                        // fences its eventual responses without stopping jobs.
+                        try await Task.sleep(for: waitInterval)
+                        guard attempt == current else { return }
+                        phase = .checking
+                    }
                 }
             } catch { await fail(error, current: current) }
         }
@@ -774,11 +876,23 @@ final class QueueBootstrapModel: ObservableObject {
     }
 }
 
-private struct QueueBootstrapPendingAction: Identifiable {
-    let issue: QueueBootstrapIssue
-    let action: QueueBootstrapAction
-    let jobID: Int?
-    var id: String { issue.id + ":" + action.id + ":" + String(jobID ?? -1) }
+private enum QueueBootstrapPendingAction: Identifiable {
+    case individual(QueueBootstrapIssue, QueueBootstrapAction, Int?)
+    case repairInstallation
+
+    var id: String {
+        switch self {
+        case let .individual(issue, action, jobID): return issue.id + ":" + action.id + ":" + String(jobID ?? -1)
+        case .repairInstallation: return "repair-installation"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case let .individual(_, action, _): return action.title
+        case .repairInstallation: return "Repair and continue"
+        }
+    }
 }
 
 struct QueueBootstrapView: View {
@@ -858,6 +972,10 @@ struct QueueBootstrapView: View {
                         }
                         Button("Check again") { model.start() }
                             .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    } else if model.canRepairAndContinue {
+                        Button("Check again") { model.start() }
+                        Button("Repair and continue") { pending = .repairInstallation }
+                            .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                     } else if model.canDisablePhoneAccess && model.issues.isEmpty {
                         Button("Disable phone access and continue") { model.start(disablePhoneAccess: true) }
                             .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
@@ -869,10 +987,15 @@ struct QueueBootstrapView: View {
             }
         }.padding(24).frame(minWidth: 560, minHeight: 410)
         .alert(item: $pending) { selected in
-            Alert(title: Text(selected.action.title),
+            Alert(title: Text(selected.title),
                   message: Text(confirmation(selected)),
-                  primaryButton: .destructive(Text(selected.action.title)) {
-                    model.perform(actionID: selected.action.id, issueID: selected.issue.id, jobID: selected.jobID, confirmed: true)
+                  primaryButton: .destructive(Text(selected.title)) {
+                    switch selected {
+                    case let .individual(issue, action, jobID):
+                        model.perform(actionID: action.id, issueID: issue.id, jobID: jobID, confirmed: true)
+                    case .repairInstallation:
+                        model.repairAndContinue(confirmed: true)
+                    }
                   }, secondaryButton: .cancel())
         }
     }
@@ -889,18 +1012,23 @@ struct QueueBootstrapView: View {
             case "move-app": model.showApplications()
             case "download-release": model.downloadRelease()
             default:
-                if action.needsConfirmation { pending = .init(issue: issue, action: action, jobID: jobID) }
+                if action.needsConfirmation { pending = .individual(issue, action, jobID) }
                 else { model.perform(actionID: action.id, issueID: issue.id, jobID: jobID) }
             }
         }.disabled(!model.canPerform(action, issue: issue))
     }
 
     private func confirmation(_ selected: QueueBootstrapPendingAction) -> String {
-        switch selected.action.id {
-        case "cancel-job": return "Cancel job \(selected.jobID.map(String.init) ?? "")? Running work will be stopped and cannot be restored by setup."
+        if case .repairInstallation = selected {
+            return "Approve the verified repairs required for this installation? Setup can restore missing standard service files, run verified cleanup for completed jobs, start a verified stopped service and disable phone access when migration requires it. Lost custom startup settings cannot be recovered. Credentials and trusted certificates will be preserved; phone access can be enabled again in settings. Active jobs will finish normally, and setup will wait and then continue automatically."
+        }
+        guard case let .individual(issue, action, jobID) = selected else { return "" }
+        switch action.id {
+        case "cancel-job": return "Cancel job \(jobID.map(String.init) ?? "")? Running work will be stopped and cannot be restored by setup."
         case "reset-callback": return "Back up and replace the current callback with Agent Queue's standard cleanup callback? Its custom behavior will no longer run. The configuration revision will be checked again before changing it."
+        case "restore-service-definitions": return "Restore missing service files using verified loaded commands and standard startup settings? Any lost custom startup settings cannot be recovered. Running services and jobs will stay active. Setup will check all requirements again before continuing."
         case "disable-phone-access": return "Disable phone access and continue setup? Credentials, configuration, and trusted certificates will be preserved. You can enable access again after setup."
-        default: return selected.issue.detail
+        default: return issue.detail
         }
     }
 }

@@ -630,7 +630,7 @@ func TestOfficialS3PutObjectUsesScopedCredentialsAndNoRetry(t *testing.T) {
 }
 
 func TestWaitStatusesTimeoutCancellationAndPublicOutput(t *testing.T) {
-	for _, kind := range []string{"accepted", "invalid", "rejected", "timeout", "cancelled", "cancel-during-get", "unknown", "wrong-id"} {
+	for _, kind := range []string{"accepted", "invalid", "rejected", "timeout", "cancelled", "cancel-during-get", "unknown", "wrong-id", "wrong-id-after-pending", "malformed-after-pending"} {
 		t.Run(kind, func(t *testing.T) {
 			f := makeFixture(t)
 			calls := 0
@@ -647,6 +647,12 @@ func TestWaitStatusesTimeoutCancellationAndPublicOutput(t *testing.T) {
 				}
 				status := "In Progress"
 				id := testID
+				if calls == 2 && kind == "wrong-id-after-pending" {
+					id = testIssuer
+				}
+				if calls == 2 && kind == "malformed-after-pending" {
+					return response(r, 200, `{broken`), nil
+				}
 				switch kind {
 				case "accepted":
 					if calls == 2 {
@@ -694,10 +700,25 @@ func TestWaitStatusesTimeoutCancellationAndPublicOutput(t *testing.T) {
 				}
 			case "cancelled", "cancel-during-get":
 				requireError(t, err, "cancelled")
-			case "unknown", "wrong-id":
+			case "unknown", "wrong-id", "wrong-id-after-pending", "malformed-after-pending":
 				requireError(t, err, "invalid_response")
 			}
-			if out != "{\"id\":\""+testID+"\",\"status\":\""+wantStatus+"\"}\n" {
+			wantError := ""
+			switch kind {
+			case "timeout":
+				wantError = "timeout"
+			case "invalid", "rejected":
+				wantError = "submission_rejected"
+			case "cancelled", "cancel-during-get":
+				wantError = "cancelled"
+			case "unknown", "wrong-id", "wrong-id-after-pending", "malformed-after-pending":
+				wantError = "invalid_response"
+			}
+			encodedError := ""
+			if wantError != "" {
+				encodedError = ",\"error\":\"" + wantError + "\""
+			}
+			if out != "{\"id\":\""+testID+"\",\"status\":\""+wantStatus+"\""+encodedError+"}\n" {
 				t.Fatalf("unsafe or incorrect output: %q", out)
 			}
 		})

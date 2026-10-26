@@ -40,8 +40,15 @@ type installer struct {
 
 var errInstallLegacyPhoneAccess = errors.New("Phone access from the previous installation must be disabled before setup can continue. Credentials and configuration will be preserved")
 var errInstallServiceNotLoaded = errors.New("Launch service is not loaded")
+var errInstallPendingCleanup = errors.New("Queue migration must wait for queue work and cleanup to finish. Retained receipts or owned lease markers may still belong to running jobs. Existing files were preserved.")
+
+type installCleanupPendingError struct{ path string }
+
+func (err *installCleanupPendingError) Error() string { return errInstallPendingCleanup.Error() }
+func (err *installCleanupPendingError) Unwrap() error { return errInstallPendingCleanup }
 
 const installDisablePhoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
+const installLegacySnapshotLimit = 32 * 1024 * 1024
 
 var installLegacyFiles = []string{"agent_heavy.py", "agent_integration.py", "resource_monitor.py", "job_profiles.py", "resource_scheduler.py", "learning_control.py", "app_updates.py", "release_metadata.py", "install-remote.sh", "scripts/migrate-installation.py", "remote/control.py", "remote/server.py", "remote/requirements.txt", "remote/requirements.lock"}
 var installLegacyDirectories = []string{".venv", "__pycache__", "remote/__pycache__", "remote/static"}
@@ -187,6 +194,14 @@ func (install *installer) commandEnvironment(args []string) []string {
 	return envList(environment)
 }
 
+func (install *installer) commandOutputLimit(args []string) int {
+	if slices.Equal(args, []string{"pueue", "--config", filepath.Join(install.config, "pueue.yml"), "--color", "never", "status", "--json"}) {
+		// Loaded and saved legacy state have the same bounded history budget.
+		return installLegacySnapshotLimit
+	}
+	return 4 * 1024 * 1024
+}
+
 func (install *installer) run(ctx context.Context, args ...string) ([]byte, error) {
 	if install.command != nil {
 		return install.command(ctx, args)
@@ -211,7 +226,7 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 	defer cancel()
 	command := exec.CommandContext(bounded, commandPath, args[1:]...)
 	command.Env = install.commandEnvironment(environmentArgs)
-	output := &boundedOutput{limit: 4 * 1024 * 1024}
+	output := &boundedOutput{limit: install.commandOutputLimit(environmentArgs)}
 	command.Stdout = output
 	command.Stderr = output
 	command.WaitDelay = time.Second
@@ -856,7 +871,7 @@ func (install *installer) legacySnapshot(ctx context.Context, node *yaml.Node, l
 			return Object{"tasks": Object{}, "groups": Object{"default": Object{"parallel_tasks": 1, "status": "Running"}}}, nil
 		}
 	}
-	raw, err := updateReadOwned(filename, 32*1024*1024)
+	raw, err := updateReadOwned(filename, installLegacySnapshotLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -866,8 +881,8 @@ func (install *installer) legacySnapshot(ctx context.Context, node *yaml.Node, l
 			return nil, err
 		}
 		defer reader.Close()
-		raw, err = io.ReadAll(io.LimitReader(reader, 32*1024*1024+1))
-		if err != nil || len(raw) > 32*1024*1024 {
+		raw, err = io.ReadAll(io.LimitReader(reader, installLegacySnapshotLimit+1))
+		if err != nil || len(raw) > installLegacySnapshotLimit {
 			return nil, errors.New("Cannot safely inspect compressed legacy queue state")
 		}
 	}
@@ -948,7 +963,6 @@ func (install *installer) queueMigration(ctx context.Context, node *yaml.Node) (
 }
 
 func (install *installer) requireLegacyCleanup() error {
-	pending := errors.New("Queue migration requires completed job cleanup. Wait for cleanup or inspect it in the existing installation, then retry; receipts and owned lease markers were preserved")
 	receipts, err := integrationParent(filepath.Join(install.state, "receipts", ".installer-probe"), false)
 	if err == nil {
 		entries, readErr := receipts.ReadDir(-1)
@@ -957,7 +971,7 @@ func (install *installer) requireLegacyCleanup() error {
 			return readErr
 		}
 		if len(entries) != 0 {
-			return pending
+			return &installCleanupPendingError{path: filepath.Join(install.state, "receipts")}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -973,7 +987,7 @@ func (install *installer) requireLegacyCleanup() error {
 	// Queue's own marker names establish unfinished queue cleanup here.
 	for _, name := range []string{"agent-heavy.json", "agent-heavy-lease.json"} {
 		if _, err := os.Lstat(filepath.Join(slot, name)); err == nil {
-			return pending
+			return &installCleanupPendingError{path: filepath.Join(slot, name)}
 		} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOTDIR) {
 			return err
 		}
@@ -991,7 +1005,7 @@ func (install *installer) requireLegacyCleanup() error {
 		return err
 	}
 	if len(entries) != 0 {
-		return pending
+		return &installCleanupPendingError{path: filepath.Join(slot, "agent-heavy-jobs")}
 	}
 	return nil
 }
@@ -1359,8 +1373,9 @@ func (install *installer) validatePhoneAccessRecovery(ctx context.Context) error
 	}
 	arguments, err := stringsFrom(definition["ProgramArguments"])
 	legacy := []string{filepath.Join(install.root, ".venv/bin/python"), filepath.Join(install.root, "remote/control.py"), "serve"}
+	legacyRemote := []string{filepath.Join(install.root, "remote/.venv/bin/python"), filepath.Join(install.root, "remote/control.py"), "serve"}
 	embedded := []string{filepath.Join(install.root, "bin/agent-remote"), "serve"}
-	if err != nil || text(definition["Label"]) != label || (!slices.Equal(arguments, legacy) && !slices.Equal(arguments, embedded)) {
+	if err != nil || text(definition["Label"]) != label || (!slices.Equal(arguments, legacy) && !slices.Equal(arguments, legacyRemote) && !slices.Equal(arguments, embedded)) {
 		return errors.New("Phone access launch agent is customized; resolve its ownership before continuing setup")
 	}
 	if program, present := definition["Program"]; present && text(program) != arguments[0] {
@@ -2170,7 +2185,12 @@ func InstallMain(args []string) int {
 		}
 		return 0
 	}
-	if err := install.execute(ctx); err != nil {
+	if options.repairAndContinue {
+		err = install.repairAndExecute(ctx)
+	} else {
+		err = install.execute(ctx)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Agent Queue installer: %v\n", err)
 		if errors.Is(err, errInstallLegacyPhoneAccess) {
 			fmt.Fprintln(os.Stderr, installDisablePhoneAccessRecovery)
