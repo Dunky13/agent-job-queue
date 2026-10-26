@@ -38,10 +38,15 @@ if [[ -d $app && ! -L $app && ! -e $installer && ! -L $installer ]]; then
   bundle=$app
   command=verify-app
   argument=--app
+  helper_directory='Contents/Resources/payload/source/bin'
+  if plutil -type AgentQueueServiceManagement "$app/Contents/Info.plist" >/dev/null 2>&1; then
+    # verify-app checks the marker type and every bundled service definition.
+    helper_directory='Contents/MacOS'
+  fi
   executables=(
     'Contents/MacOS/AgentQueue'
-    'Contents/Resources/payload/source/bin/agent-heavy'
-    'Contents/Resources/payload/source/bin/agent-remote'
+    "$helper_directory/agent-heavy"
+    "$helper_directory/agent-remote"
   )
 elif [[ -d $installer && ! -L $installer && ! -e $app && ! -L $app && ! -e $applications && ! -L $applications ]]; then
   bundle=$installer

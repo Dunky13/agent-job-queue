@@ -530,6 +530,7 @@ if [[ $command == init ]]; then
   for path in 'Agent Queue.app/Contents/MacOS/AgentQueue' source/bin/agent-heavy source/bin/agent-remote; do
     [[ -f "$state/work/Agent Job Queue Installer.app/Contents/Resources/payload/$path" ]] || fail 'The complete installer payload is required.'
   done
+  macos_app_payload_mode "$state/work/Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app"
   archive "$state/work/Agent Job Queue Installer.app" "$state/initial.zip"
   jq -n --arg version "$resume_version" --arg team "$APPLE_TEAM_ID" --arg sha "$source_sha" \
     --arg repository "$GITHUB_REPOSITORY" --arg run "$source_run" --arg number "$source_number" \

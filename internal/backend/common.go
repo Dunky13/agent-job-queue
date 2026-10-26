@@ -3,6 +3,7 @@ package backend
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -261,6 +262,7 @@ type Gate struct {
 	Config, State, Slot, Jobs, Receipts, Cancelled, Metadata string
 	ControlEnv                                               map[string]string
 	ControlDeadline                                          time.Time
+	controlContext                                           context.Context
 	queueControl                                             func(string, Object) (Object, error)
 	DescriptionCache, ProjectCache                           map[string]Object
 }
@@ -355,6 +357,13 @@ func (b *boundedOutput) Write(p []byte) (int, error) {
 func (g *Gate) Snapshot() (Object, error) {
 	return g.QueueControl("snapshot", nil)
 }
+
+func (g *Gate) operationContext() context.Context {
+	if g.controlContext != nil {
+		return g.controlContext
+	}
+	return context.Background()
+}
 func (g *Gate) Task(id int) (Object, error) {
 	snapshot, err := g.Snapshot()
 	if err != nil {
@@ -372,6 +381,10 @@ func (g *Gate) Task(id int) (Object, error) {
 }
 
 func LockPrivate(g *Gate, name string) (func(), error) {
+	ctx := g.operationContext()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if name == "" {
 		name = "lease.lock"
 	}
@@ -396,6 +409,10 @@ func LockPrivate(g *Gate, name string) (func(), error) {
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
+		if err := ctx.Err(); err != nil {
+			file.Close()
+			return nil, err
+		}
 		err = syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
 			break
@@ -408,7 +425,12 @@ func LockPrivate(g *Gate, name string) (func(), error) {
 			file.Close()
 			return nil, errors.New("Queue coordination lock did not become available")
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			file.Close()
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 	return func() { _ = syscall.Flock(fd, syscall.LOCK_UN); _ = file.Close() }, nil
 }

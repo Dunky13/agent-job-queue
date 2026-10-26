@@ -15,3 +15,5 @@ AGENT_QUEUE_TEST_INSTALLER_PAYLOAD="$installer/Contents/Resources/payload" \
   go test -p 2 -parallel 2 ./internal/backend -run '^TestInstallerPackaged(Payload|AppBundle)$' -count=1 -v -timeout 3m
 AGENT_QUEUE_TEST_INSTALLER_PAYLOAD="$installer/Contents/Resources/payload" \
   go test -p 2 -parallel 2 ./internal/remote -run '^TestRemotePackagedGateway$' -count=1 -v -timeout 3m
+AGENT_QUEUE_TEST_INSTALLER_PAYLOAD="$installer/Contents/Resources/payload" \
+  go test -race -p 2 -parallel 2 ./internal/tooling -run '^TestManagedInstallerPackagedNativeFixture$' -count=1 -v -timeout 3m

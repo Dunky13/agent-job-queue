@@ -7,7 +7,7 @@ enum InstallerActivity { static var running = false }
 
 @MainActor
 final class InstallerModel: ObservableObject {
-    @Published var output = "Install Agent Queue for your macOS account.\n\nChoosing Install approves the verified setup repairs required to continue: restore missing standard service files, clean up completed jobs, start a verified stopped service, and disable phone access when migration requires it. Lost custom startup settings cannot be recovered. Credentials and trusted certificates will be preserved; phone access can be enabled again in settings. Active jobs finish normally while setup waits. Unknown ownership or custom configuration still requires review.\n\nIncludes its queue and HTTPS runtime. macOS may need an internet connection for first-open verification. Later embedded queue upgrades preserve running jobs and settings.\n"
+    @Published var output = "Install Agent Queue for your macOS account.\n\nChoosing Install approves the verified setup repairs required to continue: restore missing standard service files, clean up completed jobs, start a verified stopped service, and disable phone access when migration requires it. Lost custom startup settings cannot be recovered. Credentials and trusted certificates will be preserved; phone access can be enabled again in settings. Unknown ownership or custom configuration still requires review.\n\nInstallation and managed upgrades wait for queued and running jobs to finish before changing background services. Includes its queue and HTTPS runtime. macOS may need an internet connection for first-open verification.\n"
     @Published var running = false
     @Published var completed = false
     private var process: Process?
@@ -21,6 +21,10 @@ final class InstallerModel: ObservableObject {
         }
         let payload = resources.appendingPathComponent("payload")
         let controller = payload.appendingPathComponent("source/bin/agent-heavy")
+        guard QueueExecutableNamespace.allows(executable: controller, root: Bundle.main.bundleURL) else {
+            output += "\nThe installer location permits unsafe executable replacement. Open it from a protected download or your account's Applications folder. No installation was started.\n"
+            return
+        }
         let task = Process()
         let stream = Pipe()
         task.executableURL = controller

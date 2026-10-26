@@ -28,6 +28,14 @@ copied="$work/installed/Agent Queue.app"
 xattr -p com.apple.quarantine "$copied" >/dev/null
 codesign --verify --strict --deep --all-architectures \
   -R "=anchor apple generic and certificate leaf[subject.OU] = \"$team\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists" "$copied"
+macos_signing_verification_configure "$team"
+macos_app_payload_mode "$copied"
+if [[ $MACOS_APP_EMBEDDED == 1 ]]; then
+  for name in agent-heavy agent-remote; do
+    macos_verify_code "$MACOS_APP_HELPERS/$name"
+  done
+  (cd "$root" && go run -p 2 ./cmd/queue-tool verify-app --app "$copied")
+fi
 macos_validate_ticket "$copied"
 syspolicy_check distribution "$copied" --verbose
 "$root/scripts/macos-signing.sh" verify-dmg "$image" "$team"

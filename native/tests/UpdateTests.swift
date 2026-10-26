@@ -56,7 +56,7 @@ actor UpdateFixture {
         if arguments == ["updates", "install", "--build", "101", "--json"] {
             if failInstall { throw ClientError.message("Checksum mismatch") }
             return try encoder.encode(QueueInstallerResult(installerOpened: true, build: installerBuild,
-                message: "Installer opened. Choose Install to finish. Queued and running jobs are preserved"))
+                message: "Installer opened. Finish queued and running jobs. Choose Install to continue; active work blocks managed service changes"))
         }
         throw ClientError.message("Unexpected update command")
     }
@@ -201,10 +201,18 @@ struct UpdateTests {
         let callsAfterPreview = await fixture.calls
         try check(callsAfterPreview == callsBeforePreview && preview.check?.latest?.build == 101,
             "Snapshot fixture has a simulated release and performs no external effects")
+        for role in ["queue", "resources", "remote", "login"] {
+            try check(QueueClient.timeout(for: ["--service-management", "status", role], budget: .setup) == 5,
+                "Exact native status for \(role) has a five-second read budget")
+        }
+        try check(QueueClient.timeout(for: ["--service-management", "register", "queue"], budget: .setup) == 330 &&
+            QueueClient.timeout(for: ["--service-management", "status", "queue", "extra"], budget: .setup) == 330 &&
+            QueueClient.timeout(for: ["--service-management", "status", "unknown"], budget: .setup) == 330,
+            "Native mutation and malformed arguments cannot inherit discardable read budgets")
         try check(QueueClient.timeout(for: ["status"], budget: .updates) == 8 &&
             QueueClient.timeout(for: ["cancel", "1"]) == 25 &&
             QueueClient.timeout(for: ["status"], controller: .remote) == 8 &&
-            QueueClient.timeout(for: ["configure"], controller: .remote) == 35 &&
+            QueueClient.timeout(for: ["configure"], controller: .remote) == 125 &&
             QueueClient.timeout(for: ["updates", "install"], budget: .updates) == 130 &&
             QueueClient.timeout(for: ["updates", "install"]) == 25,
             "Explicit update deadline leaves normal queue and remote deadlines unchanged")

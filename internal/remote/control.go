@@ -27,6 +27,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 	"github.com/caddyserver/caddy/v2"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -53,6 +54,7 @@ type Settings struct {
 type remotePaths struct {
 	testing                                                                                 bool
 	state, config, plist, socket, pid, gatewayConfig, certificate, log, errorFile, children string
+	home, managedApp, managedCandidate                                                      string
 }
 
 func newPaths() (remotePaths, error) {
@@ -60,7 +62,7 @@ func newPaths() (remotePaths, error) {
 	if err != nil {
 		return remotePaths{}, err
 	}
-	p := remotePaths{testing: os.Getenv("AGENT_REMOTE_TEST_MODE") == "1"}
+	p := remotePaths{testing: os.Getenv("AGENT_REMOTE_TEST_MODE") == "1", home: home}
 	p.state = filepath.Join(home, ".local/state/agent-heavy/remote")
 	p.config = filepath.Join(home, ".config/agent-heavy/remote.json")
 	p.plist = filepath.Join(home, "Library/LaunchAgents", label+".plist")
@@ -86,6 +88,20 @@ func newPaths() (remotePaths, error) {
 	p.log = filepath.Join(p.state, "service.log")
 	p.errorFile = filepath.Join(p.state, "error.json")
 	p.children = filepath.Join(p.state, "children")
+	if !p.testing {
+		installed, err := appservices.Load(home)
+		if err != nil {
+			return remotePaths{}, fmt.Errorf("Cannot read managed phone service ownership: %w", err)
+		}
+		if installed != nil {
+			p.managedApp = installed.App
+		}
+		executable, err := os.Executable()
+		if err != nil {
+			return remotePaths{}, err
+		}
+		p.managedCandidate, _ = appservices.BundleForExecutable(executable)
+	}
 	return p, nil
 }
 
@@ -247,15 +263,18 @@ type childRecord struct {
 }
 
 type controller struct {
-	p           remotePaths
-	ctx         context.Context
-	birthFn     func(int) (string, error)
-	bootFn      func() (string, error)
-	groupFn     func(int) (int, error)
-	killFn      func(int, syscall.Signal) error
-	killGroupFn func(int, syscall.Signal) error
-	serviceFn   func(string) error
-	reconcileFn func(string) error
+	p                remotePaths
+	ctx              context.Context
+	birthFn          func(int) (string, error)
+	bootFn           func() (string, error)
+	groupFn          func(int) (int, error)
+	killFn           func(int, syscall.Signal) error
+	killGroupFn      func(int, syscall.Signal) error
+	serviceFn        func(string) error
+	reconcileFn      func(string) error
+	managedCommand   func([]string) ([]byte, error)
+	newCommand       func(context.Context, string, ...string) *exec.Cmd
+	installMigration bool
 }
 
 func newController(p remotePaths, ctx context.Context) *controller {
@@ -287,7 +306,11 @@ func controlEnvironment(testing bool) []string {
 func (c *controller) command(arguments []string, input []byte, timeout time.Duration, check bool) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(c.ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, arguments[0], arguments[1:]...)
+	newCommand := c.newCommand
+	if newCommand == nil {
+		newCommand = exec.CommandContext
+	}
+	cmd := newCommand(ctx, arguments[0], arguments[1:]...)
 	cmd.WaitDelay = time.Second
 	cmd.Env = controlEnvironment(false)
 	if input != nil {
@@ -673,6 +696,12 @@ func xmlText(value string) string {
 	return buffer.String()
 }
 func (c *controller) launchAgent() error {
+	if c.p.managedApp != "" {
+		return nil // The signed app owns its service definition.
+	}
+	if c.p.managedCandidate != "" {
+		return errors.New("Complete Agent Queue installation before enabling phone access")
+	}
 	if err := os.MkdirAll(filepath.Dir(c.p.plist), 0700); err != nil {
 		return err
 	}
@@ -691,6 +720,9 @@ func (c *controller) launchAgent() error {
 }
 
 func (c *controller) serviceAction(action string) error {
+	if c.p.managedApp != "" {
+		return c.managedServiceAction(action)
+	}
 	if c.p.testing {
 		if action != "stop" {
 			return nil
@@ -728,6 +760,29 @@ func (c *controller) serviceAction(action string) error {
 }
 
 func (c *controller) enable() error {
+	if c.p.managedCandidate != "" && c.p.managedApp == "" {
+		return errors.New("Complete Agent Queue installation before enabling phone access")
+	}
+	if c.p.managedApp != "" {
+		if !c.installMigration {
+			pending := filepath.Join(c.p.home, ".local/share/agent-heavy/install-in-progress.json")
+			if _, err := appservices.ReadFile(c.p.home, pending, 16384, false); err == nil {
+				return errors.New("Installation is incomplete; finish the installer before enabling phone access")
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("Cannot verify completed installation before enabling phone access: %w", err)
+			}
+		}
+		state, err := c.managedServiceState("status")
+		if err != nil {
+			return err
+		}
+		if state == "requiresApproval" {
+			return errors.New("Allow Agent Queue's background services in Login Items settings before enabling phone access")
+		}
+		if state == "notFound" {
+			return errors.New("The installed phone service definition is unavailable")
+		}
+	}
 	if err := c.p.prepare(); err != nil {
 		return err
 	}
@@ -1579,9 +1634,11 @@ func (c *controller) supervisor() (result error) {
 
 // Main is the standalone remote controller entrypoint.
 func Main(arguments []string) int {
-	return runMain(arguments, os.Stdin, prepareConfiguration, func() (context.Context, context.CancelFunc) {
-		return context.WithTimeout(context.Background(), 30*time.Second)
-	})
+	return runMain(arguments, os.Stdin, prepareConfiguration, defaultLifecycleContext)
+}
+
+func defaultLifecycleContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), appservices.ControllerLifecycleTimeout)
 }
 
 func runMain(arguments []string, inputReader io.Reader, prepare func(map[string]json.RawMessage) (*preparedConfiguration, error), lifecycleContext func() (context.Context, context.CancelFunc)) int {
@@ -1637,6 +1694,7 @@ func runMain(arguments []string, inputReader io.Reader, prepare func(map[string]
 		defer cancel()
 	}
 	c := newController(p, ctx)
+	c.installMigration = action == "migrate"
 	switch action {
 	case "configure", "enable", "disable", "migrate":
 		if err = p.prepare(); err != nil {

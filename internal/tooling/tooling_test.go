@@ -76,12 +76,12 @@ func TestHomebrewManifestAndCaskContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{manifest.SHA256, "source/links/agent-heavy", "source/links/agent-remote", `app "Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app", target: application`, `args: ["-f", "--", "#{Dir.home}/Library/LaunchAgents/io.went.agent-queue.plist"]`, "Open Agent Queue to finish setup", "Command-line tools are ready after setup completes", "Developer ID signed and notarized", "Quarantine is retained", "sudo: false"} {
+	for _, expected := range []string{manifest.SHA256, "source/links/agent-heavy", "source/links/agent-remote", `app "Agent Job Queue Installer.app", target: "#{Dir.home}/Applications/Agent Job Queue Installer.app"`, "Open Agent Job Queue Installer", "choose Install", "CLI links become ready after setup", "Homebrew upgrade or uninstall leaves the installed Agent Queue app and services in place", "Developer ID signed and notarized", "Quarantine is retained"} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("missing %s", expected)
 		}
 	}
-	for _, obsolete := range []string{"depends_on formula:", "sudo: true", "preflight", "/usr/bin/xattr", "com.apple.quarantine", "source/scripts/install-user.sh", "installer script:", "postflight", "system_command", `"--payload"`, `delete: [`, `"#{Dir.home}/Applications/Agent Queue.app",`} {
+	for _, obsolete := range []string{"depends_on formula:", "sudo:", "preflight", "postflight", "/usr/bin/xattr", "com.apple.quarantine", "source/scripts/install-user.sh", "installer script:", "system_command", `"--payload"`, `"--app-bundle"`, "uninstall quit:", "uninstall script:", "run \"", `delete: [`, `"#{Dir.home}/Applications/Agent Queue.app",`, "payload/Agent Queue.app\", target:"} {
 		if strings.Contains(body, obsolete) {
 			t.Errorf("obsolete dependency %s", obsolete)
 		}

@@ -2119,17 +2119,45 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 	if payload != "" && !filepath.IsAbs(payload) {
 		t.Fatal("release payload must be absolute")
 	}
-	f := installTestFixture(t)
+	markedApp := appSource
+	if markedApp == "" || !appBundle {
+		markedApp = filepath.Join(payload, "Agent Queue.app")
+	}
+	metadata, err := updatePlist(filepath.Join(markedApp, "Contents/Info.plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	managed, _ := metadata["AgentQueueServiceManagement"].(bool)
+	var f *installFixture
+	var managedRuntime *managedFixture
+	if managed {
+		managedRuntime = managedTestFixture(t)
+		f = managedRuntime.installFixture
+	} else {
+		f = installTestFixture(t)
+	}
 	install := f.installer
-	home, err := os.MkdirTemp("/tmp", "aq-pkg-")
+	base, err := os.MkdirTemp("/tmp", "aq-pkg-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	home, err = filepath.EvalSymlinks(home)
+	base, err = filepath.EvalSymlinks(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	home := filepath.Join(base, "User With Spaces")
+	if err := os.Mkdir(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("packaged runtime failure evidence retained at %s", base)
+			return
+		}
+		if err := os.RemoveAll(base); err != nil {
+			t.Error(err)
+		}
+	})
 	t.Setenv("HOME", home)
 	install.home = home
 	install.payload = payload
@@ -2159,7 +2187,18 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 		install.payload = filepath.Join(install.app, "Contents/Resources/payload")
 		appBefore = installBundleSnapshot(t, install.app)
 	}
-	if err := f.run(t); err != nil {
+	if managed {
+		managedPackagedRuntimeFixture(t, managedRuntime)
+	}
+	// Packaged setup now owns actual daemon startup, previously performed later
+	// under its own readiness deadline. The five-second synthetic fixture runner
+	// cannot include cold executable policy checks, bundle copying and startup.
+	runPackaged := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return install.execute(ctx)
+	}
+	if err := runPackaged(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(install.config, "pueue.yml")); !errors.Is(err, os.ErrNotExist) {
@@ -2167,7 +2206,7 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 	}
 	private := filepath.Join(install.state, "fixture-history")
 	integrationTestWrite(t, private, []byte("preserved private fixture"))
-	if err := f.run(t); err != nil {
+	if err := runPackaged(); err != nil {
 		t.Fatal(err)
 	}
 	if string(integrationTestRead(t, private)) != "preserved private fixture" {
@@ -2231,7 +2270,9 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 		return command
 	}
 	cli := filepath.Join(home, ".local/bin/agent-heavy")
-	start("daemon", cli, "daemon")
+	if !managed {
+		start("daemon", cli, "daemon")
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	ready := false
 	for time.Now().Before(deadline) {
@@ -2255,14 +2296,16 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 	if appBundle {
 		// Re-run setup with the real packaged daemon live, then exercise a job
 		// through that same daemon and scheduler below.
-		if err := f.run(t); err != nil {
+		if err := runPackaged(); err != nil {
 			t.Fatalf("packaged app setup could not retry with a live daemon: %v", err)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(install.config, "pueue.yml")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("packaged upgrade or daemon generated legacy queue configuration")
 	}
-	start("scheduler", cli, "scheduler")
+	if !managed {
+		start("scheduler", cli, "scheduler")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	job := exec.CommandContext(ctx, cli, "run", "--label", "Packaged fixture", "--", "/bin/sh", "-c", `printf '%s|%s|%s\n' "$1" "$2" "$PACKAGED_TEST_VALUE"; exit 7`, "packaged-fixture", "argument with spaces", "literal;$HOME")

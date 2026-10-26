@@ -24,12 +24,109 @@ struct BootstrapTests {
             catch { return error.localizedDescription.contains(text) }
         }
 
+        // Ordinary launch must never use the installation/recovery executor,
+        // including repeated launches after security software removed helpers.
+        for incomplete in [false, true] {
+            let ordinary = try BootstrapFixture(parent: temporary, setupMode: false)
+            if incomplete {
+                try BootstrapFixture.write(ordinary.identity,
+                    to: ordinary.environment.root.appendingPathComponent("install-in-progress.json"))
+            }
+            let counter = BootstrapCountingExecutorFixture()
+            var completed = false
+            let startup = QueueBootstrapModel(environment: ordinary.environment, execute: { request, output in
+                await counter.execute(request, output: output)
+            }) { completed = true }
+            await startup.start()?.value
+            await startup.start()?.value
+            let calls = await counter.calls
+            try check(startup.phase == .setupRequired && !completed && calls == 0,
+                "Ordinary \(incomplete ? "incomplete" : "fresh") startup directs the user to the installer without executing setup")
+            try check(startup.start(disablePhoneAccess: true) == nil && startup.waitAndContinue() == nil &&
+                startup.repairAndContinue(confirmed: true) == nil,
+                "Ordinary startup cannot enter mutation or recovery through hidden actions")
+            try check(!FileManager.default.fileExists(atPath: ordinary.environment.root.appendingPathComponent("bin").path) &&
+                !FileManager.default.fileExists(atPath: ordinary.environment.home.appendingPathComponent("Library/LaunchAgents").path),
+                "Ordinary startup creates neither private executables nor launch definitions")
+            if incomplete {
+                try check(FileManager.default.fileExists(atPath: ordinary.environment.root.appendingPathComponent("install-in-progress.json").path),
+                    "Ordinary startup preserves the incomplete-install marker")
+            }
+        }
+
+        let stalled = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
+        try stalled.installManaged()
+        let stalledPID = temporary.appendingPathComponent("native-startup-read.pid")
+        let quotedPID = "'" + stalledPID.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let stalledLauncher = stalled.environment.app.appendingPathComponent("Contents/MacOS/AgentQueue")
+        try BootstrapFixture.write(Data("#!/bin/sh\nprintf '%s' \"$$\" > \(quotedPID)\nexec /bin/sleep 30\n".utf8),
+            to: stalledLauncher, executable: true)
+        var stalledCompleted = false
+        let stalledModel = QueueBootstrapModel(environment: stalled.environment) { stalledCompleted = true }
+        let stalledTask = stalledModel.start()
+        let readDeadline = ProcessInfo.processInfo.systemUptime + 3
+        while !FileManager.default.fileExists(atPath: stalledPID.path) {
+            guard ProcessInfo.processInfo.systemUptime < readDeadline else {
+                stalledTask?.cancel()
+                await stalledTask?.value
+                throw ClientError.message("Private native status read did not launch")
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let stoppedAt = ProcessInfo.processInfo.systemUptime
+        stalledModel.cancelWaiting()
+        await stalledTask?.value
+        let childPID = Int32(try String(contentsOf: stalledPID, encoding: .utf8)) ?? -1
+        try check(childPID > 1 && kill(childPID, 0) == -1 && errno == ESRCH &&
+            ProcessInfo.processInfo.systemUptime - stoppedAt < 1 && !stalledCompleted && !stalledModel.isRunning,
+            "Stopping ordinary startup cancels and reaps the actual private native status child")
+
+        for status in ["enabled", "requiresApproval", "notRegistered", "notFound", "invalid"] {
+            let managed = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
+            try managed.installManaged()
+            let readback = BootstrapServiceStatusFixture(status: status)
+            var completed = false
+            let startup = QueueBootstrapModel(environment: managed.environment, execute: { request, _ in
+                try await readback.execute(request)
+            }) { completed = true }
+            await startup.start()?.value
+            let requests = await readback.requests
+            try check(!requests.isEmpty && requests.allSatisfy { $0.arguments.prefix(2) == ["--service-management", "status"] },
+                "Managed startup reads service status only for \(status)")
+            if status == "enabled" {
+                try check(startup.phase == .complete && completed && requests.count == 2,
+                    "Enabled managed services open the queue without registration")
+            } else if status == "invalid" {
+                try check(startup.phase == .failed && !completed,
+                    "Malformed managed service status cannot authorize readiness")
+            } else {
+                try check(startup.phase == .setupRequired && !completed &&
+                    startup.requiresServiceApproval == (status == "requiresApproval"),
+                    "Managed \(status) remains explicit and cannot trigger re-registration")
+            }
+        }
+
+        let tamperedManaged = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
+        try tamperedManaged.installManaged()
+        let definition = tamperedManaged.environment.app.appendingPathComponent("Contents/Library/LaunchAgents/io.went.agent-heavy.plist")
+        let outsideProgram: [String: Any] = ["Label": "io.went.agent-heavy", "BundleProgram": "Contents/MacOS/agent-heavy",
+                                            "ProgramArguments": ["agent-heavy", "daemon"], "Program": "/usr/bin/false"]
+        try BootstrapFixture.write(try PropertyListSerialization.data(fromPropertyList: outsideProgram, format: .xml, options: 0), to: definition)
+        let tamperedCounter = BootstrapCountingExecutorFixture()
+        let tamperedStartup = QueueBootstrapModel(environment: tamperedManaged.environment, execute: { request, output in
+            await tamperedCounter.execute(request, output: output)
+        }) { }
+        await tamperedStartup.start()?.value
+        let tamperedCalls = await tamperedCounter.calls
+        try check(tamperedStartup.phase == .failed && tamperedCalls == 0,
+            "A bundled service with an external Program cannot authorize startup or run a controller")
+
         let fresh = try fixture()
         let decision = try fresh.environment.inspect()
         if case let .install(request, _) = decision {
             try check(request.executable == fresh.environment.source.appendingPathComponent("bin/agent-heavy") &&
                 request.arguments == ["install", "--app-bundle", fresh.environment.app.path],
-                "Fresh launch runs only its own bundled installer targeting the running app")
+                "Explicit setup selects its own bundled installer targeting the supplied app")
         } else { throw ClientError.message("Fresh package did not require setup") }
         try check(!FileManager.default.fileExists(atPath: fresh.environment.root.path), "Inspection makes no backend changes")
         try fresh.install()
@@ -167,7 +264,7 @@ struct BootstrapTests {
         try fresh.install()
         let marker = fresh.environment.root.appendingPathComponent("install-in-progress.json")
         try BootstrapFixture.write(Data("unfinished".utf8), to: marker)
-        try check(try needsSetup(fresh.environment), "Any incomplete-install marker forces safe backend retry")
+        try check(try needsSetup(fresh.environment), "An incomplete-install marker requires an explicit installation step")
         try FileManager.default.removeItem(at: marker)
         for name in ["agent-heavy", "agent-remote"] {
             for path in [fresh.environment.root.appendingPathComponent("bin/\(name)"), fresh.environment.home.appendingPathComponent(".local/bin/\(name)")] {

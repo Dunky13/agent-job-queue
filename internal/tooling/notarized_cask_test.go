@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +36,11 @@ func TestNotarizedHomebrew(t *testing.T) {
 		t.Fatal("notarized runtime requires macOS, an absolute payload and APPLE_TEAM_ID")
 	}
 	payload, err := filepath.EvalSymlinks(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := filepath.Join(payload, "Agent Queue.app")
+	managed, err := managedApp(app)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,39 +89,47 @@ func TestNotarizedHomebrew(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var native *managedCaskController
+	if managed {
+		native = newManagedCaskController(t, fixture, home, environment, owner)
+
+	}
 	cask := notarizedFixtureCask(t, fixture, identity.Version)
 	cancelVerification()
 	// Trust verification has its own deadline. Its duration must not consume
 	// the installation phase's reserved Homebrew command and cleanup budget.
 	ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
 	t.Cleanup(cancel)
-	log, err := os.Create(filepath.Join(fixture, "daemon.log"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	daemon, err := owner.start(ctx, environment, log, executable, "daemon")
-	if err != nil {
-		log.Close()
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = log.Close() })
-	ready := false
-	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
-		probeCtx, stop := context.WithTimeout(ctx, time.Second)
-		probe, err := owner.start(probeCtx, environment, nil, executable, "status", "--json")
-		if err == nil {
-			_, err = probe.wait()
+	var daemon *notarizedOwnedCommand
+	if !managed {
+		log, err := os.Create(filepath.Join(fixture, "daemon.log"))
+		if err != nil {
+			t.Fatal(err)
 		}
-		stop()
-		if err == nil {
-			ready = true
-			break
+		daemon, err = owner.start(ctx, environment, log, executable, "daemon")
+		if err != nil {
+			log.Close()
+			t.Fatal(err)
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if !ready {
-		output, _ := os.ReadFile(filepath.Join(fixture, "daemon.log"))
-		t.Fatalf("private signed queue daemon did not become ready: %s", output)
+		t.Cleanup(func() { _ = log.Close() })
+		ready := false
+		for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline); {
+			probeCtx, stop := context.WithTimeout(ctx, time.Second)
+			probe, err := owner.start(probeCtx, environment, nil, executable, "status", "--json")
+			if err == nil {
+				_, err = probe.wait()
+			}
+			stop()
+			if err == nil {
+				ready = true
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		if !ready {
+			output, _ := os.ReadFile(filepath.Join(fixture, "daemon.log"))
+			t.Fatalf("private signed queue daemon did not become ready: %s", output)
+		}
 	}
 	brew, err := exec.LookPath("brew")
 	if err != nil {
@@ -135,7 +149,7 @@ func TestNotarizedHomebrew(t *testing.T) {
 	}
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &result); err != nil || !result.AppInstalled || result.Executed {
-		t.Fatalf("real cask did not relocate the app without running setup: %v\n%s", err, output)
+		t.Fatalf("real cask did not deliver only the explicit installer: %v\n%s", err, output)
 	}
 	if result.Attrs["entries"] == 0 || len(result.Attrs) != 5 {
 		t.Fatalf("missing staged attribute evidence: %v", result.Attrs)
@@ -145,20 +159,26 @@ func TestNotarizedHomebrew(t *testing.T) {
 			t.Fatalf("staged %s was not retained: %v", name, result.Attrs)
 		}
 	}
-	// Homebrew installs the app artifact without running setup in its restricted
-	// install-hook sandbox. First launch invokes this exact signed helper request
-	// through QueueBootstrapEnvironment and presents any failure with Retry.
-	// Exercise that request directly in the private home, without opening a menu
-	// app in the operator's graphical session.
-	app := filepath.Join(home, "Applications/Agent Queue.app")
-	if _, err := os.Stat(filepath.Join(home, ".local/share/agent-heavy/build-info.json")); !os.IsNotExist(err) {
-		t.Fatal("cask unexpectedly initialized the private backend")
+	if calls, err := os.ReadFile(filepath.Join(fixture, "calls")); err == nil && len(calls) != 0 || err != nil && !os.IsNotExist(err) {
+		t.Fatalf("Homebrew delivery called queue/native lifecycle: %v: %s", err, calls)
 	}
-	// Ruby previously rehydrated these fixture-only settings. The native launch
-	// request now runs separately, so explicitly keep every service command on
-	// the private launchctl stub rather than the operator's login services.
-	run(ctx, "/usr/bin/env", "AGENT_QUEUE_INSTALL_TEST_MODE=1", "AGENT_QUEUE_INSTALL_TEST_TOOLS="+filepath.Join(fixture, "tools"),
-		filepath.Join(app, "Contents/Resources/payload/source/bin/agent-heavy"), "install", "--app-bundle", app)
+	// Explicit setup occurs outside Homebrew and its sandbox, only after
+	// delivery and quarantine readback have completed successfully.
+	deliveredPayload := filepath.Join(home, "Applications/Agent Job Queue Installer.app/Contents/Resources/payload")
+	runtimeEnvironment := append(slices.Clone(environment), "AGENT_QUEUE_INSTALL_TEST_MODE=1", "AGENT_QUEUE_INSTALL_TEST_TOOLS="+filepath.Join(fixture, "tools"))
+	if managed {
+		runtimeEnvironment = append(runtimeEnvironment, "AGENT_QUEUE_INSTALL_TEST_MANAGED=private-native-lifecycle")
+		deliveredApp := filepath.Join(deliveredPayload, "Agent Queue.app")
+		proveManagedNativeFixture(t, owner, ctx, runtimeEnvironment, fixture, deliveredApp,
+			filepath.Join(deliveredApp, "Contents/MacOS/agent-heavy"), filepath.Join(deliveredPayload, "source/bin/agent-heavy"))
+	}
+	setup, err := owner.start(ctx, runtimeEnvironment, nil, filepath.Join(deliveredPayload, "source/bin/agent-heavy"), "install", "--payload", deliveredPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output, err := setup.wait(); err != nil {
+		t.Fatalf("explicit signed private installer setup failed outside Homebrew: %v: %s", err, output)
+	}
 	installed, err := os.ReadFile(filepath.Join(home, ".local/share/agent-heavy/build-info.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -167,7 +187,21 @@ func TestNotarizedHomebrew(t *testing.T) {
 	if err != nil || !identity.Equal(installedIdentity) {
 		t.Fatalf("real installed identity differs: %v", err)
 	}
-	for _, name := range []string{"Applications/Agent Queue.app/Contents/MacOS/AgentQueue", ".local/share/agent-heavy/bin/agent-heavy", ".local/bin/agent-remote", "Library/LaunchAgents/io.went.agent-resources.plist"} {
+	expectedFiles := []string{"Applications/Agent Queue.app/Contents/MacOS/AgentQueue", ".local/bin/agent-remote"}
+	installedHeavy := filepath.Join(home, ".local/share/agent-heavy/bin/agent-heavy")
+	if managed {
+		expectedFiles = append(expectedFiles, "Applications/Agent Queue.app/Contents/MacOS/agent-heavy", "Applications/Agent Queue.app/Contents/MacOS/agent-remote", ".local/share/agent-heavy/installation.json")
+		installedHeavy = filepath.Join(home, "Applications/Agent Queue.app/Contents/MacOS/agent-heavy")
+		native.mu.Lock()
+		daemon = native.processes["queue"]
+		native.mu.Unlock()
+		if daemon == nil {
+			t.Fatal("managed fixture did not start the actual packaged canonical daemon")
+		}
+	} else {
+		expectedFiles = append(expectedFiles, ".local/share/agent-heavy/bin/agent-heavy", "Library/LaunchAgents/io.went.agent-resources.plist")
+	}
+	for _, name := range expectedFiles {
 		if _, err := os.Stat(filepath.Join(home, name)); err != nil {
 			t.Fatalf("missing real installed file %s: %v", name, err)
 		}
@@ -175,17 +209,38 @@ func TestNotarizedHomebrew(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, ".local/share/agent-heavy/install-in-progress.json")); !os.IsNotExist(err) {
 		t.Fatal("real installation did not finish its transaction")
 	}
-	run(ctx, filepath.Join(home, ".local/share/agent-heavy/bin/agent-heavy"), "status", "--json")
+	run(ctx, installedHeavy, "status", "--json")
 	select {
 	case <-daemon.done:
 		t.Fatalf("installation stopped the private daemon: %v", daemon.waitErr)
 	default:
 	}
 	calls, err := os.ReadFile(filepath.Join(fixture, "calls"))
-	if err != nil || strings.Contains(string(calls), "UNEXPECTED") || !strings.Contains(string(calls), "bootstrap") {
+	expectedLifecycle := "bootstrap"
+	if managed {
+		expectedLifecycle = "service-management|register|resources"
+	}
+	if err != nil || strings.Contains(string(calls), "UNEXPECTED") || !strings.Contains(string(calls), expectedLifecycle) {
 		t.Fatalf("private launchctl boundary was not exercised safely: %v\n%s", err, calls)
 	}
-	t.Logf("Real quarantined app relocation and signed first-launch setup completed; %d entries retain both attributes and the private daemon remains healthy", result.Attrs["entries"])
+	if managed {
+		jobEnvironment := append(slices.Clone(environment), "PACKAGED_TEST_VALUE=fixture-env")
+		job, err := owner.start(ctx, jobEnvironment, nil, installedHeavy, "run", "--label", "Quarantined packaged fixture", "--", "/bin/sh", "-c", `printf '%s|%s|%s\n' "$1" "$2" "$PACKAGED_TEST_VALUE"; exit 7`, "fixture", "argument with spaces", "literal;$HOME")
+		if err != nil {
+			t.Fatal(err)
+		}
+		output, err := job.wait()
+		var exited *exec.ExitError
+		if !errors.As(err, &exited) || exited.ExitCode() != 7 || !strings.Contains(string(output), "argument with spaces|literal;$HOME|fixture-env") {
+			t.Fatalf("signed packaged private job lost argv, environment or exit status: %v: %s", err, output)
+		}
+		database := filepath.Join(home, ".local/state/agent-heavy/queue.sqlite3")
+		if info, err := os.Lstat(database); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
+			t.Fatalf("signed packaged queue DB is not private: %v: %v", info, err)
+		}
+		t.Log("Native lifecycle and loaded-service readback were injected; actual OS ServiceManagement registration remains UNQUALIFIED and needs an isolated login-session gate")
+	}
+	t.Logf("Real quarantined installer delivery and separate explicit signed private setup completed; %d entries retain both attributes and the private daemon remains healthy", result.Attrs["entries"])
 }
 
 func TestNotarizedHomebrewRejectsUnsignedPayload(t *testing.T) {
@@ -474,6 +529,10 @@ func notarizedCaskFixture(t *testing.T, team string) (string, string, []string, 
 			}
 		} else if !os.IsNotExist(err) {
 			owner.retain = true
+		}
+		if t.Failed() {
+			t.Logf("private cask failure evidence retained at %s", fixture)
+			return
 		}
 		if owner.retain {
 			t.Errorf("command cleanup was not proven; private fixture tools retained at %s", fixture)

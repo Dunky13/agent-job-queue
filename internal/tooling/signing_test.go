@@ -561,6 +561,9 @@ case "$tool" in
     esac
     ;;
   plutil)
+    if [[ $1 == -convert || $1 == -type || ( $1 == -extract && $2 == AgentQueueServiceManagement ) ]]; then
+      exec /usr/bin/plutil "$@"
+    fi
     value=$(sed -n "s/.*\"$2\":\"\([^\"]*\)\".*/\1/p" "$last")
     [[ -n $value ]] || exit 1
     printf '%s\n' "$value"
@@ -586,6 +589,11 @@ case "$tool" in
         [[ -L "$image_source/Applications" && $(readlink "$image_source/Applications") == /Applications ]]
         [[ ! -e "$image_source/Agent Job Queue Installer.app" ]]
         printf 'disk-image-layout|Agent Queue.app|Applications->/Applications\n' >> "$SIGNING_TEST_EVENTS"
+      elif [[ -f "$image_source/Contents/MacOS/Installer" ]]; then
+        [[ ! -e "$image_source/Applications" && ! -e "$image_source/Agent Queue.app" ]]
+        printf 'disk-image-layout|Agent Job Queue Installer.app|explicit-setup\n' >> "$SIGNING_TEST_EVENTS"
+      else
+        exit 91
       fi
       printf 'disk image' > "$last"
     fi
@@ -597,3 +605,88 @@ case "$tool" in
   *) exit 90;;
 esac
 `
+
+func (f signingFixture) embedManagedApp(t *testing.T) string {
+	t.Helper()
+	source := f.embedAppSupport(t)
+	app := filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app")
+	verificationWrite(t, filepath.Join(app, "Contents/Info.plist"), `<?xml version="1.0"?><plist version="1.0"><dict><key>AgentQueueServiceManagement</key><true/></dict></plist>`, 0600)
+	for _, name := range []string{"agent-heavy", "agent-remote"} {
+		if err := os.Rename(filepath.Join(source, "bin", name), filepath.Join(app, "Contents/MacOS", name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Remove(filepath.Join(source, "bin")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"heavy", "resources", "remote"} {
+		filename := "io.went.agent-" + name + ".plist"
+		raw, err := os.ReadFile(filepath.Join("../../native/LaunchAgents", filename))
+		if err != nil {
+			t.Fatal(err)
+		}
+		verificationWrite(t, filepath.Join(app, "Contents/Library/LaunchAgents", filename), string(raw), 0600)
+	}
+	return app
+}
+
+func TestMacOSSigningManagedHelpersInsideOut(t *testing.T) {
+	f := newSigningFixture(t)
+	app := f.embedManagedApp(t)
+	if output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3"); err != nil {
+		t.Fatalf("managed signing: %v: %s", err, output)
+	}
+	record := f.recorded(t)
+	seal := strings.Index(record, "codesign|--force|--sign|Developer ID Application: Fixture ("+signingTestTeam+")|--timestamp|--options|runtime|"+app+"\n")
+	for _, name := range []string{"agent-heavy", "agent-remote"} {
+		path := filepath.Join(app, "Contents/MacOS", name)
+		sign := strings.Index(record, "|--identifier|io.went.agent-queue."+name+"|"+path+"\n")
+		if sign < 0 || seal < sign {
+			t.Fatalf("canonical helper not sealed before app: %s", record)
+		}
+		for _, arch := range []string{"arm64", "x86_64"} {
+			if !strings.Contains(record, "codesign|--display|--verbose=4|--architecture|"+arch+"|"+path+"\n") {
+				t.Fatalf("canonical helper not verified: %s", record)
+			}
+		}
+	}
+	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|explicit-setup\n") || strings.Contains(record, "Applications->/Applications") {
+		t.Fatalf("managed release lost explicit installer layout: %s", record)
+	}
+	assertNotarySubmissionNames(t, record, "1.2.3")
+}
+
+func TestMacOSSigningRejectsManagedLayoutTampering(t *testing.T) {
+	for _, mutation := range []string{"duplicate bin", "missing helper", "missing plist", "modified plist", "extra login plist", "false marker"} {
+		t.Run(mutation, func(t *testing.T) {
+			f := newSigningFixture(t)
+			app := f.embedManagedApp(t)
+			path := filepath.Join(app, "Contents/Library/LaunchAgents/io.went.agent-heavy.plist")
+			switch mutation {
+			case "duplicate bin":
+				verificationWrite(t, filepath.Join(app, "Contents/Resources/payload/source/bin/agent-heavy"), "duplicate", 0700)
+			case "missing helper":
+				if err := os.Remove(filepath.Join(app, "Contents/MacOS/agent-remote")); err != nil {
+					t.Fatal(err)
+				}
+			case "missing plist":
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			case "modified plist":
+				raw, _ := os.ReadFile(path)
+				verificationWrite(t, path, strings.Replace(string(raw), "<integer>63</integer>", "<integer>0</integer>", 1), 0600)
+			case "extra login plist":
+				verificationWrite(t, filepath.Join(filepath.Dir(path), "io.went.agent-queue.plist"), "login", 0600)
+			case "false marker":
+				verificationWrite(t, filepath.Join(app, "Contents/Info.plist"), `<?xml version="1.0"?><plist version="1.0"><dict><key>AgentQueueServiceManagement</key><false/></dict></plist>`, 0600)
+			}
+			if output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3"); err == nil {
+				t.Fatalf("managed tampering accepted: %s", output)
+			}
+			if strings.Contains(f.recorded(t), "notarytool|submit") {
+				t.Fatal("tampered managed app reached Apple submission")
+			}
+		})
+	}
+}

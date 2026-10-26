@@ -3,8 +3,8 @@
 # Load the real Homebrew DSL. Optional fixture mode moves its app and verifies
 # its bytes with a temporary HOME and shared Caskroom supplied by tests.
 # --quarantined verifies data only. --quarantined-runtime requires a notarized
-# Developer ID payload and installs its app into a private HOME. Native first-
-# launch setup acceptance runs separately after the Homebrew app installation.
+# Developer ID payload and verifies relocated installer bytes. Explicit setup
+# and simulated native lifecycle run separately in the parent, outside Homebrew.
 require "json"
 require "find"
 require "cask/cask_loader"
@@ -80,6 +80,31 @@ class FixtureSystemCommand < SystemCommand
   end
 end
 
+# Homebrew delivers the explicit installer. Only its native App movement and
+# two CLI symlinks are allowed; setup and runtime lifecycle belong to the user.
+def verify_delivery_cask_contract(cask)
+  installer = cask.staged_path/"Agent Job Queue Installer.app"
+  applications = cask.artifacts.grep(Cask::Artifact::App)
+  target = Pathname(Dir.home)/"Applications/Agent Job Queue Installer.app"
+  unless applications.length == 1 && applications.first.source == installer && applications.first.target == target
+    raise "The cask must deliver only the explicit installer app to this user's Applications directory"
+  end
+  allowed = [Cask::Artifact::App, Cask::Artifact::Binary]
+  unless cask.artifacts.all? { |artifact| allowed.include?(artifact.class) }
+    raise "Delivery-only cask cannot contain executable hooks, uninstall directives or other artifacts"
+  end
+  binaries = cask.artifacts.grep(Cask::Artifact::Binary)
+  source = installer/"Contents/Resources/payload/source/links"
+  unless binaries.map(&:source).sort == %w[agent-heavy agent-remote].map { |name| source/name }.sort &&
+         binaries.all? { |binary| binary.target == cask.config.binarydir/binary.source.basename }
+    raise "Both canonical CLI links are required"
+  end
+  artifacts = cask.artifacts.to_a
+  unless binaries.all? { |binary| artifacts.index(applications.first) < artifacts.index(binary) }
+    raise "Installer delivery must precede its CLI links"
+  end
+end
+
 # Allow the timeout regression to use this exact command owner without running
 # the cask loader or evaluating a synthetic release as a notarized artifact.
 return if __FILE__ != $PROGRAM_NAME
@@ -92,14 +117,35 @@ runtime_fixture = ARGV[2] == "--quarantined-runtime"
 fixture_command = SystemCommand
 raise "Runtime mode requires a private fixture" if runtime_fixture && !ARGV[1]
 
+def app_helpers(app)
+  info = IO.popen(["/usr/bin/plutil", "-convert", "json", "-o", "-", (app/"Contents/Info.plist").to_s], &:read)
+  raise "Cannot read app metadata" unless $?.success?
+
+  metadata = JSON.parse(info)
+  if metadata.key?("AgentQueueServiceManagement")
+    raise "Invalid managed marker" unless metadata.fetch("AgentQueueServiceManagement") == true
+
+    base = app/"Contents/MacOS"
+  elsif (app/"Contents/Resources/payload").exist?
+    base = app/"Contents/Resources/payload/source/bin"
+  else
+    return []
+  end
+  %w[agent-heavy agent-remote].map { |name| base/name }
+end
+
 def verify_runtime_installer(installer, team, command)
   payload = installer/"Contents/Resources/payload"
   requirement = "=anchor apple generic and certificate leaf[subject.OU] = \"#{team}\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and notarized"
-  [installer, payload/"source/bin/agent-heavy", payload/"source/bin/agent-remote", payload/"Agent Queue.app",
-   payload/"Agent Queue.app/Contents/Resources/payload/source/bin/agent-heavy",
-   payload/"Agent Queue.app/Contents/Resources/payload/source/bin/agent-remote"].each do |code|
+  app = payload/"Agent Queue.app"
+  codes = [installer, payload/"source/bin/agent-heavy", payload/"source/bin/agent-remote", app]
+  codes.each do |code|
     command.run!("/usr/bin/codesign", args: ["--verify", "--strict", "--all-architectures", "--check-notarization", "--test-requirement", requirement, code])
   end
+  app_helpers(app).each do |code|
+    command.run!("/usr/bin/codesign", args: ["--verify", "--strict", "--all-architectures", "--check-notarization", "--test-requirement", requirement, code])
+  end
+
 rescue ErrorDuringExecution => e
   raise "Runtime fixture failed Developer ID/notarization verification: #{e.message}"
 end
@@ -140,28 +186,17 @@ end
 cask = Cask::CaskLoader.load(cask_path)
 payload = cask.staged_path/"Agent Job Queue Installer.app/Contents/Resources/payload"
 applications = cask.artifacts.grep(Cask::Artifact::App)
-application = Pathname(Dir.home)/"Applications/Agent Queue.app"
-unless applications.length == 1 && applications.first.source == payload/"Agent Queue.app" && applications.first.target == application
-  raise "The cask must install one Homebrew-managed app in this user's Applications directory"
-end
-hook_classes = [Cask::Artifact::Installer, Cask::Artifact::PreflightBlock, Cask::Artifact::PostflightBlock]
-hook_classes << Cask::Artifact::PreflightSteps if defined?(Cask::Artifact::PreflightSteps)
-hook_classes << Cask::Artifact::PostflightSteps if defined?(Cask::Artifact::PostflightSteps)
-raise "Setup belongs to native first launch; executable install hooks are forbidden" if cask.artifacts.any? { |artifact| hook_classes.any? { |klass| artifact.is_a?(klass) } }
+application = Pathname(Dir.home)/"Applications/Agent Job Queue Installer.app"
+verify_delivery_cask_contract(cask)
 
 binaries = cask.artifacts.select { |artifact| artifact.is_a?(Cask::Artifact::Binary) }
 raise "Both CLI binaries are required" unless binaries.map { |artifact| artifact.source.basename.to_s }.sort == %w[agent-heavy agent-remote]
 
 artifacts = cask.artifacts.to_a
 
-uninstalls = cask.artifacts.grep(Cask::Artifact::Uninstall)
-unless uninstalls.length == 1 && uninstalls.first.to_h == { quit: "io.went.agent-queue", script: { executable: "/bin/rm", args: ["-f", "--", "#{Dir.home}/Library/LaunchAgents/io.went.agent-queue.plist"], sudo: false }, signal: [] }
-  raise "Only the app launch agent may be deleted; Homebrew must own app removal and rollback"
-end
-raise "Live state must never be zapped" if cask.artifacts.any? { |artifact| artifact.is_a?(Cask::Artifact::Zap) }
-
 fixture_attributes = nil
 fixture_app_installed = false
+fixture_installer_executed = false
 if ARGV[1]
   raise "Fixture install requires explicit test mode" unless ENV.fetch("AGENT_QUEUE_INSTALL_TEST_MODE") == "1"
 
@@ -173,7 +208,7 @@ if ARGV[1]
     # starts. Retain the actual signed installer, including its stapled ticket.
     fixture_command.run!("/usr/bin/ditto", args: ["--rsrc", "--extattr", "--qtn", "--acl", fixture/"Agent Job Queue Installer.app", cask.staged_path/"Agent Job Queue Installer.app"])
   else
-    FileUtils.cp_r(fixture/"payload", payload)
+    FileUtils.cp_r((fixture/"Agent Job Queue Installer.app").children, cask.staged_path/"Agent Job Queue Installer.app")
   end
   if %w[--quarantined --quarantined-runtime].include?(ARGV[2])
     entries = Find.find(cask.staged_path.to_s).to_a
@@ -190,16 +225,9 @@ if ARGV[1]
   end
   # Recheck the actual quarantined staged bytes before native app relocation.
   verify_runtime_installer(cask.staged_path/"Agent Job Queue Installer.app", team, fixture_command) if runtime_fixture
-  if !fixture_attributes || runtime_fixture
-    applications.first.install_phase(command: fixture_command)
-    if runtime_fixture
-      requirement = "=anchor apple generic and certificate leaf[subject.OU] = \"#{team}\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and notarized"
-      [application, application/"Contents/Resources/payload/source/bin/agent-heavy", application/"Contents/Resources/payload/source/bin/agent-remote"].each do |code|
-        fixture_command.run!("/usr/bin/codesign", args: ["--verify", "--strict", "--all-architectures", "--check-notarization", "--test-requirement", requirement, code])
-      end
-    end
-    fixture_app_installed = true
-  end
+  applications.first.install_phase
+  verify_runtime_installer(application, team, fixture_command) if runtime_fixture
+  fixture_app_installed = true
   if fixture_attributes
     # App relocation leaves a staging symlink. Inspect that link itself, then
     # the installed app separately, so no bundle entry is followed or counted twice.
@@ -219,4 +247,4 @@ puts JSON.generate({ version: cask.version.to_s, sha256: cask.sha256.to_s, url: 
                      artifact_order: artifacts.map { |artifact| artifact.class.name },
                      fixture_attributes: fixture_attributes,
                      fixture_app_installed: fixture_app_installed,
-                     fixture_installer_executed: false })
+                     fixture_installer_executed: fixture_installer_executed })

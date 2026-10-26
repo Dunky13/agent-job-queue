@@ -33,11 +33,11 @@ This is a custom installer that copies another app and standalone helpers.
 Apple explicitly requires payload notarization before assembling such an
 installer. Our additional DMG distribution also receives its own ticket:
 
-1. Sign the two Go helpers in both the outer payload and the menu app's embedded setup payload, then sign the menu app. Submit the complete payload ZIP.
+1. Sign the two Go helpers in both the outer controller payload and the menu app's `Contents/MacOS`, then sign the menu app. Submit the complete payload ZIP. Managed service definitions remain in the app's `Contents/Library/LaunchAgents` and use `BundleProgram`.
 2. Require acceptance, fetch the log, then staple and validate the menu app.
 3. Sign the outer installer, submit its ZIP, require acceptance, and staple it.
 4. Recreate the distribution ZIP with the stapled installer inside it.
-5. Copy the stapled, self-contained menu app into a DMG with an Applications shortcut, sign the DMG, notarize it, and staple it. Retained older builds without an embedded setup payload keep their original installer DMG layout.
+5. Package the stapled explicit installer in the managed DMG, sign the DMG, notarize it, and staple it. Retained historical drag-to-Applications images keep their original layout and verification path.
 6. Generate final checksums and Homebrew metadata after all byte changes.
 
 Hosted Apple submissions use `Agent-Job-Queue-Payload-VERSION-build-N-SHA-universal.zip`,
@@ -56,7 +56,7 @@ first launch of the complete installed product remains a separate test.
 These requirements come from Apple's
 [custom notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
-The menu app carries its own source payload for first-launch setup after a Finder copy. Its helpers are signed before sealing the app; setup never modifies the installed bundle. The ZIP remains a custom installer for existing updater and Homebrew consumers. The DMG contains the same app, copied with its signature, ticket and quarantine preserved.
+The menu app carries support metadata and documents without duplicate helper binaries. Explicit setup can use its canonical bundled helpers; ordinary first launch only checks installation and approval state. Helpers are signed before sealing the app, and in-place setup never modifies the installed bundle. Both managed ZIP and DMG deliver the explicit installer, preserving signatures, tickets and quarantine. Homebrew delivers that installer and command links; runtime installation occurs explicitly outside its hook sandbox.
 
 The payload app is stapled before signing its parent because it lives under
 the installer's sealed resources. Production installation copies the app with
@@ -131,9 +131,12 @@ and never executes its signed target.
 
 Before publication, separate fresh Apple Silicon and Intel jobs verify final
 checksums, signatures, tickets and app-copy policy, exercise the hardened queue
-and HTTPS gateway, and run the actual Homebrew installer with quarantine kept.
-The Homebrew test owns a private daemon and user directory, substitutes only
-its private launchctl fixture, and bounds installer descendants before cleanup.
+and HTTPS gateway, and exercise actual Homebrew delivery with quarantine kept.
+The runtime test then invokes the signed explicit installer outside Homebrew's
+restricted hook sandbox. It owns private daemon processes and user directories,
+substitutes native lifecycle and launchctl readback, and bounds descendants
+before cleanup. These checks do not qualify real Service Management registration,
+approval, subsequent login or reboot; those need an isolated login-session test.
 No Apple credential is passed to these acceptance jobs. Checkout precedes all
 artifact downloads so its workspace cleanup cannot erase the release inputs.
 
@@ -396,8 +399,9 @@ Do not submit the same pending build repeatedly to try to accelerate processing.
 
 ## Distribution and acceptance
 
-Both the native installer and new Homebrew casks directly execute the signed
-Go controller. The cask preserves quarantine. Historical ad hoc casks remain
+The native installer directly executes the signed Go controller. New Homebrew
+casks deliver that explicit installer without executing setup in a hook. The
+user opens it and chooses Install. The cask preserves quarantine. Historical ad hoc casks remain
 unchanged until the next numbered release; the trusted tap helper validates
 their original cask as bounded data. Merge the companion trusted tap update
 before the source release, as documented in [Homebrew delivery](homebrew-delivery.md).
@@ -413,7 +417,9 @@ Use `codesign --verify --check-notarization` with an explicit `notarized`
 requirement for the standalone Go executables. An app-oriented `spctl` check
 does not establish the correct behavior for every non-app code type. The
 quarantined Homebrew test verifies both helpers' notarization before exercising
-the actual signed installer entry. Apple documents these distinct checks in
+the actual signed installer entry outside Homebrew's hook sandbox. Native
+service operations remain simulated there; signing and packaged job execution
+cannot certify live Service Management or endpoint-security acceptance. Apple documents these distinct checks in
 [Testing a Notarised Product](https://developer.apple.com/forums/thread/130560).
 
 Signing, notarization and Gatekeeper acceptance are distinct results. A normal
