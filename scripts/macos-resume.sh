@@ -417,6 +417,20 @@ export_assets() {
   rm -rf "$state/work"
 }
 
+bind_origin() {
+  [[ -n ${BUILD_RUN_ID:-} && ${QUEUE_NOTARY_TOOL:-} == /* && -x ${QUEUE_NOTARY_TOOL:-} ]] ||
+    fail 'Original artifact binding requires verified build context and the prebuilt trusted verifier.'
+  "$QUEUE_NOTARY_TOOL" verify-checkpoint-origin --original "$original_archive" --initial "$state/initial.zip"
+  if [[ $(json_field "$state/metadata.json" schema) == 1 ]]; then
+    # Metadata upgrade follows exact original-byte/mode/resource verification.
+    # The submitted archives, UUIDs and Apple receipts are never rewritten.
+    jq --arg attempt "$BUILD_RUN_ATTEMPT" --arg artifact "$BUILD_ARTIFACT_ID" --arg digest "$BUILD_ARTIFACT_DIGEST" '
+      . + {schema:2,build_attempt:$attempt,artifact_id:$artifact,artifact_digest:$digest}
+    ' "$state/metadata.json" > "$state/metadata.json.new"
+    mv "$state/metadata.json.new" "$state/metadata.json"
+  fi
+}
+
 command=${1:-}
 # Explicit version arguments ensure restored metadata cannot choose a release.
 case "$command" in
@@ -436,7 +450,11 @@ case "$command" in
     [[ $# == 4 ]] || fail 'Usage: macos-resume.sh export STATE DESTINATION VERSION'
     state=$2 destination=$3 resume_version=$4
     ;;
-  *) fail 'Usage: macos-resume.sh {init|verify-state|begin|prepare|submit|finish|export} ...' ;;
+  bind-origin)
+    [[ $# == 4 ]] || fail 'Usage: macos-resume.sh bind-origin STATE ORIGINAL_ARCHIVE VERSION'
+    state=$2 original_archive=$3 resume_version=$4
+    ;;
+  *) fail 'Usage: macos-resume.sh {init|verify-state|bind-origin|begin|prepare|submit|finish|export} ...' ;;
 esac
 identity
 state=$(macos_signing_canonical_path "$state")
@@ -470,6 +488,7 @@ else
     submit) require_stage; submit_stage ;;
     finish) require_stage; finish_stage ;;
     export) export_assets "$destination" ;;
+    bind-origin) bind_origin ;;
   esac
   verify_state
 fi

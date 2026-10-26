@@ -324,6 +324,13 @@ before credentials, and retain the actual SDK, Swift, Go, notary client and runn
 image identity. Hosted qualification is required for this pin; a local receipt
 from another Xcode is not its proof.
 
+Each required toolchain probe must exit successfully and return an identity
+before a receipt is written. A legacy checkpoint receives schema-2 artifact
+binding only after its existing source/run/team metadata is verified and the
+trusted verifier proves its initial archive matches the original CI archive's
+contents, modes and resource metadata. This upgrade changes neither signed
+archives nor submission records. Missing or mismatched origin proof blocks it.
+
 The channel remains numbered main-build prereleases, with `VERSION` as the
 product version and `build-N-SHA` as the immutable release identity. No stable
 version or updater trust authority changes. `ci-required` remains the aggregate

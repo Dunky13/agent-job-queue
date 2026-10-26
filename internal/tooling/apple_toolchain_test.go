@@ -10,20 +10,20 @@ import (
 )
 
 func TestAppleToolchainFailsBeforeCredentialsForUnqualifiedTools(t *testing.T) {
-	for _, variant := range []string{"qualified", "wrong version", "wrong build", "missing stapler"} {
+	for _, variant := range []string{"qualified", "wrong version", "wrong build", "missing stapler", "SDK error", "empty SDK", "Swift error", "Go error", "notary error", "OS error", "architecture error"} {
 		t.Run(variant, func(t *testing.T) {
 			root := t.TempDir()
 			testTool(t, root, "xcodebuild", `printf 'Xcode %s\nBuild version %s\n' "$TOOLCHAIN_TEST_VERSION" "$TOOLCHAIN_TEST_BUILD"`)
 			testTool(t, root, "xcrun", `case "$*" in
 --find\ stapler) [ "$TOOLCHAIN_TEST_VARIANT" != 'missing stapler' ] || exit 9; printf '/Applications/Xcode.app/stapler\n';;
 --find\ *) printf '/Applications/Xcode.app/tool\n';;
---sdk\ macosx\ --show-sdk-version) printf '15.5\n';;
-swift\ --version) printf 'Apple Swift fixture\n';;
-notarytool\ --version) printf '1.1.0 fixture\n';;
+--sdk\ macosx\ --show-sdk-version) [ "$TOOLCHAIN_TEST_VARIANT" != 'SDK error' ] || exit 42; [ "$TOOLCHAIN_TEST_VARIANT" != 'empty SDK' ] || exit 0; printf '15.5\n';;
+swift\ --version) [ "$TOOLCHAIN_TEST_VARIANT" != 'Swift error' ] || exit 42; printf 'Apple Swift fixture\n';;
+notarytool\ --version) [ "$TOOLCHAIN_TEST_VARIANT" != 'notary error' ] || exit 42; printf '1.1.0 fixture\n';;
 *) exit 99;; esac`)
-			testTool(t, root, "go", `printf 'go version fixture\n'`)
-			testTool(t, root, "sw_vers", `printf '15.7.9\n'`)
-			testTool(t, root, "uname", `printf 'arm64\n'`)
+			testTool(t, root, "go", `[ "$TOOLCHAIN_TEST_VARIANT" != 'Go error' ] || exit 42; printf 'go version fixture\n'`)
+			testTool(t, root, "sw_vers", `[ "$TOOLCHAIN_TEST_VARIANT" != 'OS error' ] || exit 42; printf '15.7.9\n'`)
+			testTool(t, root, "uname", `[ "$TOOLCHAIN_TEST_VARIANT" != 'architecture error' ] || exit 42; printf 'arm64\n'`)
 			version, build := "16.4", "16F6"
 			if variant == "wrong version" {
 				version = "27.1"

@@ -142,9 +142,8 @@ jobs:
         run: scripts/macos-resume.sh init 'prepared-installer/Agent Job Queue Installer.app' notarization-state "$BUILD_VERSION"
       - name: Bind retained initial installer to the exact original source bytes
         run: |
-          "$QUEUE_NOTARY_TOOL" verify-checkpoint-origin \
-            --original "validated-installer/Agent-Job-Queue-Installer-$BUILD_VERSION-universal.zip" \
-            --initial notarization-state/initial.zip
+          scripts/macos-resume.sh bind-origin notarization-state \
+            "validated-installer/Agent-Job-Queue-Installer-$BUILD_VERSION-universal.zip" "$BUILD_VERSION"
       - name: Verify restored build identity and signed archives
         run: scripts/macos-resume.sh verify-state notarization-state "$BUILD_VERSION"
       - name: Snapshot state before credential setup
