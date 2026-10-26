@@ -2,8 +2,9 @@
 # Usage: bash native/tests/run-bootstrap-ui-tests.sh OUTPUT_DIRECTORY [--build-only]
 # Run through the shared heavy queue. Uses AppKit's own events and rendering;
 # needs a logged-in graphical macOS session, but no Accessibility permission.
-# Output: verification.json, three PNGs and a standalone index.html with embedded
-# screenshots. Bundle, home, state and preference fixtures are temporary/private.
+# Output: recovery verification.json, three PNGs and a standalone index.html with
+# embedded screenshots; generic-retry/ retains the same checks for other errors.
+# Bundle, home, state and preference fixtures are temporary/private.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 output=${1:?Usage: run-bootstrap-ui-tests.sh OUTPUT_DIRECTORY [--build-only]}
@@ -38,11 +39,24 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
     --open-window --temporary "$temporary" --output "$output"
 [[ "$(plutil -extract passed raw -o - "$output/verification.json")" == "true" ]]
+mkdir -p -- "$output/generic-retry"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --open-window --temporary "$temporary" --output "$output/generic-retry" --generic-retry
+[[ "$(plutil -extract passed raw -o - "$output/generic-retry/verification.json")" == "true" ]]
 {
   printf '# Bootstrap fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
   cat "$output/verification.json"
   printf '\n```\n\n'
-  for picture in 01-progress 02-failure-retry 03-normal-fixture-startup; do
+  for picture in 01-progress 02-disable-phone-access 03-normal-fixture-startup; do
     printf '![%s](%s.png)\n\n' "$picture" "$picture"
   done
 } > "$output/verification.md"
+{
+  printf '# Generic retry fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
+  cat "$output/generic-retry/verification.json"
+  printf '\n```\n\n'
+  for picture in 01-progress 02-failure-retry 03-normal-fixture-startup; do
+    printf '![%s](%s.png)\n\n' "$picture" "$picture"
+  done
+} > "$output/generic-retry/verification.md"

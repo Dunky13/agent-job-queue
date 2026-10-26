@@ -66,7 +66,8 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             throw ClientError.message("UI fixture requires --fixture, a temporary HOME and CFFIXED_USER_HOME from its runner.")
         }
         let fixture = try BootstrapFixture(parent: temporary)
-        let executor = BootstrapExecutorFixture(fixture)
+        let phoneAccessBlocker = !CommandLine.arguments.contains("--generic-retry")
+        let executor = BootstrapExecutorFixture(fixture, phoneAccessBlocker: phoneAccessBlocker)
         let delegate = AppDelegate(environment: fixture.environment) { request, output in
             try await executor.execute(request, output: output)
         }
@@ -83,22 +84,25 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         try snapshot(setup, name: "01-progress")
         await executor.release()
         try await waitUntil { model.phase == .failed }
-        try check(delegate.setupWindow === setup && setup.isVisible && model.output.contains("Fixture service could not start") &&
+        let expectedFailure = phoneAccessBlocker ? model.canDisablePhoneAccess && model.message.contains("Phone access") :
+            !model.canDisablePhoneAccess && model.output.contains("Fixture service could not start")
+        try check(delegate.setupWindow === setup && setup.isVisible && expectedFailure &&
+            !model.output.contains("AGENT_QUEUE_SETUP_RECOVERY") &&
             AppRuntime.menuBarController == nil && delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "Failure keeps the same window, shows the diagnostic and permits quit")
-        try snapshot(setup, name: "02-failure-retry")
+        try snapshot(setup, name: phoneAccessBlocker ? "02-disable-phone-access" : "02-failure-retry")
 
-        // Exercise SwiftUI's real Retry default action through its hosting window.
+        // Exercise SwiftUI's real recovery default action through its hosting window.
         setup.makeKeyAndOrderFront(nil)
         guard let enter = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: setup.windowNumber, context: nil,
             characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36) else {
-            throw ClientError.message("Could not create the Retry fixture key event")
+            throw ClientError.message("Could not create the recovery fixture key event")
         }
         if !setup.performKeyEquivalent(with: enter) { setup.sendEvent(enter) }
         try await waitUntil { await executor.isHeld }
         try check(model.phase == .installing && delegate.setupWindow === setup && delegate.applicationShouldTerminate(NSApp) == .terminateCancel,
-            "Retry button action starts a second private attempt and restores termination guard")
+            "\(phoneAccessBlocker ? "Disable phone access and continue" : "Retry") starts a private attempt and restores termination guard")
         await executor.release()
         try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
         guard let controller = AppRuntime.menuBarController, let queue = AppRuntime.queueWindow else {
@@ -106,8 +110,9 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         }
         let requests = await executor.requests
         try check(delegate.setupWindow == nil && !setup.isVisible && AppRuntime.store.fixtureMode &&
-            requests.count == 2 && requests.allSatisfy { $0.arguments == ["install", "--app-bundle", fixture.environment.app.path] },
-            "Successful retry verifies readback, closes setup and continues real fixture startup")
+            requests.count == 2 && requests[0].arguments == ["install", "--app-bundle", fixture.environment.app.path] &&
+            requests[1].arguments == requests[0].arguments + (phoneAccessBlocker ? ["--disable-phone-access"] : []),
+            "Successful recovery verifies readback, closes setup and continues real fixture startup")
         try check(model.start() == nil && AppRuntime.menuBarController === controller &&
             delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "Completed startup keeps exactly one menu controller and permits normal quit")

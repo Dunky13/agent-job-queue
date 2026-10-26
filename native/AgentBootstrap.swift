@@ -328,6 +328,8 @@ final class QueueBootstrapModel: ObservableObject {
     @Published private(set) var phase = Phase.idle
     @Published private(set) var message = "Checking setup…"
     @Published private(set) var output = ""
+    @Published private(set) var canDisablePhoneAccess = false
+    private static let phoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
     var isRunning: Bool { phase == .checking || phase == .installing }
     var onSetupRequired: (() -> Void)?
     private let inspect: @Sendable () throws -> QueueBootstrapDecision
@@ -349,8 +351,10 @@ final class QueueBootstrapModel: ObservableObject {
             transport: .init(executable: request.executable, timeout: 330), onOutput: output)
     }
 
-    @discardableResult func start() -> Task<Void, Never>? {
+    @discardableResult func start(disablePhoneAccess: Bool = false) -> Task<Void, Never>? {
         guard !isRunning, phase != .complete else { return nil }
+        guard !disablePhoneAccess || canDisablePhoneAccess else { return nil }
+        canDisablePhoneAccess = false
         phase = .checking
         message = "Checking setup…"
         output = ""
@@ -360,7 +364,9 @@ final class QueueBootstrapModel: ObservableObject {
             do {
                 let decision = try await Task.detached(priority: .utility, operation: inspect).value
                 if case let .install(request, reason) = decision {
-                    message = reason
+                    let request = QueueBootstrapRequest(executable: request.executable,
+                        arguments: request.arguments + (disablePhoneAccess ? ["--disable-phone-access"] : []))
+                    message = disablePhoneAccess ? "Disabling phone access and continuing setup…" : reason
                     phase = .installing
                     onSetupRequired?()
                     let result = try await execute(request) { [weak self] data in
@@ -379,8 +385,10 @@ final class QueueBootstrapModel: ObservableObject {
                 completed()
             } catch {
                 phase = .failed
-                message = "Agent Queue setup could not finish."
-                output = String(error.localizedDescription.suffix(8_000))
+                let lines = error.localizedDescription.components(separatedBy: .newlines)
+                canDisablePhoneAccess = lines.contains(Self.phoneAccessRecovery)
+                message = canDisablePhoneAccess ? "Phone access must be disabled to continue setup." : "Agent Queue setup could not finish."
+                output = String(lines.filter { $0 != Self.phoneAccessRecovery }.joined(separator: "\n").suffix(8_000))
                 onSetupRequired?()
             }
         }
@@ -398,6 +406,10 @@ struct QueueBootstrapView: View {
                 if model.isRunning { ProgressView().controlSize(.small) }
                 Text(model.message).font(.headline)
             }
+            if model.canDisablePhoneAccess {
+                Text("Your credentials and configuration will be preserved. You can enable phone access again in settings after setup.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             ScrollView {
                 Text(model.output.isEmpty ? "Installing the queue backend and background services…" : model.output)
                     .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
@@ -407,7 +419,12 @@ struct QueueBootstrapView: View {
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }.disabled(model.isRunning)
                 if model.phase == .failed {
-                    Button("Retry") { model.start() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    if model.canDisablePhoneAccess {
+                        Button("Disable phone access and continue") { model.start(disablePhoneAccess: true) }
+                            .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    } else {
+                        Button("Retry") { model.start() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    }
                 }
             }
         }.padding(24).frame(minWidth: 560, minHeight: 410)
