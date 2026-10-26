@@ -1,6 +1,7 @@
 import AppKit
 import Darwin
 import Foundation
+import ServiceManagement
 import SwiftUI
 
 // This is a read-only startup decision. The backend remains the authority for
@@ -19,8 +20,12 @@ struct QueueBootstrapEnvironment: Sendable {
 
     var root: URL { home.appendingPathComponent(".local/share/agent-heavy") }
     var source: URL { resources.appendingPathComponent("payload/source") }
+    var allowsInstallation: Bool { arguments.filter { $0 == "--setup" }.count == 1 }
 
     func validateDiagnostics() throws {
+        if arguments.filter({ $0 == "--setup" }).count > 1 || arguments.contains(where: { $0.hasPrefix("--setup=") }) {
+            throw ClientError.message("Use --setup once to open the explicit installation workflow.")
+        }
         let fixtureIndices = arguments.indices.filter { arguments[$0] == "--fixture" }
         if !fixtureIndices.isEmpty || arguments.contains(where: { $0.hasPrefix("--fixture=") }) {
             guard fixtureIndices.count == 1, let index = fixtureIndices.first,
@@ -52,7 +57,9 @@ struct QueueBootstrapEnvironment: Sendable {
         let bundleScope = QueueBootstrapFiles.Scope(root: app, bundled: true)
         try QueueBootstrapFiles.validateFile(infoURL, scope: bundleScope)
         let payloadExists = Self.exists(resources.appendingPathComponent("payload"))
-        let marked = (try? Self.readPlist(QueueBootstrapPackaging.self, at: infoURL, scope: bundleScope))?.embeddedPayload == true
+        let packaging = try? Self.readPlist(QueueBootstrapPackaging.self, at: infoURL, scope: bundleScope)
+        let managed = packaging?.serviceManagement == true
+        let marked = packaging?.embeddedPayload == true || managed
         guard payloadExists || marked else { return .legacy }
         let info = try? Self.readPlist(QueueBootstrapBundle.self, at: infoURL, scope: bundleScope)
 
@@ -80,7 +87,7 @@ struct QueueBootstrapEnvironment: Sendable {
                 throw ClientError.message("App and payload build identities differ.")
             }
             for name in ["agent-heavy", "agent-remote"] {
-                let binary = source.appendingPathComponent("bin/\(name)")
+                let binary = managed ? app.appendingPathComponent("Contents/MacOS/\(name)") : source.appendingPathComponent("bin/\(name)")
                 guard try QueueBootstrapFiles.safeExecutable(binary, scope: bundleScope) else {
                     throw ClientError.message("The bundled \(name) executable is missing or unsafe.")
                 }
@@ -88,7 +95,7 @@ struct QueueBootstrapEnvironment: Sendable {
         } catch {
             throw ClientError.message("Agent Queue's embedded setup payload is incomplete or invalid. Download the app again. \(error.localizedDescription)")
         }
-        let request = QueueBootstrapRequest(executable: source.appendingPathComponent("bin/agent-heavy"),
+        let request = QueueBootstrapRequest(executable: managed ? app.appendingPathComponent("Contents/MacOS/agent-heavy") : source.appendingPathComponent("bin/agent-heavy"),
             arguments: ["install", "--app-bundle", app.path])
         let cli = home.appendingPathComponent(".local/bin")
         let launch = home.appendingPathComponent("Library/LaunchAgents")
@@ -102,7 +109,7 @@ struct QueueBootstrapEnvironment: Sendable {
                           home.appendingPathComponent(".local/state/agent-heavy"), home.appendingPathComponent(".config/agent-heavy")] {
             try QueueBootstrapFiles.validateDirectory(directory, scope: .init(root: directory))
         }
-        for name in ["build-info.json", "install-in-progress.json", "bin/agent-heavy", "bin/agent-remote"] {
+        for name in ["build-info.json", "install-in-progress.json", "installation.json"] + (managed ? [] : ["bin/agent-heavy", "bin/agent-remote"]) {
             try QueueBootstrapFiles.validateFile(root.appendingPathComponent(name), scope: privateScope)
         }
         for name in ["agent-heavy", "agent-remote"] {
@@ -116,6 +123,31 @@ struct QueueBootstrapEnvironment: Sendable {
         }
         guard let installed = try? Self.readIdentity(root.appendingPathComponent("build-info.json"), scope: privateScope), installed == identity else {
             return .install(request, "Setting up this version for your macOS account…")
+        }
+        if managed {
+            guard let installation = try? JSONDecoder().decode(QueueBootstrapInstallation.self,
+                from: Self.read(root.appendingPathComponent("installation.json"), scope: privateScope)),
+                  installation.schemaVersion == 1, installation.serviceManagement,
+                  installation.app == app.path else {
+                return .install(request, "The installed application location needs setup.")
+            }
+            for name in ["agent-heavy", "agent-remote"] {
+                guard try QueueBootstrapFiles.safeExecutable(cli.appendingPathComponent(name), scope: cliScope) else {
+                    return .install(request, "The command entry points need setup.")
+                }
+            }
+            for (label, helper, command) in [("io.went.agent-heavy", "agent-heavy", "daemon"),
+                                             ("io.went.agent-resources", "agent-heavy", "scheduler"),
+                                             ("io.went.agent-remote", "agent-remote", "serve")] {
+                let definition = app.appendingPathComponent("Contents/Library/LaunchAgents/\(label).plist")
+                guard let service = try? Self.readPlist(QueueBootstrapManagedLaunch.self, at: definition, scope: bundleScope),
+                      service.label == label, service.bundleProgram == "Contents/MacOS/\(helper)",
+                      service.program == nil,
+                      service.arguments == [helper, command] else {
+                    throw ClientError.message("A bundled background service definition is missing or invalid. Download a complete installer.")
+                }
+            }
+            return .ready
         }
         for name in ["agent-heavy", "agent-remote"] {
             guard try QueueBootstrapFiles.safeExecutable(root.appendingPathComponent("bin/\(name)"), scope: privateScope) else {
@@ -144,6 +176,21 @@ struct QueueBootstrapEnvironment: Sendable {
             }
         }
         return .ready
+    }
+
+    func serviceStatusRequests() throws -> [QueueBootstrapRequest] {
+        guard !arguments.contains("--fixture"), Self.exists(app.appendingPathComponent("Contents/Info.plist")) else { return [] }
+        let scope = QueueBootstrapFiles.Scope(root: app, bundled: true)
+        let packaging = try Self.readPlist(QueueBootstrapPackaging.self,
+            at: app.appendingPathComponent("Contents/Info.plist"), scope: scope)
+        guard packaging.serviceManagement == true else { return [] }
+        let executable = app.appendingPathComponent("Contents/MacOS/AgentQueue")
+        guard try QueueBootstrapFiles.safeExecutable(executable, scope: scope) else {
+            throw ClientError.message("The app launcher is missing or unsafe. Download a complete installer.")
+        }
+        return ["queue", "resources"].map {
+            QueueBootstrapRequest(executable: executable, arguments: ["--service-management", "status", $0])
+        }
     }
 
     private static func exists(_ url: URL) -> Bool {
@@ -273,7 +320,8 @@ enum QueueBootstrapFiles {
         defer { close(descriptor) }
         // Respect the account's effective owner/group permissions rather than
         // accepting an execute bit that applies only to another class of user.
-        return faccessat(directory, url.lastPathComponent, X_OK, 0) == 0
+        return faccessat(directory, url.lastPathComponent, X_OK, 0) == 0 &&
+            QueueExecutableNamespace.allows(executable: url, root: scope.root)
     }
 }
 
@@ -287,7 +335,33 @@ private struct QueueBootstrapIdentity: Decodable, Equatable {
 
 private struct QueueBootstrapPackaging: Decodable {
     let embeddedPayload: Bool?
-    enum CodingKeys: String, CodingKey { case embeddedPayload = "AgentQueueEmbeddedPayload" }
+    let serviceManagement: Bool?
+    enum CodingKeys: String, CodingKey {
+        case embeddedPayload = "AgentQueueEmbeddedPayload"
+        case serviceManagement = "AgentQueueServiceManagement"
+    }
+}
+
+private struct QueueBootstrapInstallation: Decodable {
+    let schemaVersion: Int
+    let app: String
+    let serviceManagement: Bool
+}
+
+private struct QueueBootstrapManagedLaunch: Decodable {
+    let label: String
+    let bundleProgram: String
+    let arguments: [String]
+    let program: String?
+    enum CodingKeys: String, CodingKey {
+        case label = "Label", bundleProgram = "BundleProgram", arguments = "ProgramArguments", program = "Program"
+    }
+}
+
+private struct QueueBootstrapServiceState: Decodable {
+    let schemaVersion: Int
+    let service: String
+    let status: String
 }
 
 private struct QueueBootstrapBundle: Decodable {
@@ -399,16 +473,18 @@ struct QueueBootstrapReport: Codable, Equatable, Sendable {
 @MainActor
 final class QueueBootstrapModel: ObservableObject {
     typealias Executor = @Sendable (QueueBootstrapRequest, @escaping @Sendable (Data) -> Void) async throws -> Data
-    enum Phase { case idle, checking, reviewing, waiting, recovering, installing, failed, complete }
+    enum Phase { case idle, checking, setupRequired, reviewing, waiting, recovering, installing, failed, complete }
     @Published private(set) var phase = Phase.idle
     @Published private(set) var message = "Checking setup…"
     @Published private(set) var output = ""
     @Published private(set) var issues: [QueueBootstrapIssue] = []
     @Published private(set) var reviewedIssueID: String?
     @Published private(set) var canDisablePhoneAccess = false
+    @Published private(set) var requiresServiceApproval = false
     private static let phoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
     var isRunning: Bool { [.checking, .waiting, .recovering, .installing].contains(phase) }
     var canStopWaiting: Bool { phase == .waiting || phase == .checking }
+    var allowsInstallation: Bool { environment.allowsInstallation }
     var onSetupRequired: (() -> Void)?
     private let environment: QueueBootstrapEnvironment
     private let inspect: @Sendable () throws -> QueueBootstrapDecision
@@ -437,11 +513,12 @@ final class QueueBootstrapModel: ObservableObject {
     nonisolated static func runInstaller(_ request: QueueBootstrapRequest,
                                         output: @escaping @Sendable (Data) -> Void) async throws -> Data {
         try await QueueClient.run(request.arguments, budget: .setup,
-            transport: .init(executable: request.executable, timeout: 330), onOutput: output)
+            transport: .init(executable: request.executable, timeout: QueueClient.timeout(for: request.arguments, budget: .setup)), onOutput: output)
     }
 
     @discardableResult func start(disablePhoneAccess: Bool = false) -> Task<Void, Never>? {
         guard !isRunning, phase != .complete else { return nil }
+        guard !disablePhoneAccess || allowsInstallation else { return nil }
         if disablePhoneAccess && !legacyPhoneAccess {
             guard let issue = issues.first(where: { $0.actions.contains(where: { $0.id == "disable-phone-access" }) }) else { return nil }
             return perform(actionID: "disable-phone-access", issueID: issue.id, confirmed: true)
@@ -450,12 +527,19 @@ final class QueueBootstrapModel: ObservableObject {
         let current = begin(.checking, message: "Checking installation requirements…")
         issues = []
         request = nil
+        requiresServiceApproval = false
         let task = Task { [self] in
             do {
                 let decision = try await inspectDecision(current)
                 if case let .install(request, reason) = decision {
                     self.request = request
                     onSetupRequired?()
+                    guard allowsInstallation else {
+                        phase = .setupRequired
+                        message = "Complete installation before opening the queue"
+                        output = "Open Agent Job Queue Installer and choose Install. An incomplete installation or a different app version needs an explicit installation step."
+                        return
+                    }
                     if disablePhoneAccess {
                         legacyPhoneAccess = false
                         try await install(QueueBootstrapRequest(executable: request.executable,
@@ -464,6 +548,25 @@ final class QueueBootstrapModel: ObservableObject {
                         try await install(request, reason: reason, current: current)
                     }
                 } else {
+                    for statusRequest in try environment.serviceStatusRequests() {
+                        let data = try await execute(statusRequest) { _ in }
+                        guard data.count <= 16_384 else { throw ClientError.message("Background service status exceeded its response limit.") }
+                        let state = try JSONDecoder().decode(QueueBootstrapServiceState.self, from: data)
+                        guard state.schemaVersion == 1, state.service == statusRequest.arguments.last,
+                              ["notRegistered", "enabled", "requiresApproval", "notFound"].contains(state.status) else {
+                            throw ClientError.message("Background service status is invalid.")
+                        }
+                        guard state.status == "enabled" else {
+                            requiresServiceApproval = state.status == "requiresApproval"
+                            phase = .setupRequired
+                            message = requiresServiceApproval ? "Allow background services in System Settings" : "Complete background service setup"
+                            output = requiresServiceApproval
+                                ? "Open Login Items settings, allow Agent Queue's background services, then check again."
+                                : "Open Agent Job Queue Installer and choose Install to register this app's background services."
+                            onSetupRequired?()
+                            return
+                        }
+                    }
                     finish(current)
                 }
             } catch { await fail(error, current: current) }
@@ -473,7 +576,7 @@ final class QueueBootstrapModel: ObservableObject {
     }
 
     @discardableResult func perform(actionID: String, issueID: String, jobID: Int? = nil, confirmed: Bool = false) -> Task<Void, Never>? {
-        guard !isRunning, phase != .complete, let issue = issues.first(where: { $0.id == issueID }),
+        guard allowsInstallation, !isRunning, phase != .complete, let issue = issues.first(where: { $0.id == issueID }),
               let action = issue.actions.first(where: { $0.id == actionID }), QueueBootstrapAction.executable.contains(actionID),
               !action.needsConfirmation || confirmed else { return nil }
         let needsJob = actionID == "cancel-job" || actionID == "cleanup-job"
@@ -503,7 +606,7 @@ final class QueueBootstrapModel: ObservableObject {
     }
 
     @discardableResult func waitAndContinue() -> Task<Void, Never>? {
-        guard !isRunning, phase != .complete, issues.contains(where: { $0.actions.contains(where: { $0.id == "wait" }) }) else { return nil }
+        guard allowsInstallation, !isRunning, phase != .complete, issues.contains(where: { $0.actions.contains(where: { $0.id == "wait" }) }) else { return nil }
         let current = begin(.waiting, message: "Waiting for the installation requirements to clear…")
         let task = Task { [self] in
             do {
@@ -546,8 +649,11 @@ final class QueueBootstrapModel: ObservableObject {
     }
 
     func canPerform(_ action: QueueBootstrapAction, issue: QueueBootstrapIssue) -> Bool {
-        !isRunning && (action.id != "reset-callback" || (reviewedIssueID == issue.id && revision != nil))
+        !isRunning && (allowsInstallation || QueueBootstrapAction.navigation.contains(action.id)) &&
+            (action.id != "reset-callback" || (reviewedIssueID == issue.id && revision != nil))
     }
+
+    func showLoginItems() { SMAppService.openSystemSettingsLoginItems() }
 
     func reveal(_ issue: QueueBootstrapIssue) {
         guard !isRunning, issues.contains(issue), let path = issue.path else { return }
@@ -680,8 +786,10 @@ struct QueueBootstrapView: View {
     @State private var pending: QueueBootstrapPendingAction?
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("Set up Agent Queue", systemImage: QueueBrand.symbolName).font(.title2.bold())
-            Text("Setup is automatic for your macOS account. Review any requirements below before continuing.")
+            Label(model.allowsInstallation ? "Set up Agent Queue" : "Agent Queue needs setup", systemImage: QueueBrand.symbolName).font(.title2.bold())
+            Text(model.allowsInstallation
+                 ? "Review installation requirements before continuing."
+                 : "Use the installer to install or repair Agent Queue for your macOS account.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {
                 if model.isRunning { ProgressView().controlSize(.small) }
@@ -742,7 +850,15 @@ struct QueueBootstrapView: View {
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }.disabled(model.isRunning)
                 if !model.isRunning && model.phase != .complete {
-                    if model.canDisablePhoneAccess && model.issues.isEmpty {
+                    if !model.allowsInstallation {
+                        if model.requiresServiceApproval {
+                            Button("Login Items settings") { model.showLoginItems() }
+                        } else {
+                            Button("Download installer") { model.downloadRelease() }
+                        }
+                        Button("Check again") { model.start() }
+                            .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                    } else if model.canDisablePhoneAccess && model.issues.isEmpty {
                         Button("Disable phone access and continue") { model.start(disablePhoneAccess: true) }
                             .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                     } else {

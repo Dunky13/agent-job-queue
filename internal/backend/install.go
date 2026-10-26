@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 	"howett.net/plist"
@@ -29,7 +30,11 @@ type installer struct {
 	serviceSlot                                           string
 	testing                                               bool
 	appBundle                                             bool
+	managed                                               bool
+	queueSnapshot                                         func(context.Context) (Object, error)
 	disablePhoneAccess                                    bool
+	prepareReplacement                                    bool
+	unregisterServices                                    bool
 	command                                               func(context.Context, []string) ([]byte, error)
 }
 
@@ -133,6 +138,18 @@ func (install *installer) executable(name string) (string, error) {
 }
 
 func installCommandContext(ctx context.Context, args []string) (context.Context, context.CancelFunc) {
+	if len(args) > 1 && (args[1] == "--service-management" || args[1] == "--prepare-app-replacement") {
+		// The native bridge has its own 30-second completion deadline. Allow
+		// startup and delivery of its failure result before the outer bound.
+		timeout := appservices.NativeCommandTimeout
+		if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" {
+			timeout = appservices.NativeStatusTimeout
+		}
+		return context.WithTimeout(ctx, timeout)
+	}
+	if len(args) == 2 && filepath.Base(args[0]) == "agent-remote" && slices.Contains([]string{"migrate", "disable"}, args[1]) {
+		return context.WithTimeout(ctx, appservices.ControllerCommandTimeout)
+	}
 	return context.WithTimeout(ctx, 30*time.Second)
 }
 
@@ -140,7 +157,8 @@ func (install *installer) commandEnvironment(args []string) []string {
 	environment := envMap()
 	environment["PATH"] = install.path
 	environment["HOMEBREW_NO_AUTO_UPDATE"] = "1"
-	if slices.Equal(args, []string{filepath.Join(install.payload, "source/bin/agent-remote"), "disable"}) || len(args) > 0 && args[0] == "pueue" {
+	managedRemote := len(args) == 2 && (args[1] == "disable" || args[1] == "migrate") && (args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote") || args[0] == filepath.Join(install.payload, "Agent Queue.app/Contents/MacOS/agent-remote"))
+	if managedRemote || slices.Equal(args, []string{filepath.Join(install.payload, "source/bin/agent-remote"), "disable"}) || len(args) > 0 && args[0] == "pueue" {
 		// Recovery targets this installation, including when launched from a
 		// developer shell with private remote-controller fixture overrides.
 		for key := range environment {
@@ -150,7 +168,8 @@ func (install *installer) commandEnvironment(args []string) []string {
 		}
 		environment["HOME"] = install.home
 	}
-	if slices.Equal(args, []string{filepath.Join(install.root, "bin/agent-heavy"), "status", "--json"}) {
+	replacement := len(args) == 3 && args[1] == "--prepare-app-replacement" && args[2] == install.app && (args[0] == filepath.Join(install.app, "Contents/MacOS/AgentQueue") || args[0] == filepath.Join(install.payload, "Agent Queue.app/Contents/MacOS/AgentQueue"))
+	if replacement || slices.Equal(args, []string{filepath.Join(install.root, "bin/agent-heavy"), "status", "--json"}) || slices.Equal(args, []string{filepath.Join(install.app, "Contents/MacOS/agent-heavy"), "status", "--json"}) || len(args) > 1 && args[0] == filepath.Join(install.app, "Contents/MacOS/AgentQueue") && args[1] == "--service-management" {
 		// Installation always targets this user's installed state. An ambient
 		// developer queue override must never establish readiness for that target.
 		for key := range environment {
@@ -172,6 +191,14 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 	if install.command != nil {
 		return install.command(ctx, args)
 	}
+	environmentArgs := args
+	if install.testing && len(args) > 1 && (args[1] == "--service-management" || args[1] == "--prepare-app-replacement") {
+		privateArgs, err := install.privateManagedCommand(args)
+		if err != nil {
+			return nil, err
+		}
+		args = privateArgs
+	}
 	commandPath := args[0]
 	if !filepath.IsAbs(commandPath) {
 		var err error
@@ -183,7 +210,7 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 	bounded, cancel := installCommandContext(ctx, args)
 	defer cancel()
 	command := exec.CommandContext(bounded, commandPath, args[1:]...)
-	command.Env = install.commandEnvironment(args)
+	command.Env = install.commandEnvironment(environmentArgs)
 	output := &boundedOutput{limit: 4 * 1024 * 1024}
 	command.Stdout = output
 	command.Stderr = output
@@ -207,7 +234,7 @@ func installRemoteServiceAbsent(output []byte, exitCode int) bool {
 }
 
 func installServiceAbsent(output []byte, exitCode int, label string) bool {
-	if !slices.Contains([]string{"io.went.agent-remote", "io.went.agent-heavy", "io.went.agent-resources"}, label) {
+	if !slices.Contains([]string{"io.went.agent-remote", "io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-queue"}, label) {
 		return false
 	}
 	expected := fmt.Sprintf("Bad request.\nCould not find service \"%s\" in domain for user gui: %d", label, os.Getuid())
@@ -316,6 +343,23 @@ func installReadInfo(filename string) (BuildInfo, error) {
 		return BuildInfo{}, err
 	}
 	return ValidateBuildInfo(raw)
+}
+
+// A downloaded payload replaces the recorded installation, including shared
+// Applications and renamed bundles. An explicit app-bundle target stays explicit
+// so the managed plan can refuse a mismatch rather than redirecting the caller.
+func (install *installer) resolvePayloadApp() error {
+	if install.appBundle {
+		return nil
+	}
+	metadata, err := appservices.Load(install.home)
+	if err != nil {
+		return err
+	}
+	if metadata != nil {
+		install.app = metadata.App
+	}
+	return nil
 }
 
 func (install *installer) validateAppPath() error {
@@ -493,7 +537,29 @@ func (install *installer) validatePayload() error {
 	if err := installValidatePayloadTree(boundary, install.appBundle); err != nil {
 		return err
 	}
-	for _, filename := range []string{filepath.Join(install.payload, "source/bin/agent-heavy"), filepath.Join(install.payload, "source/bin/agent-remote"), filepath.Join(app, "Contents/MacOS/AgentQueue")} {
+	metadata, err := install.readPayload(filepath.Join(app, "Contents/Info.plist"), 16384)
+	if err != nil {
+		return err
+	}
+	var packaging map[string]any
+	if _, err := plist.Unmarshal(metadata, &packaging); err != nil {
+		return err
+	}
+	install.managed = false
+	if marker, present := packaging["AgentQueueServiceManagement"]; present {
+		if marker != true {
+			return errors.New("Invalid service management packaging marker")
+		}
+		install.managed = true
+		if err := appservices.ValidateBundle(app); err != nil {
+			return err
+		}
+	}
+	executables := []string{filepath.Join(app, "Contents/MacOS/AgentQueue")}
+	if !install.managed || !install.appBundle {
+		executables = append(executables, filepath.Join(install.payload, "source/bin/agent-heavy"), filepath.Join(install.payload, "source/bin/agent-remote"))
+	}
+	for _, filename := range executables {
 		if _, err := install.readPayload(filename, updateMaxArchive); err != nil {
 			return err
 		}
@@ -525,6 +591,19 @@ func (install *installer) validatePayload() error {
 	if !identity.Equal(bundled) {
 		return errors.New("Installer app and support build identities differ")
 	}
+	if install.managed {
+		raw, err := install.readPayload(filepath.Join(app, "Contents/Resources/payload/source/build-info.json"), 16384)
+		if err != nil {
+			return err
+		}
+		embedded, err := ValidateBuildInfo(raw)
+		if err != nil {
+			return err
+		}
+		if !identity.Equal(embedded) {
+			return errors.New("Managed app and embedded support identities differ")
+		}
+	}
 	raw, err = install.readPayload(filepath.Join(app, "Contents/Info.plist"), 16384)
 	if err != nil {
 		return err
@@ -552,9 +631,26 @@ func (install *installer) validatePayload() error {
 		if !exists {
 			continue
 		}
-		installed, err := installReadInfo(marker)
+		var installed BuildInfo
+		if strings.HasPrefix(marker, install.app+"/") {
+			data, readErr := installReadPayload(install.app, marker, 16384, true)
+			if readErr != nil {
+				return readErr
+			}
+			installed, err = ValidateBuildInfo(data)
+		} else {
+			installed, err = installReadInfo(marker)
+		}
 		if err != nil {
 			return err
+		}
+		if install.unregisterServices {
+			// Removal verifies identities but never activates code. An installed
+			// old app can still be removed after preparation of a newer candidate.
+			continue
+		}
+		if install.managed && installed.Build != nil && identity.Build == nil {
+			return errors.New("Refusing to replace a tracked completed or pending installation with an untracked build")
 		}
 		if identity.Build != nil && installed.Build != nil {
 			if *identity.Build < *installed.Build {
@@ -563,6 +659,9 @@ func (install *installer) validatePayload() error {
 			if *identity.Build == *installed.Build && !identity.Equal(installed) {
 				return errors.New("The same tracked build number has a different commit or version")
 			}
+		}
+		if install.managed && marker == filepath.Join(install.root, "install-in-progress.json") && !identity.Equal(installed) {
+			return errors.New("Another candidate installation is pending; retry that exact build before replacing it")
 		}
 	}
 	return nil
@@ -663,6 +762,9 @@ func (install *installer) standardCleanupCallback(callback string) bool {
 	}
 	invocation := strings.TrimSuffix(callback, suffix)
 	if slices.Contains(installCallbackPathSpellings(filepath.Join(install.root, "bin/agent-heavy")), invocation) {
+		return true
+	}
+	if install.managed && slices.Contains(installCallbackPathSpellings(filepath.Join(install.home, ".local/bin/agent-heavy")), invocation) {
 		return true
 	}
 	// The legacy installer used a venv and Homebrew Python 3.12. Retain only
@@ -1292,6 +1394,10 @@ func installLoadedServiceMatches(output []byte, expected []string) bool {
 	if len(expected) == 0 {
 		return false
 	}
+	return installLoadedServiceProgramMatches(output, expected[0], expected)
+}
+
+func installLoadedServiceProgramMatches(output []byte, program string, expected []string) bool {
 	programMatches := false
 	arguments := []string{}
 	inArguments := false
@@ -1300,7 +1406,7 @@ func installLoadedServiceMatches(output []byte, expected []string) bool {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "program = ") {
 			programs++
-			programMatches = line == "program = "+expected[0]
+			programMatches = line == "program = "+program
 		}
 		if line == "arguments = {" {
 			blocks++
@@ -1735,8 +1841,25 @@ func (install *installer) execute(ctx context.Context) error {
 	if !install.testing && runtime.GOOS != "darwin" {
 		return errors.New("Agent Job Queue requires macOS")
 	}
+	if err := install.resolvePayloadApp(); err != nil {
+		return err
+	}
 	if err := install.validatePayload(); err != nil {
 		return err
+	}
+	if install.prepareReplacement || install.unregisterServices {
+		if !install.managed || install.prepareReplacement && install.appBundle || install.unregisterServices && !install.appBundle || install.prepareReplacement && install.unregisterServices {
+			return errors.New("Replacement preparation requires a marked managed payload; service removal requires a marked installed app bundle")
+		}
+		return install.prepareManaged(ctx)
+	}
+	if install.managed {
+		return install.executeManaged(ctx)
+	}
+	if metadata, err := appservices.Load(install.home); err != nil {
+		return err
+	} else if metadata != nil {
+		return errors.New("A managed installation cannot be replaced with an unmarked legacy payload")
 	}
 	directories := []string{install.root, install.state, install.config, filepath.Join(install.home, ".local/bin"), install.launch}
 	if !install.appBundle {
@@ -2025,6 +2148,8 @@ func InstallMain(args []string) int {
 		path = tools + string(os.PathListSeparator) + path
 	}
 	install := &installer{home: home, payload: args[1], root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: filepath.Join(home, "Applications/Agent Queue.app"), path: path, testing: testing, disablePhoneAccess: disablePhoneAccess}
+	install.prepareReplacement = options.prepareReplacement
+	install.unregisterServices = options.unregisterServices
 	if args[0] == "--app-bundle" {
 		install.appBundle = true
 		install.app = args[1]
@@ -2051,6 +2176,14 @@ func InstallMain(args []string) int {
 			fmt.Fprintln(os.Stderr, installDisablePhoneAccessRecovery)
 		}
 		return 1
+	}
+	if options.prepareReplacement {
+		fmt.Println("Prepared Agent Queue replacement. Services are stopped; the application and CLI wrappers are unchanged.")
+		return 0
+	}
+	if options.unregisterServices {
+		fmt.Println("Unregistered Agent Queue services. The application can now be removed; private data is preserved.")
+		return 0
 	}
 	fmt.Println("Installed Agent Queue. Your queue is private; manage optional phone access in settings.")
 	fmt.Printf("CLI: %s\n", filepath.Join(home, ".local/bin/agent-heavy"))

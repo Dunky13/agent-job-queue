@@ -21,7 +21,7 @@ mkdir -p "$installer/Contents/MacOS" "$app/Contents/MacOS" "$app/Contents/Resour
 ARCHS='arm64 x86_64' "$root/native/build.sh" "$app/Contents/MacOS/AgentQueue"
 for architecture in arm64 x86_64; do
   xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -O -target "$architecture-apple-macos15.0" \
-    -framework SwiftUI -framework AppKit "$root/native/QueueBrand.swift" "$root/native/Installer.swift" -o "$work/Installer-$architecture"
+    -framework SwiftUI -framework AppKit -framework ServiceManagement "$root/native/QueueBrand.swift" "$root/native/AgentServices.swift" "$root/native/Installer.swift" -o "$work/Installer-$architecture"
   goarch=$architecture
   [[ "$architecture" != x86_64 ]] || goarch=amd64
   for command in agent-heavy agent-remote; do
@@ -64,6 +64,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
 <key>AgentQueueEmbeddedPayload</key><true/>
+<key>AgentQueueServiceManagement</key><true/>
 </dict></plist>
 PLIST
 cat > "$installer/Contents/Info.plist" <<PLIST
@@ -82,8 +83,15 @@ cat > "$installer/Contents/Info.plist" <<PLIST
 </dict></plist>
 PLIST
 plutil -lint "$app/Contents/Info.plist" "$installer/Contents/Info.plist"
-# The menu app also carries its own setup payload so a Finder copy is complete.
+# The app carries support metadata; its only helper copies live in MacOS.
 # Copy only source support, never the app or its enclosing installer.
 mkdir -p "$app/Contents/Resources/payload"
 ditto "$payload/source" "$app/Contents/Resources/payload/source"
+for command in agent-heavy agent-remote; do
+  mv "$app/Contents/Resources/payload/source/bin/$command" "$app/Contents/MacOS/$command"
+done
+rmdir "$app/Contents/Resources/payload/source/bin"
+mkdir -p "$app/Contents/Library/LaunchAgents"
+cp "$root"/native/LaunchAgents/*.plist "$app/Contents/Library/LaunchAgents/"
+plutil -lint "$app"/Contents/Library/LaunchAgents/*.plist
 macos_package_installer "$installer" "$destination" "$version"

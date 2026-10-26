@@ -14,9 +14,8 @@ import (
 	"github.com/Dunky13/agent-job-queue/internal/backend"
 )
 
-// Exercise Homebrew's actual App movement and install-artifact rollback. The
-// setup executable refuses execution; native first-launch acceptance separately
-// runs the real Go installer after Homebrew has finished moving the signed app.
+// Exercise actual Homebrew delivery movement and rollback, with executable
+// sentinels that fail if delivery attempts setup or any runtime operation.
 func TestHomebrewNativeAppLifecycle(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Homebrew app lifecycle requires macOS")
@@ -25,7 +24,7 @@ func TestHomebrewNativeAppLifecycle(t *testing.T) {
 	if err != nil {
 		t.Skip("Homebrew is unavailable")
 	}
-	for _, prefix := range []string{"opt/homebrew", "usr/local", "custom/prefix"} {
+	for _, prefix := range []string{"opt/homebrew", "usr/local", "custom/prefix", "historical"} {
 		t.Run(prefix, func(t *testing.T) {
 			root, err := filepath.EvalSymlinks(t.TempDir())
 			if err != nil {
@@ -63,7 +62,7 @@ func TestHomebrewNativeAppLifecycle(t *testing.T) {
 				}
 			}
 			output, err := command.CombinedOutput()
-			if err != nil || !strings.Contains(string(output), "native app install, rollback, and uninstall verified") {
+			if err != nil || !strings.Contains(string(output), "installer delivery, rollback, runtime preservation and uninstall verified") {
 				t.Fatalf("Homebrew lifecycle failed: %v\n%s", err, output)
 			}
 		})
@@ -73,7 +72,8 @@ func TestHomebrewNativeAppLifecycle(t *testing.T) {
 const homebrewLifecycleRuby = `require "cask/cask_loader"
 require "cask/caskroom"
 require "cask/installer"
-
+require "find"
+require File.expand_path("../../packaging/homebrew/test-cask.rb")
 fixture, prefix = Pathname(ARGV.fetch(0)), ARGV.fetch(1)
 home = fixture/"User With Spaces"
 raise "Unexpected test home" unless Pathname(Dir.home) == home
@@ -83,94 +83,120 @@ FileUtils.chmod(0o775, [caskroom.parent, caskroom])
 shared_modes = [caskroom.parent, caskroom].map { |path| path.stat.mode & 0o777 }
 Cask::Caskroom.instance_variable_set(:@path, caskroom)
 
-# Every artifact, including real binary symlinks and uninstall scripts, remains
-# inside this fixture. quit:false below prevents targeting the operator's app.
 def load_cask(fixture, build)
   cask = Cask::CaskLoader.load(fixture/build.to_s/"agent-job-queue.rb")
   cask.config = Cask::Config.new(explicit: { appdir: (fixture/"Ignored custom appdir").to_s })
   cask.config.instance_variable_set(:@binarydir, fixture/"bin")
-  apps = cask.artifacts.grep(Cask::Artifact::App)
-  raise "Missing native App artifact" unless apps.length == 1
-  raise "Custom appdir changed the per-user target" unless apps.first.target == Pathname(Dir.home)/"Applications/Agent Queue.app"
-  raise "Fixture binary escaped its private prefix" unless cask.artifacts.grep(Cask::Artifact::Binary).all? { |artifact| artifact.target.dirname == fixture/"bin" }
-  forbidden = [Cask::Artifact::Installer, Cask::Artifact::PreflightBlock, Cask::Artifact::PostflightBlock]
-  forbidden << Cask::Artifact::PreflightSteps if defined?(Cask::Artifact::PreflightSteps)
-  forbidden << Cask::Artifact::PostflightSteps if defined?(Cask::Artifact::PostflightSteps)
-  raise "Cask has executable install hooks" if cask.artifacts.any? { |artifact| forbidden.any? { |klass| artifact.is_a?(klass) } }
+  verify_delivery_cask_contract(cask)
   cask
 end
 
-def stage_app(cask, build)
-  app = cask.artifacts.grep(Cask::Artifact::App).fetch(0)
-  bin = app.source/"Contents/Resources/payload/source/bin"
-  links = app.source.parent/"source/links"
-  FileUtils.mkdir_p([bin, links])
-  (app.source/"build").write(build.to_s)
-  helper = bin/"agent-heavy"
-  helper.write("#!/bin/sh\nprintf 'unexpected setup' > \"$HOME/setup-executed\"\nexit 99\n")
-  helper.chmod(0o755)
+def stage_installer(cask, build, historical)
+  source = cask.artifacts.grep(Cask::Artifact::App).first.source
+  payload = source/"Contents/Resources/payload"
+  helper_dir = historical ? payload/"Agent Queue.app/Contents/Resources/payload/source/bin" : payload/"Agent Queue.app/Contents/MacOS"
+  forbidden = "#!/bin/sh\nprintf 'forbidden execution: %s\\n' \"$*\" >> \"$HOME/forbidden-execution\"\nexit 95\n"
+  [source/"Contents/MacOS/Installer", payload/"source/bin/agent-heavy", payload/"source/bin/agent-remote",
+   payload/"Agent Queue.app/Contents/MacOS/AgentQueue", helper_dir/"agent-heavy", helper_dir/"agent-remote"].each do |path|
+    path.dirname.mkpath
+    path.write(forbidden)
+    path.chmod(0o755)
+  end
+  (source/"build").write(build.to_s)
   %w[agent-heavy agent-remote].each do |name|
-    wrapper = links/name
-    wrapper.write("#!/bin/sh\nexit 99\n")
-    wrapper.chmod(0o755)
+    path = payload/"source/links"/name
+    path.dirname.mkpath
+    FileUtils.cp(File.expand_path("../../packaging/links/#{name}"), path)
   end
-  app.source
+  source
 end
 
-def verify_cli_links(cask)
+def verify_links(cask, fixture)
   cask.artifacts.grep(Cask::Artifact::Binary).each do |binary|
-    unless binary.target.symlink? && binary.target.realpath == binary.source.realpath
-      raise "CLI link does not resolve to its expected cask source: #{binary.target}"
-    end
+    raise "CLI target escaped private prefix" unless binary.target.dirname == fixture/"bin"
+    raise "CLI link lost delivered installer source" unless binary.target.symlink? && binary.target.realpath == binary.source.realpath
   end
 end
 
-state = home/".local/state/agent-heavy/keep"
-credentials = home/".config/agent-heavy/keep"
-launch_agent = home/"Library/LaunchAgents/io.went.agent-queue.plist"
-[state, credentials, launch_agent].each do |path|
+runtime_app = home/"Applications/Agent Queue.app"
+private_files = [runtime_app/"Contents/MacOS/AgentQueue", runtime_app/"Contents/MacOS/agent-heavy",
+                 home/".local/share/agent-heavy/installation.json", home/".local/state/agent-heavy/queue.sqlite3",
+                 home/".config/agent-heavy/credentials", home/".local/bin/agent-heavy",
+                 home/"Library/LaunchAgents/io.went.agent-queue.plist", home/"Library/LaunchAgents/io.went.agent-heavy.plist",
+                 home/"Library/LaunchAgents/io.went.agent-remote.plist"]
+private_files.each do |path|
   path.dirname.mkpath
-  path.write("private sentinel")
+  path.write("preserved runtime sentinel: #{path.basename}")
 end
+witness = private_files.to_h { |path| [path, [path.binread, path.stat.ino, path.stat.mode]] }
+verify_runtime = lambda do
+  witness.each { |path, expected| raise "Delivery moved/deleted/changed runtime #{path}" unless path.exist? && [path.binread, path.stat.ino, path.stat.mode] == expected }
+  raise "Delivery executed setup, queue or native command" if (home/"forbidden-execution").exist?
+end
+historical = prefix == "historical"
 old = load_cask(fixture, 1)
-old_source = stage_app(old, 1)
-old_installer = Cask::Installer.new(old, upgrade: true)
+old_source = stage_installer(old, 1, historical)
 old.metadata_main_container_path.mkpath
+old_installer = Cask::Installer.new(old, upgrade: true)
 old_installer.install_artifacts
-app = old.artifacts.grep(Cask::Artifact::App).fetch(0)
-raise "App remained in shared staging" unless app.source.symlink? && app.target.directory?
-raise "Installed app is group-writable" unless (app.target.stat.mode & 0o022).zero?
-verify_cli_links(old)
+app = old.artifacts.grep(Cask::Artifact::App).first
+raise "Installer was not relocated" unless app.source.symlink? && (app.target/"build").read == "1"
+verify_links(old, fixture)
+verify_runtime.call
+
+# A later native artifact failure must roll back delivery alone.
+new = load_cask(fixture, 2)
+stage_installer(new, 2, historical)
+new.artifacts.grep(Cask::Artifact::Binary).last.define_singleton_method(:install_phase) { |**_options| raise "injected private binary-link failure" }
+old_installer.uninstall_artifacts(successor: new, quit: false)
+raise "Old installer was not backed up" unless old_source.directory? && !old_source.symlink?
+verify_runtime.call
+begin
+  Cask::Installer.new(new, upgrade: true).install_artifacts(predecessor: old)
+  raise "Delivery failure was swallowed"
+rescue RuntimeError => error
+  raise unless error.message == "injected private binary-link failure"
+  raise "Rollback left replacement installer" if app.target.exist?
+end
+old_installer.install_artifacts(predecessor: new)
+raise "Rollback lost old installer" unless (app.target/"build").read == "1"
+verify_links(old, fixture)
+verify_runtime.call
 
 new = load_cask(fixture, 2)
-stage_app(new, 2)
+stage_installer(new, 2, historical)
 new_installer = Cask::Installer.new(new, upgrade: true)
-# Fail a real later artifact, after Homebrew has installed the replacement App.
-new.artifacts.grep(Cask::Artifact::Binary).last.define_singleton_method(:install_phase) do |**_options|
-  raise "injected private binary-link failure"
-end
 old_installer.uninstall_artifacts(successor: new, quit: false)
-raise "Old app was not backed up" unless old_source.directory? && !old_source.symlink? && (!app.target.exist? || app.target.children.empty?)
-failed = false
-begin
-  new_installer.install_artifacts(predecessor: old)
-rescue RuntimeError => error
-  failed = true
-  raise "Unexpected install failure" unless error.message == "injected private binary-link failure"
-end
-raise "Failed installation was swallowed" unless failed
-raise "Failed installation left its replacement app" if app.target.exist?
-old_installer.install_artifacts(predecessor: new)
-raise "Old app was not restored" unless (app.target/"build").read == "1"
-verify_cli_links(old)
-
-launch_agent.write("private sentinel")
-old_installer.uninstall_artifacts(quit: false)
-raise "Uninstall left the menu app" if app.target.exist?
-raise "Uninstall left the app launch agent" if launch_agent.exist?
-raise "Uninstall left the CLI links" if %w[agent-heavy agent-remote].any? { |name| (fixture/"bin"/name).symlink? }
-raise "Homebrew executed native setup" if (home/"setup-executed").exist?
-[state, credentials].each { |path| raise "Lifecycle changed private queue state" unless path.read == "private sentinel" }
-raise "Lifecycle changed shared Homebrew permissions" unless [caskroom.parent, caskroom].map { |path| path.stat.mode & 0o777 } == shared_modes
-puts "native app install, rollback, and uninstall verified"
+new_installer.install_artifacts(predecessor: old)
+raise "Delivery upgrade did not replace installer" unless (app.target/"build").read == "2"
+verify_links(new, fixture)
+verify_runtime.call
+new_installer.uninstall_artifacts(quit: false)
+raise "Uninstall left installer delivery" if app.target.exist?
+raise "Uninstall left CLI delivery links" if %w[agent-heavy agent-remote].any? { |name| (fixture/"bin"/name).symlink? }
+verify_runtime.call
+raise "Delivery changed shared permissions" unless [caskroom.parent, caskroom].map { |path| path.stat.mode & 0o777 } == shared_modes
+puts "installer delivery, rollback, runtime preservation and uninstall verified"
 `
+
+func TestPackagedHomebrewLinksUseGeneratedCanonicalWrappers(t *testing.T) {
+	for _, name := range []string{"agent-heavy", "agent-remote"} {
+		t.Run(name, func(t *testing.T) {
+			home := t.TempDir()
+			generated := filepath.Join(home, ".local/bin", name)
+			verificationWrite(t, generated, "#!/bin/sh\nprintf '%s\\n' \"$@\" \"$PACKAGED_TEST_VALUE\"\nexit 7\n", 0700)
+			wrapper, err := filepath.Abs(filepath.Join("../../packaging/links", name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, wrapper, "argument with spaces", "--flag")
+			command.Env = []string{"HOME=" + home, "PATH=/usr/bin:/bin", "PACKAGED_TEST_VALUE=literal;$HOME"}
+			output, err := command.CombinedOutput()
+			if command.ProcessState == nil || command.ProcessState.ExitCode() != 7 || string(output) != "argument with spaces\n--flag\nliteral;$HOME\n" {
+				t.Fatalf("canonical wrapper forwarding failed: %v: %s", err, output)
+			}
+		})
+	}
+}

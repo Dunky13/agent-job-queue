@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -645,6 +646,13 @@ func (c *Controller) CensorRuns() error {
 func (c *Controller) Close()                  { c.store.Close() }
 func ServeScheduler(g *Gate, once bool) error { return serveScheduler(g, nil, once) }
 func serveScheduler(g *Gate, sampler *ResourceSampler, once bool) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	// The installer retains scheduling.lock until helper shutdown completes.
+	// Interrupt this controller's waits without weakening that shared lock.
+	controlledGate := *g
+	controlledGate.controlContext = ctx
+	g = &controlledGate
 	if e := g.Prepare(); e != nil {
 		return e
 	}
@@ -658,12 +666,12 @@ func serveScheduler(g *Gate, sampler *ResourceSampler, once bool) error {
 		return e
 	}
 	defer controller.Close()
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
-	defer signal.Stop(signals)
 	for {
 		started := time.Now()
 		_, e = controller.Tick()
+		if ctx.Err() != nil {
+			return nil
+		}
 		if e != nil {
 			if censorError := controller.CensorRuns(); censorError != nil {
 				return censorError
@@ -689,7 +697,7 @@ func serveScheduler(g *Gate, sampler *ResourceSampler, once bool) error {
 		}
 		timer := time.NewTimer(delay)
 		select {
-		case <-signals:
+		case <-ctx.Done():
 			timer.Stop()
 			return nil
 		case <-timer.C:

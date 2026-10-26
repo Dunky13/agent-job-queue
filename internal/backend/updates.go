@@ -23,6 +23,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 	"golang.org/x/sys/unix"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/unicode/norm"
@@ -40,34 +41,7 @@ var updateDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 var updateDecimal = regexp.MustCompile(`^[0-9]+$`)
 
 func updateReadOwned(path string, limit int64) ([]byte, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return nil, err
-	}
-	file := os.NewFile(uintptr(fd), path)
-	defer file.Close()
-	var info unix.Stat_t
-	if err := unix.Fstat(fd, &info); err != nil {
-		return nil, err
-	}
-	if uint32(info.Mode)&unix.S_IFMT != unix.S_IFREG || info.Uid != uint32(os.Getuid()) || uint32(info.Mode)&0022 != 0 || info.Nlink != 1 {
-		return nil, errors.New("Installed version metadata has unsafe ownership or permissions")
-	}
-	before := integrationStatIdentity(&info)
-	data, err := io.ReadAll(io.LimitReader(file, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > limit {
-		return nil, errors.New("Installed version metadata exceeds its size limit")
-	}
-	if err := unix.Fstat(fd, &info); err != nil {
-		return nil, err
-	}
-	if before != integrationStatIdentity(&info) {
-		return nil, errors.New("Installed version metadata changed during inspection")
-	}
-	return data, nil
+	return appservices.ReadFile(filepath.Dir(path), path, limit, false)
 }
 
 func updateExists(path string) (bool, error) {
@@ -148,6 +122,17 @@ func updateInstalled(root, app string) (Object, error) {
 
 func updateRegisteredApp() (string, error) {
 	home := integrationHome()
+	if managed, err := appservices.Load(home); err != nil {
+		return "", err
+	} else if managed != nil {
+		if err := updateCompleted(filepath.Join(home, ".local/share/agent-heavy")); err != nil {
+			return "", err
+		}
+		if err := appservices.ValidateApp(home, managed.App); err != nil {
+			return "", err
+		}
+		return managed.App, nil
+	}
 	fallback := filepath.Join(home, "Applications/Agent Queue.app")
 	filename := filepath.Join(home, "Library/LaunchAgents/io.went.agent-queue.plist")
 	parent, err := integrationParent(filename, false)
@@ -856,7 +841,7 @@ func (client *UpdateClient) OpenInstaller(build int) (Object, error) {
 		return nil, err
 	}
 	temporary = ""
-	return Object{"installerOpened": true, "build": build, "message": "Installer opened. Choose Install to finish. Queued and running jobs are preserved"}, nil
+	return Object{"installerOpened": true, "build": build, "message": "Installer opened. Finish queued and running jobs. Choose Install to continue; active work blocks managed service changes"}, nil
 }
 
 func UpdatesMain(args []string) int {

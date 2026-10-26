@@ -1,3 +1,8 @@
 #!/bin/sh
 set -eu
-exec "${HOME:?}/.local/share/agent-heavy/bin/agent-heavy" "$@"
+entry="${HOME:?}/.local/bin/agent-heavy"
+if [ ! -x "$entry" ]; then
+  echo 'Agent Queue needs setup. Open Agent Job Queue Installer from Applications and choose Install.' >&2
+  exit 125
+fi
+exec "$entry" "$@"

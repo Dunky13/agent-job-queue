@@ -7,16 +7,18 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 	"github.com/Dunky13/agent-job-queue/internal/backend"
 	"howett.net/plist"
 )
 
-// VerifyInstaller checks the distributed installer and both copies of its Go
-// payload. Only retained legacy installers may omit the app's embedded payload.
+// VerifyInstaller checks the outer control payload and the app-owned helpers.
+// Only retained legacy installers may omit the app's embedded support payload.
 func VerifyInstaller(installer string) error {
 	if installer == "" {
 		return errors.New("Installer path is required")
@@ -59,16 +61,20 @@ func verifyApp(app string, expected []byte, requirePayload bool) error {
 	if err := verifyPayloadTree(app, true); err != nil {
 		return err
 	}
+	managed, err := managedApp(app)
+	if err != nil {
+		return err
+	}
 	payload := filepath.Join(app, "Contents/Resources/payload")
-	_, err := os.Lstat(payload)
+	_, err = os.Lstat(payload)
 	switch {
-	case errors.Is(err, os.ErrNotExist) && !requirePayload:
+	case errors.Is(err, os.ErrNotExist) && !requirePayload && !managed:
 		// Old retained installers predate the self-contained app. A present but
 		// partial payload must never take this compatibility path.
 	case err != nil:
 		return fmt.Errorf("App embedded payload is missing: %w", err)
 	default:
-		raw, err := verifySource(filepath.Join(payload, "source"))
+		raw, err := verifySourceLayout(filepath.Join(payload, "source"), app, managed)
 		if err != nil {
 			return err
 		}
@@ -84,6 +90,10 @@ func verifyApp(app string, expected []byte, requirePayload bool) error {
 }
 
 func verifySource(source string) ([]byte, error) {
+	return verifySourceLayout(source, "", false)
+}
+
+func verifySourceLayout(source, app string, managed bool) ([]byte, error) {
 	if err := verifyPayloadTree(source, true); err != nil {
 		return nil, err
 	}
@@ -97,6 +107,9 @@ func verifySource(source string) ([]byte, error) {
 	}
 	for _, name := range []string{"agent-heavy", "agent-remote"} {
 		binary := filepath.Join(source, "bin", name)
+		if managed {
+			binary = filepath.Join(app, "Contents/MacOS", name)
+		}
 		if err := universalExecutable(binary); err != nil {
 			return nil, err
 		}
@@ -111,7 +124,9 @@ func verifySource(source string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if !strings.Contains(string(wrapper), "/.local/share/agent-heavy/bin/"+name) {
+		legacy := strings.Contains(string(wrapper), "/.local/share/agent-heavy/bin/"+name)
+		current := strings.Contains(string(wrapper), "/.local/bin/"+name)
+		if !current && (managed || !legacy) {
 			return nil, fmt.Errorf("Cask wrapper does not use the stable backend: %s", name)
 		}
 	}
@@ -127,7 +142,86 @@ func verifySource(source string) ([]byte, error) {
 	if strings.TrimSpace(string(version)) != identity.Version {
 		return nil, errors.New("Payload VERSION differs from its build identity")
 	}
+	if managed {
+		if _, err := os.Lstat(filepath.Join(source, "bin")); !errors.Is(err, os.ErrNotExist) {
+			return nil, errors.New("Managed app must not embed source/bin")
+		}
+		if err := verifyManagedAgents(app); err != nil {
+			return nil, err
+		}
+		// Reuse the installer's no-follow ownership and permission boundary.
+		// macOS temporary-directory ancestors may use their /var aliases.
+		canonical, err := filepath.EvalSymlinks(app)
+		if err != nil {
+			return nil, err
+		}
+		canonical, err = filepath.Abs(canonical)
+		if err != nil {
+			return nil, err
+		}
+		if err := appservices.ValidateBundle(canonical); err != nil {
+			return nil, err
+		}
+	}
 	return raw, nil
+}
+
+// Presence of a malformed marker must not select retained-artifact compatibility.
+func managedApp(app string) (bool, error) {
+	raw, err := os.ReadFile(filepath.Join(app, "Contents/Info.plist"))
+	if err != nil {
+		return false, err
+	}
+	var info map[string]any
+	if _, err := plist.Unmarshal(raw, &info); err != nil {
+		return false, err
+	}
+	marker, present := info["AgentQueueServiceManagement"]
+	if present && marker != true {
+		return false, errors.New("Invalid service management packaging marker")
+	}
+	return present, nil
+}
+
+func verifyManagedAgents(app string) error {
+	directory := filepath.Join(app, "Contents/Library/LaunchAgents")
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 3 {
+		return errors.New("Managed app must contain exactly three bundled LaunchAgents")
+	}
+	for service, command := range map[string]string{"heavy": "daemon", "resources": "scheduler", "remote": "serve"} {
+		helper := "agent-heavy"
+		if service == "remote" {
+			helper = "agent-remote"
+		}
+		label := "io.went.agent-" + service
+		filename := filepath.Join(directory, label+".plist")
+		if err := requiredPayloadFile(filename, false); err != nil {
+			return err
+		}
+		raw, err := os.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+		var actual map[string]any
+		if _, err := plist.Unmarshal(raw, &actual); err != nil {
+			return err
+		}
+		expected := map[string]any{"Label": label, "BundleProgram": "Contents/MacOS/" + helper, "ProgramArguments": []any{helper, command}, "ThrottleInterval": uint64(10), "Umask": uint64(63), "ProcessType": "Background"}
+		if service == "resources" {
+			expected["KeepAlive"] = true
+		} else {
+			expected["RunAtLoad"] = true
+			expected["KeepAlive"] = map[string]any{"SuccessfulExit": false}
+		}
+		if !reflect.DeepEqual(actual, expected) {
+			return fmt.Errorf("Invalid bundled LaunchAgent definition: %s", label)
+		}
+	}
+	return nil
 }
 
 func verifyNativeBundle(bundle, executable, identifier string, raw []byte) error {

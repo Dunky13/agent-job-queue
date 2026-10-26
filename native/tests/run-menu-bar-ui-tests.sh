@@ -43,9 +43,9 @@ cat > "$fixture_app/Contents/Info.plist" <<'PLIST'
 PLIST
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier io.went.agentqueue.fixture.$(uuidgen)" "$fixture_app/Contents/Info.plist"
 sed '/^@main$/d' "$root/native/AgentQueue.swift" > "$temporary/AgentQueue.swift"
-xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -framework SwiftUI -framework AppKit \
+xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -framework SwiftUI -framework AppKit -framework ServiceManagement \
   "$root/native/QueueBrand.swift" "$temporary/AgentQueue.swift" "$root/native/AgentIntegration.swift" "$root/native/AgentUpdates.swift" \
-  "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/tests/MenuBarUITests.swift" -o "$fixture_binary"
+  "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/AgentServices.swift" "$root/native/tests/MenuBarUITests.swift" -o "$fixture_binary"
 rm -f -- "$report"
 open -W -n --stdout "$temporary/stdout.log" --stderr "$temporary/stderr.log" "$fixture_app" \
   --args --fixture "$root/native/tests/fixtures/queue.json" --report "$report" --pid-file "$fixture_pid_file" "$@" &

@@ -1,18 +1,20 @@
 # Guided installation and upgrade recovery
 
-First-launch setup checks the installation before changing it. When requirements need attention, the setup window lists them together with the affected jobs, service, or file. A clean preflight permits an installation attempt; the installer repeats its authoritative checks before publication, and the app verifies the installed state before opening the queue.
+Normal app launch checks installation and background-service authorization without installing or repairing files. Use the installer, or explicitly invoke the app with `--setup`, to enter the installation workflow. Explicit setup checks the installation before changing it. When requirements need attention, the setup window lists them together with the affected jobs, service, or file. A clean preflight permits an installation attempt; the installer repeats its authoritative checks before publication, and the app verifies the installed state before opening the queue.
 
 ## Available choices
 
 - **Wait and continue** rechecks transient blockers for a bounded period. **Stop waiting** cancels the read-only check without stopping queue jobs or an accepted repair. Paused and stashed legacy jobs still need attention in the existing queue.
-- **Review jobs** shows the unfinished legacy jobs. Cancelling a selected job requires confirmation because running work may be stopped. Normal Go upgrades retain active jobs and do not require this legacy drain.
+- **Review jobs** shows the unfinished legacy jobs. Cancelling a selected job requires confirmation because running work may be stopped. Managed Go upgrades also require a drained queue before changing service registration. Active work blocks those changes.
 - **Run verified cleanup** uses the established ownership-checked cleanup path for a selected completed job. Setup does not remove receipts, leases, or lock files merely to bypass a blocker.
 - **Start verified service** starts a confirmed stopped, canonical installed Go service. An already loaded service or uncertain job attempt is not restarted by recovery; its diagnostics remain available for inspection.
 - **Disable phone access and continue** preserves credentials, configuration, and trusted certificates. It covers the Python migration blocker and a failed enabled remote migration during a Go upgrade. Access can be enabled again in settings after setup.
 - **Review configuration** opens the affected file and explains the proposed callback replacement. **Back up and replace callback** requires a separate confirmation, preserves the complete original privately, and checks that the configuration is still the version reviewed. The custom callback's behavior will no longer run after replacement. Arbitrary custom service definitions and missing configuration remain guided repairs rather than guessed defaults.
-- **Show affected file**, **Open Applications**, and **Download current release** provide a path forward for unsafe private paths, misplaced apps, damaged packages, or a downgrade attempt. Use Finder to copy and reopen a correctly signed app; setup does not silently replace another app, relax signature checks, or take ownership of unknown files.
+- **Show affected file**, **Open Applications**, and **Download current release** provide a path forward for unsafe private paths, misplaced apps, damaged packages, or a downgrade attempt. Use a complete signed installer to finish setup; a Finder copy alone does not register its services. Setup does not relax signature checks or take ownership of unknown files.
 
 Recovery failures retain the original diagnostic and refresh the preflight choices. A successful recovery is followed by a new preflight before installation continues. None of these choices authorizes an unidentified process to be killed, a shared lock to be removed, or a custom configuration to be silently overwritten.
+
+If an interrupted publication retains an owned backup and receipt, finish the exact pending setup before preparing an external replacement or removing the runtime. Those operations refuse before service changes while the backup is needed for recovery. Do not delete the receipt or pending marker to bypass the refusal. A partial first installation without a backup can still unregister denied services; it retires candidate-only custody while preserving the app and queue data.
 
 ## Controller contract
 
@@ -37,7 +39,7 @@ agent-heavy install --app-bundle ABSOLUTE_APP_PATH --recover reset-callback --ex
 
 Each operation rechecks current eligibility and ownership. Callback replacement requires the revision supplied by the reviewed report. Recovery returns a fresh report and does not itself finish installation. Navigation and waiting are native UI operations, not arbitrary controller command execution.
 
-The native transport treats only the exact read-only preflight command as cancellable. Installation and recovery retain the existing accepted-mutation behavior. Unsupported schemas, unknown action IDs, malformed job IDs, and invalid paths are rejected before execution.
+The native transport treats exact read-only preflight and native service-status commands as cancellable. Installation and recovery retain the existing accepted-mutation behavior. Unsupported schemas, unknown action IDs, malformed job IDs, and invalid paths are rejected before execution. Executable locations with group- or world-writable ancestors are refused; setup does not change shared Applications permissions to bypass that refusal.
 
 ## Verification
 

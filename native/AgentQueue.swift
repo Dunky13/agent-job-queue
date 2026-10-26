@@ -190,7 +190,7 @@ enum QueueClient {
         let discardable = input == nil && (arguments.first == "status" ||
             (controller == .heavy && arguments.first == "profiles" &&
                 ["list", "show"].contains(arguments.dropFirst().first ?? "")) ||
-            (controller == .heavy && isSetupPreflight(arguments)))
+            (controller == .heavy && (isSetupPreflight(arguments) || isNativeServiceStatus(arguments))))
         let cancellation = discardable ? QueueReadCancellation() : nil
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -214,12 +214,20 @@ enum QueueClient {
             Array(arguments.suffix(2)) == ["--preflight", "--json"]
     }
 
+    private static func isNativeServiceStatus(_ arguments: [String]) -> Bool {
+        arguments.count == 3 && arguments[0] == "--service-management" && arguments[1] == "status" &&
+            ["queue", "resources", "remote", "login"].contains(arguments[2])
+    }
+
     static func timeout(for arguments: [String], controller: Controller = .heavy, budget: Budget = .normal) -> TimeInterval {
+        if controller == .heavy && isNativeServiceStatus(arguments) { return 5 }
         // A verified update includes a bounded download and signature checks. The
         // backend has a 120-second aggregate deadline; normal queue I/O is unchanged.
         if budget == .updates && controller == .heavy && arguments.first == "updates" { return 130 }
         if budget == .setup { return 330 }
-        return arguments.first == "status" ? 8 : (controller == .remote ? 35 : 25)
+        // Phone lifecycle owns up to 120 seconds for native stop/start and
+        // readiness. Its caller must allow startup and result delivery too.
+        return arguments.first == "status" ? 8 : (controller == .remote ? 125 : 25)
     }
 
     private static func runBlocking(_ arguments: [String], controller: Controller, input: Data?, budget: Budget,
@@ -236,8 +244,18 @@ enum QueueClient {
             throw ClientError.message("Could not prepare the private controller output pipe.")
         }
         let process = Process()
-        process.executableURL = transport?.executable ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".local/bin/\(controller.rawValue)")
+        if let transport {
+            process.executableURL = transport.executable
+        } else if Bundle.main.object(forInfoDictionaryKey: "AgentQueueServiceManagement") as? Bool == true {
+            let app = Bundle.main.bundleURL
+            let executable = app.appendingPathComponent("Contents/MacOS/\(controller.rawValue)")
+            guard try QueueBootstrapFiles.safeExecutable(executable, scope: .init(root: app, bundled: true)) else {
+                throw ClientError.message("The bundled controller is missing or unsafe. Use a complete installer to repair Agent Queue.")
+            }
+            process.executableURL = executable
+        } else {
+            process.executableURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/\(controller.rawValue)")
+        }
         process.arguments = arguments
         let inputPipe = input == nil ? nil : Pipe()
         if let inputPipe {
@@ -2196,6 +2214,17 @@ struct ConfirmationVerification: Encodable {
 @main
 struct AgentQueueApp {
     @MainActor static func main() {
+        do {
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            if let result = try QueueAppReplacement.handle(arguments: arguments)
+                ?? QueueServiceManagement.handle(arguments: arguments) {
+                FileHandle.standardOutput.write(Data((result.json + "\n").utf8))
+                exit(result.exitCode)
+            }
+        } catch {
+            FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
+            exit(EXIT_FAILURE)
+        }
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
         let delegate = AppDelegate()

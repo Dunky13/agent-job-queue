@@ -69,6 +69,25 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             try await verifyPreflight(notification)
             return
         }
+        let ordinary = try BootstrapFixture(parent: temporary, setupMode: false)
+        let counter = BootstrapCountingExecutorFixture()
+        let ordinaryDelegate = AppDelegate(environment: ordinary.environment) { request, output in
+            await counter.execute(request, output: output)
+        }
+        production = ordinaryDelegate
+        ordinaryDelegate.applicationDidFinishLaunching(notification)
+        try await waitUntil { ordinaryDelegate.bootstrap?.phase == .setupRequired }
+        guard let requiredWindow = ordinaryDelegate.setupWindow, let requiredModel = ordinaryDelegate.bootstrap else {
+            throw ClientError.message("Read-only startup did not show installation guidance")
+        }
+        await requiredModel.start()?.value
+        let ordinaryCalls = await counter.calls
+        try check(requiredWindow.isVisible && ordinaryCalls == 0 && !requiredModel.allowsInstallation &&
+                  ordinaryDelegate.applicationShouldTerminate(NSApp) == .terminateNow,
+                  "Normal startup shows installer guidance without executing setup and permits Quit")
+        try snapshot(requiredWindow, name: "00-installer-required")
+        requiredWindow.close()
+        ordinaryDelegate.applicationWillTerminate(notification)
         let fixture = try BootstrapFixture(parent: temporary)
         let phoneAccessBlocker = !CommandLine.arguments.contains("--generic-retry")
         let executor = BootstrapExecutorFixture(fixture, phoneAccessBlocker: phoneAccessBlocker)

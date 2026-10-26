@@ -7,7 +7,7 @@ enum InstallerActivity { static var running = false }
 
 @MainActor
 final class InstallerModel: ObservableObject {
-    @Published var output = "Install Agent Queue for your macOS account.\n\nIncludes its queue and HTTPS runtime. macOS may need an internet connection for first-open verification. Finish or cancel all existing jobs before the first legacy queue migration. Later embedded queue upgrades preserve running jobs and settings. Manage optional phone access in settings.\n"
+    @Published var output = "Install Agent Queue for your macOS account.\n\nIncludes its queue and HTTPS runtime. macOS may need an internet connection for first-open verification. Finish or cancel all queued and running jobs before installation or an upgrade. Active work blocks changes to background services. Configuration, history and phone credentials are preserved. Manage optional phone access in settings.\n"
     @Published var running = false
     @Published var completed = false
     private var process: Process?
@@ -21,6 +21,10 @@ final class InstallerModel: ObservableObject {
         }
         let payload = resources.appendingPathComponent("payload")
         let controller = payload.appendingPathComponent("source/bin/agent-heavy")
+        guard QueueExecutableNamespace.allows(executable: controller, root: Bundle.main.bundleURL) else {
+            output += "\nThe installer location permits unsafe executable replacement. Open it from a protected download or your account's Applications folder. No installation was started.\n"
+            return
+        }
         let task = Process()
         let stream = Pipe()
         task.executableURL = controller

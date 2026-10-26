@@ -89,6 +89,10 @@ func TestDiskImageVerificationSelectsOnlyCompleteDistributionLayouts(t *testing.
 	}{
 		{"drag", "verify-app", "--app", "Agent Queue.app"},
 		{"legacy", "verify-installer", "--installer", "Agent Job Queue Installer.app"},
+		{"managed installer", "verify-installer", "--installer", "Agent Job Queue Installer.app"},
+		{"managed drag", "verify-app", "--app", "Agent Queue.app"},
+		{"managed missing helper", "", "", ""},
+		{"managed non executable helper", "", "", ""},
 		{"missing apps", "", "", ""},
 		{"mixed", "", "", ""},
 		{"missing link", "", "", ""},
@@ -119,7 +123,7 @@ attach)
   mountpoint=$1
   printf '%s' "$mountpoint" > "$DMG_TEST_RECORD"
   [ "$DMG_TEST_LAYOUT" != 'missing apps' ] || exit 0
-  if [ "$DMG_TEST_LAYOUT" = legacy ] || [ "$DMG_TEST_LAYOUT" = 'legacy link' ] || [ "$DMG_TEST_LAYOUT" = mixed ]; then
+  if [ "$DMG_TEST_LAYOUT" = legacy ] || [ "$DMG_TEST_LAYOUT" = 'legacy link' ] || [ "$DMG_TEST_LAYOUT" = mixed ] || [ "$DMG_TEST_LAYOUT" = "managed installer" ]; then
     for file in 'Contents/MacOS/Installer' \
       'Contents/Resources/payload/Agent Queue.app/Contents/MacOS/AgentQueue' \
       'Contents/Resources/payload/source/bin/agent-heavy' \
@@ -129,6 +133,13 @@ attach)
       printf 'fixture' > "$target"
       chmod 700 "$target"
     done
+    if [ "$DMG_TEST_LAYOUT" = 'managed installer' ]; then
+      app="$mountpoint/Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app"
+      for name in agent-heavy agent-remote; do
+        cp "$mountpoint/Agent Job Queue Installer.app/Contents/Resources/payload/source/bin/$name" "$app/Contents/MacOS/$name"
+      done
+      exit 0
+    fi
     if [ "$DMG_TEST_LAYOUT" = legacy ]; then exit 0; fi
     if [ "$DMG_TEST_LAYOUT" = 'legacy link' ]; then ln -s /Applications "$mountpoint/Applications"; exit 0; fi
   fi
@@ -142,7 +153,14 @@ attach)
     chmod 700 "$target"
   done
   case "$DMG_TEST_LAYOUT" in
-    'missing link') ;;
+    managed*)
+      mv "$app/Contents/Resources/payload/source/bin/agent-heavy" "$app/Contents/MacOS/agent-heavy"
+      mv "$app/Contents/Resources/payload/source/bin/agent-remote" "$app/Contents/MacOS/agent-remote"
+      if [ "$DMG_TEST_LAYOUT" = 'managed missing helper' ]; then rm "$app/Contents/MacOS/agent-remote"; fi
+      if [ "$DMG_TEST_LAYOUT" = 'managed non executable helper' ]; then chmod 600 "$app/Contents/MacOS/agent-heavy"; fi ;;
+  esac
+  case "$DMG_TEST_LAYOUT" in
+    'missing link' ) ;;
     'wrong link') ln -s /tmp "$mountpoint/Applications";;
     'relative link') ln -s Applications "$mountpoint/Applications";;
     'newline link') target=$(printf '/Applications\n.'); ln -s "${target%.}" "$mountpoint/Applications";;
@@ -163,6 +181,7 @@ detach) exit 0;;
 *) exit 99;;
 esac
 `)
+			testTool(t, root, "plutil", `case "$DMG_TEST_LAYOUT" in managed*) exit 0;; *) exit 1;; esac`)
 			testTool(t, root, "go", `printf 'go' >> "$DMG_TEST_EVENTS"
 for argument in "$@"; do printf '|%s' "$argument" >> "$DMG_TEST_EVENTS"; done
 printf '\n' >> "$DMG_TEST_EVENTS"

@@ -130,9 +130,12 @@ and never executes its signed target.
 
 Before publication, separate fresh Apple Silicon and Intel jobs verify final
 checksums, signatures, tickets and app-copy policy, exercise the hardened queue
-and HTTPS gateway, and run the actual Homebrew installer with quarantine kept.
-The Homebrew test owns a private daemon and user directory, substitutes only
-its private launchctl fixture, and bounds installer descendants before cleanup.
+and HTTPS gateway, and exercise actual Homebrew delivery with quarantine kept.
+The runtime test then invokes the signed explicit installer outside Homebrew's
+restricted hook sandbox. It owns private daemon processes and user directories,
+substitutes native lifecycle and launchctl readback, and bounds descendants
+before cleanup. These checks do not qualify real Service Management registration,
+approval, subsequent login or reboot; those need an isolated login-session test.
 No Apple credential is passed to these acceptance jobs. Checkout precedes all
 artifact downloads so its workspace cleanup cannot erase the release inputs.
 
@@ -335,8 +338,9 @@ Do not submit the same pending build repeatedly to try to accelerate processing.
 
 ## Distribution and acceptance
 
-Both the native installer and new Homebrew casks directly execute the signed
-Go controller. The cask preserves quarantine. Historical ad hoc casks remain
+The native installer directly executes the signed Go controller. New Homebrew
+casks deliver that explicit installer without executing setup in a hook. The
+user opens it and chooses Install. The cask preserves quarantine. Historical ad hoc casks remain
 unchanged until the next numbered release; the trusted tap helper validates
 their original cask as bounded data. Merge the companion trusted tap update
 before the source release, as documented in [Homebrew delivery](homebrew-delivery.md).
@@ -352,7 +356,9 @@ Use `codesign --verify --check-notarization` with an explicit `notarized`
 requirement for the standalone Go executables. An app-oriented `spctl` check
 does not establish the correct behavior for every non-app code type. The
 quarantined Homebrew test verifies both helpers' notarization before exercising
-the actual signed installer entry. Apple documents these distinct checks in
+the actual signed installer entry outside Homebrew's hook sandbox. Native
+service operations remain simulated there; signing and packaged job execution
+cannot certify live Service Management or endpoint-security acceptance. Apple documents these distinct checks in
 [Testing a Notarised Product](https://developer.apple.com/forums/thread/130560).
 
 Signing, notarization and Gatekeeper acceptance are distinct results. A normal

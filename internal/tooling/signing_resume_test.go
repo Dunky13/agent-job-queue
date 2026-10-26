@@ -90,8 +90,7 @@ func TestMacOSResumeRejectsDeclaredMissingPayload(t *testing.T) {
 	if err := os.RemoveAll(f.state); err != nil {
 		t.Fatal(err)
 	}
-	f.command(t, nil, "init", f.installer, f.state, "0.1.0")
-	f.reject(t, nil, "declares an embedded setup payload but it is missing", "prepare", f.state, "payload", "0.1.0")
+	f.reject(t, nil, "declares an embedded setup payload but it is missing", "init", f.installer, f.state, "0.1.0")
 	if _, err := os.Stat(filepath.Join(f.state, "stages/payload.json")); !os.IsNotExist(err) {
 		t.Fatalf("missing payload created a prepared signing stage: %v", err)
 	}
@@ -873,5 +872,28 @@ func TestMacOSResumeBindsExactOriginalArtifactAndTeam(t *testing.T) {
 				t.Fatal("mismatched state reached signing/provider")
 			}
 		})
+	}
+}
+
+func TestMacOSResumeManagedHelpersRemainInsidePayloadCheckpoint(t *testing.T) {
+	f := newResumeFixture(t)
+	f.embedManagedApp(t)
+	if err := os.RemoveAll(f.state); err != nil {
+		t.Fatal(err)
+	}
+	f.command(t, nil, "init", f.installer, f.state, "0.1.0")
+	for _, stage := range []string{"payload", "installer", "dmg"} {
+		for _, operation := range []string{"prepare", "submit", "finish"} {
+			f.step(t, operation, stage)
+		}
+	}
+	record := f.recorded(t)
+	for _, name := range []string{"agent-heavy", "agent-remote"} {
+		if !strings.Contains(record, "Agent Queue.app/Contents/MacOS/"+name) {
+			t.Fatalf("resumed release omitted canonical helper: %s", record)
+		}
+	}
+	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|explicit-setup\n") {
+		t.Fatal("managed resume lost explicit installer disk image layout")
 	}
 }

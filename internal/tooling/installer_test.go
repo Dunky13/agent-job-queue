@@ -272,3 +272,137 @@ func TestVerifyInstallerChecksEmbeddedPayloadAndRetainedLegacyApp(t *testing.T) 
 		})
 	}
 }
+
+// Managed artifacts move the app's helper copies rather than adding another
+// executable tree. Legacy fixtures above deliberately keep their old layout.
+func managedVerificationFixture(t *testing.T) verificationFixture {
+	t.Helper()
+	f := newVerificationFixture(t)
+	info := filepath.Join(f.app, "Contents/Info.plist")
+	raw, err := os.ReadFile(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verificationWrite(t, info, strings.Replace(string(raw), "</dict>", "<key>AgentQueueServiceManagement</key><true/></dict>", 1), 0600)
+	for _, name := range []string{"agent-heavy", "agent-remote"} {
+		if err := os.Rename(filepath.Join(f.source, "bin", name), filepath.Join(f.app, "Contents/MacOS", name)); err != nil {
+			t.Fatal(err)
+		}
+		verificationWrite(t, filepath.Join(f.source, "links", name), "#!/bin/sh\nexec \"${HOME:?}/.local/bin/"+name+"\" \"$@\"\n", 0700)
+	}
+	if err := os.Remove(filepath.Join(f.source, "bin")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"heavy", "resources", "remote"} {
+		filename := "io.went.agent-" + name + ".plist"
+		raw, err := os.ReadFile(filepath.Join("../../native/LaunchAgents", filename))
+		if err != nil {
+			t.Fatal(err)
+		}
+		verificationWrite(t, filepath.Join(f.app, "Contents/Library/LaunchAgents", filename), string(raw), 0600)
+	}
+	return f
+}
+
+func TestVerifyManagedAppAndInstaller(t *testing.T) {
+	for _, installer := range []bool{false, true} {
+		t.Run(fmt.Sprint(installer), func(t *testing.T) {
+			f := managedVerificationFixture(t)
+			if !installer {
+				if err := VerifyApp(f.app); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				bundle := filepath.Join(f.root, "Installer.app")
+				verificationBundle(t, bundle, "Installer", "io.went.agent-queue.installer")
+				payload := filepath.Join(bundle, "Contents/Resources/payload")
+				verificationSource(t, filepath.Join(payload, "source"))
+				if err := os.Rename(f.app, filepath.Join(payload, "Agent Queue.app")); err != nil {
+					t.Fatal(err)
+				}
+				if err := VerifyInstaller(bundle); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func TestVerifyManagedAppRejectsTampering(t *testing.T) {
+	for _, mutation := range []string{"marker type", "marker false", "missing payload", "hidden bin", "helper missing", "helper signature", "helper architecture", "helper permissions", "writable helper", "hardlinked helper", "missing plist", "plist symlink", "argument", "run policy", "home environment", "log path", "extra login plist", "legacy wrapper"} {
+		t.Run(mutation, func(t *testing.T) {
+			f := managedVerificationFixture(t)
+			agent := filepath.Join(f.app, "Contents/Library/LaunchAgents/io.went.agent-heavy.plist")
+			helper := filepath.Join(f.app, "Contents/MacOS/agent-heavy")
+			switch mutation {
+			case "marker type", "marker false":
+				info := filepath.Join(f.app, "Contents/Info.plist")
+				raw, _ := os.ReadFile(info)
+				value := "<string>true</string>"
+				if mutation == "marker false" {
+					value = "<false/>"
+				}
+				verificationWrite(t, info, strings.Replace(string(raw), "<key>AgentQueueServiceManagement</key><true/>", "<key>AgentQueueServiceManagement</key>"+value, 1), 0600)
+			case "missing payload":
+				if err := os.RemoveAll(filepath.Dir(f.source)); err != nil {
+					t.Fatal(err)
+				}
+			case "hidden bin":
+				verificationWrite(t, filepath.Join(f.source, "bin/agent-heavy"), "duplicate", 0700)
+			case "helper missing":
+				if err := os.Remove(helper); err != nil {
+					t.Fatal(err)
+				}
+			case "helper signature":
+				t.Setenv("VERIFY_TEST_BAD_SIGNATURE", helper)
+			case "helper architecture":
+				t.Setenv("VERIFY_TEST_BAD_ARCH", helper)
+			case "writable helper":
+				if err := os.Chmod(helper, 0777); err != nil {
+					t.Fatal(err)
+				}
+			case "hardlinked helper":
+				if err := os.Link(helper, filepath.Join(f.root, "extra-helper")); err != nil {
+					t.Fatal(err)
+				}
+			case "helper permissions":
+				if err := os.Chmod(helper, 0600); err != nil {
+					t.Fatal(err)
+				}
+			case "missing plist":
+				if err := os.Remove(agent); err != nil {
+					t.Fatal(err)
+				}
+			case "plist symlink":
+				target := filepath.Join(f.root, "external.plist")
+				if err := os.Rename(agent, target); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, agent); err != nil {
+					t.Fatal(err)
+				}
+			case "extra login plist":
+				verificationWrite(t, filepath.Join(filepath.Dir(agent), "io.went.agent-queue.plist"), "login", 0600)
+			case "legacy wrapper":
+				verificationWrite(t, filepath.Join(f.source, "links/agent-heavy"), "#!/bin/sh\nexec \"$HOME/.local/share/agent-heavy/bin/agent-heavy\"", 0700)
+			default:
+				raw, _ := os.ReadFile(agent)
+				value := string(raw)
+				switch mutation {
+				case "argument":
+					value = strings.Replace(value, "<string>daemon</string>", "<string>scheduler</string>", 1)
+				case "run policy":
+					value = strings.Replace(value, "<key>SuccessfulExit</key><false/>", "<key>SuccessfulExit</key><true/>", 1)
+				case "home environment":
+					value = strings.Replace(value, "</dict></plist>", "<key>EnvironmentVariables</key><dict><key>HOME</key><string>/private/var/empty</string></dict></dict></plist>", 1)
+				case "log path":
+					value = strings.Replace(value, "</dict></plist>", "<key>StandardOutPath</key><string>/tmp/private.log</string></dict></plist>", 1)
+				}
+				verificationWrite(t, agent, value, 0600)
+			}
+			if err := VerifyApp(f.app); err == nil {
+				t.Fatal("managed tampering accepted")
+			}
+		})
+	}
+}

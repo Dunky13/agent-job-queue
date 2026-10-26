@@ -54,6 +54,8 @@ type installOptions struct {
 	target             []string
 	preflight          bool
 	disablePhoneAccess bool
+	prepareReplacement bool
+	unregisterServices bool
 	recovery           string
 	jobID              *int
 	revision           string
@@ -61,8 +63,8 @@ type installOptions struct {
 
 func installParseOptions(args []string) (installOptions, error) {
 	options := installOptions{}
-	usage := errors.New("Usage: agent-heavy install (--payload DIRECTORY | --app-bundle ABSOLUTE_APP_PATH) [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access]")
-	if len(args) < 2 || (args[0] != "--payload" && args[0] != "--app-bundle") || !filepath.IsAbs(args[1]) {
+	usage := errors.New("Usage: agent-heavy install (--payload ABSOLUTE_PAYLOAD | --app-bundle ABSOLUTE_APP_PATH) [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access | --prepare-replacement (payload only) | --unregister-services (app-bundle only)]")
+	if len(args) < 2 || (args[0] != "--payload" && args[0] != "--app-bundle") || !integrationValidPath(args[1]) || filepath.Clean(args[1]) != args[1] {
 		return options, usage
 	}
 	options.target = append([]string{}, args[:2]...)
@@ -79,6 +81,10 @@ func installParseOptions(args []string) (installOptions, error) {
 		case "--json":
 		case "--disable-phone-access":
 			options.disablePhoneAccess = true
+		case "--prepare-replacement":
+			options.prepareReplacement = true
+		case "--unregister-services":
+			options.unregisterServices = true
 		case "--recover", "--job-id", "--expected-revision":
 			if i+1 >= len(args) {
 				return options, usage
@@ -102,6 +108,17 @@ func installParseOptions(args []string) (installOptions, error) {
 			}
 		default:
 			return options, usage
+		}
+	}
+	if options.prepareReplacement || options.unregisterServices {
+		if len(args) != 3 || options.prepareReplacement && args[0] != "--payload" || options.unregisterServices && args[0] != "--app-bundle" {
+			return options, usage
+		}
+		if options.unregisterServices {
+			home, err := os.UserHomeDir()
+			if err != nil || installValidateAppPath(home, args[1]) != nil {
+				return options, usage
+			}
 		}
 	}
 	if options.preflight != seen["--json"] || options.preflight && (options.recovery != "" || options.disablePhoneAccess) || options.recovery != "" && options.disablePhoneAccess || options.recovery == "" && (options.jobID != nil || options.revision != "") {
@@ -347,12 +364,19 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 		report.add("platform-unsupported", "macOS is required", "Agent Queue installation requires macOS.", "")
 		return report
 	}
+	if err := install.resolvePayloadApp(); err != nil {
+		report.add("installation-invalid", "Review the recorded application location", err.Error(), install.root, "reveal")
+		return report
+	}
 	if err := install.validatePayload(); err != nil {
 		actions := []string{"download-release", "reveal"}
 		if install.appBundle && installValidateAppPath(install.home, install.app) != nil {
 			actions = []string{"move-app", "reveal"}
 		}
 		report.add("payload-invalid", "Review the application package", err.Error(), install.app, actions...)
+	}
+	if install.managed {
+		return install.preflightManaged(ctx, report)
 	}
 	privateSafe := true
 	for _, directory := range []string{install.root, filepath.Join(install.root, "bin"), install.state, filepath.Join(install.state, "pueue"), install.config, install.launch, filepath.Join(install.home, ".local/bin")} {

@@ -315,8 +315,13 @@ func TestRenderedCaskRetainsQuarantine(t *testing.T) {
 			t.Fatalf("rendered cask contains quarantine bypass: %s", unsafe)
 		}
 	}
-	if !strings.Contains(cask, `app "Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app", target: application`) || !strings.Contains(cask, "Open Agent Queue to finish setup") || strings.Contains(cask, "installer script:") || strings.Contains(cask, "postflight") || strings.Contains(cask, `"--payload"`) {
-		t.Fatal("rendered cask must install the Homebrew-managed app and defer setup to its native first launch")
+	if !strings.Contains(cask, `app "Agent Job Queue Installer.app", target: "#{Dir.home}/Applications/Agent Job Queue Installer.app"`) || !strings.Contains(cask, "Open Agent Job Queue Installer") || !strings.Contains(cask, "choose Install") || !strings.Contains(cask, "CLI links become ready after setup") || !strings.Contains(cask, "Homebrew upgrade or uninstall leaves the installed Agent Queue app and services in place") {
+		t.Fatal("rendered cask must deliver the explicit installer and retain the independently installed runtime")
+	}
+	for _, forbidden := range []string{"preflight", "postflight", "installer script:", "uninstall quit:", "uninstall script:", "system_command", "run \"", `"--payload"`, `"--app-bundle"`, "payload/Agent Queue.app\", target:"} {
+		if strings.Contains(cask, forbidden) {
+			t.Fatal("rendered delivery cask contains executable setup or runtime app ownership", forbidden)
+		}
 	}
 	if !strings.Contains(cask, "Developer ID signed and notarized") || !strings.Contains(cask, "Quarantine is retained") {
 		t.Fatal("rendered cask is missing notarized release provenance")

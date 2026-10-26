@@ -54,6 +54,10 @@ func safeQueueSocket(path string) error {
 	return nil
 }
 func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
+	ctx := g.operationContext()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if g.queueControl != nil {
 		return g.queueControl(operation, payload)
 	}
@@ -67,11 +71,14 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 	if !deadline.After(time.Now()) {
 		return nil, errors.New("Queue control deadline expired")
 	}
-	conn, e := net.DialTimeout("unix", queueSocket(g), time.Until(deadline))
+	dialer := net.Dialer{Deadline: deadline}
+	conn, e := dialer.DialContext(ctx, "unix", queueSocket(g))
 	if e != nil {
 		return nil, errors.New("Queue daemon unavailable; command was not run directly")
 	}
 	defer conn.Close()
+	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancellation()
 	if e = conn.SetDeadline(deadline); e != nil {
 		return nil, e
 	}

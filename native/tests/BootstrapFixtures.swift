@@ -8,22 +8,36 @@ struct BootstrapFixture: Sendable {
     let environment: QueueBootstrapEnvironment
     let identity: Data
 
-    init(parent: URL, location: String = "Applications", tracked: Bool = true) throws {
+    init(parent: URL, location: String = "Applications", tracked: Bool = true,
+         setupMode: Bool = true, managed: Bool = false) throws {
         directory = try Self.canonicalDirectory(parent).appendingPathComponent(UUID().uuidString)
         let home = directory.appendingPathComponent("home")
         let applications = directory.appendingPathComponent("Applications")
         let appParent = location == "home" ? home.appendingPathComponent("Applications") : directory.appendingPathComponent(location)
         let app = appParent.appendingPathComponent("Agent Queue.app")
         environment = QueueBootstrapEnvironment(app: app, resources: app.appendingPathComponent("Contents/Resources"),
-            home: home, systemApplications: applications)
+            home: home, arguments: setupMode ? ["--setup"] : [], systemApplications: applications)
         identity = try JSONEncoder().encode(BootstrapFixtureIdentity(version: "1.2.3", commit: tracked ? String(repeating: "a", count: 40) : nil,
             build: tracked ? 42 : nil))
-        try Self.write(Data("#!/bin/sh\nexit 99\n".utf8), to: environment.source.appendingPathComponent("bin/agent-heavy"), executable: true)
-        try Self.write(Data("#!/bin/sh\nexit 99\n".utf8), to: environment.source.appendingPathComponent("bin/agent-remote"), executable: true)
+        let binaries = managed ? app.appendingPathComponent("Contents/MacOS") : environment.source.appendingPathComponent("bin")
+        try Self.write(Data("#!/bin/sh\nexit 99\n".utf8), to: binaries.appendingPathComponent("agent-heavy"), executable: true)
+        try Self.write(Data("#!/bin/sh\nexit 99\n".utf8), to: binaries.appendingPathComponent("agent-remote"), executable: true)
+        if managed {
+            try Self.write(Data("#!/bin/sh\nexit 99\n".utf8), to: binaries.appendingPathComponent("AgentQueue"), executable: true)
+            for label in ["io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-remote"] {
+                let remote = label == "io.went.agent-remote"
+                let command = remote ? "agent-remote" : "agent-heavy"
+                let action = remote ? "serve" : (label == "io.went.agent-heavy" ? "daemon" : "scheduler")
+                let definition: [String: Any] = ["Label": label, "BundleProgram": "Contents/MacOS/\(command)",
+                    "ProgramArguments": [command, action]]
+                try Self.write(try PropertyListSerialization.data(fromPropertyList: definition, format: .xml, options: 0),
+                    to: app.appendingPathComponent("Contents/Library/LaunchAgents/\(label).plist"))
+            }
+        }
         try Self.write(identity, to: environment.source.appendingPathComponent("build-info.json"))
         try Self.write(identity, to: environment.resources.appendingPathComponent("build-info.json"))
         let info: [String: Any] = ["CFBundleIdentifier": "io.went.agent-queue", "CFBundleShortVersionString": "1.2.3",
-            "CFBundleVersion": tracked ? "42" : "0", "AgentQueueEmbeddedPayload": true]
+            "CFBundleVersion": tracked ? "42" : "0", "AgentQueueEmbeddedPayload": true, "AgentQueueServiceManagement": managed]
         try Self.write(try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0),
             to: app.appendingPathComponent("Contents/Info.plist"))
     }
@@ -41,6 +55,16 @@ struct BootstrapFixture: Sendable {
         ] { try writeDefinition(label, arguments: arguments) }
         let pending = environment.root.appendingPathComponent("install-in-progress.json")
         if FileManager.default.fileExists(atPath: pending.path) { try FileManager.default.removeItem(at: pending) }
+    }
+
+    func installManaged() throws {
+        try Self.write(identity, to: environment.root.appendingPathComponent("build-info.json"))
+        let record = BootstrapFixtureInstallation(app: environment.app.path)
+        try Self.write(try JSONEncoder().encode(record), to: environment.root.appendingPathComponent("installation.json"))
+        for name in ["agent-heavy", "agent-remote"] {
+            try Self.write(Data("#!/bin/sh\nexit 99\n".utf8),
+                to: environment.home.appendingPathComponent(".local/bin/\(name)"), executable: true)
+        }
     }
 
     func writeDefinition(_ label: String, arguments: [String], program: String? = nil, runAtLoad: Bool? = true) throws {
@@ -65,6 +89,34 @@ struct BootstrapFixture: Sendable {
         defer { free(path) }
         return URL(fileURLWithPath: String(cString: path), isDirectory: true)
     }
+}
+
+private struct BootstrapFixtureInstallation: Encodable {
+    let schemaVersion = 1
+    let app: String
+    let serviceManagement = true
+}
+
+actor BootstrapServiceStatusFixture {
+    private(set) var requests: [QueueBootstrapRequest] = []
+    let status: String
+
+    init(status: String = "enabled") { self.status = status }
+
+    func execute(_ request: QueueBootstrapRequest) throws -> Data {
+        requests.append(request)
+        guard request.arguments.count == 3, request.arguments.prefix(2) == ["--service-management", "status"],
+              let service = request.arguments.last else {
+            throw ClientError.message("Ordinary startup attempted a service mutation.")
+        }
+        return try JSONEncoder().encode(BootstrapFixtureServiceStatus(service: service, status: status))
+    }
+}
+
+private struct BootstrapFixtureServiceStatus: Encodable {
+    let schemaVersion = 1
+    let service: String
+    let status: String
 }
 
 struct BootstrapFixtureIdentity: Encodable {

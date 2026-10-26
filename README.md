@@ -27,13 +27,13 @@ Screenshots use sample jobs. The Mac image uses the app's safe preview mode.
 
 ### Homebrew
 
-On macOS 15 or later, install the app and CLI through the project's [Homebrew tap](https://github.com/Dunky13/homebrew-agent-job-queue):
+On macOS 15 or later, obtain the installer and CLI links through the project's [Homebrew tap](https://github.com/Dunky13/homebrew-agent-job-queue):
 
 ```sh
 brew install --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
-Homebrew installs the menu-bar app in your account's Applications folder and links `agent-heavy` and `agent-remote` into its bin directory. Open Agent Queue to complete its private queue setup; the command-line tools are ready once setup finishes. The app shows progress and lets you retry if setup fails. No Xcode or manual installer window is needed.
+Open **Agent Job Queue Installer.app** in your account's Applications folder and choose **Install**. It completes queue setup and installs the menu app. Homebrew links `agent-heavy` and `agent-remote` into its bin directory; those links become ready after setup. Finish all queued and running jobs before installing or upgrading the runtime. If macOS requires background-service approval, review Agent Queue in System Settings, then finish installation. Opening the menu app checks readiness without installing or repairing files. No Xcode is needed.
 
 New releases produced by the notarized release pipeline use Developer ID signatures and Apple notarization. Their Homebrew cask verifies the download's SHA-256 and retains quarantine for macOS assessment. It does not bypass Gatekeeper. Older published builds remain ad hoc signed; their historical casks are preserved until a newer release replaces them. See [Apple signing and notarization](docs/apple-signing.md) for the release requirements and verification limits.
 
@@ -43,24 +43,32 @@ The tap becomes installable after the first validated `main` installer release i
 brew upgrade --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
-Each successfully published main installer triggers and verifies its Homebrew delivery. Scheduled reconciliation provides recovery. Maintainer setup, failure handling and trusted tap tooling synchronization are documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
+After a Homebrew upgrade, open the updated installer and choose **Install** to upgrade Agent Queue. Homebrew's install-hook sandbox cannot access the private queue socket or manage native services, so Homebrew owns installer delivery while the explicit installer owns the runtime app. Each successfully published main installer triggers and verifies its Homebrew delivery. Scheduled reconciliation provides recovery. Maintainer setup, failure handling and trusted tap tooling synchronization are documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
 
-Uninstalling the cask removes the menu app and Homebrew command links. It preserves the queue daemon, running jobs, private backend, data, credentials, and any enabled remote service. Disable remote access in settings or with `agent-remote disable` first if you want it stopped.
+Homebrew uninstall removes its installer and command links. It leaves the installed Agent Queue app, its private command entry points and services in place. To remove a managed runtime, finish queued and running jobs, then run the following command before moving the app to Trash:
 
-### Drag to Applications
+```sh
+agent-heavy install --app-bundle "$HOME/Applications/Agent Queue.app" --unregister-services
+```
+
+Use the app's actual absolute Applications path if it differs. Exit zero confirms service shutdown and retires generated command entry points. Queue history, configuration, credentials and certificate data are preserved. Quitting the menu app during ordinary use leaves the independent queue and enabled phone access running.
+
+### Installer app
 
 1. Use macOS 15 or later on an Apple Silicon or Intel Mac.
 2. Download the DMG from [Releases](https://github.com/Dunky13/agent-job-queue/releases), then open it. Successful main CI builds trigger distribution; a prerelease appears after notarization and both architecture checks pass. CI runs also retain the installer as an artifact for 30 days.
-3. Drag **Agent Queue.app** onto **Applications**, then open it from Applications. You can also copy it to your own Applications folder. Opening it from the disk image shows instructions to move it first.
-4. On first launch, the app sets up your private queue and login services. It displays progress and lets you retry if setup fails. Once setup finishes, the app appears in your menu bar. Add your local bin directory to your shell's `PATH` to use `agent-heavy` by name.
+3. Open **Agent Job Queue Installer.app** and choose **Install**. It verifies the package and queue, installs the app, and registers its background services. Finish all queued and running jobs before installing over an existing queue.
+4. Complete any background-service approval requested in System Settings, then finish installation. The app appears in your menu bar once setup succeeds. Add your local bin directory to your shell's `PATH` to use `agent-heavy` by name.
 
-The ZIP remains available for the updater, Homebrew, and per-user installation. Extract it, open **Agent Job Queue Installer.app**, and choose **Install**. Older disk images also contain this installer app.
+The ZIP uses the same installer. Older drag-to-Applications images remain available, but copying a new managed app alone does not complete queue setup. Opening an incomplete app shows installation guidance and leaves the incomplete-installation marker intact.
 
-The app includes prebuilt universal executables and a Go queue daemon. The Go remote service embeds Caddy's HTTPS and authentication modules. Homebrew, Pueue, Python, uv, Xcode, and a Go toolchain are not required on the installed Mac. Backend setup runs in your user account without `sudo`; Finder may ask for permission to copy the app into the shared Applications folder. The payload is self-contained, but first-launch Gatekeeper assessment can require Apple connectivity. Offline first launch of the standalone Go executables has not been verified.
+The app includes prebuilt universal executables and a Go queue daemon. The Go remote service embeds Caddy's HTTPS and authentication modules. Homebrew, Pueue, Python, uv, Xcode, and a Go toolchain are not required on the installed Mac. Backend setup runs in your user account without `sudo` and defaults to your account's Applications folder. Executable locations must be protected from replacement by other accounts; a group-writable shared Applications folder is refused without changing its permissions. The payload is self-contained, but first-launch Gatekeeper assessment can require Apple connectivity. Offline first launch of the standalone Go executables has not been verified.
 
 The notarized release pipeline signs the installer, menu app and executable payload with Developer ID, submits the release to Apple, and staples tickets to the app bundles and DMG. Historical releases and local development packages can remain ad hoc signed. Installer checksums identify the downloaded bytes; they do not establish notarization.
 
-Upgrades of the embedded Go queue preserve queue configuration, job data, the running daemon, concurrency settings, and remote credentials. Quit the menu app before replacing it in Finder, then open the new copy to update its per-user backend. First-launch setup leaves that app bundle in place. The ZIP installer continues to replace the menu app atomically in your user Applications folder.
+The executable helpers and service definitions remain inside the signed app bundle. Apple's Service Management framework registers the queue and resource controller, optional phone service, and app login preference. They are visible in System Settings under Login Items. The installer does not copy new executable helpers to a hidden support directory or create a login service through `open -a`.
+
+Installations and upgrades preserve configuration, history, concurrency settings and remote credentials. They require a drained queue before unregistering or replacing services, because macOS unregisters running helpers before their code can be replaced safely. Active work causes a refusal before service changes; let it finish and run the explicit installer afterward. Normal app startup never retries a failed installation automatically. Keep incomplete-installation evidence until a verified installation succeeds. If endpoint protection quarantines files, obtain IT review before retrying; Developer ID and notarization do not establish acceptance by another security product.
 
 For the first upgrade from Pueue, finish all running and waiting jobs first. If migrating from the Python backend, also disable remote access in the old app. The installer refuses an unsafe migration before replacing support files, then replaces the drained private daemon and resource controller. Completed job IDs, logs, learning history, operator settings, and remote credentials are retained. Previously installed Homebrew packages are left alone because other software may use them.
 
@@ -80,7 +88,7 @@ Do not clear quarantine to work around a failed verification of a release advert
 
 ## Version and updates
 
-Choose **About and updates** from the queue's gear menu to see the running app and installed controller versions. **Check for updates** finds published builds, including builds with the same version number. **Download and open installer** verifies the selected build and opens the existing installer; choose **Install** there to finish. Running and queued jobs remain with the independent daemon.
+Choose **About and updates** from the queue's gear menu to see the running app and installed controller versions. **Check for updates** finds published builds, including builds with the same version number. **Download and open installer** verifies the selected build and opens the installer. Finish queued and running jobs, then choose **Install** there to replace and register the bundle-owned services.
 
 Legacy and local builds are labelled untracked and can explicitly choose a published installer. The updater does not install automatically. It preserves Gatekeeper policy and refuses tracked downgrades. CLI equivalents and verification details are in [Installed version and updates](docs/updates.md).
 

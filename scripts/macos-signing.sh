@@ -372,13 +372,12 @@ macos_assess_app() {
 }
 
 macos_verify_installer_code() {
-  local installer=$1 payload="$1/Contents/Resources/payload" name embedded
-  embedded="$payload/Agent Queue.app/Contents/Resources/payload/source"
+  local installer=$1 payload="$1/Contents/Resources/payload" name
   macos_app_payload_mode "$payload/Agent Queue.app" || return
   for name in agent-heavy agent-remote; do
     macos_verify_code "$payload/source/bin/$name" || return
     if [[ $MACOS_APP_EMBEDDED == 1 ]]; then
-      macos_verify_code "$embedded/bin/$name" || return
+      macos_verify_code "$MACOS_APP_HELPERS/$name" || return
     fi
   done
   macos_verify_code "$payload/Agent Queue.app" || return
@@ -389,18 +388,25 @@ macos_verify_installer_code() {
 # Old retained build artifacts lack self-contained menu apps. Keep their custom
 # installer packaging intact when newer distribution automation replays them.
 macos_app_payload_mode() {
-  local app=$1 payload="$1/Contents/Resources/payload" name
+  local app=$1 payload="$1/Contents/Resources/payload" name marker service helper command definition
   MACOS_APP_EMBEDDED=0
+  MACOS_APP_MANAGED=0
+  MACOS_APP_HELPERS="$payload/source/bin"
+  if marker=$(plutil -type AgentQueueServiceManagement "$app/Contents/Info.plist" 2>/dev/null); then
+    [[ $marker == bool && $(plutil -extract AgentQueueServiceManagement raw -o - "$app/Contents/Info.plist") == true ]] || { macos_signing_error 'Invalid service management packaging marker.'; return 1; }
+    MACOS_APP_MANAGED=1
+    MACOS_APP_HELPERS="$app/Contents/MacOS"
+  fi
   if [[ -L $payload ]]; then
     macos_signing_error 'The menu app setup payload must not be a symlink.'; return 1;
   fi
   if [[ ! -e $payload ]]; then
-    if plutil -extract AgentQueueEmbeddedPayload raw -o - "$app/Contents/Info.plist" >/dev/null 2>&1; then
+    if [[ $MACOS_APP_MANAGED == 1 ]] || plutil -extract AgentQueueEmbeddedPayload raw -o - "$app/Contents/Info.plist" >/dev/null 2>&1; then
       macos_signing_error 'The menu app declares an embedded setup payload but it is missing.'; return 1;
     fi
     return 0
   fi
-  for name in "$payload" "$payload/source" "$payload/source/bin"; do
+  for name in "$payload" "$payload/source" "$MACOS_APP_HELPERS"; do
     [[ -d $name && ! -L $name ]] || {
       macos_signing_error 'The menu app setup payload is incomplete or linked.'; return 1;
     }
@@ -409,19 +415,45 @@ macos_app_payload_mode() {
     macos_signing_error 'The menu app setup payload is incomplete.'; return 1;
   }
   for name in agent-heavy agent-remote; do
-    [[ -f "$payload/source/bin/$name" && ! -L "$payload/source/bin/$name" && -x "$payload/source/bin/$name" ]] || {
+    [[ -f "$MACOS_APP_HELPERS/$name" && ! -L "$MACOS_APP_HELPERS/$name" && -x "$MACOS_APP_HELPERS/$name" ]] || {
       macos_signing_error 'The menu app setup helper is missing or not executable.'; return 1;
     }
   done
+  if [[ $MACOS_APP_MANAGED == 1 ]]; then
+    [[ ! -e $payload/source/bin && ! -L $payload/source/bin ]] || {
+      macos_signing_error 'Managed app must not embed source/bin.'; return 1;
+    }
+    [[ -d $app/Contents/Library && ! -L $app/Contents/Library && -d $app/Contents/Library/LaunchAgents && ! -L $app/Contents/Library/LaunchAgents ]] || {
+      macos_signing_error 'Managed app LaunchAgents directory is missing or linked.'; return 1;
+    }
+    for service in heavy resources remote; do
+      helper=agent-heavy; command=daemon
+      case $service in resources) command=scheduler ;; remote) helper=agent-remote; command=serve ;; esac
+      definition="$app/Contents/Library/LaunchAgents/io.went.agent-$service.plist"
+      [[ -f $definition && ! -L $definition ]] || { macos_signing_error 'Managed app LaunchAgent is missing or linked.'; return 1; }
+      plutil -convert json -o - "$definition" | jq -e --arg service "$service" --arg helper "$helper" --arg command "$command" '
+        . == ({Label:("io.went.agent-"+$service), BundleProgram:("Contents/MacOS/"+$helper),
+               ProgramArguments:[$helper,$command], ThrottleInterval:10, Umask:63, ProcessType:"Background"} +
+              if $service == "resources" then {KeepAlive:true} else {RunAtLoad:true,KeepAlive:{SuccessfulExit:false}} end)
+      ' >/dev/null || { macos_signing_error 'Invalid managed app LaunchAgent definition.'; return 1; }
+    done
+    # No fourth service (including a legacy /usr/bin/open login item) is allowed.
+    local count=0 entry
+    for entry in "$app"/Contents/Library/LaunchAgents/* "$app"/Contents/Library/LaunchAgents/.[!.]* "$app"/Contents/Library/LaunchAgents/..?*; do
+      [[ -e $entry || -L $entry ]] || continue
+      count=$((count + 1))
+    done
+    [[ $count == 3 ]] || { macos_signing_error 'Unexpected managed app LaunchAgent.'; return 1; }
+  fi
   MACOS_APP_EMBEDDED=1
 }
 
 macos_sign_app_helpers() {
-  local app=$1 source="$1/Contents/Resources/payload/source" name
+  local app=$1 name
   macos_app_payload_mode "$app" || return
   [[ $MACOS_APP_EMBEDDED == 1 ]] || return 0
   for name in agent-heavy agent-remote; do
-    macos_sign_code "$source/bin/$name" "io.went.agent-queue.$name" "app-$name" || return
+    macos_sign_code "$MACOS_APP_HELPERS/$name" "io.went.agent-queue.$name" "app-$name" || return
   done
 }
 
@@ -429,6 +461,9 @@ macos_disk_image_source() {
   local installer=$1 directory=$2 app="$1/Contents/Resources/payload/Agent Queue.app"
   MACOS_DISK_IMAGE_SOURCE=$installer
   macos_app_payload_mode "$app" || return
+  # Managed setup is an explicit installation operation. Keep its installer as
+  # the disk-image entry point; retained self-installing apps keep their layout.
+  [[ $MACOS_APP_MANAGED != 1 ]] || return 0
   [[ $MACOS_APP_EMBEDDED == 1 ]] || return 0
   mkdir "$directory" || return
   ditto --rsrc --extattr --qtn --acl "$app" "$directory/Agent Queue.app" || return
