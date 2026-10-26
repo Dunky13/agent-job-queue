@@ -391,7 +391,7 @@ struct QueueBootstrapView: View {
     @ObservedObject var model: QueueBootstrapModel
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("Set up Agent Queue", systemImage: "square.stack.3d.up").font(.title2.bold())
+            Label("Set up Agent Queue", systemImage: QueueBrand.symbolName).font(.title2.bold())
             Text("Setup is automatic for your macOS account. Manage optional phone access in settings.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {

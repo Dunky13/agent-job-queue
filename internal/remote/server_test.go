@@ -318,7 +318,7 @@ func TestProductionQueueLogLocations(t *testing.T) {
 
 func TestAPIStaticAndProductionSecurity(t *testing.T) {
 	f := newAPIFixture(t)
-	for _, item := range []struct{ path, mime string }{{"/", "text/html"}, {"/static/app.css", "text/css"}, {"/static/app.js", "javascript"}, {"/static/profiles.js", "javascript"}, {"/static/schema.mjs", "javascript"}, {"/static/vendor/zod.mjs", "javascript"}} {
+	for _, item := range []struct{ path, mime string }{{"/static/app-icon.png", "image/png"}, {"/static/favicon.png", "image/png"}, {"/static/apple-touch-icon.png", "image/png"}, {"/", "text/html"}, {"/static/app.css", "text/css"}, {"/static/app.js", "javascript"}, {"/static/profiles.js", "javascript"}, {"/static/schema.mjs", "javascript"}, {"/static/vendor/zod.mjs", "javascript"}} {
 		w := f.request("GET", item.path, "", nil)
 		if w.Code != 200 || !strings.Contains(w.Header().Get("Content-Type"), item.mime) {
 			t.Fatal(item.path, w.Code, w.Header())

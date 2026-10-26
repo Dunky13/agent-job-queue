@@ -83,7 +83,7 @@ struct InstallerView: View {
     @StateObject private var model = InstallerModel()
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("Agent Job Queue", systemImage: "square.stack.3d.up")
+            Label("Agent Job Queue", systemImage: QueueBrand.symbolName)
                 .font(.largeTitle.bold())
             Text("Keep heavy builds and tests under control.").foregroundStyle(.secondary)
             ScrollView {
