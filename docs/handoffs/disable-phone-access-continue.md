@@ -4,6 +4,8 @@ When first-launch setup encounters enabled or loaded phone access from the Pytho
 
 The installer emits a dedicated recovery diagnostic only for this legacy blocker. An explicit recovery click reruns the validated bundled installer with the trailing `--disable-phone-access` option. The backend invokes the bundled remote controller's existing ownership-checked disable operation before acquiring the remote control lock, then repeats migration checks. It retains queue drain, process ownership, payload validation, credential preservation, and installation readback requirements. This option does not disable an enabled Go installation's phone access. A failed shutdown keeps setup gated and displays its diagnostic.
 
+The spec review identified that the existing controller stops its launch service by label. Recovery therefore also validates the private remote LaunchAgent definition against supported Python/Go commands and checks the actual loaded executable and arguments before invoking the controller. Missing ownership evidence, unsafe files, customized commands, conflicting Program values, and another installation's environment are rejected without shutdown or settings changes. Inspection errors cannot stand in for absence: only launchctl's specific exit code and exact missing-service diagnostic confirm an unloaded service. A regression reproduced the unsafe inspection-error path before this final guard was added.
+
 ## Validation
 
 - The new native regression failed against the original generic failure state before implementation.

@@ -34,6 +34,7 @@ type installer struct {
 }
 
 var errInstallLegacyPhoneAccess = errors.New("Phone access from the previous installation must be disabled before setup can continue. Credentials and configuration will be preserved")
+var errInstallServiceNotLoaded = errors.New("Launch service is not loaded")
 
 const installDisablePhoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
 
@@ -191,9 +192,19 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 		if bounded.Err() != nil {
 			return nil, fmt.Errorf("Installer command %s timed out", filepath.Base(args[0]))
 		}
+		var exited *exec.ExitError
+		if slices.Equal(args, []string{"launchctl", "print", install.domain() + "/io.went.agent-remote"}) && errors.As(err, &exited) &&
+			installRemoteServiceAbsent(output.Bytes(), exited.ExitCode()) {
+			return nil, errInstallServiceNotLoaded
+		}
 		return nil, fmt.Errorf("Installer command %s failed: %w", filepath.Base(args[0]), err)
 	}
 	return output.Bytes(), nil
+}
+
+func installRemoteServiceAbsent(output []byte, exitCode int) bool {
+	expected := fmt.Sprintf("Bad request.\nCould not find service \"io.went.agent-remote\" in domain for user gui: %d", os.Getuid())
+	return exitCode == 113 && strings.TrimSpace(string(output)) == expected
 }
 
 func (install *installer) domain() string { return fmt.Sprintf("gui/%d", os.Getuid()) }
@@ -1211,6 +1222,59 @@ func (install *installer) disabledRemoteCleanup(ctx context.Context) (bool, erro
 	return false, nil
 }
 
+func (install *installer) validatePhoneAccessRecovery(ctx context.Context) error {
+	const label = "io.went.agent-remote"
+	filename := filepath.Join(install.launch, label+".plist")
+	exists, err := updateExists(filename)
+	if err != nil {
+		return err
+	}
+	output, queryErr := install.run(ctx, "launchctl", "print", install.domain()+"/"+label)
+	if queryErr != nil && !errors.Is(queryErr, errInstallServiceNotLoaded) {
+		return fmt.Errorf("Cannot inspect phone access service ownership: %w", queryErr)
+	}
+	loaded := queryErr == nil
+	if !exists {
+		if loaded {
+			return errors.New("Cannot establish phone access service ownership without its launch agent definition")
+		}
+		return nil
+	}
+	definition, err := updatePlist(filename)
+	if err != nil {
+		return err
+	}
+	arguments, err := stringsFrom(definition["ProgramArguments"])
+	legacy := []string{filepath.Join(install.root, ".venv/bin/python"), filepath.Join(install.root, "remote/control.py"), "serve"}
+	embedded := []string{filepath.Join(install.root, "bin/agent-remote"), "serve"}
+	if err != nil || text(definition["Label"]) != label || (!slices.Equal(arguments, legacy) && !slices.Equal(arguments, embedded)) {
+		return errors.New("Phone access launch agent is customized; resolve its ownership before continuing setup")
+	}
+	if program, present := definition["Program"]; present && text(program) != arguments[0] {
+		return errors.New("Phone access launch agent Program differs from its expected executable")
+	}
+	if raw, present := definition["EnvironmentVariables"]; present {
+		environment := obj(raw)
+		if environment == nil {
+			return errors.New("Phone access launch agent environment is invalid")
+		}
+		for key, expected := range map[string]string{"HOME": install.home, "AGENT_REMOTE_STATE": filepath.Join(install.state, "remote"), "AGENT_REMOTE_CONFIG": filepath.Join(install.config, "remote.json")} {
+			if actual, present := environment[key]; present && text(actual) != expected {
+				return errors.New("Phone access launch agent targets another installation")
+			}
+		}
+		if value, present := environment["AGENT_REMOTE_TEST_MODE"]; present && text(value) != "0" {
+			return errors.New("Phone access launch agent uses a private test environment")
+		}
+	}
+	if loaded {
+		if !installLoadedServiceMatches(output, arguments) {
+			return errors.New("Loaded phone access service differs from its owned launch agent; no service was stopped")
+		}
+	}
+	return nil
+}
+
 // launchctl print exposes the loaded executable and arguments. A disk plist
 // alone cannot prove which process a service label currently owns.
 func installLoadedServiceMatches(output []byte, expected []string) bool {
@@ -1722,6 +1786,9 @@ func (install *installer) execute(ctx context.Context) error {
 	migration, err := install.pythonMigration(ctx, node)
 	if errors.Is(err, errInstallLegacyPhoneAccess) && install.disablePhoneAccess {
 		if err := install.validateRetirement(); err != nil {
+			return err
+		}
+		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
 			return err
 		}
 		// The bundled controller understands legacy process ownership. Never

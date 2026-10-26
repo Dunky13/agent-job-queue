@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,7 +103,7 @@ func installTestFixture(t *testing.T) *installFixture {
 					}
 					return []byte("program = " + program + "\narguments = {\n" + strings.Join(arguments, "\n") + "\n}\n"), nil
 				}
-				return nil, errors.New("not loaded")
+				return nil, errInstallServiceNotLoaded
 			case "bootstrap":
 				label := strings.TrimSuffix(filepath.Base(args[3]), ".plist")
 				f.loaded[label] = true
@@ -1475,6 +1476,14 @@ func TestInstallerLegacyPhoneAccessRecovery(t *testing.T) {
 			certificate := filepath.Join(install.state, "remote/caddy/pki/authorities/local/root.crt")
 			integrationTestWrite(t, certificate, []byte("retained CA"))
 			f.loaded["io.went.agent-remote"] = kind == "loaded"
+			if kind == "loaded" {
+				definition := Object{"Label": "io.went.agent-remote", "ProgramArguments": []string{filepath.Join(install.root, ".venv/bin/python"), filepath.Join(install.root, "remote/control.py"), "serve"}}
+				raw, err := plist.Marshal(definition, plist.XMLFormat)
+				if err != nil {
+					t.Fatal(err)
+				}
+				integrationTestWrite(t, filepath.Join(install.launch, "io.went.agent-remote.plist"), raw)
+			}
 			if err := f.run(t); !errors.Is(err, errInstallLegacyPhoneAccess) {
 				t.Fatalf("legacy blocker is not recoverable: %v", err)
 			}
@@ -1540,9 +1549,82 @@ func TestInstallerLegacyPhoneAccessRecovery(t *testing.T) {
 	}
 }
 
+func TestInstallerPhoneAccessRecoveryRejectsUnownedServices(t *testing.T) {
+	for _, kind := range []string{"missing", "unsafe", "symlink", "arguments", "label", "program", "loaded-mismatch", "query-failed", "home", "test-mode"} {
+		t.Run(kind, func(t *testing.T) {
+			f := installTestFixture(t)
+			f.legacy(t)
+			install := f.installer
+			install.disablePhoneAccess = true
+			f.loaded["io.went.agent-remote"] = true
+			config := filepath.Join(install.config, "remote.json")
+			original := []byte(`{"enabled":true,"password_hash":"retained hash","secret_key":"retained secret"}`)
+			integrationTestWrite(t, config, original)
+			filename := filepath.Join(install.launch, "io.went.agent-remote.plist")
+			definition := Object{"Label": "io.went.agent-remote", "ProgramArguments": []string{filepath.Join(install.root, ".venv/bin/python"), filepath.Join(install.root, "remote/control.py"), "serve"}}
+			switch kind {
+			case "arguments":
+				definition["ProgramArguments"] = []string{"/usr/bin/unrelated", "serve"}
+			case "label":
+				definition["Label"] = "unrelated"
+			case "program":
+				definition["Program"] = "/usr/bin/unrelated"
+			case "home":
+				definition["EnvironmentVariables"] = Object{"HOME": filepath.Join(install.home, "unrelated")}
+			case "test-mode":
+				definition["EnvironmentVariables"] = Object{"AGENT_REMOTE_TEST_MODE": "1"}
+			}
+			if kind != "missing" {
+				raw, err := plist.Marshal(definition, plist.XMLFormat)
+				if err != nil {
+					t.Fatal(err)
+				}
+				integrationTestWrite(t, filename, raw)
+			}
+			if kind == "unsafe" {
+				if err := os.Chmod(filename, 0666); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if kind == "symlink" {
+				if err := os.Rename(filename, filename+".target"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(filename+".target", filename); err != nil {
+					t.Fatal(err)
+				}
+			}
+			command := install.command
+			install.command = func(ctx context.Context, args []string) ([]byte, error) {
+				if args[0] == filepath.Join(install.payload, "source/bin/agent-remote") || (args[0] == "launchctl" && args[1] == "bootout") {
+					t.Fatalf("unowned service permitted a shutdown command: %v", args)
+				}
+				if kind == "loaded-mismatch" && args[0] == "launchctl" && args[1] == "print" && filepath.Base(args[2]) == "io.went.agent-remote" {
+					return []byte("program = /usr/bin/unrelated\narguments = {\n/usr/bin/unrelated\nserve\n}\n"), nil
+				}
+				if kind == "query-failed" && args[0] == "launchctl" && args[1] == "print" && filepath.Base(args[2]) == "io.went.agent-remote" {
+					return nil, errors.New("fixture service inspection failed")
+				}
+				return command(ctx, args)
+			}
+			if err := f.run(t); err == nil {
+				t.Fatal("unowned phone service accepted")
+			}
+			if !bytes.Equal(original, integrationTestRead(t, config)) {
+				t.Fatal("unowned service changed remote settings")
+			}
+		})
+	}
+}
+
 func TestInstallMainLegacyPhoneAccessRecoveryDiagnostic(t *testing.T) {
 	f := installTestFixture(t)
 	f.legacy(t)
+	launchctl := filepath.Join(f.installer.path, "launchctl")
+	integrationTestWrite(t, launchctl, []byte(fmt.Sprintf("#!/bin/sh\nprintf 'Bad request.\\nCould not find service \"io.went.agent-remote\" in domain for user gui: %d\\n' >&2\nexit 113\n", os.Getuid())))
+	if err := os.Chmod(launchctl, 0700); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MODE", "1")
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", f.installer.path)
 	integrationTestWrite(t, filepath.Join(f.installer.config, "remote.json"), []byte(`{"enabled":true}`))
@@ -1577,6 +1659,26 @@ func TestInstallMainLegacyPhoneAccessRecoveryDiagnostic(t *testing.T) {
 		}
 		if recovery && !strings.Contains(string(message), "Phone access could not be disabled") {
 			t.Fatalf("recovery failed without actionable diagnostic: %s", message)
+		}
+	}
+}
+
+func TestInstallerRemoteServiceAbsenceRequiresExactEvidence(t *testing.T) {
+	missing := fmt.Sprintf("Bad request.\nCould not find service \"io.went.agent-remote\" in domain for user gui: %d\n", os.Getuid())
+	for _, test := range []struct {
+		output string
+		code   int
+		absent bool
+	}{
+		{missing, 113, true},
+		{missing, 1, false},
+		{missing, 0, false},
+		{"inspection timed out", 113, false},
+		{strings.ReplaceAll(missing, "io.went.agent-remote", "unrelated"), 113, false},
+		{missing + "unexpected diagnostic", 113, false},
+	} {
+		if got := installRemoteServiceAbsent([]byte(test.output), test.code); got != test.absent {
+			t.Fatalf("exit %d diagnostic %q: absence=%v", test.code, test.output, got)
 		}
 	}
 }
