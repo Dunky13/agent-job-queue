@@ -27,3 +27,7 @@ See [guided recovery](../upgrade-recovery.md) for the operator flow and controll
 ## Bounded legacy history capture
 
 The command output wrapper embedded `bytes.Buffer`, whose promoted `ReadFrom` method let a real child-process copy bypass the intended `Write` limit. Capture now enforces that limit through both copy paths. The exact owned Pueue status command uses the same 32 MB bound as saved legacy state; other installer commands retain their 4 MB bound. Real-process regressions cover retained history above 4 MB, oversized state rejection and ordinary command bounds. No private job contents are included in these fixtures.
+
+## Hosted validation recovery
+
+The initial hosted Intel job passed its Go regression suite but then exhausted the shared job deadline while compiling the native suite. Go and native tests now run as separate required jobs on both Apple Silicon and Intel, each retaining the existing 20-minute limit. The aggregate check requires both matrices. Hosted arm64 jobs also experienced runner-acquisition capacity cancellations before executing any steps; those remain an infrastructure retry rather than a source pass.

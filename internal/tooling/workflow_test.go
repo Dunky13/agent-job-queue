@@ -3,11 +3,72 @@ package tooling
 import (
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
+	type validationStep struct {
+		Run             string `yaml:"run"`
+		If              string `yaml:"if"`
+		ContinueOnError bool   `yaml:"continue-on-error"`
+	}
+	body, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			If              string   `yaml:"if"`
+			RunsOn          string   `yaml:"runs-on"`
+			Timeout         int      `yaml:"timeout-minutes"`
+			ContinueOnError bool     `yaml:"continue-on-error"`
+			Needs           []string `yaml:"needs"`
+			Strategy        struct {
+				FailFast *bool `yaml:"fail-fast"`
+				Matrix   struct {
+					OS []string `yaml:"os"`
+				} `yaml:"matrix"`
+			} `yaml:"strategy"`
+			Steps []validationStep `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(body, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"macos-tests", "native-tests"} {
+		job, exists := workflow.Jobs[name]
+		if !exists {
+			t.Fatalf("missing independent validation stage %s", name)
+		}
+		if job.Timeout != 20 || job.ContinueOnError || job.If != "" || job.RunsOn != "${{ matrix.os }}" || job.Strategy.FailFast == nil || *job.Strategy.FailFast || !reflect.DeepEqual(job.Strategy.Matrix.OS, []string{"macos-15", "macos-15-intel"}) {
+			t.Fatalf("%s changed the existing budget or architecture requirements", name)
+		}
+		hasGo, hasNative := false, false
+		for _, step := range job.Steps {
+			if step.ContinueOnError || step.If != "" {
+				t.Fatalf("%s may skip or ignore a validation failure", name)
+			}
+			hasGo = hasGo || strings.Contains(step.Run, "go test -p 2 -parallel 2 -race ./cmd/... ./internal/... ./packaging/homebrew ./remote/static -timeout 12m")
+			hasNative = hasNative || strings.Contains(step.Run, "bash scripts/test-native.sh")
+		}
+		if name == "macos-tests" && (!hasGo || hasNative) || name == "native-tests" && (!hasNative || hasGo) {
+			t.Fatalf("%s combines unrelated validation phases or omits its suite", name)
+		}
+	}
+	gate := workflow.Jobs["ci-required"]
+	if gate.If != "always()" || !slices.Contains(gate.Needs, "macos-tests") || !slices.Contains(gate.Needs, "native-tests") {
+		t.Fatal("both complete architecture matrices must remain required")
+	}
+	if !slices.ContainsFunc(gate.Steps, func(step validationStep) bool {
+		return !step.ContinueOnError && step.If == "" && strings.Contains(step.Run, `all(.[]; .result == "success")`)
+	}) {
+		t.Fatal("aggregate check no longer rejects incomplete validation")
+	}
+}
 
 func TestWorkflowPreservesDownloadedArtifacts(t *testing.T) {
 	// Checkout cleans untracked and ignored workspace files by default. Main
