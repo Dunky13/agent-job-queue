@@ -122,6 +122,10 @@ jobs:
     name: Universal installer
     runs-on: macos-15
     timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      EXPECTED_XCODE_VERSION: '16.4'
+      EXPECTED_XCODE_BUILD: 16F6
     outputs:
       artifact_name: ${{ steps.artifact-name.outputs.name }}
     steps:
@@ -133,7 +137,16 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Build macOS 15+ universal installer app
-        run: scripts/build-installer.sh
+        run: |
+          scripts/apple-toolchain.sh "$RUNNER_TEMP/build-toolchain.json"
+          scripts/build-installer.sh
+      - name: Retain credential-free build toolchain identity
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Apple-build-toolchain-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/build-toolchain.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Generate immutable release manifest and Homebrew cask
         run: |
           go run -p 2 ./cmd/queue-tool render-cask \
@@ -157,7 +170,7 @@ jobs:
           name: Agent-Job-Queue-Installer-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90
       - name: Record validated installer artifact
         id: artifact-name
         run: printf 'name=Agent-Job-Queue-Installer-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"

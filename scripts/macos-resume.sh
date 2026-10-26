@@ -56,6 +56,18 @@ check_receipt() {
   jq -e --arg id "$(json_field "$record" submission_id)" --arg hash "$(json_field "$record" archive_sha256)" '
     .status == "Accepted" and .jobId == $id and .sha256 == $hash
   ' "$log" >/dev/null || fail "$stage accepted Apple log does not match its exact submission and archive."
+  check_log_name "$log" "$stage"
+}
+
+check_log_name() {
+  local log=$1 selected_stage=$2 expected legacy
+  expected=$(macos_notary_archive_name "$selected_stage" "$resume_version")
+  # Older, fully bound checkpoints used version-only names. Their UUID/hash and
+  # original-artifact checks remain mandatory when current automation resumes.
+  legacy=$(BUILD_RUN_ID='' macos_notary_archive_name "$selected_stage" "$resume_version")
+  jq -e --arg expected "$expected" --arg legacy "$legacy" '
+    (has("archiveFilename") | not) or .archiveFilename == $expected or .archiveFilename == $legacy
+  ' "$log" >/dev/null || fail 'Apple log archive filename does not match this product, version and stage.'
 }
 
 verify_state() {
@@ -284,6 +296,9 @@ finish_stage() {
   phase=$(json_field "$record" phase)
   [[ $phase != prepared && $phase != uploading ]] || fail 'No submission ID exists for this prepared stage.'
   [[ $phase != finished ]] || { printf '%s already finished.\n' "$stage"; return; }
+  # An earlier transient must never authorize a retry of a later terminal error.
+  rm -f "$state/receipts/$stage.retry" "$state/receipts/$stage.status.json"
+  MACOS_TICKET_RECOVERY_FILE="$state/receipts/$stage.retry"
   if [[ $phase == submitted ]]; then
     configure_credentials
     submission=$(json_field "$record" submission_id)
@@ -293,6 +308,14 @@ finish_stage() {
       "$QUEUE_NOTARY_TOOL" notarize wait --id "$submission" --timeout "$NOTARY_TIMEOUT" > "$response" || wait_result=$?
     else
       xcrun notarytool wait "$submission" "${MACOS_NOTARY_AUTH[@]}" --timeout "$NOTARY_TIMEOUT" --output-format json > "$response" || wait_result=$?
+    fi
+    # Retain only allowlisted, UUID-bound provider status. Unknown/malformed
+    # responses provide no authority for the automatic observer to retry.
+    if jq -e --arg id "$submission" '
+      .id == $id and (.status == "In Progress" or .status == "Accepted" or
+        .status == "Invalid" or .status == "Rejected")
+    ' "$response" >/dev/null 2>&1; then
+      jq '{id, status}' "$response" > "$state/receipts/$stage.status.json"
     fi
     # Rejected submissions and Accepted submissions with warnings both carry
     # useful Apple diagnostics. Attempt the log even after a wait timeout.
@@ -312,7 +335,7 @@ finish_stage() {
       fail "$stage remains pending or failed; submission $submission is preserved with available Apple diagnostics."
     fi
     if ! jq -e --arg id "$submission" --arg rest "$MACOS_NOTARY_REST" \
-      '.status == "Accepted" and ($rest != "1" or .id == $id)' "$response" >/dev/null; then
+      '.status == "Accepted" and ($rest != "1" or .id == $id) and ((has("id") | not) or .id == $id)' "$response" >/dev/null; then
       rm -f "$response" "$provider_log"
       fail "$stage was not Accepted; submission $submission and available Apple diagnostics are preserved."
     fi
@@ -327,6 +350,7 @@ finish_stage() {
       rm -f "$response" "$provider_log"
       fail 'Apple log does not bind Accepted status to this exact submission ID and archive SHA-256.'
     fi
+    check_log_name "$provider_log" "$stage"
     if jq -e '.issues != null and (.issues | length > 0)' "$state/receipts/$stage.log.json" >/dev/null; then
       printf 'Apple reported issues for %s; inspect its retained Apple log before release.\n' "$stage" >&2
     fi
@@ -363,6 +387,7 @@ finish_stage() {
   fi
   jq --arg hash "$(sha256 "$completed")" '.phase="finished" | .completed_sha256=$hash' "$record" > "$record.new"
   mv "$record.new" "$record"
+  rm -f "$state/receipts/$stage.retry"
   rm -rf "$state/work"
 }
 

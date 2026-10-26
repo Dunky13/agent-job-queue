@@ -82,10 +82,12 @@ func TestNotarizationPersistsReceiptsBeforeWaiting(t *testing.T) {
 			}
 		}
 		if strings.HasPrefix(step.Uses, "actions/upload-artifact@") {
-			if step.With["overwrite"] == "true" || step.With["retention-days"] != "30" || step.With["if-no-files-found"] != "error" {
+			if step.With["overwrite"] == "true" || step.With["retention-days"] != "90" || step.With["if-no-files-found"] != "error" {
 				t.Fatalf("checkpoint upload must be immutable, required and retained: %+v", step.With)
 			}
-			operations = append(operations, "persist")
+			if strings.HasPrefix(step.With["name"], "Apple-notarization-") {
+				operations = append(operations, "persist")
+			}
 			if strings.Contains(step.With["name"], "finished-slot") && !strings.Contains(step.If, "always()") {
 				t.Fatal("pending or rejected state must survive a failed wait")
 			}
@@ -177,7 +179,7 @@ func TestNotarizationPersistsInitialStateBeforeCredentials(t *testing.T) {
 			snapshotted = true
 		}
 		if strings.HasSuffix(step.With["name"], "-s00") {
-			if !snapshotted || !strings.HasPrefix(step.Uses, "actions/upload-artifact@") || step.With["if-no-files-found"] != "error" || step.With["retention-days"] != "30" || step.With["overwrite"] == "true" || step.If != "" || step.ContinueOnError {
+			if !snapshotted || !strings.HasPrefix(step.Uses, "actions/upload-artifact@") || step.With["if-no-files-found"] != "error" || step.With["retention-days"] != "90" || step.With["overwrite"] == "true" || step.If != "" || step.ContinueOnError {
 				t.Fatal("a required immutable initial checkpoint must precede credential setup")
 			}
 			persisted = true
@@ -283,7 +285,7 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, guard := range []string{"types: [completed]", "branches: [main]", "github.ref == 'refs/heads/main'", "github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.event == 'push'", "github.event.workflow_run.path == '.github/workflows/ci.yml'", "github.event.workflow_run.repository.full_name == github.repository", "github.event.workflow_run.head_repository.full_name == github.repository", "required: true", "--target \"$BUILD_SHA\"", "--commit \"$BUILD_SHA\"", "tag=\"$BUILD_TAG\""} {
+	for _, guard := range []string{"types: [completed]", "branches: [main]", "github.ref == 'refs/heads/main'", "github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.event == 'push'", "github.event.workflow_run.path == '.github/workflows/ci.yml'", "github.event.workflow_run.repository.full_name == github.repository", "github.event.workflow_run.head_repository.full_name == github.repository", "required: true", "--commit \"$BUILD_SHA\"", "scripts/distribution-publish.sh dist"} {
 		if !strings.Contains(string(body), guard) {
 			t.Errorf("missing source/publication guard %s", guard)
 		}
