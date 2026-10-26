@@ -1,5 +1,7 @@
 # Homebrew managed-app upgrade repair
 
+Source repair: [PR #25](https://github.com/Dunky13/agent-job-queue/pull/25). Companion tap tooling: [PR #5](https://github.com/Dunky13/homebrew-agent-job-queue/pull/5), which must merge first.
+
 ## Problem and scope
 
 The script-installer cask executes setup directly from the shared Caskroom. Payload validation introduced with drag-to-Applications installation rejects group-writable ancestors, including Homebrew's Caskroom and some installation prefixes. The old cask also deletes the installed app before attempting replacement, while its rollback metadata does not describe an app artifact.
