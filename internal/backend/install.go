@@ -35,6 +35,12 @@ type installer struct {
 
 var errInstallLegacyPhoneAccess = errors.New("Phone access from the previous installation must be disabled before setup can continue. Credentials and configuration will be preserved")
 var errInstallServiceNotLoaded = errors.New("Launch service is not loaded")
+var errInstallPendingCleanup = errors.New("Queue migration must wait for queue work and cleanup to finish. Retained receipts or owned lease markers may still belong to running jobs. Existing files were preserved.")
+
+type installCleanupPendingError struct{ path string }
+
+func (err *installCleanupPendingError) Error() string { return errInstallPendingCleanup.Error() }
+func (err *installCleanupPendingError) Unwrap() error { return errInstallPendingCleanup }
 
 const installDisablePhoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
 
@@ -846,7 +852,6 @@ func (install *installer) queueMigration(ctx context.Context, node *yaml.Node) (
 }
 
 func (install *installer) requireLegacyCleanup() error {
-	pending := errors.New("Queue migration requires completed job cleanup. Wait for cleanup or inspect it in the existing installation, then retry; receipts and owned lease markers were preserved")
 	receipts, err := integrationParent(filepath.Join(install.state, "receipts", ".installer-probe"), false)
 	if err == nil {
 		entries, readErr := receipts.ReadDir(-1)
@@ -855,7 +860,7 @@ func (install *installer) requireLegacyCleanup() error {
 			return readErr
 		}
 		if len(entries) != 0 {
-			return pending
+			return &installCleanupPendingError{path: filepath.Join(install.state, "receipts")}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -871,7 +876,7 @@ func (install *installer) requireLegacyCleanup() error {
 	// Queue's own marker names establish unfinished queue cleanup here.
 	for _, name := range []string{"agent-heavy.json", "agent-heavy-lease.json"} {
 		if _, err := os.Lstat(filepath.Join(slot, name)); err == nil {
-			return pending
+			return &installCleanupPendingError{path: filepath.Join(slot, name)}
 		} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOTDIR) {
 			return err
 		}
@@ -889,7 +894,7 @@ func (install *installer) requireLegacyCleanup() error {
 		return err
 	}
 	if len(entries) != 0 {
-		return pending
+		return &installCleanupPendingError{path: filepath.Join(slot, "agent-heavy-jobs")}
 	}
 	return nil
 }
@@ -1257,8 +1262,9 @@ func (install *installer) validatePhoneAccessRecovery(ctx context.Context) error
 	}
 	arguments, err := stringsFrom(definition["ProgramArguments"])
 	legacy := []string{filepath.Join(install.root, ".venv/bin/python"), filepath.Join(install.root, "remote/control.py"), "serve"}
+	legacyRemote := []string{filepath.Join(install.root, "remote/.venv/bin/python"), filepath.Join(install.root, "remote/control.py"), "serve"}
 	embedded := []string{filepath.Join(install.root, "bin/agent-remote"), "serve"}
-	if err != nil || text(definition["Label"]) != label || (!slices.Equal(arguments, legacy) && !slices.Equal(arguments, embedded)) {
+	if err != nil || text(definition["Label"]) != label || (!slices.Equal(arguments, legacy) && !slices.Equal(arguments, legacyRemote) && !slices.Equal(arguments, embedded)) {
 		return errors.New("Phone access launch agent is customized; resolve its ownership before continuing setup")
 	}
 	if program, present := definition["Program"]; present && text(program) != arguments[0] {
@@ -2045,7 +2051,12 @@ func InstallMain(args []string) int {
 		}
 		return 0
 	}
-	if err := install.execute(ctx); err != nil {
+	if options.repairAndContinue {
+		err = install.repairAndExecute(ctx)
+	} else {
+		err = install.execute(ctx)
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "Agent Queue installer: %v\n", err)
 		if errors.Is(err, errInstallLegacyPhoneAccess) {
 			fmt.Fprintln(os.Stderr, installDisablePhoneAccessRecovery)

@@ -54,6 +54,7 @@ type installOptions struct {
 	target             []string
 	preflight          bool
 	disablePhoneAccess bool
+	repairAndContinue  bool
 	recovery           string
 	jobID              *int
 	revision           string
@@ -61,7 +62,7 @@ type installOptions struct {
 
 func installParseOptions(args []string) (installOptions, error) {
 	options := installOptions{}
-	usage := errors.New("Usage: agent-heavy install (--payload DIRECTORY | --app-bundle ABSOLUTE_APP_PATH) [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access]")
+	usage := errors.New("Usage: agent-heavy install (--payload DIRECTORY | --app-bundle ABSOLUTE_APP_PATH) [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access | --repair-and-continue]")
 	if len(args) < 2 || (args[0] != "--payload" && args[0] != "--app-bundle") || !filepath.IsAbs(args[1]) {
 		return options, usage
 	}
@@ -79,6 +80,8 @@ func installParseOptions(args []string) (installOptions, error) {
 		case "--json":
 		case "--disable-phone-access":
 			options.disablePhoneAccess = true
+		case "--repair-and-continue":
+			options.repairAndContinue = true
 		case "--recover", "--job-id", "--expected-revision":
 			if i+1 >= len(args) {
 				return options, usage
@@ -107,7 +110,10 @@ func installParseOptions(args []string) (installOptions, error) {
 	if options.preflight != seen["--json"] || options.preflight && (options.recovery != "" || options.disablePhoneAccess) || options.recovery != "" && options.disablePhoneAccess || options.recovery == "" && (options.jobID != nil || options.revision != "") {
 		return options, usage
 	}
-	if options.recovery != "" && !slices.Contains([]string{"cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback"}, options.recovery) {
+	if options.repairAndContinue && (options.preflight || options.recovery != "" || options.disablePhoneAccess) {
+		return options, usage
+	}
+	if options.recovery != "" && !slices.Contains([]string{"cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback", installRestoreServices}, options.recovery) {
 		return options, usage
 	}
 	if options.recovery != "" && ((options.recovery == "cancel-job" || options.recovery == "cleanup-job") != (options.jobID != nil)) {
@@ -133,6 +139,7 @@ func installAction(id string) installRecoveryAction {
 		"cancel-job":           {ID: "cancel-job", Title: "Cancel selected job", Destructive: true},
 		"cleanup-job":          {ID: "cleanup-job", Title: "Run verified cleanup"},
 		"repair-service":       {ID: "repair-service", Title: "Start verified service"},
+		installRestoreServices: {ID: installRestoreServices, Title: "Restore verified service files", Destructive: true},
 		"disable-phone-access": {ID: "disable-phone-access", Title: "Disable phone access and continue"},
 		"reset-callback":       {ID: "reset-callback", Title: "Back up and replace callback", Destructive: true},
 		"review-configuration": {ID: "review-configuration", Title: "Review configuration"},
@@ -395,15 +402,30 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 			report.Revision = hex.EncodeToString(hash[:])
 		}
 	}
+	missingDefinitions := map[string]bool{}
+	missingServices, missingDefinitionErr := install.missingServiceDefinitions(ctx)
+	if missingDefinitionErr == nil && len(missingServices) > 0 {
+		for _, service := range missingServices {
+			missingDefinitions[service.label] = true
+		}
+		report.add("service-definitions-missing", "Restore missing background service files", "Background services are still running, but their LaunchAgent files are missing. Restore standard definitions from verified loaded commands and environment. Lost custom service options cannot be recovered. Running services and jobs will not be restarted or stopped.", install.launch, "reveal", installRestoreServices)
+	}
 	servicesSafe := true
 	if err := install.validateServices(); err != nil {
 		servicesSafe = false
 		report.add("service-configuration", "Review background service configuration", err.Error()+" Custom settings require an explicit reviewed repair.", install.launch, "review-configuration", "reveal")
 	}
+	if servicesSafe && len(missingDefinitions) > 0 {
+		servicesSafe = false // Restore the verified missing definitions before dependent recovery.
+	}
 	if servicesSafe {
 		if err := install.validateLoadedServices(ctx); err != nil {
 			servicesSafe = false
-			report.add("service-configuration", "Review loaded background service ownership", err.Error(), install.launch, "reveal")
+			detail := err.Error()
+			if errors.Is(err, os.ErrNotExist) && missingDefinitionErr != nil {
+				detail = "A running service's LaunchAgent file is missing. Automatic restoration is unavailable: " + missingDefinitionErr.Error()
+			}
+			report.add("service-configuration", "Review loaded background service ownership", detail, install.launch, "reveal")
 		}
 	}
 	legacy := install.legacyInstallation(node)
@@ -450,7 +472,21 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 	}
 	if legacy {
 		if err := install.requireLegacyCleanup(); err != nil {
-			report.add("pending-cleanup", "Completed jobs still need cleanup", err.Error()+" Inspect the retained receipts; do not delete lease or receipt files.", filepath.Join(install.state, "receipts"), "review-jobs", "reveal", "wait")
+			path := filepath.Join(install.state, "receipts")
+			var pending *installCleanupPendingError
+			if errors.As(err, &pending) {
+				path = pending.path
+			}
+			detail := err.Error() + " Review jobs in the existing queue; completed jobs can use verified cleanup when offered. Do not delete lease or receipt files."
+			actions := []string{"review-jobs", "reveal", "wait"}
+			// Native file navigation is restricted to the account or app folder.
+			// A configured external lease can be reported without offering an
+			// inert button or widening that boundary.
+			if path != install.home && !strings.HasPrefix(path, filepath.Clean(install.home)+string(filepath.Separator)) {
+				actions = []string{"review-jobs", "wait"}
+				detail += " This lease is outside your account folder. Inspect the displayed path manually; setup cannot open it automatically."
+			}
+			report.add("pending-cleanup", "Wait for queue work and cleanup", detail, path, actions...)
 			install.preflightCleanupJobs(&report, callbackSafe, legacyTasks)
 		}
 		if err := install.validateRetirement(); err != nil {
@@ -463,6 +499,8 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 		_, loaded, inspectErr := install.inspectService(ctx, "io.went.agent-remote")
 		if inspectErr != nil {
 			report.add("service-configuration", "Cannot inspect phone access service", inspectErr.Error(), install.launch, "reveal")
+		} else if loaded && missingDefinitions["io.went.agent-remote"] {
+			// The explicit service-file recovery must finish before phone recovery.
 		} else if loaded && install.validatePhoneAccessRecovery(ctx) != nil {
 			report.add("service-configuration", "Review loaded phone access ownership", "The loaded phone access service does not match a safe canonical definition. Setup will not stop it or replace its configuration.", filepath.Join(install.launch, "io.went.agent-remote.plist"), "reveal")
 		} else if legacy && (enabled || loaded) {
@@ -488,7 +526,7 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 			report.add("service-not-ready", "The queue service is not ready", "Inspect its startup diagnostics. Setup will not restart a running service or uncertain job attempts.", filepath.Join(install.state, "daemon.log"), "reveal", "wait")
 		}
 	}
-	if legacy {
+	if legacy && len(missingDefinitions) == 0 {
 		install.preflightLegacyProcesses(ctx, &report, servicesSafe)
 	}
 	return report
@@ -746,7 +784,7 @@ func installValidateRecoveryFiles(g *Gate, id int) error {
 }
 
 func (install *installer) recover(ctx context.Context, action string, jobID *int, revision string) error {
-	if !slices.Contains([]string{"cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback"}, action) {
+	if !slices.Contains([]string{"cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback", installRestoreServices}, action) {
 		return errors.New("Unsupported installation recovery action")
 	}
 	if (action == "cancel-job" || action == "cleanup-job") != (jobID != nil) {
@@ -779,6 +817,9 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 	defer scheduling.Close()
 	if err := install.validateServices(); err != nil {
 		return err
+	}
+	if action == installRestoreServices {
+		return install.restoreServiceDefinitions(ctx)
 	}
 	if err := install.validateLoadedServices(ctx); err != nil {
 		return err
