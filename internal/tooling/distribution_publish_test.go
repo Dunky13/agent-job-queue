@@ -156,14 +156,19 @@ func newPublishFixture(t *testing.T) checkpointFixture {
 		"schema": 2, "repository": "owner/project", "source_sha": checkpointSHA, "version": "0.1.0", "team": signingTestTeam,
 		"run_id": "123", "run_number": "45", "build_attempt": "1", "artifact_id": "800", "artifact_digest": "sha256:" + strings.Repeat("c", 64),
 	}, "stages": stages, "logs": logs})
-	// Match the real producer's canonical public audit bytes.
+	f.canonicalPublishEvidence(t)
+	return f
+}
+
+func (f checkpointFixture) canonicalPublishEvidence(t *testing.T) {
+	t.Helper()
+	// Match the real producer without bypassing semantic binding checks.
 	path := filepath.Join(f.root, "dist/apple-notarization.json")
 	data, err := exec.Command("jq", "-S", ".", path).Output()
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.publishWrite(t, "dist/apple-notarization.json", data)
-	return f
 }
 
 func (f checkpointFixture) publishWrite(t *testing.T, name string, data []byte) {
@@ -182,7 +187,7 @@ func (f checkpointFixture) publishCalls(t *testing.T) string {
 	return string(data)
 }
 
-func (f checkpointFixture) publish(t *testing.T, failure string, success bool, extra ...string) {
+func (f checkpointFixture) publish(t *testing.T, failure string, success bool, extra ...string) string {
 	t.Helper()
 	env := append([]string{"PUBLISH_FAIL=" + failure}, extra...)
 	output, err := f.run(t, env, "dist")
@@ -192,6 +197,7 @@ func (f checkpointFixture) publish(t *testing.T, failure string, success bool, e
 	if success && !strings.Contains(output, "Verified immutable prerelease build-45-1111111 at "+checkpointSHA) {
 		t.Fatalf("missing verification result: %s", output)
 	}
+	return output
 }
 
 func (f checkpointFixture) publishDraft(t *testing.T) {
@@ -397,7 +403,11 @@ func TestDistributionPublishRejectsUnboundAppleEvidenceBeforeProviderAccess(t *t
 					stages[1].(map[string]any)["completed_sha256"] = strings.Repeat("e", 64)
 				}
 			})
-			f.publish(t, "", false)
+			f.canonicalPublishEvidence(t)
+			output := f.publish(t, "", false)
+			if !strings.Contains(output, "Public Apple evidence does not bind Accepted stages to this source and final candidate.") {
+				t.Fatalf("semantic binding refusal was masked by another gate: %s", output)
+			}
 			if calls := f.publishCalls(t); calls != "" {
 				t.Fatalf("unbound Apple evidence reached GitHub: %s", calls)
 			}
