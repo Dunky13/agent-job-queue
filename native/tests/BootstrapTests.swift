@@ -273,6 +273,8 @@ struct BootstrapTests {
         await first?.value
         try check(model.phase == .failed && !model.isRunning && completions == 0 && model.output.contains("Fixture service"),
             "Failure retains a readable error, permits quit and leaves normal startup gated")
+        try check(!model.canDisablePhoneAccess && model.start(disablePhoneAccess: true) == nil,
+            "Unrelated setup failures cannot authorize disabling phone access")
         let retry = model.start()
         try await waitUntil { await executor.isHeld }
         await executor.release()
@@ -284,6 +286,54 @@ struct BootstrapTests {
             "Retry uses the same verified bundled executable and completion is idempotent")
 
         let noMutation = try fixture()
+        let phoneFailure = QueueBootstrapModel(environment: noMutation.environment, execute: { _, _ in
+            throw ClientError.message("Agent Queue installer: Disable phone access before migrating.\nAGENT_QUEUE_SETUP_RECOVERY:disable-phone-access\n")
+        }) { completions += 1 }
+        await phoneFailure.start()?.value
+        try check(phoneFailure.phase == .failed && phoneFailure.message.contains("Phone access") &&
+            phoneFailure.canDisablePhoneAccess && !phoneFailure.output.contains("AGENT_QUEUE_SETUP_RECOVERY"),
+            "Legacy phone access failure offers an actionable recovery without exposing protocol diagnostics")
+        let recoveryFixture = try fixture()
+        let recoveryExecutor = BootstrapExecutorFixture(recoveryFixture, phoneAccessBlocker: true)
+        var recoveryCompletions = 0
+        let recovery = QueueBootstrapModel(environment: recoveryFixture.environment, execute: { request, output in
+            try await recoveryExecutor.execute(request, output: output)
+        }) { recoveryCompletions += 1 }
+        try check(recovery.start(disablePhoneAccess: true) == nil,
+            "Disabling phone access requires a prior recoverable failure")
+        let blocked = recovery.start()
+        try await waitUntil { await recoveryExecutor.isHeld }
+        await recoveryExecutor.release()
+        await blocked?.value
+        try check(recovery.canDisablePhoneAccess && recoveryCompletions == 0,
+            "Phone access blocker keeps normal startup gated until the user chooses recovery")
+        let continued = recovery.start(disablePhoneAccess: true)
+        try await waitUntil { await recoveryExecutor.isHeld }
+        try check(!recovery.canDisablePhoneAccess && recovery.isRunning && recovery.start(disablePhoneAccess: true) == nil,
+            "Recovery consumes consent and prevents duplicate installers")
+        await recoveryExecutor.release()
+        await continued?.value
+        let recoveryRequests = await recoveryExecutor.requests
+        try check(recovery.phase == .complete && recoveryCompletions == 1 && recoveryRequests.count == 2 &&
+            recoveryRequests[0].arguments == ["install", "--app-bundle", recoveryFixture.environment.app.path] &&
+            recoveryRequests[1].arguments == recoveryRequests[0].arguments + ["--disable-phone-access"] &&
+            recoveryRequests[0].executable == recoveryRequests[1].executable,
+            "Explicit recovery uses the verified bundled installer and completes only after installation readback")
+        let failedRecovery = QueueBootstrapModel(environment: noMutation.environment, execute: { request, _ in
+            if request.arguments.contains("--disable-phone-access") { throw ClientError.message("Phone access shutdown could not verify process ownership.") }
+            throw ClientError.message("AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access")
+        }) { recoveryCompletions += 1 }
+        await failedRecovery.start()?.value
+        await failedRecovery.start(disablePhoneAccess: true)?.value
+        try check(failedRecovery.phase == .failed && !failedRecovery.canDisablePhoneAccess && recoveryCompletions == 1 &&
+            failedRecovery.output.contains("ownership"),
+            "Failed phone access shutdown remains gated, retains its diagnostic and clears recovery consent")
+        let unmarkedFailure = QueueBootstrapModel(environment: noMutation.environment, execute: { _, _ in
+            throw ClientError.message("Disable phone access. Invalid embedded AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access text.")
+        }) { recoveryCompletions += 1 }
+        await unmarkedFailure.start()?.value
+        try check(!unmarkedFailure.canDisablePhoneAccess,
+            "Similar prose and embedded marker text cannot enable the recovery action")
         let incomplete = QueueBootstrapModel(environment: noMutation.environment, execute: { _, _ in Data() }) {
             completions += 1
         }
