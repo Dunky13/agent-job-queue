@@ -12,6 +12,12 @@ The user subsequently authorized pushing this implementation, resolving conflict
 
 Published build 118 uses source `5ab7db8`, which does not contain this PR's native Service Management adapter or bundle-owned service packaging. Its reported SentinelOne alert therefore does not qualify the changed implementation. The authoritative detection and a protected retest of the eventual signed candidate are still required to establish SentinelOne acceptance.
 
+### Merged-source certification recovery
+
+PR 41 was squash-merged as `c3a690b27d593d97165ed7b5275c04f1b46ffcce`. Its file tree exactly matches the integrated branch, but GitHub selected author `Marc Went <Dunky13@users.noreply.github.com>` while the commit carries maintainer certifications for `Marc Went <marc@went.io>`. The GitHub signature is valid. Main CI run `40397632997`, commit-policy job `121834785287`, correctly failed with `missing author-matching DCO sign-off`.
+
+The published commit and failed witness are retained. Re-running the same SHA cannot correct that identity mismatch. A documentation-only successor PR establishes a new, properly signed and certified source commit without rewriting main or changing the DCO verifier. Its squash merge must explicitly select author email `marc@went.io`, retain exactly one matching maintainer trailer, and pass post-merge author/signature verification. Required CI and the existing distribution pipeline must then qualify that new source before any release is claimed. Build 118 remains immutable and is not replaced.
+
 Requirements carried into implementation:
 
 - Installation and upgrades perform setup explicitly. Opening an incomplete app shows instructions without rewriting files or automatically retrying recovery.
