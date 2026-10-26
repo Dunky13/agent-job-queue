@@ -300,6 +300,7 @@ func TestMacOSResumeRESTFinishesAllStagesWithBoundReceipts(t *testing.T) {
 	}
 	f.command(t, nil, "export", f.state, f.destination, "0.1.0")
 	events := f.recorded(t)
+	assertNotarySubmissionNames(t, events, "0.1.0")
 	for _, event := range []string{"queue-tool|notarize|preflight", "rest-create|", "queue-tool|notarize|wait|", "queue-tool|notarize|log|", "xcrun|stapler|staple|"} {
 		if strings.Count(events, event) != 3 {
 			t.Fatalf("expected three %s events: %s", event, events)
@@ -409,7 +410,8 @@ case "$operation" in
     jq '.phase="uploading"' "$record" > "$record.new"; mv "$record.new" "$record"
     printf 'rest-create|\n' >> "$SIGNING_TEST_EVENTS"
     [[ $failure != rest-before-id ]] || exit 34
-    case "$archive" in */payload.zip) number=1;; */installer.zip) number=2;; *.dmg) number=3;; *) exit 93;; esac
+    [[ $(shasum -a 256 "$archive" | awk '{print $1}') == "$hash" ]] || exit 97
+    case "$archive" in */Agent-Job-Queue-Payload-*-universal.zip) number=1;; */Agent-Job-Queue-Installer-*-universal.zip) number=2;; *.dmg) number=3;; *) exit 93;; esac
     printf -v id '00000000-0000-0000-0000-%012d' "$number"
     jq --arg id "$id" '.phase="submitted" | .submission_id=$id' "$record" > "$record.new"; mv "$record.new" "$record"
     printf '%s' "$hash" > "$SIGNING_TEST_ROOT/hash.$number"
@@ -556,6 +558,7 @@ func TestMacOSResumeRetainsExactArtifactsAndIDsAcrossAttempts(t *testing.T) {
 	}
 	f.command(t, []string{"GITHUB_RUN_ATTEMPT=3", "APPLE_SIGNING_IDENTITY=", "NOTARY_KEYCHAIN_PROFILE="}, "export", f.state, f.destination, "0.1.0")
 	record := f.recorded(t)
+	assertNotarySubmissionNames(t, record, "0.1.0")
 	if strings.Count(record, "xcrun|notarytool|submit|") != 3 || strings.Count(record, "codesign|--force|") != 5 {
 		t.Fatalf("retry signed or submitted again:\n%s", record)
 	}
@@ -774,7 +777,7 @@ if [[ ${0##*/} == ditto ]]; then
 fi
 if [[ ${0##*/} == xcrun && $1:$2 == notarytool:submit ]]; then
   record_event "$@"
-  case "$3" in */payload.zip) number=1; stage=payload;; */installer.zip) number=2; stage=installer;; *.dmg) number=3; stage=dmg;; *) exit 92;; esac
+  case "$3" in */Agent-Job-Queue-Payload-*-universal.zip) number=1; stage=payload;; */Agent-Job-Queue-Installer-*-universal.zip) number=2; stage=installer;; *.dmg) number=3; stage=dmg;; *) exit 92;; esac
   [[ ${SIGNING_TEST_FAILURE:-} != "$stage-upload" ]] || exit 18
   if [[ ${SIGNING_TEST_FAILURE:-} == "$stage-interrupted" ]]; then kill -TERM "$PPID"; exit 143; fi
   shasum -a 256 "$3" | awk '{print $1}' > "$SIGNING_TEST_ROOT/hash.$number"

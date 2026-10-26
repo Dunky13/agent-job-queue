@@ -224,11 +224,19 @@ submit_stage() {
   [[ $prepared_run == "$GITHUB_RUN_ID" && $(json_field "$record" prepared_attempt) == "$GITHUB_RUN_ATTEMPT" ]] ||
     fail 'Prepared snapshot has no submission ID from an earlier attempt. Upload outcome is unknown; reconcile with Apple manually, never resubmit.'
   configure_credentials
+  # Keep checkpoint paths stable, but give Apple a recognizable submission name.
+  # Copy the immutable bytes rather than rebuilding or changing signed contents.
+  local upload_archive
+  upload_archive="$state/work/$(macos_notary_archive_name "$stage" "$resume_version")"
+  rm -rf "$state/work"
+  mkdir "$state/work"
+  cp "$submitted_archive" "$upload_archive"
+  check_file "$upload_archive" "$(json_field "$record" archive_sha256)"
   if [[ $MACOS_NOTARY_REST == 1 ]]; then
     # The client preflights authentication before recording upload intent, then
     # durably records Apple's ID before S3. Never premark or rewrite its record.
     macos_signing_operation notary-submit "$QUEUE_NOTARY_TOOL" notarize submit \
-      --archive "$submitted_archive" --record "$record" --sha256 "$(json_field "$record" archive_sha256)"
+      --archive "$upload_archive" --record "$record" --sha256 "$(json_field "$record" archive_sha256)"
     return
   fi
   local response submission id_pattern='^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$'
@@ -236,7 +244,7 @@ submit_stage() {
   # Raw provider output stays outside the durable public state. Do not retain
   # stderr, auth arguments or private runner paths in snapshots.
   atomic_json "$record" '.phase="uploading"'
-  if ! xcrun notarytool submit "$submitted_archive" "${MACOS_NOTARY_AUTH[@]}" --output-format json --no-progress > "$response"; then
+  if ! xcrun notarytool submit "$upload_archive" "${MACOS_NOTARY_AUTH[@]}" --output-format json --no-progress > "$response"; then
     rm -f "$response"
     fail 'Notary upload failed or its outcome is unknown; preserve the prepared snapshot for manual reconciliation.'
   fi
