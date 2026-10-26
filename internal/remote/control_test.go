@@ -669,9 +669,10 @@ func runRemoteLifecycleAcceptance(t *testing.T, legacyExecutable string) {
 		if credential != "" {
 			request.SetBasicAuth(username, credential)
 		}
+		started := time.Now()
 		response, err := client.Do(request)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("gateway request failed after %s within %s response budget: %v", time.Since(started), requestBudget, err)
 		}
 		defer response.Body.Close()
 		data, _ := io.ReadAll(response.Body)

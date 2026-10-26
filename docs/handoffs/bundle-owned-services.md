@@ -8,9 +8,39 @@ Original incident evidence and the build-58/build-94 comparison are recorded in 
 
 ## PR integration and release authorization
 
-The user subsequently authorized pushing this implementation, resolving conflicts, getting [PR 41](https://github.com/Dunky13/agent-job-queue/pull/41) green, merging it and completing the signed release. Integration preserves main commit `5ab7db8` and its approved-repair and unattended-release changes alongside explicit-only setup. Integrated validation is running through queue job 2161 and the PR's required Apple Silicon/Intel CI matrices. The completed local evidence below records the earlier implementation snapshot; it does not certify the integrated or published artifact.
+The user subsequently authorized pushing this implementation, resolving conflicts, getting [PR 41](https://github.com/Dunky13/agent-job-queue/pull/41) green, merging it and completing the signed release. Integration preserves main commit `5ab7db8` and its approved-repair and unattended-release changes alongside explicit-only setup. Queue job 2161 passed the complete integrated local validation pipeline, including Go race tests, native tests, universal packaging, actual private installed-runtime acceptance and DMG verification. Required Apple Silicon/Intel hosted CI and signed publication remain separate gates. The detailed local evidence below records the earlier implementation snapshot.
 
 Published build 118 uses source `5ab7db8`, which does not contain this PR's native Service Management adapter or bundle-owned service packaging. Its reported SentinelOne alert therefore does not qualify the changed implementation. The authoritative detection and a protected retest of the eventual signed candidate are still required to establish SentinelOne acceptance.
+
+### Merged-source certification recovery
+
+PR 41 was squash-merged as `c3a690b27d593d97165ed7b5275c04f1b46ffcce`. Its file tree exactly matches the integrated branch, but GitHub selected author `Marc Went <Dunky13@users.noreply.github.com>` while the commit carries maintainer certifications for `Marc Went <marc@went.io>`. The GitHub signature is valid. Main CI run `40397632997`, commit-policy job `121834785287`, correctly failed with `missing author-matching DCO sign-off`.
+
+The published commit and failed witness are retained. Re-running the same SHA cannot correct that identity mismatch. Successor PR 42 establishes a new, properly signed and certified source commit without rewriting main or changing the DCO verifier. It records this recovery and the CI scheduling repair below without changing product code. Its squash merge must explicitly select author email `marc@went.io`, retain exactly one matching maintainer trailer, and pass post-merge author/signature verification. Required CI and the existing distribution pipeline must then qualify that new source before any release is claimed. Build 118 remains immutable and is not replaced.
+
+### Intel tooling budget recovery
+
+PR 42 run `40398515127`, Intel tooling job `121837837447`, reached the unchanged 12-minute package timeout after 720.078 seconds. The active stapling-retry parent had run for 89 seconds; its current subcase had run for one second. Other parallel tests were still queued. This was an aggregate workload failure, and `ci-required` correctly failed too. The failed job log remains the witness; no assertion failure or green result is inferred from it.
+
+The full tooling package now runs as two deterministic inventory shards on each architecture. Enumeration includes every top-level test, example and fuzz seed, rejects malformed, duplicate, partial or empty inventory, and assigns each executable name exactly once. Top-level selection keeps all subtests. Benchmarks remain excluded as in the prior command. Both shards retain race detection, two package/test workers, the 12-minute package timeout and the 20-minute job limit. The required aggregate job still requires the entire tooling matrix. Regression fixtures verify coverage, deterministic membership, exact flags, failure propagation and refusal before testing invalid input. No product code, release trust check or timeout is relaxed.
+
+Queue job 2162 passed the actual two-shard runner locally: 85 and 84 top-level tests, in 203.965 and 175.657 seconds respectively, with race detection and the original worker limits. Hosted results for both architectures remain required.
+
+### Packaged setup refusal recovery
+
+Universal-installer job `121857014460` in run `40403882465` passed packaging, signatures, Homebrew validation and packaged payload installation, then the app-bundle fixture hit the installer's safe kernel busy-lock refusal. This fixture performs a second installation while its real private resource controller is running. Its original one-attempt assumption differed from the explicit-refusal contract already exercised by the removal fixture.
+
+The package fixture now permits at most three attempts within its original single 30-second deadline. Only `EWOULDBLOCK` or `EAGAIN` with an absent prior pending marker, unchanged installation records and wrappers (including inode, mode and content), and an intact native-call history with no mutation can be retried. Any accepted mutation, retained pending state, uncertain witness, non-kernel error or cancellation fails immediately. Regression cases cover each refusal boundary and the attempt limit. Production locking and installation behavior are unchanged; the failed hosted witness is retained.
+
+Queue job 2163 passed lint, the focused refusal race tests, complete packaged installer acceptance and DMG verification with exit 0. The packaged payload and app-bundle tests passed in 9.09 and 6.62 seconds; the actual private outer-installer lifecycle passed under race in 67.459 seconds. The disk image detached successfully. These checks reuse the unchanged development artifact; native lifecycle calls remain injected, and fresh hosted CI is still required.
+
+### Intel HTTPS workload isolation
+
+A later notification for the same `05c1758` run identified a separate failure in Intel runtime job `121857014412`. The cold 16-request asset burst took 35.93 seconds; fourteen waiting requests received HTTP 429. The single-comparison cache assertion did not fail. The private lifecycle then hit its existing 30-second request deadlines, and an enabled reconfigure was killed at its 35-second fixture limit. Backend and remote packages shared that job, taking 562.952 and 406.182 seconds respectively. These are retained failed assertions, not a package timeout or a successful run.
+
+Race-instrumented cost-14 bcrypt competing with the backend workload is the leading explanation, not a proven Intel measurement. Isolated local queue job 2165 passed those same two race tests: the cold burst took 9.86 seconds and the lifecycle took 92.62 seconds in total. The local Mac is Apple Silicon; Intel execution is unavailable here and cannot be inferred from that result.
+
+CI now requires separate core and HTTPS runtime partitions on each architecture. HTTPS runs the entire remote package on a separate runner; core dynamically includes every other original runtime package except the separately tested tooling root. Future remote children and similarly named packages remain in core. The default `all` mode retains the previous complete runtime scope. Parser and workflow regressions verify exact coverage, unchanged race/worker/time limits, refusal before testing invalid or incomplete inventories, and error propagation. The partition assertions failed before the adapter change and passed afterward. Authentication configuration, bcrypt cost 14, cache behavior, admission bounds and service deadlines are unchanged. Fresh isolated hosted Intel results remain the acceptance gate.
 
 Requirements carried into implementation:
 

@@ -30,7 +30,9 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 			Strategy        struct {
 				FailFast *bool `yaml:"fail-fast"`
 				Matrix   struct {
-					OS []string `yaml:"os"`
+					OS    []string `yaml:"os"`
+					Shard []int    `yaml:"shard"`
+					Scope []string `yaml:"scope"`
 				} `yaml:"matrix"`
 			} `yaml:"strategy"`
 			Steps []validationStep `yaml:"steps"`
@@ -40,8 +42,8 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 		t.Fatal(err)
 	}
 	suites := map[string]string{
-		"macos-tests":   "bash scripts/test-go-runtime.sh",
-		"tooling-tests": "go test -p 2 -parallel 2 -race -v ./internal/tooling -timeout 12m",
+		"macos-tests":   "bash scripts/test-go-runtime.sh '${{ matrix.scope }}'",
+		"tooling-tests": "bash scripts/test-go-tooling.sh '${{ matrix.shard }}'",
 		"native-tests":  "bash scripts/test-native.sh",
 	}
 	for name, command := range suites {
@@ -51,6 +53,12 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 		}
 		if job.Timeout != 20 || job.ContinueOnError || job.If != "" || job.RunsOn != "${{ matrix.os }}" || job.Strategy.FailFast == nil || *job.Strategy.FailFast || !reflect.DeepEqual(job.Strategy.Matrix.OS, []string{"macos-15", "macos-15-intel"}) {
 			t.Fatalf("%s changed the existing budget or architecture requirements", name)
+		}
+		if name == "tooling-tests" && !reflect.DeepEqual(job.Strategy.Matrix.Shard, []int{1, 2}) {
+			t.Fatal("both tooling shards must run on every required architecture")
+		}
+		if name == "macos-tests" && !reflect.DeepEqual(job.Strategy.Matrix.Scope, []string{"core", "https"}) {
+			t.Fatal("complete core and HTTPS partitions must run independently on every required architecture")
 		}
 		found := false
 		for _, step := range job.Steps {

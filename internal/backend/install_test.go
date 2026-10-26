@@ -2196,7 +2196,11 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 	runPackaged := func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		return install.execute(ctx)
+		retries, err := runPackagedSetup(ctx, f, install.execute)
+		if retries > 0 {
+			t.Logf("Packaged setup observed %d proven unaccepted busy refusals within its original deadline", retries)
+		}
+		return err
 	}
 	if err := runPackaged(); err != nil {
 		t.Fatal(err)

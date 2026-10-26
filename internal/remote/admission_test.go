@@ -80,6 +80,7 @@ func TestAuthAdmissionRealCaddyCacheAndDistinctGuesses(t *testing.T) {
 	// assets and cached dashboard polling consume only that single comparison.
 	var assets sync.WaitGroup
 	start := make(chan struct{})
+	started := time.Now()
 	for i := range limits.Burst {
 		assets.Add(1)
 		go func() {
@@ -94,6 +95,7 @@ func TestAuthAdmissionRealCaddyCacheAndDistinctGuesses(t *testing.T) {
 	}
 	close(start)
 	assets.Wait()
+	t.Logf("Cold asset burst: %d requests, %d real bcrypt comparisons, %s elapsed, %s admission wait limit", limits.Burst, counter.calls.Load(), time.Since(started), gatewayResponseTimeout)
 	if counter.calls.Load() != 1 {
 		t.Fatal("cached polls recomputed bcrypt", counter.calls.Load())
 	}

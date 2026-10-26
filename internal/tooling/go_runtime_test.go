@@ -14,7 +14,7 @@ import (
 
 const goRuntimeModule = "github.com/Dunky13/agent-job-queue"
 
-func goRuntimeFixture(t *testing.T, packages string, listStatus, testStatus string) (string, error, string) {
+func goRuntimeFixture(t *testing.T, packages string, listStatus, testStatus string, selection ...string) (string, error, string) {
 	t.Helper()
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "packages"), []byte(packages), 0600); err != nil {
@@ -38,7 +38,7 @@ esac`)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "/bin/bash", script)
+	cmd := exec.CommandContext(ctx, "/bin/bash", append([]string{script}, selection...)...)
 	// Invocation from elsewhere must still enumerate the repository's packages.
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"),
@@ -72,6 +72,9 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 		goRuntimeModule + "/remote/static",
 		goRuntimeModule + "/cmd",
 		goRuntimeModule + "/internal",
+		goRuntimeModule + "/internal/remote",
+		goRuntimeModule + "/internal/remote/child",
+		goRuntimeModule + "/internal/remote-extra",
 	}
 	root, err, output := goRuntimeFixture(t, strings.Join(packages, "\n")+"\n", "0", "0")
 	if err != nil {
@@ -92,7 +95,7 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 		t.Fatalf("enumerated in %q, want repository %q", cwd, repository)
 	}
 	want := []string{"test", "-p", "2", "-parallel", "2", "-race"}
-	for _, index := range []int{0, 1, 3, 4, 5, 6, 7, 8, 9} {
+	for _, index := range []int{0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12} {
 		want = append(want, packages[index])
 	}
 	want = append(want, "-timeout", "12m")
@@ -101,10 +104,74 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 	}
 }
 
+func TestGoRuntimeCoreAndHTTPSCoverOriginalScopeExactlyOnce(t *testing.T) {
+	packages := []string{
+		goRuntimeModule + "/internal/tooling", goRuntimeModule + "/internal/backend",
+		goRuntimeModule + "/internal/remote", goRuntimeModule + "/internal/remote/child",
+		goRuntimeModule + "/internal/remote-extra", goRuntimeModule + "/cmd/new-command",
+	}
+	selected := map[string]int{}
+	for _, suite := range []struct {
+		name string
+		want []string
+	}{
+		{"core", []string{packages[1], packages[3], packages[4], packages[5]}},
+		{"https", []string{packages[2]}},
+	} {
+		root, err, output := goRuntimeFixture(t, strings.Join(packages, "\n"), "0", "0", suite.name)
+		if err != nil {
+			t.Fatalf("%s: %v: %s", suite.name, err, output)
+		}
+		want := append([]string{"test", "-p", "2", "-parallel", "2", "-race"}, suite.want...)
+		want = append(want, "-timeout", "12m")
+		if got := goRuntimeArguments(t, root, "test"); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s changed scope or flags: got %q, want %q", suite.name, got, want)
+		}
+		for _, name := range suite.want {
+			selected[name]++
+		}
+	}
+	for _, name := range packages[1:] {
+		if selected[name] != 1 {
+			t.Fatal("original runtime scope omitted or duplicated", name, selected[name])
+		}
+	}
+}
+
+func TestGoRuntimeRejectsInvalidSelectionBeforeEnumeration(t *testing.T) {
+	for _, selection := range [][]string{{""}, {"unknown"}, {"--run=Nothing"}, {"core", "https"}} {
+		root, err, output := goRuntimeFixture(t, "unused", "0", "0", selection...)
+		if err == nil || !strings.Contains(output, "Usage:") {
+			t.Fatalf("invalid selection accepted: %q: %v: %s", selection, err, output)
+		}
+		for _, file := range []string{"list-args", "test-args"} {
+			if _, err := os.Stat(filepath.Join(root, file)); !os.IsNotExist(err) {
+				t.Fatal("invalid selection reached Go", selection, file, err)
+			}
+		}
+	}
+}
+
+func TestGoRuntimeRejectsIncompleteSelectedScope(t *testing.T) {
+	for _, suite := range []struct{ name, packages string }{
+		{"core", goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/remote"},
+		{"https", goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend"},
+	} {
+		root, err, output := goRuntimeFixture(t, suite.packages, "0", "0", suite.name)
+		if err == nil || !strings.Contains(output, "nonempty runtime suite") {
+			t.Fatalf("incomplete %s accepted: %v: %s", suite.name, err, output)
+		}
+		if _, err := os.Stat(filepath.Join(root, "test-args")); !os.IsNotExist(err) {
+			t.Fatal("incomplete partition reached tests", suite.name, err)
+		}
+	}
+}
+
 func TestGoRuntimeFailsBeforeTestingInvalidEnumeration(t *testing.T) {
 	runtime := goRuntimeModule + "/internal/backend"
 	tooling := goRuntimeModule + "/internal/tooling"
-	valid := runtime + "\n" + tooling + "\n"
+	https := goRuntimeModule + "/internal/remote"
+	valid := runtime + "\n" + tooling + "\n" + https + "\n"
 	for _, test := range []struct {
 		name, packages, status, diagnostic string
 	}{
@@ -112,9 +179,11 @@ func TestGoRuntimeFailsBeforeTestingInvalidEnumeration(t *testing.T) {
 		{"partial enumeration error", valid, "23", "fixture enumeration failed"},
 		{"empty", "", "0", "Unexpected Go package"},
 		{"missing tooling", runtime, "0", "requires tooling"},
+		{"missing HTTPS", runtime + "\n" + tooling, "0", "requires tooling and HTTPS"},
 		{"empty runtime", tooling, "0", "nonempty runtime suite"},
 		{"duplicate runtime", valid + runtime, "0", "Duplicate Go package"},
 		{"duplicate tooling", valid + tooling, "0", "Duplicate Go package"},
+		{"duplicate HTTPS", valid + https, "0", "Duplicate Go package"},
 		{"blank record", runtime + "\n\n" + tooling, "0", "Unexpected Go package"},
 		{"option", valid + "-run=Nothing", "0", "Unexpected Go package"},
 		{"foreign module", valid + "example.com/other/internal/tooling", "0", "Unexpected Go package"},
@@ -146,13 +215,15 @@ func TestGoRuntimeFailsBeforeTestingInvalidEnumeration(t *testing.T) {
 }
 
 func TestGoRuntimePreservesTestFailure(t *testing.T) {
-	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n"
-	root, err, output := goRuntimeFixture(t, packages, "0", "37")
-	var exit *exec.ExitError
-	if !errors.As(err, &exit) || exit.ExitCode() != 37 {
-		t.Fatalf("go test failure lost: %v: %s", err, output)
-	}
-	if got := goRuntimeArguments(t, root, "test"); len(got) == 0 || got[0] != "test" {
-		t.Fatalf("runtime test was not invoked: %q", got)
+	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n" + goRuntimeModule + "/internal/remote\n"
+	for _, suite := range []string{"all", "core", "https"} {
+		root, err, output := goRuntimeFixture(t, packages, "0", "37", suite)
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 37 {
+			t.Fatalf("%s go test failure lost: %v: %s", suite, err, output)
+		}
+		if got := goRuntimeArguments(t, root, "test"); len(got) == 0 || got[0] != "test" {
+			t.Fatalf("%s runtime test was not invoked: %q", suite, got)
+		}
 	}
 }
