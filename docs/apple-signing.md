@@ -173,12 +173,17 @@ resolution rather than an automatic retry.
 
 ## Resuming a pending CI submission
 
-Ticket validation retries only a positively identified CloudKit connection loss:
+Ticket stapling and validation retry only a positively identified CloudKit connection loss:
 stapler exit 68 together with `NSURLErrorDomain -1005` and the exact Apple ticket lookup
-endpoint in that error's own fields. It permits three attempts, with two- and four-second delays. Invalid,
+endpoint in that error's own fields. Each operation permits six attempts, with
+5-, 10-, 20-, 40- and 80-second delays (155 seconds of backoff in total). Invalid,
 revoked, missing, or otherwise failed ticket checks remain fatal, as does an
-exhausted retry. This read-only retry never signs, staples, or submits code and
-never substitutes a local ticket for the required successful validation.
+exhausted retry. Stapling retries attach the ticket to the same working copy;
+they never sign or submit code. A successful staple still requires a separate
+successful validation. Validation retries remain read-only and never substitute
+a local ticket for the required successful validation. If retries are exhausted,
+the accepted receipt and immutable submitted archive remain recoverable through
+the existing checkpoints. The 45-minute signing job budget still applies.
 
 Build CI and distribution run independently. `ci.yml` validates and retains the
 universal installer. `distribution.yml` automatically follows a successful

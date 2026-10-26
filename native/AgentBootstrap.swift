@@ -680,7 +680,7 @@ struct QueueBootstrapView: View {
     @State private var pending: QueueBootstrapPendingAction?
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label("Set up Agent Queue", systemImage: "square.stack.3d.up").font(.title2.bold())
+            Label("Set up Agent Queue", systemImage: QueueBrand.symbolName).font(.title2.bold())
             Text("Setup is automatic for your macOS account. Review any requirements below before continuing.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {

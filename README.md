@@ -1,5 +1,7 @@
 # Agent Job Queue
 
+<img src="remote/static/app-icon.png" width="80" height="80" alt="Agent Queue stacked-layers icon">
+
 [![CI](https://github.com/Dunky13/agent-job-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/Dunky13/agent-job-queue/actions/workflows/ci.yml)
 [![Distribution](https://github.com/Dunky13/agent-job-queue/actions/workflows/distribution.yml/badge.svg)](https://github.com/Dunky13/agent-job-queue/actions/workflows/distribution.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
