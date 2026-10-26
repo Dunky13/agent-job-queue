@@ -28,6 +28,7 @@ func (e failure) Error() string { return "notarization: " + string(e) }
 type result struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
 }
 
 type client struct {
@@ -124,7 +125,7 @@ func (c *client) wait(ctx context.Context, id string, timeout time.Duration) (re
 			return r, contextFailure(ctx)
 		}
 		if err != nil {
-			return r, err
+			return result{ID: id, Status: "Unknown"}, err
 		}
 		var response struct {
 			Data struct {
@@ -135,7 +136,7 @@ func (c *client) wait(ctx context.Context, id string, timeout time.Duration) (re
 			} `json:"data"`
 		}
 		if json.Unmarshal(data, &response) != nil || !equalID(response.Data.ID, id) {
-			return r, failure("invalid_response")
+			return result{ID: id, Status: "Unknown"}, failure("invalid_response")
 		}
 		switch response.Data.Attributes.Status {
 		case "Accepted":
@@ -147,7 +148,7 @@ func (c *client) wait(ctx context.Context, id string, timeout time.Duration) (re
 		case "In Progress":
 			r.Status = "In Progress"
 		default:
-			return r, failure("invalid_response")
+			return result{ID: id, Status: "Unknown"}, failure("invalid_response")
 		}
 		timer := time.NewTimer(c.pollInterval)
 		select {

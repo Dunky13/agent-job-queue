@@ -39,7 +39,12 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 	if err := yaml.Unmarshal(body, &workflow); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"macos-tests", "native-tests"} {
+	suites := map[string]string{
+		"macos-tests":   "bash scripts/test-go-runtime.sh",
+		"tooling-tests": "go test -p 2 -parallel 2 -race -v ./internal/tooling -timeout 12m",
+		"native-tests":  "bash scripts/test-native.sh",
+	}
+	for name, command := range suites {
 		job, exists := workflow.Jobs[name]
 		if !exists {
 			t.Fatalf("missing independent validation stage %s", name)
@@ -47,21 +52,30 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 		if job.Timeout != 20 || job.ContinueOnError || job.If != "" || job.RunsOn != "${{ matrix.os }}" || job.Strategy.FailFast == nil || *job.Strategy.FailFast || !reflect.DeepEqual(job.Strategy.Matrix.OS, []string{"macos-15", "macos-15-intel"}) {
 			t.Fatalf("%s changed the existing budget or architecture requirements", name)
 		}
-		hasGo, hasNative := false, false
+		found := false
 		for _, step := range job.Steps {
 			if step.ContinueOnError || step.If != "" {
 				t.Fatalf("%s may skip or ignore a validation failure", name)
 			}
-			hasGo = hasGo || strings.Contains(step.Run, "go test -p 2 -parallel 2 -race ./cmd/... ./internal/... ./packaging/homebrew ./remote/static -timeout 12m")
-			hasNative = hasNative || strings.Contains(step.Run, "bash scripts/test-native.sh")
+			found = found || strings.TrimSpace(step.Run) == command
+			for other, otherCommand := range suites {
+				if other != name && strings.Contains(step.Run, otherCommand) {
+					t.Fatalf("%s combines unrelated validation phases", name)
+				}
+			}
 		}
-		if name == "macos-tests" && (!hasGo || hasNative) || name == "native-tests" && (!hasNative || hasGo) {
-			t.Fatalf("%s combines unrelated validation phases or omits its suite", name)
+		if !found {
+			t.Fatalf("%s omits its complete suite", name)
 		}
 	}
 	gate := workflow.Jobs["ci-required"]
-	if gate.If != "always()" || !slices.Contains(gate.Needs, "macos-tests") || !slices.Contains(gate.Needs, "native-tests") {
-		t.Fatal("both complete architecture matrices must remain required")
+	if gate.If != "always()" || gate.ContinueOnError {
+		t.Fatal("aggregate check must always require successful validation")
+	}
+	for name := range suites {
+		if !slices.Contains(gate.Needs, name) {
+			t.Fatalf("complete architecture matrix %s must remain required", name)
+		}
 	}
 	if !slices.ContainsFunc(gate.Steps, func(step validationStep) bool {
 		return !step.ContinueOnError && step.If == "" && strings.Contains(step.Run, `all(.[]; .result == "success")`)
@@ -143,10 +157,12 @@ func TestNotarizationPersistsReceiptsBeforeWaiting(t *testing.T) {
 			}
 		}
 		if strings.HasPrefix(step.Uses, "actions/upload-artifact@") {
-			if step.With["overwrite"] == "true" || step.With["retention-days"] != "30" || step.With["if-no-files-found"] != "error" {
+			if step.With["overwrite"] == "true" || step.With["retention-days"] != "90" || step.With["if-no-files-found"] != "error" {
 				t.Fatalf("checkpoint upload must be immutable, required and retained: %+v", step.With)
 			}
-			operations = append(operations, "persist")
+			if strings.HasPrefix(step.With["name"], "Apple-notarization-") {
+				operations = append(operations, "persist")
+			}
 			if strings.Contains(step.With["name"], "finished-slot") && !strings.Contains(step.If, "always()") {
 				t.Fatal("pending or rejected state must survive a failed wait")
 			}
@@ -238,7 +254,7 @@ func TestNotarizationPersistsInitialStateBeforeCredentials(t *testing.T) {
 			snapshotted = true
 		}
 		if strings.HasSuffix(step.With["name"], "-s00") {
-			if !snapshotted || !strings.HasPrefix(step.Uses, "actions/upload-artifact@") || step.With["if-no-files-found"] != "error" || step.With["retention-days"] != "30" || step.With["overwrite"] == "true" || step.If != "" || step.ContinueOnError {
+			if !snapshotted || !strings.HasPrefix(step.Uses, "actions/upload-artifact@") || step.With["if-no-files-found"] != "error" || step.With["retention-days"] != "90" || step.With["overwrite"] == "true" || step.If != "" || step.ContinueOnError {
 				t.Fatal("a required immutable initial checkpoint must precede credential setup")
 			}
 			persisted = true
@@ -344,7 +360,7 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, guard := range []string{"types: [completed]", "branches: [main]", "github.ref == 'refs/heads/main'", "github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.event == 'push'", "github.event.workflow_run.path == '.github/workflows/ci.yml'", "github.event.workflow_run.repository.full_name == github.repository", "github.event.workflow_run.head_repository.full_name == github.repository", "required: true", "--target \"$BUILD_SHA\"", "--commit \"$BUILD_SHA\"", "tag=\"$BUILD_TAG\""} {
+	for _, guard := range []string{"types: [completed]", "branches: [main]", "github.ref == 'refs/heads/main'", "github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.event == 'push'", "github.event.workflow_run.path == '.github/workflows/ci.yml'", "github.event.workflow_run.repository.full_name == github.repository", "github.event.workflow_run.head_repository.full_name == github.repository", "required: true", "--commit \"$BUILD_SHA\"", "scripts/distribution-publish.sh dist"} {
 		if !strings.Contains(string(body), guard) {
 			t.Errorf("missing source/publication guard %s", guard)
 		}

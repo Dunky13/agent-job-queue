@@ -25,6 +25,11 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Start this stage invocation without inherited retry authority
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+      run: scripts/macos-resume.sh begin notarization-state "$STAGE" "$BUILD_VERSION"
     - name: Prepare exact signed archive
       id: prepare
       shell: bash
@@ -46,7 +51,7 @@ runs:
         name: Apple-notarization-b${{ env.BUILD_RUN_ID }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.prepared-slot }}
         path: ${{ runner.temp }}/checkpoint-${{ inputs.stage }}-prepared/*
         if-no-files-found: error
-        retention-days: 30
+        retention-days: 90
     - name: Submit once or reuse the existing submission
       id: submit
       shell: bash
@@ -64,13 +69,30 @@ runs:
         STAGE: ${{ inputs.stage }}
       run: scripts/macos-checkpoint.sh snapshot notarization-state "$RUNNER_TEMP/checkpoint-$STAGE-submitted"
     - name: Persist submission before waiting
+      id: submitted-upload
       if: always() && steps.submitted-snapshot.outcome == 'success'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: Apple-notarization-b${{ env.BUILD_RUN_ID }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.submitted-slot }}
         path: ${{ runner.temp }}/checkpoint-${{ inputs.stage }}-submitted/*
         if-no-files-found: error
-        retention-days: 30
+        retention-days: 90
+    - name: Select public submission receipts
+      if: always() && steps.submitted-upload.outcome == 'success'
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+        CHECKPOINT_ID: ${{ steps.submitted-upload.outputs.artifact-id }}
+        CHECKPOINT_DIGEST: ${{ steps.submitted-upload.outputs.artifact-digest }}
+      run: scripts/macos-receipts.sh notarization-state "$RUNNER_TEMP/receipts-$STAGE-submitted" "$STAGE" "$CHECKPOINT_ID" "$CHECKPOINT_DIGEST"
+    - name: Retain small public submission receipts
+      if: always() && steps.submitted-upload.outcome == 'success'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: Apple-receipts-b${{ env.BUILD_RUN_ID }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.submitted-slot }}
+        path: ${{ runner.temp }}/receipts-${{ inputs.stage }}-submitted/*
+        if-no-files-found: error
+        retention-days: 90
     - name: Wait for acceptance and staple
       id: finish
       shell: bash
@@ -79,6 +101,8 @@ runs:
         APPLE_DEVELOPER_ID_P12_BASE64: ${{ inputs.certificate }}
         APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ inputs.certificate-password }}
         APPLE_NOTARY_KEY_P8: ${{ inputs.notary-key }}
+        APPLE_SIGNING_RESULT_FILE: ${{ runner.temp }}/apple-finish-${{ inputs.stage }}.json
+        APPLE_SIGNING_OPERATION: ${{ inputs.stage }}-finish
       run: scripts/with-apple-signing.sh scripts/macos-resume.sh finish notarization-state "$STAGE" "$BUILD_VERSION"
     - name: Snapshot latest state after the stage attempt
       id: finished-snapshot
@@ -88,10 +112,28 @@ runs:
         STAGE: ${{ inputs.stage }}
       run: scripts/macos-checkpoint.sh snapshot notarization-state "$RUNNER_TEMP/checkpoint-$STAGE-finished"
     - name: Persist latest state after the stage attempt
+      id: finished-upload
       if: always() && steps.finished-snapshot.outcome == 'success'
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: Apple-notarization-b${{ env.BUILD_RUN_ID }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.finished-slot }}
         path: ${{ runner.temp }}/checkpoint-${{ inputs.stage }}-finished/*
         if-no-files-found: error
-        retention-days: 30
+        retention-days: 90
+    - name: Select public stage receipts and recovery classification
+      if: always() && steps.finished-upload.outcome == 'success'
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+        CHECKPOINT_ID: ${{ steps.finished-upload.outputs.artifact-id }}
+        CHECKPOINT_DIGEST: ${{ steps.finished-upload.outputs.artifact-digest }}
+        APPLE_SIGNING_RESULT_FILE: ${{ runner.temp }}/apple-finish-${{ inputs.stage }}.json
+      run: scripts/macos-receipts.sh notarization-state "$RUNNER_TEMP/receipts-$STAGE-finished" "$STAGE" "$CHECKPOINT_ID" "$CHECKPOINT_DIGEST"
+    - name: Retain small public stage receipts and diagnostics
+      if: always() && steps.finished-upload.outcome == 'success'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: Apple-receipts-b${{ env.BUILD_RUN_ID }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s${{ inputs.finished-slot }}
+        path: ${{ runner.temp }}/receipts-${{ inputs.stage }}-finished/*
+        if-no-files-found: error
+        retention-days: 90

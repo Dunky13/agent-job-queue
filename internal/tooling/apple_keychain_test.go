@@ -1,6 +1,7 @@
 package tooling
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -348,6 +349,41 @@ exit "$KEYCHAIN_TEST_CHILD_STATUS"
 			}
 			if (test.failure == "" || test.failure == "delete-keychain") && childErr != nil {
 				t.Fatalf("child environment verification did not finish: %v", childErr)
+			}
+			assertAppleSigningRemoved(t, root)
+		})
+	}
+}
+
+func TestAppleSigningReportsOutcomeOnlyAfterCredentialCleanup(t *testing.T) {
+	for _, cleanup := range []string{"success", "failed"} {
+		t.Run(cleanup, func(t *testing.T) {
+			root, env := appleSigningFixture(t)
+			path := filepath.Join(root, "outcome.json")
+			env = append(env, "APPLE_SIGNING_RESULT_FILE="+path, "APPLE_SIGNING_OPERATION=payload-finish", "GITHUB_RUN_ID=1234", "GITHUB_RUN_ATTEMPT=2")
+			if cleanup == "failed" {
+				env = append(env, "KEYCHAIN_TEST_FAIL=delete-keychain")
+			}
+			code, output := appleSigningExitCode(t, appleSigningCommand(t, env, "/bin/bash", "-c", `exit 23`))
+			want := 23
+			if cleanup == "failed" {
+				want = 1
+			}
+			if code != want {
+				t.Fatalf("wrapper exit=%d, want=%d: %s", code, want, output)
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var outcome struct {
+				Cleanup, Operation string
+				Run                string `json:"execution_id"`
+				Attempt            string `json:"execution_attempt"`
+				CommandStatus      int    `json:"command_status"`
+			}
+			if err := json.Unmarshal(body, &outcome); err != nil || outcome.Cleanup != cleanup || outcome.Operation != "payload-finish" || outcome.Run != "1234" || outcome.Attempt != "2" || outcome.CommandStatus != 23 {
+				t.Fatalf("incorrect cleanup outcome: %s (%v)", body, err)
 			}
 			assertAppleSigningRemoved(t, root)
 		})
