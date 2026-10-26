@@ -44,6 +44,11 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
     --open-window --temporary "$temporary" --output "$output/generic-retry" --generic-retry
 [[ "$(plutil -extract passed raw -o - "$output/generic-retry/verification.json")" == "true" ]]
+mkdir -p -- "$output/preflight-summary"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --open-window --temporary "$temporary" --output "$output/preflight-summary" --preflight-summary
+[[ "$(plutil -extract passed raw -o - "$output/preflight-summary/verification.json")" == "true" ]]
 {
   printf '# Bootstrap fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
   cat "$output/verification.json"
@@ -60,3 +65,11 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
     printf '![%s](%s.png)\n\n' "$picture" "$picture"
   done
 } > "$output/generic-retry/verification.md"
+{
+  printf '# Preflight summary fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
+  cat "$output/preflight-summary/verification.json"
+  printf '\n```\n\n'
+  for picture in 01-preflight-summary 02-waiting 03-wait-stopped 04-normal-fixture-startup; do
+    printf '![%s](%s.png)\n\n' "$picture" "$picture"
+  done
+} > "$output/preflight-summary/verification.md"

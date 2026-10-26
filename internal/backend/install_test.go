@@ -363,6 +363,11 @@ func TestInstallerDisabledRemoteReconcilesStaleOwnedServicesBeforeCompletion(t *
 			switch state {
 			case "loaded":
 				f.loaded["io.went.agent-remote"] = true
+				definition, err := plist.Marshal(Object{"Label": "io.went.agent-remote", "ProgramArguments": []string{filepath.Join(install.root, "bin/agent-remote"), "serve"}}, plist.XMLFormat)
+				if err != nil {
+					t.Fatal(err)
+				}
+				integrationTestWrite(t, filepath.Join(install.launch, "io.went.agent-remote.plist"), definition)
 			case "active-generation":
 				integrationTestWrite(t, filepath.Join(install.state, "remote/processes.json"), []byte(`{"active":true}`))
 			case "legacy-child":
@@ -1621,7 +1626,7 @@ func TestInstallMainLegacyPhoneAccessRecoveryDiagnostic(t *testing.T) {
 	f := installTestFixture(t)
 	f.legacy(t)
 	launchctl := filepath.Join(f.installer.path, "launchctl")
-	integrationTestWrite(t, launchctl, []byte(fmt.Sprintf("#!/bin/sh\nprintf 'Bad request.\\nCould not find service \"io.went.agent-remote\" in domain for user gui: %d\\n' >&2\nexit 113\n", os.Getuid())))
+	integrationTestWrite(t, launchctl, []byte(fmt.Sprintf("#!/bin/sh\nprintf 'Bad request.\\nCould not find service \"%%s\" in domain for user gui: %d\\n' \"${2##*/}\" >&2\nexit 113\n", os.Getuid())))
 	if err := os.Chmod(launchctl, 0700); err != nil {
 		t.Fatal(err)
 	}

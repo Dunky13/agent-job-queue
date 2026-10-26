@@ -65,6 +65,10 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
               ProcessInfo.processInfo.environment["CFFIXED_USER_HOME"] == privateHome else {
             throw ClientError.message("UI fixture requires --fixture, a temporary HOME and CFFIXED_USER_HOME from its runner.")
         }
+        if CommandLine.arguments.contains("--preflight-summary") {
+            try await verifyPreflight(notification)
+            return
+        }
         let fixture = try BootstrapFixture(parent: temporary)
         let phoneAccessBlocker = !CommandLine.arguments.contains("--generic-retry")
         let executor = BootstrapExecutorFixture(fixture, phoneAccessBlocker: phoneAccessBlocker)
@@ -117,6 +121,74 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "Completed startup keeps exactly one menu controller and permits normal quit")
         try snapshot(queue, name: "03-normal-fixture-startup")
+    }
+
+    private func verifyPreflight(_ notification: Notification) async throws {
+        let fixture = try BootstrapFixture(parent: temporary)
+        let waitingIssue = QueueBootstrapIssue(id: "installer-busy", title: "Another installation is running",
+            detail: "Wait for the other installation to finish. Its lock and files will be preserved.",
+            actions: [.init(id: "wait", title: "Wait and continue", destructive: false)])
+        let phoneIssue = QueueBootstrapIssue(id: "legacy-phone-access", title: "Phone access needs to be disabled",
+            detail: "Your credentials, configuration, and trusted certificates will be preserved. You can enable phone access again in settings after setup.",
+            actions: [.init(id: "disable-phone-access", title: "Disable phone access and continue", destructive: false)])
+        let executor = BootstrapPreflightExecutorFixture(fixture,
+            report: .init(schemaVersion: 1, issues: [waitingIssue, phoneIssue]))
+        let delegate = AppDelegate(environment: fixture.environment) { request, output in
+            try await executor.execute(request, output: output)
+        }
+        production = delegate
+        delegate.applicationDidFinishLaunching(notification)
+        try await waitUntil { delegate.bootstrap?.phase == .reviewing }
+        guard let setup = delegate.setupWindow, let model = delegate.bootstrap else {
+            throw ClientError.message("Preflight did not present its production setup window")
+        }
+        let initialInstalls = await executor.installations
+        try check(setup.isVisible && model.issues.count == 2 && initialInstalls == 0 && AppRuntime.menuBarController == nil,
+            "Production preflight displays multiple independent blockers before installation")
+        try check(delegate.applicationShouldTerminate(NSApp) == .terminateNow,
+            "A blocked preflight permits quit without initializing the queue")
+        try snapshot(setup, name: "01-preflight-summary")
+
+        setup.makeKeyAndOrderFront(nil)
+        guard let enter = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: setup.windowNumber, context: nil,
+            characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: 36) else {
+            throw ClientError.message("Could not create the Check again fixture event")
+        }
+        if !setup.performKeyEquivalent(with: enter) { setup.sendEvent(enter) }
+        try await waitUntil { await executor.checks >= 2 && model.phase == .reviewing }
+        let checkedMutations = await executor.mutations
+        try check(checkedMutations == 0 && model.issues.count == 2,
+            "The real Check again button refreshes every blocker without authorizing changes")
+
+        await executor.update(.init(schemaVersion: 1, issues: [waitingIssue]))
+        await model.start()?.value
+        await executor.holdPreflight()
+        let waiting = model.waitAndContinue()
+        try await waitUntil { await executor.isHeld }
+        try check(model.phase == .waiting && model.canStopWaiting && delegate.applicationShouldTerminate(NSApp) == .terminateCancel,
+            "Waiting shows progress and an explicit stop control while retaining the termination guard")
+        try snapshot(setup, name: "02-waiting")
+        model.cancelWaiting()
+        await executor.update(.clear)
+        await executor.releasePreflight()
+        await waiting?.value
+        let cancelledInstalls = await executor.installations
+        try check(model.phase == .reviewing && cancelledInstalls == 0 && delegate.applicationShouldTerminate(NSApp) == .terminateNow,
+            "Stopping a pending preflight prevents its late result from installing")
+        try snapshot(setup, name: "03-wait-stopped")
+
+        await executor.update(.init(schemaVersion: 1, issues: [phoneIssue]))
+        await model.start()?.value
+        await model.perform(actionID: "disable-phone-access", issueID: phoneIssue.id)?.value
+        try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
+        let requests = await executor.requests
+        let mutations = await executor.mutations
+        try check(mutations == 1 && requests.contains(where: { $0.arguments.suffix(2) == ["--recover", "disable-phone-access"] }) &&
+            delegate.setupWindow == nil && AppRuntime.store.fixtureMode,
+            "Explicit preflight recovery refreshes requirements, verifies installation, and continues simulated queue startup")
+        guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Preflight recovery did not open its simulated queue") }
+        try snapshot(queue, name: "04-normal-fixture-startup")
     }
 
     private func snapshot(_ window: NSWindow, name: String) throws {

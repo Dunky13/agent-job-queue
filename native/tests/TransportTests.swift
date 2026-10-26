@@ -13,6 +13,11 @@ struct TransportTests {
             try stub(Array(CommandLine.arguments.dropFirst(index + 1)))
             return
         }
+        if CommandLine.arguments.dropFirst().first == "install", CommandLine.arguments.count >= 4 {
+            let marker = CommandLine.arguments[3]
+            try stub([URL(fileURLWithPath: marker).lastPathComponent == "preflight-read" ? "hold" : "mutation", marker])
+            return
+        }
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("agent-queue-transport-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false,
                                               attributes: [.posixPermissions: 0o700])
@@ -98,6 +103,29 @@ struct TransportTests {
         try check(String(decoding: result, as: UTF8.self) == "accepted" &&
             FileManager.default.fileExists(atPath: mutationMarker.appendingPathExtension("done").path) && childIsGone(mutationMarker),
             "Cancelling an accepted mutation leaves its private controller operation intact")
+
+        for target in ["--app-bundle", "--payload"] {
+            let marker = temporary.appendingPathComponent("preflight-read")
+            let read = Task { try await QueueClient.run(["install", target, marker.path, "--preflight", "--json"],
+                budget: .setup, transport: transport) }
+            try await waitForFile(marker)
+            read.cancel()
+            do { _ = try await read.value; throw ClientError.message("Cancelled setup preflight succeeded") }
+            catch is CancellationError { }
+            try check(childIsGone(marker), "Cancelling \(target) setup preflight reaps its private read controller")
+            try FileManager.default.removeItem(at: marker)
+        }
+        for (index, extra) in [["--recover", "repair-service"], ["--disable-phone-access"], ["--unexpected"]].enumerated() {
+            let marker = temporary.appendingPathComponent("preflight-mutation-\(index)")
+            let mutation = Task { try await QueueClient.run(["install", "--app-bundle", marker.path, "--preflight", "--json"] + extra,
+                budget: .setup, transport: transport) }
+            try await waitForFile(marker)
+            mutation.cancel()
+            let response = try await mutation.value
+            try check(String(decoding: response, as: UTF8.self) == "accepted" &&
+                FileManager.default.fileExists(atPath: marker.appendingPathExtension("done").path),
+                "Preflight syntax with additional options retains its accepted operation")
+        }
 
         let interleavedInput = Data(repeating: 66, count: 16_384)
         let interleaved = try await QueueClient.run(arguments("interleaved", temporary.appendingPathComponent("interleaved"), mutation: true),

@@ -99,6 +99,9 @@ actor BootstrapExecutorFixture {
     }
 
     func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) async throws -> Data {
+        if request.arguments.suffix(2) == ["--preflight", "--json"] {
+            return try JSONEncoder().encode(QueueBootstrapReport.clear)
+        }
         requests.append(request)
         output(Data("Preparing private fixture services…".utf8))
         await withCheckedContinuation { held = $0 }
@@ -126,6 +129,9 @@ actor BootstrapRetainedExecutorFixture {
     init(_ fixture: BootstrapFixture) { self.fixture = fixture }
 
     func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) throws -> Data {
+        if request.arguments.suffix(2) == ["--preflight", "--json"] {
+            return try JSONEncoder().encode(QueueBootstrapReport.clear)
+        }
         calls += 1
         try fixture.install()
         let binary = fixture.environment.root.appendingPathComponent("bin/agent-heavy").path
@@ -141,5 +147,70 @@ actor BootstrapCountingExecutorFixture {
     func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) -> Data {
         calls += 1
         return Data()
+    }
+}
+
+actor BootstrapPreflightExecutorFixture {
+    let fixture: BootstrapFixture
+    private(set) var requests: [QueueBootstrapRequest] = []
+    private(set) var checks = 0
+    private(set) var mutations = 0
+    private(set) var installations = 0
+    private var report: QueueBootstrapReport
+    private var afterRecovery: QueueBootstrapReport
+    private var holdNext = false
+    private var held: CheckedContinuation<Void, Never>?
+    var failRecovery = false
+    var returnOnlyClearedRecovery = false
+    private var failedInstallationReport: QueueBootstrapReport?
+
+    init(_ fixture: BootstrapFixture, report: QueueBootstrapReport, afterRecovery: QueueBootstrapReport = .clear) {
+        self.fixture = fixture
+        self.report = report
+        self.afterRecovery = afterRecovery
+    }
+
+    func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) async throws -> Data {
+        requests.append(request)
+        if request.arguments.suffix(2) == ["--preflight", "--json"] {
+            checks += 1
+            if holdNext {
+                holdNext = false
+                await withCheckedContinuation { held = $0 }
+            }
+            return try JSONEncoder().encode(report)
+        }
+        if request.arguments.contains("--recover") {
+            mutations += 1
+            if failRecovery { throw ClientError.message("Fixture recovery failed ownership verification.") }
+            if !returnOnlyClearedRecovery { report = afterRecovery }
+            return try JSONEncoder().encode(afterRecovery)
+        }
+        installations += 1
+        if let failedInstallationReport {
+            self.failedInstallationReport = nil
+            report = failedInstallationReport
+            throw ClientError.message("Fixture daemon could not become ready.")
+        }
+        try fixture.install()
+        return Data("Fixture setup complete.".utf8)
+    }
+
+    func update(_ report: QueueBootstrapReport) { self.report = report }
+    func holdPreflight() { holdNext = true }
+    func releasePreflight() { held?.resume(); held = nil }
+    var isHeld: Bool { held != nil }
+    func setFailure() { failRecovery = true }
+    func setStaleRecovery() { returnOnlyClearedRecovery = true }
+    func failInstallation(with report: QueueBootstrapReport) { failedInstallationReport = report }
+}
+
+actor BootstrapRawPreflightFixture {
+    let data: Data
+    private(set) var calls = 0
+    init(_ data: Data) { self.data = data }
+    func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) -> Data {
+        calls += 1
+        return data
     }
 }
