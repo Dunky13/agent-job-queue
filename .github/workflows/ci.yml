@@ -76,11 +76,12 @@ jobs:
         run: go run -p 2 golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./cmd/agent-heavy ./cmd/agent-remote ./cmd/queue-tool
 
   macos-tests:
-    name: macOS tests (${{ matrix.os }})
+    name: macOS tests (${{ matrix.os }}, ${{ matrix.scope }})
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15, macos-15-intel]
+        scope: [core, https]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -92,7 +93,7 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Go unit, ownership, SQLite, real daemon, and HTTPS regressions
-        run: bash scripts/test-go-runtime.sh
+        run: bash scripts/test-go-runtime.sh '${{ matrix.scope }}'
 
   tooling-tests:
     name: Tooling tests (${{ matrix.os }}, shard ${{ matrix.shard }}/2)

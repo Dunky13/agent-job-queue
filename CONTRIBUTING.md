@@ -19,6 +19,8 @@ The batch checks source portability, Go formatting and vet, known reachable Go v
 
 The tooling matrix uses two deterministic shards on each architecture, invoked with `bash scripts/test-go-tooling.sh 1` and `bash scripts/test-go-tooling.sh 2`. Their complete discovered test, example and fuzz-seed inventory is partitioned exactly once; malformed or incomplete enumeration fails before testing. Every shard remains required, with the same race detection, worker limits and time budgets.
 
+The runtime matrix independently runs `bash scripts/test-go-runtime.sh core` and `bash scripts/test-go-runtime.sh https` on both architectures. HTTPS runs the complete `internal/remote` package on its own runner so real cost-14 bcrypt does not compete with the backend suite on that host. Core includes every other dynamically discovered runtime package, including any future remote child packages. The two partitions cover the original runtime scope exactly once; absent required packages, malformed inventory and invalid selectors fail before testing. Omitting the selector retains the complete original runtime scope. Both partitions keep the existing race detection, workers, test timeout and job budget; both remain required by `ci-required`.
+
 For focused development, these commands use only this checkout and private fixtures:
 
 ```sh

@@ -34,6 +34,14 @@ The package fixture now permits at most three attempts within its original singl
 
 Queue job 2163 passed lint, the focused refusal race tests, complete packaged installer acceptance and DMG verification with exit 0. The packaged payload and app-bundle tests passed in 9.09 and 6.62 seconds; the actual private outer-installer lifecycle passed under race in 67.459 seconds. The disk image detached successfully. These checks reuse the unchanged development artifact; native lifecycle calls remain injected, and fresh hosted CI is still required.
 
+### Intel HTTPS workload isolation
+
+A later notification for the same `05c1758` run identified a separate failure in Intel runtime job `121857014412`. The cold 16-request asset burst took 35.93 seconds; fourteen waiting requests received HTTP 429. The single-comparison cache assertion did not fail. The private lifecycle then hit its existing 30-second request deadlines, and an enabled reconfigure was killed at its 35-second fixture limit. Backend and remote packages shared that job, taking 562.952 and 406.182 seconds respectively. These are retained failed assertions, not a package timeout or a successful run.
+
+Race-instrumented cost-14 bcrypt competing with the backend workload is the leading explanation, not a proven Intel measurement. Isolated local queue job 2165 passed those same two race tests: the cold burst took 9.86 seconds and the lifecycle took 92.62 seconds in total. The local Mac is Apple Silicon; Intel execution is unavailable here and cannot be inferred from that result.
+
+CI now requires separate core and HTTPS runtime partitions on each architecture. HTTPS runs the entire remote package on a separate runner; core dynamically includes every other original runtime package except the separately tested tooling root. Future remote children and similarly named packages remain in core. The default `all` mode retains the previous complete runtime scope. Parser and workflow regressions verify exact coverage, unchanged race/worker/time limits, refusal before testing invalid or incomplete inventories, and error propagation. The partition assertions failed before the adapter change and passed afterward. Authentication configuration, bcrypt cost 14, cache behavior, admission bounds and service deadlines are unchanged. Fresh isolated hosted Intel results remain the acceptance gate.
+
 Requirements carried into implementation:
 
 - Installation and upgrades perform setup explicitly. Opening an incomplete app shows instructions without rewriting files or automatically retrying recovery.
