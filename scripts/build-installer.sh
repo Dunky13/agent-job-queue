@@ -21,7 +21,7 @@ mkdir -p "$installer/Contents/MacOS" "$app/Contents/MacOS" "$app/Contents/Resour
 ARCHS='arm64 x86_64' "$root/native/build.sh" "$app/Contents/MacOS/AgentQueue"
 for architecture in arm64 x86_64; do
   xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -O -target "$architecture-apple-macos15.0" \
-    -framework SwiftUI -framework AppKit "$root/native/Installer.swift" -o "$work/Installer-$architecture"
+    -framework SwiftUI -framework AppKit "$root/native/QueueBrand.swift" "$root/native/Installer.swift" -o "$work/Installer-$architecture"
   goarch=$architecture
   [[ "$architecture" != x86_64 ]] || goarch=amd64
   for command in agent-heavy agent-remote; do
@@ -36,6 +36,8 @@ for command in agent-heavy agent-remote; do
   xcrun lipo -create "$work/$command-arm64" "$work/$command-x86_64" -output "$payload/source/bin/$command"
   cp "$root/packaging/links/$command" "$payload/source/links/$command"
 done
+cp "$root/native/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+cp "$root/native/Resources/AppIcon.icns" "$installer/Contents/Resources/AppIcon.icns"
 cp "$work/build-info.json" "$app/Contents/Resources/build-info.json"
 cp "$work/build-info.json" "$installer/Contents/Resources/build-info.json"
 cp "$work/build-info.json" "$payload/source/build-info.json"
@@ -55,6 +57,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>CFBundleName</key><string>Agent Queue</string>
 <key>CFBundleDisplayName</key><string>Agent Queue</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
 <key>CFBundleVersion</key><string>$bundle_build</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
@@ -71,6 +74,7 @@ cat > "$installer/Contents/Info.plist" <<PLIST
 <key>CFBundleIdentifier</key><string>io.went.agent-queue.installer</string>
 <key>CFBundleName</key><string>Agent Job Queue Installer</string>
 <key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleShortVersionString</key><string>$version</string>
 <key>CFBundleVersion</key><string>$bundle_build</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>

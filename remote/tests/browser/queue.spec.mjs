@@ -49,7 +49,17 @@ test("real queue changes arrive on a background poll and mobile layout fits", as
   for (const width of [375, 390, 1280]) {
     await page.setViewportSize({ width, height: 844 });
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    for (const colorScheme of ["light", "dark"]) {
+      await page.emulateMedia({ colorScheme });
+      const icon = page.locator(".brand .app-symbol");
+      await expect(icon).toHaveAttribute("src", "/static/app-icon.png");
+      await expect(icon).toHaveAttribute("alt", "");
+      expect(await icon.evaluate((image) => image.complete && image.naturalWidth === 256)).toBe(true);
+      await expect(icon).toHaveCSS("width", width <= 500 ? "46px" : "52px");
+    }
   }
+  await expect(page.locator('link[rel="icon"]')).toHaveAttribute("href", "/static/favicon.png");
+  await expect(page.locator('link[rel="apple-touch-icon"]')).toHaveAttribute("href", "/static/apple-touch-icon.png");
   expect(await queueFixture.events()).toEqual([]);
 });
 

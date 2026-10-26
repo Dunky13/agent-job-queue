@@ -931,7 +931,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
         popover.contentSize = NSSize(width: 500, height: 650)
         popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, tracksVisibility: false))
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "square.stack.3d.up", accessibilityDescription: nil)
+            button.image = NSImage(systemSymbolName: QueueBrand.symbolName, accessibilityDescription: nil)
             button.image?.isTemplate = true
             button.imagePosition = .imageLeading
             button.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
@@ -1220,7 +1220,7 @@ struct QueuePanel: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 11) {
             HStack {
-                Label("Agent Queue", systemImage: "square.stack.3d.up").font(.system(size: 20, weight: .semibold))
+                Label("Agent Queue", systemImage: QueueBrand.symbolName).font(.system(size: 20, weight: .semibold))
                 Spacer()
                 if store.fixtureMode { Text("PREVIEW").font(.caption2.weight(.semibold)).foregroundStyle(.secondary) }
                 Button { Task { await store.refresh(manual: true) } } label: {

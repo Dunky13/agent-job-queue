@@ -531,7 +531,7 @@ func validQueueLogPath(home, logPath string, id int64) bool {
 }
 
 func (api *queueAPI) asset(w http.ResponseWriter, r *http.Request, name string) {
-	if !fs.ValidPath(name) || name != path.Clean(name) || name != "index.html" && name != "app.css" && name != "app.js" && name != "profiles.js" && name != "schema.mjs" && name != "vendor/zod.mjs" && name != "vendor/ZOD-LICENSE" {
+	if !fs.ValidPath(name) || name != path.Clean(name) || name != "app-icon.png" && name != "favicon.png" && name != "apple-touch-icon.png" && name != "index.html" && name != "app.css" && name != "app.js" && name != "profiles.js" && name != "schema.mjs" && name != "vendor/zod.mjs" && name != "vendor/ZOD-LICENSE" {
 		jsonError(w, 404, "Not Found")
 		return
 	}
