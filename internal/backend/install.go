@@ -43,6 +43,7 @@ func (err *installCleanupPendingError) Error() string { return errInstallPending
 func (err *installCleanupPendingError) Unwrap() error { return errInstallPendingCleanup }
 
 const installDisablePhoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
+const installLegacySnapshotLimit = 32 * 1024 * 1024
 
 var installLegacyFiles = []string{"agent_heavy.py", "agent_integration.py", "resource_monitor.py", "job_profiles.py", "resource_scheduler.py", "learning_control.py", "app_updates.py", "release_metadata.py", "install-remote.sh", "scripts/migrate-installation.py", "remote/control.py", "remote/server.py", "remote/requirements.txt", "remote/requirements.lock"}
 var installLegacyDirectories = []string{".venv", "__pycache__", "remote/__pycache__", "remote/static"}
@@ -174,6 +175,14 @@ func (install *installer) commandEnvironment(args []string) []string {
 	return envList(environment)
 }
 
+func (install *installer) commandOutputLimit(args []string) int {
+	if slices.Equal(args, []string{"pueue", "--config", filepath.Join(install.config, "pueue.yml"), "--color", "never", "status", "--json"}) {
+		// Loaded and saved legacy state have the same bounded history budget.
+		return installLegacySnapshotLimit
+	}
+	return 4 * 1024 * 1024
+}
+
 func (install *installer) run(ctx context.Context, args ...string) ([]byte, error) {
 	if install.command != nil {
 		return install.command(ctx, args)
@@ -190,7 +199,7 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 	defer cancel()
 	command := exec.CommandContext(bounded, commandPath, args[1:]...)
 	command.Env = install.commandEnvironment(args)
-	output := &boundedOutput{limit: 4 * 1024 * 1024}
+	output := &boundedOutput{limit: install.commandOutputLimit(args)}
 	command.Stdout = output
 	command.Stderr = output
 	command.WaitDelay = time.Second
@@ -760,7 +769,7 @@ func (install *installer) legacySnapshot(ctx context.Context, node *yaml.Node, l
 			return Object{"tasks": Object{}, "groups": Object{"default": Object{"parallel_tasks": 1, "status": "Running"}}}, nil
 		}
 	}
-	raw, err := updateReadOwned(filename, 32*1024*1024)
+	raw, err := updateReadOwned(filename, installLegacySnapshotLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -770,8 +779,8 @@ func (install *installer) legacySnapshot(ctx context.Context, node *yaml.Node, l
 			return nil, err
 		}
 		defer reader.Close()
-		raw, err = io.ReadAll(io.LimitReader(reader, 32*1024*1024+1))
-		if err != nil || len(raw) > 32*1024*1024 {
+		raw, err = io.ReadAll(io.LimitReader(reader, installLegacySnapshotLimit+1))
+		if err != nil || len(raw) > installLegacySnapshotLimit {
 			return nil, errors.New("Cannot safely inspect compressed legacy queue state")
 		}
 	}

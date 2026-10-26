@@ -23,3 +23,7 @@ Backend tests use private installation and launch-service fixtures. Native tests
 Full backend acceptance exposed a scheduler hold while SQLite retired a transaction journal. A focused real-SQL regression reproduced a regular, private journal owned by the current account with a zero link count during concurrent commit and unlink. The ownership check now rechecks only that retired sidecar case, with a fixed observation bound. Confirmed absence or a fresh fully safe file can pass; the main database, unsafe permissions or ownership, symlinks, hardlinks, unsafe replacements, and unresolved repeated retirement still fail closed. The original scheduler scenario and the existing unsafe-file tests remain required checks.
 
 See [guided recovery](../upgrade-recovery.md) for the operator flow and controller commands.
+
+## Bounded legacy history capture
+
+The command output wrapper embedded `bytes.Buffer`, whose promoted `ReadFrom` method let a real child-process copy bypass the intended `Write` limit. Capture now enforces that limit through both copy paths. The exact owned Pueue status command uses the same 32 MB bound as saved legacy state; other installer commands retain their 4 MB bound. Real-process regressions cover retained history above 4 MB, oversized state rejection and ordinary command bounds. No private job contents are included in these fixtures.
