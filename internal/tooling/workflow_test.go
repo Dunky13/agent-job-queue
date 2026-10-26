@@ -39,7 +39,12 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 	if err := yaml.Unmarshal(body, &workflow); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"macos-tests", "native-tests"} {
+	suites := map[string]string{
+		"macos-tests":   "bash scripts/test-go-runtime.sh",
+		"tooling-tests": "go test -p 2 -parallel 2 -race -v ./internal/tooling -timeout 12m",
+		"native-tests":  "bash scripts/test-native.sh",
+	}
+	for name, command := range suites {
 		job, exists := workflow.Jobs[name]
 		if !exists {
 			t.Fatalf("missing independent validation stage %s", name)
@@ -47,21 +52,30 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 		if job.Timeout != 20 || job.ContinueOnError || job.If != "" || job.RunsOn != "${{ matrix.os }}" || job.Strategy.FailFast == nil || *job.Strategy.FailFast || !reflect.DeepEqual(job.Strategy.Matrix.OS, []string{"macos-15", "macos-15-intel"}) {
 			t.Fatalf("%s changed the existing budget or architecture requirements", name)
 		}
-		hasGo, hasNative := false, false
+		found := false
 		for _, step := range job.Steps {
 			if step.ContinueOnError || step.If != "" {
 				t.Fatalf("%s may skip or ignore a validation failure", name)
 			}
-			hasGo = hasGo || strings.Contains(step.Run, "go test -p 2 -parallel 2 -race ./cmd/... ./internal/... ./packaging/homebrew ./remote/static -timeout 12m")
-			hasNative = hasNative || strings.Contains(step.Run, "bash scripts/test-native.sh")
+			found = found || strings.TrimSpace(step.Run) == command
+			for other, otherCommand := range suites {
+				if other != name && strings.Contains(step.Run, otherCommand) {
+					t.Fatalf("%s combines unrelated validation phases", name)
+				}
+			}
 		}
-		if name == "macos-tests" && (!hasGo || hasNative) || name == "native-tests" && (!hasNative || hasGo) {
-			t.Fatalf("%s combines unrelated validation phases or omits its suite", name)
+		if !found {
+			t.Fatalf("%s omits its complete suite", name)
 		}
 	}
 	gate := workflow.Jobs["ci-required"]
-	if gate.If != "always()" || !slices.Contains(gate.Needs, "macos-tests") || !slices.Contains(gate.Needs, "native-tests") {
-		t.Fatal("both complete architecture matrices must remain required")
+	if gate.If != "always()" || gate.ContinueOnError {
+		t.Fatal("aggregate check must always require successful validation")
+	}
+	for name := range suites {
+		if !slices.Contains(gate.Needs, name) {
+			t.Fatalf("complete architecture matrix %s must remain required", name)
+		}
 	}
 	if !slices.ContainsFunc(gate.Steps, func(step validationStep) bool {
 		return !step.ContinueOnError && step.If == "" && strings.Contains(step.Run, `all(.[]; .result == "success")`)

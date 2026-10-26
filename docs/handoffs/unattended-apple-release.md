@@ -109,3 +109,22 @@ Historical build 94 is a prior release witness, not proof for the new source.
 
 Synthetic failure tests establish source contracts only. They never establish
 Apple acceptance, ticket delivery, hosted installation or publication.
+
+
+## Intel validation scheduling repair
+
+Hosted run `40377193359` at signed integrated source `13eb210` again exceeded
+the Intel Go job's 20-minute limit. Every other required job passed. Intel
+finished the backend and HTTPS packages but was still running tooling when the
+job stopped; the aggregate check correctly failed. ARM completed tooling in
+397.085 seconds. This is a failed hosted witness, not Apple or release proof.
+
+Runtime and the full tooling suite now have separate mandatory ARM/Intel jobs,
+alongside the existing native matrix. Runtime enumeration retains the original
+Go package scope and excludes only the exact tooling package. Enumeration and
+test failures propagate; malformed or duplicate inventories fail before testing.
+New packages, including tooling children and package-scope roots, stay covered.
+Both matrices retain race detection, two workers, the existing 12-minute Go test
+timeout and 20-minute job limit. Tooling adds per-test timing output. The same
+`ci-required` gate requires all matrices. Hosted Intel qualification remains
+necessary before this repair or the release can be declared qualified.
