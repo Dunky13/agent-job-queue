@@ -7,6 +7,16 @@ macos_signing_error() {
   return 1
 }
 
+macos_notary_archive_name() {
+  local stage=$1 version=$2
+  case "$stage" in
+    payload) printf 'Agent-Job-Queue-Payload-%s-universal.zip\n' "$version" ;;
+    installer) printf 'Agent-Job-Queue-Installer-%s-universal.zip\n' "$version" ;;
+    dmg) printf 'Agent-Job-Queue-Installer-%s-universal.dmg\n' "$version" ;;
+    *) macos_signing_error 'Unknown notarization stage.'; return 1 ;;
+  esac
+}
+
 # Callers supply fixed operation labels, never paths or command arguments.
 # Wrapped shell functions must explicitly return each failure: an if condition
 # disables Bash errexit inside the called function as well as its descendants.
@@ -455,7 +465,7 @@ macos_package_installer() (
   # live elsewhere and survive failures, including Apple's first-time delays.
   local installer=$1 destination=$2 version=$3 build_dmg=${BUILD_DMG:-1}
   local payload="$1/Contents/Resources/payload" app="$1/Contents/Resources/payload/Agent Queue.app"
-  local version_pattern='^[A-Za-z0-9][A-Za-z0-9.+_-]*$' staging base name
+  local version_pattern='^[A-Za-z0-9][A-Za-z0-9.+_-]*$' staging base name notary_archive
   [[ $version =~ $version_pattern && ( $build_dmg == 0 || $build_dmg == 1 ) ]] || {
     macos_signing_error 'Provide a filename-safe version and BUILD_DMG=0 or 1.'; return 1;
   }
@@ -479,8 +489,9 @@ macos_package_installer() (
   if [[ $SIGNING_MODE == developer-id ]]; then
     # Apple's custom installer workflow requires the installed product to be
     # notarized first. Bare helper binaries receive tickets but cannot be stapled.
-    ditto -c -k --sequesterRsrc --keepParent "$payload" "$staging/payload.zip" || return
-    macos_notarize payload "$staging/payload.zip" || return
+    notary_archive="$staging/$(macos_notary_archive_name payload "$version")"
+    ditto -c -k --sequesterRsrc --keepParent "$payload" "$notary_archive" || return
+    macos_notarize payload "$notary_archive" || return
     macos_staple "$app" || return
     macos_verify_code "$app" || return
     macos_assess_app "$app" || return
@@ -489,8 +500,10 @@ macos_package_installer() (
   # modify its contents after signing the parent installer.
   macos_sign_code "$installer" '' installer || return
   if [[ $SIGNING_MODE == developer-id ]]; then
-    ditto -c -k --sequesterRsrc --keepParent "$installer" "$staging/installer.zip" || return
-    macos_notarize installer "$staging/installer.zip" || return
+    notary_archive="$staging/$(macos_notary_archive_name installer "$version")"
+    ditto -c -k --sequesterRsrc --keepParent "$installer" "$notary_archive" || return
+    macos_notarize installer "$notary_archive" || return
+    rm "$notary_archive" || return
     macos_staple "$installer" || return
     macos_assess_app "$installer" || return
   fi

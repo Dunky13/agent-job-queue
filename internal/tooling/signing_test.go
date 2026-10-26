@@ -134,6 +134,27 @@ func (f signingFixture) recorded(t *testing.T) string {
 	return string(data)
 }
 
+func assertNotarySubmissionNames(t *testing.T, events, version string) {
+	t.Helper()
+	var names []string
+	for _, line := range strings.Split(events, "\n") {
+		for _, prefix := range []string{"xcrun|notarytool|submit|", "queue-tool|notarize|submit|--archive|"} {
+			if archive, ok := strings.CutPrefix(line, prefix); ok {
+				path, _, _ := strings.Cut(archive, "|")
+				names = append(names, filepath.Base(path))
+			}
+		}
+	}
+	want := []string{
+		"Agent-Job-Queue-Payload-" + version + "-universal.zip",
+		"Agent-Job-Queue-Installer-" + version + "-universal.zip",
+		"Agent-Job-Queue-Installer-" + version + "-universal.dmg",
+	}
+	if strings.Join(names, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("unexpected Apple submission names: %v, want %v", names, want)
+	}
+}
+
 func (f signingFixture) embedAppSupport(t *testing.T) string {
 	t.Helper()
 	source := filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app/Contents/Resources/payload/source")
@@ -220,6 +241,7 @@ func TestMacOSSigningPackagesInsideOutAndHashesStapledBytes(t *testing.T) {
 		t.Fatalf("packaging failed: %v: %s", err, output)
 	}
 	record := f.recorded(t)
+	assertNotarySubmissionNames(t, record, "1.2.3")
 	ordered := []string{
 		"xcrun|notarytool|submit|", "xcrun|notarytool|wait|00000000-0000-0000-0000-000000000001",
 		"xcrun|notarytool|log|00000000-0000-0000-0000-000000000001", "xcrun|stapler|staple|" + filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app"),
@@ -505,7 +527,7 @@ case "$tool" in
   xcrun)
     case "$1:$2" in
       notarytool:submit)
-        case "$3" in */payload.zip) number=1; stage=payload;; */installer.zip) number=2; stage=installer;; *.dmg) number=3; stage=dmg;; *) exit 92;; esac
+        case "$3" in */Agent-Job-Queue-Payload-*-universal.zip) number=1; stage=payload;; */Agent-Job-Queue-Installer-*-universal.zip) number=2; stage=installer;; *.dmg) number=3; stage=dmg;; *) exit 92;; esac
         [[ $failure != "$stage-upload" ]] || exit 18
         if [[ $failure == "$stage-malformed-id" ]]; then printf '{}\n'; else printf '{"id":"00000000-0000-0000-0000-%012d"}\n' "$number"; fi
         ;;

@@ -40,6 +40,13 @@ installer. Our additional DMG distribution also receives its own ticket:
 5. Copy the stapled, self-contained menu app into a DMG with an Applications shortcut, sign the DMG, notarize it, and staple it. Retained older builds without an embedded setup payload keep their original installer DMG layout.
 6. Generate final checksums and Homebrew metadata after all byte changes.
 
+Apple submissions use `Agent-Job-Queue-Payload-VERSION-universal.zip`,
+`Agent-Job-Queue-Installer-VERSION-universal.zip`, and
+`Agent-Job-Queue-Installer-VERSION-universal.dmg` so the project, version, and
+stage are visible in notarization history. Resumable checkpoints retain their
+existing internal filenames; submission copies preserve the exact archive bytes
+and SHA-256. Already recorded submissions are resumed by ID without resubmitting.
+
 Record each submission ID before waiting. A timeout leaves a submission at
 Apple; inspect it before retrying. Read successful logs for warnings too.
 ZIPs and standalone executables cannot themselves carry stapled tickets. Bare
