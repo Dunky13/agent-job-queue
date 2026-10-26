@@ -185,6 +185,8 @@ jobs:
           certificate: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
           certificate-password: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
           notary-key: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+      - name: Retain immutable publication evidence for this candidate
+        run: scripts/macos-resume.sh evidence notarization-state "$BUILD_VERSION"
       - name: Export only completed notarized assets
         id: export
         run: scripts/macos-resume.sh export notarization-state dist "$BUILD_VERSION"
@@ -223,19 +225,7 @@ jobs:
             --version "$BUILD_VERSION" --tag "$BUILD_TAG" \
             --commit "$BUILD_SHA" --build "$BUILD_RUN_NUMBER" --output dist
       - name: Bind permanent public Apple evidence to the exact final assets
-        run: |
-          jq -n --slurpfile metadata notarization-state/metadata.json \
-            --slurpfile payload notarization-state/stages/payload.json \
-            --slurpfile installer notarization-state/stages/installer.json \
-            --slurpfile dmg notarization-state/stages/dmg.json \
-            --slurpfile payload_log notarization-state/receipts/payload.log.json \
-            --slurpfile installer_log notarization-state/receipts/installer.log.json \
-            --slurpfile dmg_log notarization-state/receipts/dmg.log.json \
-            --slurpfile toolchain "$APPLE_TOOLCHAIN_RECEIPT" \
-            --arg execution "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg automation "$AUTOMATION_SHA" \
-            '{schema:1,metadata:$metadata[0],stages:[$payload[0],$installer[0],$dmg[0]],
-              logs:[$payload_log[0],$installer_log[0],$dmg_log[0]],toolchain:$toolchain[0],
-              execution_id:$execution,execution_attempt:$attempt,automation_sha:$automation}' > dist/apple-notarization.json
+        run: cp notarization-state/publication.json dist/apple-notarization.json
       - name: Upload notarized installer and final checksums
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

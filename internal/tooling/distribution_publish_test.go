@@ -156,6 +156,13 @@ func newPublishFixture(t *testing.T) checkpointFixture {
 		"schema": 2, "repository": "owner/project", "source_sha": checkpointSHA, "version": "0.1.0", "team": signingTestTeam,
 		"run_id": "123", "run_number": "45", "build_attempt": "1", "artifact_id": "800", "artifact_digest": "sha256:" + strings.Repeat("c", 64),
 	}, "stages": stages, "logs": logs})
+	// Match the real producer's canonical public audit bytes.
+	path := filepath.Join(f.root, "dist/apple-notarization.json")
+	data, err := exec.Command("jq", "-S", ".", path).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.publishWrite(t, "dist/apple-notarization.json", data)
 	return f
 }
 
@@ -202,6 +209,7 @@ func (f checkpointFixture) publishDraft(t *testing.T) {
 }
 
 func TestDistributionPublishDraftReadbackBeforeExposure(t *testing.T) {
+	t.Parallel()
 	f := newPublishFixture(t)
 	f.publish(t, "", true)
 	calls := f.publishCalls(t)
@@ -219,6 +227,7 @@ func TestDistributionPublishDraftReadbackBeforeExposure(t *testing.T) {
 }
 
 func TestDistributionPublishResumesInterruptedDraft(t *testing.T) {
+	t.Parallel()
 	for _, failure := range []string{"create after", "upload before", "upload after", "publish after"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newPublishFixture(t)
@@ -238,6 +247,7 @@ func TestDistributionPublishResumesInterruptedDraft(t *testing.T) {
 }
 
 func TestDistributionPublishRejectsCorruptionAndProviderAmbiguity(t *testing.T) {
+	t.Parallel()
 	for _, failure := range []string{"list", "malformed list", "tag", "tag ambiguous", "inventory", "read", "download", "corrupt", "malformed upload", "target changes", "inventory changes"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newPublishFixture(t)
@@ -251,6 +261,7 @@ func TestDistributionPublishRejectsCorruptionAndProviderAmbiguity(t *testing.T) 
 }
 
 func TestDistributionPublishRejectsConflictingDraftWithoutMutation(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"target", "tag", "channel", "title", "draft candidate", "remote bytes", "extra asset", "duplicate name", "duplicate ID", "unfinished asset", "source manifest", "candidate changed", "checksum", "symlink", "hidden asset", "missing asset"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newPublishFixture(t)
@@ -321,6 +332,7 @@ func TestDistributionPublishRejectsConflictingDraftWithoutMutation(t *testing.T)
 }
 
 func TestDistributionPublishExistingPublicReleaseIsReadOnlyAndExact(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"identical", "missing", "different", "extra", "tag missing", "mutable"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newPublishFixture(t)
@@ -360,6 +372,7 @@ func TestDistributionPublishExistingPublicReleaseIsReadOnlyAndExact(t *testing.T
 }
 
 func TestDistributionPublishRejectsUnboundAppleEvidenceBeforeProviderAccess(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"source", "artifact", "phase", "uuid", "hash", "status", "completed"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newPublishFixture(t)
@@ -393,6 +406,7 @@ func TestDistributionPublishRejectsUnboundAppleEvidenceBeforeProviderAccess(t *t
 }
 
 func TestDistributionPublishBindsPartialDraftToWholeCandidate(t *testing.T) {
+	t.Parallel()
 	f := newPublishFixture(t)
 	f.publish(t, "upload after", false)
 	// This cask was not uploaded before the interruption. The draft's immutable
@@ -406,6 +420,7 @@ func TestDistributionPublishBindsPartialDraftToWholeCandidate(t *testing.T) {
 }
 
 func TestDistributionPublishVerifiesExistingTagIdentity(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"lightweight", "annotated", "annotated wrong commit", "tag moves", "tag disappears"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newPublishFixture(t)
@@ -434,5 +449,45 @@ func TestDistributionPublishVerifiesExistingTagIdentity(t *testing.T) {
 				t.Fatalf("changed tag permitted publication:\n%s", f.publishCalls(t))
 			}
 		})
+	}
+}
+
+func TestDistributionPublishRejectsJSONStreamsBeforeProviderAccess(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"agent-job-queue.json", "apple-notarization.json"} {
+		t.Run(name, func(t *testing.T) {
+			f := newPublishFixture(t)
+			path := filepath.Join(f.root, "dist", name)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream := append(append(append([]byte{}, data...), '\n'), data...)
+			if err := os.WriteFile(path, stream, 0600); err != nil {
+				t.Fatal(err)
+			}
+			f.publish(t, "", false)
+			if calls := f.publishCalls(t); calls != "" {
+				t.Fatalf("JSON stream reached GitHub: %s", calls)
+			}
+		})
+	}
+}
+
+func TestDistributionPublishRejectsDuplicateEvidenceKeysBeforeProviderAccess(t *testing.T) {
+	t.Parallel()
+	f := newPublishFixture(t)
+	path := filepath.Join(f.root, "dist/apple-notarization.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := append([]byte(`{"metadata":{"private":"must not publish"},`), data[1:]...)
+	if err := os.WriteFile(path, changed, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.publish(t, "", false)
+	if calls := f.publishCalls(t); calls != "" {
+		t.Fatalf("duplicate JSON keys reached GitHub: %s", calls)
 	}
 }

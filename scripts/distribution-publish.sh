@@ -25,6 +25,13 @@ for asset in "$assets"/*; do
 done
 candidate="$temporary/candidate"
 manifest="$candidate/agent-job-queue.json"
+for document in "$manifest" "$candidate/apple-notarization.json"; do
+  jq -s -e 'length == 1 and (.[0] | type == "object")' "$document" >/dev/null ||
+    fail 'Candidate metadata must contain exactly one JSON object.'
+done
+jq -S . "$candidate/apple-notarization.json" > "$temporary/canonical-apple-evidence.json"
+cmp -s "$candidate/apple-notarization.json" "$temporary/canonical-apple-evidence.json" ||
+  fail 'Public Apple evidence must retain its canonical serialization without duplicate keys.'
 jq -e --arg repository "$GITHUB_REPOSITORY" --arg sha "$BUILD_SHA" --arg tag "$BUILD_TAG" --arg build "$BUILD_RUN_NUMBER" '
   keys == ["asset", "build", "commit", "repository", "schemaVersion", "sha256", "tag", "version"] and
   .schemaVersion == 1 and .repository == $repository and .commit == $sha and .tag == $tag and

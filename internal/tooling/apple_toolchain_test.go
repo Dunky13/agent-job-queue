@@ -10,6 +10,7 @@ import (
 )
 
 func TestAppleToolchainFailsBeforeCredentialsForUnqualifiedTools(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"qualified", "wrong version", "wrong build", "missing stapler", "SDK error", "empty SDK", "Swift error", "Go error", "notary error", "OS error", "architecture error"} {
 		t.Run(variant, func(t *testing.T) {
 			root := t.TempDir()

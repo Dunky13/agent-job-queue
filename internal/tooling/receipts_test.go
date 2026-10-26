@@ -38,6 +38,7 @@ func (f *resumeFixture) signingOutcome(t *testing.T, stage, cleanup, attempt str
 }
 
 func TestAppleReceiptsRequireCurrentInvocationAndSuccessfulCleanup(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"inherited attempt", "cleanup failed", "cleanup missing", "stage not entered"} {
 		t.Run(variant, func(t *testing.T) {
 			f := receiptFixture(t)
@@ -67,6 +68,7 @@ func TestAppleReceiptsRequireCurrentInvocationAndSuccessfulCleanup(t *testing.T)
 }
 
 func TestAppleExportTicketFailureRetainsFinishedCandidateForContinuation(t *testing.T) {
+	t.Parallel()
 	f := receiptFixture(t)
 	f.step(t, "finish", "payload")
 	for _, stage := range []string{"installer", "dmg"} {
@@ -107,6 +109,7 @@ func (f resumeFixture) receipts(t *testing.T, extra []string, destination string
 }
 
 func TestAppleReceiptsOnlyClassifyBoundPendingState(t *testing.T) {
+	t.Parallel()
 	for _, failure := range []string{"payload-timeout", "payload-rejected", "waitid", "logid", "loghash", "logstatus"} {
 		t.Run(failure, func(t *testing.T) {
 			f := receiptFixture(t)
@@ -150,6 +153,7 @@ func TestAppleReceiptsOnlyClassifyBoundPendingState(t *testing.T) {
 }
 
 func TestAppleReceiptsRejectUnboundSourceAndUnsafeFiles(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"different build", "different artifact", "different team", "unsafe status", "wrong filename"} {
 		t.Run(variant, func(t *testing.T) {
 			f := receiptFixture(t)
@@ -177,8 +181,136 @@ func TestAppleReceiptsRejectUnboundSourceAndUnsafeFiles(t *testing.T) {
 }
 
 func TestAppleSubmissionNameIncludesOriginalBuild(t *testing.T) {
+	t.Parallel()
 	f := receiptFixture(t)
 	if !strings.Contains(f.recorded(t), "Agent-Job-Queue-Payload-0.1.0-build-21-aaaaaaa-universal.zip") {
 		t.Fatalf("submission omitted its original build identity: %s", f.recorded(t))
+	}
+}
+
+func publicationFixture(t *testing.T) resumeFixture {
+	t.Helper()
+	f := receiptFixture(t)
+	f.step(t, "finish", "payload")
+	for _, stage := range []string{"installer", "dmg"} {
+		for _, operation := range []string{"prepare", "submit", "finish"} {
+			f.step(t, operation, stage)
+		}
+	}
+	path := filepath.Join(f.root, "toolchain.json")
+	data, _ := json.Marshal(map[string]any{
+		"schema": 1, "source_sha": strings.Repeat("a", 40), "automation_sha": strings.Repeat("a", 40),
+		"xcode": "16.4", "xcode_build": "16F6", "macos_sdk": "15.5", "swift": "Apple Swift fixture",
+		"go": "go version fixture", "notarytool": "1.1.0 fixture", "os": "15.7.9", "host_architecture": "arm64",
+		"runner_image": "macos15", "runner_image_version": "fixture",
+	})
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.environment = append(f.environment, "APPLE_TOOLCHAIN_RECEIPT="+path)
+	f.command(t, nil, "evidence", f.state, "0.1.0")
+	return f
+}
+
+func TestPublicationEvidenceRetainsExactBytesAcrossWholeWorkflowRecovery(t *testing.T) {
+	t.Parallel()
+	f := publicationFixture(t)
+	path := filepath.Join(f.state, "publication.json")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := filepath.Join(f.root, "first-export")
+	f.command(t, nil, "export", f.state, first, "0.1.0")
+	// A later execution has a different runner/toolchain receipt, execution ID,
+	// attempt and automation revision. The candidate's public audit asset stays
+	// bound to the first finalization instead of becoming different release bytes.
+	if err := os.Remove(filepath.Join(f.root, "toolchain.json")); err != nil {
+		t.Fatal(err)
+	}
+	later := []string{"GITHUB_RUN_ID=9999", "GITHUB_RUN_NUMBER=100", "GITHUB_RUN_ATTEMPT=2", "GITHUB_SHA=" + strings.Repeat("b", 40)}
+	calls := f.recorded(t)
+	f.command(t, later, "evidence", f.state, "0.1.0")
+	second := filepath.Join(f.root, "second-export")
+	f.command(t, later, "export", f.state, second, "0.1.0")
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatal("whole-workflow recovery rewrote the immutable public evidence asset")
+	}
+	for _, suffix := range []string{"zip", "zip.sha256", "dmg", "dmg.sha256"} {
+		name := "Agent-Job-Queue-Installer-0.1.0-universal." + suffix
+		left, err := os.ReadFile(filepath.Join(first, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		right, err := os.ReadFile(filepath.Join(second, name))
+		if err != nil || string(left) != string(right) {
+			t.Fatalf("whole-workflow recovery changed %s: %v", name, err)
+		}
+	}
+	if strings.Contains(strings.TrimPrefix(f.recorded(t), calls), "rest-create|") {
+		t.Fatal("publication recovery created another Apple submission")
+	}
+}
+
+func TestPublicationEvidenceRejectsUnboundRetainedContents(t *testing.T) {
+	t.Parallel()
+	f := publicationFixture(t)
+	path := filepath.Join(f.state, "publication.json")
+	valid, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"metadata", "stage", "log", "toolchain", "unknown", "toolchain missing", "toolchain unknown", "toolchain empty", "toolchain type", "toolchain architecture", "JSON stream", "duplicate top key", "duplicate nested key"} {
+		t.Run(field, func(t *testing.T) {
+			// Each refusal has a fresh copy of the same completed candidate;
+			// failed verification must never alter its other immutable state.
+			if err := os.WriteFile(path, valid, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if strings.HasPrefix(field, "duplicate") {
+				changed := "{\"toolchain\":{\"private\":\"must not publish\"}," + string(valid[1:])
+				if field == "duplicate nested key" {
+					changed = strings.Replace(string(valid), `"toolchain": {`, `"toolchain": {"go":{"private":"must not publish"},`, 1)
+				}
+				if err := os.WriteFile(path, []byte(changed), 0600); err != nil {
+					t.Fatal(err)
+				}
+				f.reject(t, nil, "Retained publication evidence", "evidence", f.state, "0.1.0")
+				return
+			}
+			if field == "JSON stream" {
+				if err := os.WriteFile(path, append([]byte("{\"private\":\"must not publish\"}\n"), valid...), 0600); err != nil {
+					t.Fatal(err)
+				}
+				f.reject(t, nil, "Retained publication evidence", "evidence", f.state, "0.1.0")
+				return
+			}
+			f.mutate(t, "publication.json", func(v map[string]any) {
+				switch field {
+				case "metadata":
+					v["metadata"].(map[string]any)["source_sha"] = strings.Repeat("c", 40)
+				case "stage":
+					v["stages"].([]any)[0].(map[string]any)["submission_id"] = "00000000-0000-0000-0000-000000000009"
+				case "log":
+					v["logs"].([]any)[0].(map[string]any)["status"] = "Rejected"
+				case "toolchain":
+					v["toolchain"].(map[string]any)["automation_sha"] = strings.Repeat("c", 40)
+				case "unknown":
+					v["private"] = "must not become a public asset"
+				case "toolchain missing":
+					delete(v["toolchain"].(map[string]any), "swift")
+				case "toolchain unknown":
+					v["toolchain"].(map[string]any)["private"] = "must not publish"
+				case "toolchain empty":
+					v["toolchain"].(map[string]any)["macos_sdk"] = ""
+				case "toolchain type":
+					v["toolchain"].(map[string]any)["go"] = 1
+				case "toolchain architecture":
+					v["toolchain"].(map[string]any)["host_architecture"] = "other"
+				}
+			})
+			f.reject(t, nil, "Retained publication evidence", "evidence", f.state, "0.1.0")
+		})
 	}
 }

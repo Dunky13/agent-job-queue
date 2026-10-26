@@ -336,6 +336,15 @@ product version and `build-N-SHA` as the immutable release identity. No stable
 version or updater trust authority changes. `ci-required` remains the aggregate
 CI gate. The protected environment stays main-only without recurring reviewers.
 
+The final candidate checkpoint retains `publication.json` before export. That
+file records the first finalization execution and toolchain, and later executions
+verify and reuse its exact bytes as `apple-notarization.json`. Per-attempt
+toolchain receipts remain separate. A whole-workflow rerun therefore preserves
+every public asset instead of regenerating execution-dependent audit bytes.
+Retained audit evidence must match the producer's sorted JSON serialization;
+unknown fields, multiple documents, incomplete toolchains and duplicate-key
+ambiguities fail verification before publication.
+
 Publication creates a private draft, binds its entire candidate inventory in the
 draft notes, and uploads without overwriting assets. It verifies exact remote
 inventory, source/tag identity and downloaded bytes before exposure. GitHub

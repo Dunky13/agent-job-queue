@@ -189,6 +189,7 @@ func (f *distributionRecoveryFixture) assertMutations(t *testing.T, want int) {
 }
 
 func TestDistributionRecoveryPendingUsesExactFailedRun(t *testing.T) {
+	t.Parallel()
 	for _, event := range []string{"workflow_run", "workflow_dispatch", "schedule"} {
 		t.Run(event, func(t *testing.T) {
 			f := newDistributionRecoveryFixture(t)
@@ -207,6 +208,7 @@ func TestDistributionRecoveryPendingUsesExactFailedRun(t *testing.T) {
 }
 
 func TestDistributionRecoveryRequiresTrustedObserver(t *testing.T) {
+	t.Parallel()
 	for _, environment := range []string{"GITHUB_ACTIONS=false", "GITHUB_REF=refs/heads/feature", "GITHUB_REPOSITORY=../owner/project", "GITHUB_REPOSITORY=owner/..", "GITHUB_REPOSITORY=./project", "GITHUB_EVENT_NAME=push", "GITHUB_EVENT_NAME=pull_request_target"} {
 		t.Run(environment, func(t *testing.T) {
 			f := newDistributionRecoveryFixture(t)
@@ -219,6 +221,7 @@ func TestDistributionRecoveryRequiresTrustedObserver(t *testing.T) {
 }
 
 func TestDistributionRecoveryRefusesUnboundOrTerminalEvidence(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{
 		"schema", "extra key", "string schema", "numeric context", "repository", "source hash", "execution", "attempt binding", "automation hash", "build title", "uuid", "archive hash", "team", "version",
 		"bad digest", "missing digest", "expired receipts", "receipt run", "receipt sha", "receipt branch", "missing receipts", "old attempt receipts", "malformed slot", "duplicate slot",
@@ -420,6 +423,7 @@ func TestDistributionRecoveryRefusesUnboundOrTerminalEvidence(t *testing.T) {
 }
 
 func TestDistributionRecoveryPacesLaterAttempts(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"recent", "future", "before creation", "missing"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newDistributionRecoveryFixture(t)
@@ -443,6 +447,7 @@ func TestDistributionRecoveryPacesLaterAttempts(t *testing.T) {
 }
 
 func TestDistributionRecoveryRejectsUnsafeZIP(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"symlink", "directory", "fifo", "path", "absolute", "duplicate", "newline", "unknown", "large", "malformed JSON", "multiple JSON", "corrupt"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newDistributionRecoveryFixture(t)
@@ -491,6 +496,7 @@ func (f *distributionRecoveryFixture) ticket() {
 }
 
 func TestDistributionRecoveryTicketAndDeliveryOnlyRetries(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"ticket accepted", "ticket finished", "ticket legacy filename", "ticket bound filename", "publish", "homebrew", "retained signing", "publish validation failed", "homebrew signing failed", "missing intel", "delivery other failure", "legacy delivery", "ticket missing acceptance"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newDistributionRecoveryFixture(t)
@@ -548,6 +554,7 @@ func TestDistributionRecoveryTicketAndDeliveryOnlyRetries(t *testing.T) {
 }
 
 func TestDistributionRecoveryPermitsFinalBoundedAttempt(t *testing.T) {
+	t.Parallel()
 	f := newDistributionRecoveryFixture(t)
 	f.execution["run_attempt"] = 47
 	f.recovery["execution_attempt"] = "47"
@@ -569,6 +576,7 @@ func TestDistributionRecoveryPermitsFinalBoundedAttempt(t *testing.T) {
 }
 
 func TestDistributionRecoveryOrdersSlotsNumericallyAcrossArtifactIDs(t *testing.T) {
+	t.Parallel()
 	f := newDistributionRecoveryFixture(t)
 	// A high artifact ID must not displace the later stage slot.
 	f.artifacts = append(f.artifacts,
@@ -582,6 +590,7 @@ func TestDistributionRecoveryOrdersSlotsNumericallyAcrossArtifactIDs(t *testing.
 }
 
 func TestDistributionRecoveryFindsSuccessfulSiblingOnSecondPage(t *testing.T) {
+	t.Parallel()
 	f := newDistributionRecoveryFixture(t)
 	f.write(t)
 	sibling := distributionRecoveryCandidate(f.checkpointFixture, 998, 123).execution
@@ -595,6 +604,7 @@ func TestDistributionRecoveryFindsSuccessfulSiblingOnSecondPage(t *testing.T) {
 }
 
 func TestDistributionRecoveryFiltersAndGroupGuards(t *testing.T) {
+	t.Parallel()
 	for _, variant := range []string{"fork", "branch", "path", "event", "title", "active", "success", "active sibling", "success sibling", "older failure", "new active", "new success", "changed attempt"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newDistributionRecoveryFixture(t)
@@ -648,6 +658,7 @@ func TestDistributionRecoveryFiltersAndGroupGuards(t *testing.T) {
 }
 
 func TestDistributionRecoveryPaginationAndFiveCandidateBound(t *testing.T) {
+	t.Parallel()
 	for _, result := range []string{"0", "1"} {
 		t.Run("POST result "+result, func(t *testing.T) {
 			testDistributionRecoveryCandidateBudget(t, result)
@@ -718,6 +729,7 @@ esac
 }
 
 func TestDistributionRecoveryReportsProviderRefusal(t *testing.T) {
+	t.Parallel()
 	f := newDistributionRecoveryFixture(t)
 	output, err := f.observe(t, "RECOVERY_POST_RESULT=1")
 	if err != nil || !strings.Contains(output, "GitHub refused failed-job recovery") || strings.Contains(output, "Recovery requested:") {

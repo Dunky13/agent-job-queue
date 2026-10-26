@@ -31,6 +31,7 @@ none was removed. The existing automatic successful-main trigger is retained.
 - Retain allowlisted small receipts, provider status and logs separately from large signed archives. Checkpoint/source/receipt retention is 90 days. Successful releases publish permanent `apple-notarization.json` linking source, submitted hashes, UUIDs, Accepted logs and final hashes.
 - Observe completed distributions and scheduled reconciliation without Apple secrets. The first continuation may be immediate; later attempts have a 15-minute cooldown. Stop at attempt 48 or seven days of candidate age. Retry only a bound pending UUID, classified CloudKit connection loss, or delivery-only failure after both architecture acceptance jobs pass. Rerun the same execution's failed jobs, preserving successful work and exact artifacts.
 - Fail closed on expired/missing or ambiguous custody, unknown upload outcomes, rejection, mismatched diagnostics, cleanup errors and acceptance failures. Runner loss before a checkpoint can require provider reconciliation; no receipt import or new upload is inferred from an older checkpoint.
+- Retain the first finalization audit JSON in the candidate checkpoint before export. Whole-workflow recovery validates and reuses its exact bytes, retaining per-attempt toolchain evidence separately.
 - Create a draft, bind its whole candidate inventory, upload without replacement, and compare remote inventory, tag/source identity and every byte before exposure. Require GitHub immutable publication and repeat byte verification afterward. Resume partial drafts and verify identical published candidates read-only.
 - Keep Homebrew's existing exact-build dispatch and signed tap readback as a separate final delivery gate.
 
@@ -75,8 +76,25 @@ classification to the current invocation and successful credential cleanup,
 reject malformed later polls, checkpoint export-time ticket failures, pace
 continuations. The extra Administration-read preflight was withdrawn under the
 accepted scope; exact-byte publication and published immutable metadata remain
-required. Final repair
-validation and independent re-check remain pending.
+required. Frozen release lint and race validation passed at `cc48258` through
+shared queue job 2085, and the independent Sol 6.1 high source review was CLEAN
+for that head.
+
+A later whole-workflow recovery fix retains the original public audit JSON in
+the candidate checkpoint. Review found and reproduced extra JSON documents and
+incomplete toolchain schemas passing its first validator. The repaired validator
+requires one object, exact toolchain keys and nonempty measured fields; focused
+failure tests pass. The publisher also rejects metadata JSON streams before any
+provider call. The cached asset must also match the producer's sorted serialization, rejecting
+hidden duplicate-key values without rewriting retained bytes. The broader
+release race suite passed in job 2126 before this serialization check; focused
+race tests cover the final evidence and publication changes. Final hosted CI
+and source recheck remain merge gates.
+
+Hosted run `40366569995` passed ARM tests and universal packaging; Intel exceeded
+its existing 20-minute job budget during the Go suite. Its timeout remains a
+failed gate. New private fake-provider test suites now use the existing two-test
+parallelism limit; no test, acceptance check or time limit was removed.
 
 The first hosted PR run, `40356788074`, passed universal packaging, commit policy,
 web and vulnerability checks, but both native Go suites failed in the new

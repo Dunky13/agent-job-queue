@@ -123,6 +123,67 @@ verify_state() {
     fi
     previous=$phase
   done
+  if [[ -e $state/publication.json || -L $state/publication.json ]]; then verify_publication; fi
+}
+
+verify_publication() {
+  [[ -f $state/publication.json && ! -L $state/publication.json ]] || fail 'Retained publication evidence is unsafe.'
+  jq -s -e --slurpfile metadata "$state/metadata.json" \
+    --slurpfile payload "$state/stages/payload.json" --slurpfile installer "$state/stages/installer.json" \
+    --slurpfile dmg "$state/stages/dmg.json" --slurpfile payload_log "$state/receipts/payload.log.json" \
+    --slurpfile installer_log "$state/receipts/installer.log.json" --slurpfile dmg_log "$state/receipts/dmg.log.json" '
+    def toolchain_valid:
+      keys == ["automation_sha","go","host_architecture","macos_sdk","notarytool","os",
+        "runner_image","runner_image_version","schema","source_sha","swift","xcode","xcode_build"] and
+      all(to_entries[]; if .key == "schema" then .value == 1
+        else (.value | type == "string" and length > 0) end) and
+      (.host_architecture == "arm64" or .host_architecture == "x86_64");
+    def evidence_valid:
+      keys == ["automation_sha","execution_attempt","execution_id","logs","metadata","schema","stages","toolchain"] and
+    .schema == 1 and .metadata == $metadata[0] and
+    .stages == [$payload[0],$installer[0],$dmg[0]] and
+    all(.stages[]; .phase == "finished") and
+    .logs == [$payload_log[0],$installer_log[0],$dmg_log[0]] and
+    (.execution_id | type == "string" and test("^[1-9][0-9]*$")) and
+    (.execution_attempt | type == "string" and test("^[1-9][0-9]*$")) and
+    (.automation_sha | type == "string" and test("^[a-f0-9]{40}$")) and
+    (.toolchain | toolchain_valid) and .toolchain.source_sha == .metadata.source_sha and
+    .toolchain.automation_sha == .automation_sha;
+    ([$metadata,$payload,$installer,$dmg,$payload_log,$installer_log,$dmg_log] |
+      all(.[]; length == 1 and (.[0] | type == "object"))) and
+    length == 1 and all(.[]; type == "object" and evidence_valid)
+  ' "$state/publication.json" >/dev/null || fail 'Retained publication evidence does not match this exact completed candidate.'
+  # Only the producer's sorted serialization is retained. Parsing alone would
+  # discard earlier duplicate keys, leaving hidden bytes in the public asset.
+  cmp -s "$state/publication.json" <(jq -S . "$state/publication.json") ||
+    fail 'Retained publication evidence is not canonical JSON.'
+}
+
+publication_evidence() {
+  [[ -n ${BUILD_RUN_ID:-} && $(json_field "$state/metadata.json" schema) == 2 ]] ||
+    fail 'Publication evidence requires an artifact-bound CI candidate.'
+  local stage
+  for stage in payload installer dmg; do
+    [[ -f $state/stages/$stage.json && $(json_field "$state/stages/$stage.json" phase) == finished ]] ||
+      fail 'All stages must finish before retaining publication evidence.'
+  done
+  if [[ ! -e $state/publication.json && ! -L $state/publication.json ]]; then
+    [[ -f ${APPLE_TOOLCHAIN_RECEIPT:-} && ! -L ${APPLE_TOOLCHAIN_RECEIPT:-} ]] || fail 'The finalization toolchain receipt is required.'
+    jq -s -e 'length == 1 and (.[0] | type == "object")' "$APPLE_TOOLCHAIN_RECEIPT" >/dev/null ||
+      fail 'The finalization toolchain receipt must be one JSON object.'
+    jq -S -n --slurpfile metadata "$state/metadata.json" \
+      --slurpfile payload "$state/stages/payload.json" --slurpfile installer "$state/stages/installer.json" \
+      --slurpfile dmg "$state/stages/dmg.json" --slurpfile payload_log "$state/receipts/payload.log.json" \
+      --slurpfile installer_log "$state/receipts/installer.log.json" --slurpfile dmg_log "$state/receipts/dmg.log.json" \
+      --slurpfile toolchain "$APPLE_TOOLCHAIN_RECEIPT" --arg execution "$GITHUB_RUN_ID" \
+      --arg attempt "$GITHUB_RUN_ATTEMPT" --arg automation "$GITHUB_SHA" '
+      {schema:1,metadata:$metadata[0],stages:[$payload[0],$installer[0],$dmg[0]],
+       logs:[$payload_log[0],$installer_log[0],$dmg_log[0]],toolchain:$toolchain[0],
+       execution_id:$execution,execution_attempt:$attempt,automation_sha:$automation}
+    ' > "$state/publication.json.new"
+    mv "$state/publication.json.new" "$state/publication.json"
+  fi
+  verify_publication
 }
 
 configure_credentials() {
@@ -438,8 +499,8 @@ case "$command" in
     [[ $# == 4 ]] || fail 'Usage: macos-resume.sh init INSTALLER STATE VERSION'
     initial_installer=$2 state=$3 resume_version=$4
     ;;
-  verify-state)
-    [[ $# == 3 ]] || fail 'Usage: macos-resume.sh verify-state STATE VERSION'
+  verify-state|evidence)
+    [[ $# == 3 ]] || fail "Usage: macos-resume.sh $command STATE VERSION"
     state=$2 resume_version=$3
     ;;
   begin|prepare|submit|finish)
@@ -454,7 +515,7 @@ case "$command" in
     [[ $# == 4 ]] || fail 'Usage: macos-resume.sh bind-origin STATE ORIGINAL_ARCHIVE VERSION'
     state=$2 original_archive=$3 resume_version=$4
     ;;
-  *) fail 'Usage: macos-resume.sh {init|verify-state|bind-origin|begin|prepare|submit|finish|export} ...' ;;
+  *) fail 'Usage: macos-resume.sh {init|verify-state|bind-origin|evidence|begin|prepare|submit|finish|export} ...' ;;
 esac
 identity
 state=$(macos_signing_canonical_path "$state")
@@ -489,6 +550,7 @@ else
     finish) require_stage; finish_stage ;;
     export) export_assets "$destination" ;;
     bind-origin) bind_origin ;;
+    evidence) publication_evidence ;;
   esac
   verify_state
 fi
