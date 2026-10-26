@@ -28,8 +28,11 @@ email is the bot's GitHub noreply address while their DCO sign-off uses
 `missing author-matching DCO sign-off`.
 
 As required by CONTRIBUTING.md, these changes use a maintainer-owned
-replacement PR with signed commits and both established maintainer DCO
-trailers. Do not synthesize a bot certification or relax the policy. Close
+replacement PR with signed commits and author-matching maintainer DCO
+trailers. Main's PR #33 subsequently standardized future commits and the final
+squash on the single `Signed-off-by: Marc Went <marc@went.io>` trailer, with
+`--author-email marc@went.io`. The initial batch commit retains its historical
+dual-address metadata. Do not synthesize a bot certification or relax the policy. Close
 the five superseded PRs after the replacement merges. PR #33 is independent
 and excluded from this batch.
 
@@ -40,8 +43,12 @@ CONTRIBUTING.md, independent diff review, and the replacement PR's hosted CI.
 The local batch additionally checks the YAML grouping invariants,
 `go mod tidy -diff`, and `go mod verify`.
 
-At document creation validation and review are in progress. Current check
-results and the eventual merge state belong to the replacement PR. After
+The complete local validation batch passed, including YAML invariants, module
+checks, lint, race tests, browser tests, native regressions, and universal
+installer verification. Independent diff review found no issues. Main's
+subsequent changes only update contribution and PR-template documentation;
+the dependency versions and runtime source are unchanged. Current hosted check
+results and the eventual merge state belong to PR #38. After
 merge, verify the GitHub signature, author-matching DCO trailers, and merged
 tree, then close the superseded PRs. Publication, Apple notarization, Homebrew
 delivery, and installed runtime qualification are separate from this task.
