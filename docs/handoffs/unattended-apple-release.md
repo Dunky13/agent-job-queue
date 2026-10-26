@@ -1,6 +1,7 @@
 # Unattended Apple release delivery
 
 Implementation date: 2026-10-26. Repository: Dunky13/agent-job-queue.
+Pull request: https://github.com/Dunky13/agent-job-queue/pull/39.
 Baseline: `ced25f439b10496f819a6237f5bd53942fbcb791`.
 The operator authorized merge after passing checks and review, followed by real
 Apple signing, same-candidate recovery, publication and Homebrew qualification.
@@ -48,14 +49,27 @@ environment and its single `main` branch policy were read back unchanged.
 
 ## Qualification state
 
-The complete finite local validation passed through shared queue job 2019:
+The complete finite local validation passed on the pre-review implementation
+through shared queue job 2019:
 source portability, formatting/vet, reachable vulnerabilities, shell/workflow lint,
 Go race tests, tap helper tests, Linux tool builds, web/browser tests, native
 regressions, universal installer build, private installation and mounted DMG
 verification. Focused recovery, receipt, publication and toolchain failure tests
 also pass. These local installer artifacts use development signatures.
 
-Final independent review, PR/hosted CI, merged-source qualification, real
+The first independent review reported five findings. Repairs bind retry
+classification to the current invocation and successful credential cleanup,
+reject malformed later polls, checkpoint export-time ticket failures, pace
+continuations and check live immutability before exposure. Final repair
+validation and independent re-check remain pending.
+
+The first hosted PR run, `40356788074`, passed universal packaging, commit policy,
+web and vulnerability checks, but both native Go suites failed in the new
+publisher evidence expression (`Cannot index boolean with string ("stages")`).
+That expression is corrected; the failure logs are retained and the new source
+requires fresh hosted qualification. No failure is reclassified as success.
+
+PR/hosted CI, merged-source qualification, real
 same-UUID continuation, Apple acceptance/stapling/Gatekeeper, public asset
 readback and Homebrew delivery are not yet established for this implementation.
 Historical build 94 is a prior release witness, not proof for the new source.

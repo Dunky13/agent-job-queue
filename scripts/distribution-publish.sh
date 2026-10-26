@@ -55,13 +55,14 @@ jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$BUILD_SHA" --arg version "$ver
   --arg run "${BUILD_RUN_ID:?}" --arg number "$BUILD_RUN_NUMBER" --arg attempt "${BUILD_RUN_ATTEMPT:?}" \
   --arg artifact "${BUILD_ARTIFACT_ID:?}" --arg digest "${BUILD_ARTIFACT_DIGEST:?}" \
   --arg zip "$archive_hash" --arg dmg "$(hash "$candidate/$base.dmg")" '
+  . as $evidence |
   .schema == 1 and .metadata.repository == $repo and .metadata.source_sha == $sha and
   .metadata.run_id == $run and .metadata.run_number == $number and .metadata.version == $version and
   (.metadata.team | test("^[A-Z0-9]{10}$")) and
   (.metadata.schema == 1 or (.metadata.schema == 2 and .metadata.build_attempt == $attempt and
     .metadata.artifact_id == $artifact and .metadata.artifact_digest == $digest)) and
   ([.stages[].stage] == ["payload", "installer", "dmg"]) and (.logs | length) == 3 and
-  . as $evidence | all(range(0;3); . as $i |
+  all(range(0;3); . as $i |
     $evidence.stages[$i].phase == "finished" and $evidence.logs[$i].status == "Accepted" and
     ($evidence.stages[$i].submission_id | test("^[A-Fa-f0-9]{8}(-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}$")) and
     ($evidence.stages[$i].archive_sha256 | test("^[a-f0-9]{64}$")) and
@@ -203,6 +204,10 @@ jq -S 'sort_by(.id) | map({id,name,size,state})' "$temporary/remote" > "$tempora
 jq -S 'sort_by(.id) | map({id,name,size,state})' "$temporary/verified-inventory" > "$temporary/previous-inventory"
 cmp -s "$temporary/current-inventory" "$temporary/previous-inventory" || fail 'Release assets changed during verification.'
 if [[ $draft == true ]]; then
+  # Read live policy before changing visibility. An unreadable or disabled
+  # setting leaves this candidate private, even if uploads already completed.
+  api "$repository/immutable-releases" > "$temporary/immutability"
+  jq -e '.enabled == true' "$temporary/immutability" >/dev/null || fail 'Repository release immutability is disabled; candidate remains a draft.'
   api "$repository/releases/$release_id" --method PATCH -F draft=false -F prerelease=true -f make_latest=false > "$temporary/published"
 fi
 # The publication request can have succeeded despite a lost response. Fail now

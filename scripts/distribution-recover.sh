@@ -81,9 +81,10 @@ recovery_candidate() (
   attempt=$(jq -r '.run_attempt' "$temporary/execution.json")
   sha=$(jq -r '.head_sha' "$temporary/execution.json")
   if ! distribution_number "$attempt" || ((attempt >= 48)); then distribution_error 'Automatic attempt limit reached (maximum 48).'; fi
-  jq -e '(.head_sha|type == "string" and test("^[a-f0-9]{40}$")) and
+  jq -e '(.created_at|fromdateiso8601) as $created |
+    (.head_sha|type == "string" and test("^[a-f0-9]{40}$")) and
     .status == "completed" and .conclusion == "failure" and
-    (.created_at|fromdateiso8601) as $created | $created <= now and now - $created <= 604800' \
+    $created <= now and now - $created <= 604800' \
     "$temporary/execution.json" >/dev/null || distribution_error 'Run is not a recent completed failure (maximum age 7 days).'
   # The first continuation can run immediately after a finite Apple wait. Later
   # completion events must yield to the scheduled observer instead of consuming
@@ -113,7 +114,7 @@ recovery_candidate() (
   jq -s -e --arg prefix "Apple-receipts-b$build-r$id-a" --argjson attempt "$attempt" '
     [.[]|select(.name|startswith("Apple-receipts-"))] |
     ([.[].name]|length) == ([.[].name]|unique|length) and all(.[];
-      (.name|test("^" + $prefix + "[1-9][0-9]{0,14}-s0[0-9]$")) and
+      (.name|test("^" + $prefix + "[1-9][0-9]{0,14}-s(0[0-9]|10)$")) and
       (.name|capture("-a(?<attempt>[0-9]+)-s").attempt|tonumber) <= $attempt)' "$temporary/artifacts" >/dev/null ||
     distribution_error 'Mixed or malformed receipt slots.'
   # Delivery-only reruns retain successful signing from earlier attempts. Their
@@ -161,7 +162,7 @@ recovery_candidate() (
   jq -s -e --arg prefix "Apple-notarization-b$build-r$id-a" --argjson attempt "$attempt" '
     [.[]|select(.name|startswith("Apple-notarization-"))] |
     ([.[].name]|length) == ([.[].name]|unique|length) and all(.[];
-      (.name|test("^" + $prefix + "[1-9][0-9]{0,14}-s0[0-9]$")) and
+      (.name|test("^" + $prefix + "[1-9][0-9]{0,14}-s(0[0-9]|10)$")) and
       (.name|capture("-a(?<attempt>[0-9]+)-s").attempt|tonumber) <= $attempt)' "$temporary/artifacts" >/dev/null ||
     distribution_error 'Malformed checkpoint slots.'
   checkpoint=$(jq -s -c '
@@ -196,7 +197,7 @@ recovery_candidate() (
             ($d.status == "Accepted" or ($stage == $r.stage and $r.reason == "pending" and $d.status == "In Progress"))
            else $d.jobId == $s.submission_id and $d.sha256 == $s.archive_sha256 and $d.status == "Accepted" and
              (if $d|has("archiveFilename") then $d.archiveFilename as $name | archive_names($stage; $r)|index($name) != null else true end) end)))) and
-    (if $r.reason == "pending" then $e["status-" + $r.stage + ".json"].status == "In Progress"
+    (if $r.reason == "pending" then $e["status-" + $r.stage + ".json"] | .status == "In Progress" and .error == "timeout" and .execution_id == $r.execution_id and .execution_attempt == $r.execution_attempt
      elif $r.reason == "ticket-connection-loss" then
        $e["receipt-" + $r.stage + ".json"].status == "Accepted" and $e["log-" + $r.stage + ".json"].status == "Accepted"
      else true end)

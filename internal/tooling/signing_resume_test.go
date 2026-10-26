@@ -425,6 +425,10 @@ case "$operation" in
       [[ $failure != "$stage-rejected" ]] || status=Invalid
       [[ $failure != "$stage-timeout" ]] || status='In Progress'
       [[ $failure != waitid ]] || id=00000000-0000-0000-0000-000000000009
+      if [[ $failure == "$stage-timeout" ]]; then
+        printf '{"id":"%s","status":"In Progress","error":"timeout"}\n' "$id"
+        exit 75
+      fi
       printf '{"id":"%s","status":"%s"}\n' "$id" "$status"
       [[ $failure != "$stage-timeout" ]] || exit 75
     else

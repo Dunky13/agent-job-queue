@@ -20,7 +20,84 @@ func receiptFixture(t *testing.T) resumeFixture {
 	f.command(t, nil, "init", f.installer, f.state, "0.1.0")
 	f.step(t, "prepare", "payload")
 	f.step(t, "submit", "payload")
+	f.signingOutcome(t, "payload", "success", "1")
 	return f
+}
+
+func (f *resumeFixture) signingOutcome(t *testing.T, stage, cleanup, attempt string) {
+	t.Helper()
+	path := filepath.Join(f.root, "signing-outcome-"+stage+".json")
+	data, err := json.Marshal(map[string]any{"cleanup": cleanup, "operation": stage + "-finish", "execution_id": "1234", "execution_attempt": attempt, "command_status": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.environment = append(f.environment, "APPLE_SIGNING_RESULT_FILE="+path)
+}
+
+func TestAppleReceiptsRequireCurrentInvocationAndSuccessfulCleanup(t *testing.T) {
+	for _, variant := range []string{"inherited attempt", "cleanup failed", "cleanup missing", "stage not entered"} {
+		t.Run(variant, func(t *testing.T) {
+			f := receiptFixture(t)
+			f.reject(t, []string{"SIGNING_TEST_FAILURE=payload-timeout"}, "", "finish", f.state, "payload", "0.1.0")
+			switch variant {
+			case "inherited attempt":
+				f.environment = append(f.environment, "GITHUB_RUN_ATTEMPT=2")
+				f.signingOutcome(t, "payload", "success", "2")
+			case "cleanup failed":
+				f.signingOutcome(t, "payload", "failed", "1")
+			case "cleanup missing":
+				f.environment = append(f.environment, "APPLE_SIGNING_RESULT_FILE=")
+			case "stage not entered":
+				f.step(t, "begin", "payload")
+			}
+			out := filepath.Join(f.root, "public-receipts")
+			if output, err := f.receipts(t, nil, out); err != nil {
+				t.Fatalf("public receipts: %v: %s", err, output)
+			}
+			body, _ := os.ReadFile(filepath.Join(out, "recovery.json"))
+			var record struct{ Reason string }
+			if err := json.Unmarshal(body, &record); err != nil || record.Reason != "none" {
+				t.Fatalf("stale or failed cleanup authorized continuation: %s (%v)", body, err)
+			}
+		})
+	}
+}
+
+func TestAppleExportTicketFailureRetainsFinishedCandidateForContinuation(t *testing.T) {
+	f := receiptFixture(t)
+	f.step(t, "finish", "payload")
+	for _, stage := range []string{"installer", "dmg"} {
+		for _, op := range []string{"prepare", "submit", "finish"} {
+			f.step(t, op, stage)
+		}
+	}
+	f.signingOutcome(t, "dmg", "success", "1")
+	before, err := os.ReadFile(filepath.Join(f.state, "completed/dmg.dmg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.injectTicketFailures(t, "validate", "persistent")
+	f.reject(t, nil, "exhausted 6 attempts", "export", f.state, f.destination, "0.1.0")
+	copy := f
+	copy.script, _ = filepath.Abs("../../scripts/macos-receipts.sh")
+	out := filepath.Join(f.root, "export-receipts")
+	if output, err := copy.run(t, nil, f.state, out, "dmg", "910", strings.Repeat("d", 64)); err != nil {
+		t.Fatalf("export receipts: %v: %s", err, output)
+	}
+	body, _ := os.ReadFile(filepath.Join(out, "recovery.json"))
+	var record struct{ Reason, Phase string }
+	if err := json.Unmarshal(body, &record); err != nil || record.Reason != "ticket-connection-loss" || record.Phase != "finished" {
+		t.Fatalf("export failure lost continuation authority: %s (%v)", body, err)
+	}
+	calls := f.recorded(t)
+	f.command(t, []string{"SIGNING_TEST_TICKET_OUTCOME=valid", "GITHUB_RUN_ATTEMPT=2"}, "export", f.state, f.destination, "0.1.0")
+	after, _ := os.ReadFile(filepath.Join(f.state, "completed/dmg.dmg"))
+	if string(before) != string(after) || strings.Contains(strings.TrimPrefix(f.recorded(t), calls), "rest-create|") {
+		t.Fatal("export continuation changed completed bytes or created an Apple submission")
+	}
 }
 
 func (f resumeFixture) receipts(t *testing.T, extra []string, destination string) (string, error) {

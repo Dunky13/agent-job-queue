@@ -315,7 +315,9 @@ finish_stage() {
       .id == $id and (.status == "In Progress" or .status == "Accepted" or
         .status == "Invalid" or .status == "Rejected")
     ' "$response" >/dev/null 2>&1; then
-      jq '{id, status}' "$response" > "$state/receipts/$stage.status.json"
+      jq --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" \
+        '{id, status} + (if .error == "timeout" then {error:"timeout"} else {} end) + {execution_id:$run,execution_attempt:$attempt}' \
+        "$response" > "$state/receipts/$stage.status.json"
     fi
     # Rejected submissions and Accepted submissions with warnings both carry
     # useful Apple diagnostics. Attempt the log even after a wait timeout.
@@ -393,6 +395,8 @@ finish_stage() {
 
 export_assets() {
   local stage destination=$1 base="Agent-Job-Queue-Installer-$resume_version-universal"
+  rm -f "$state/receipts/dmg.retry"
+  MACOS_TICKET_RECOVERY_FILE="$state/receipts/dmg.retry"
   for stage in payload installer dmg; do
     [[ -f $state/stages/$stage.json && $(json_field "$state/stages/$stage.json" phase) == finished ]] ||
       fail 'All three stages must be Accepted and finished before publishing.'
@@ -424,15 +428,15 @@ case "$command" in
     [[ $# == 3 ]] || fail 'Usage: macos-resume.sh verify-state STATE VERSION'
     state=$2 resume_version=$3
     ;;
-  prepare|submit|finish)
-    [[ $# == 4 ]] || fail 'Usage: macos-resume.sh {prepare|submit|finish} STATE STAGE VERSION'
+  begin|prepare|submit|finish)
+    [[ $# == 4 ]] || fail 'Usage: macos-resume.sh {begin|prepare|submit|finish} STATE STAGE VERSION'
     state=$2 stage=$3 resume_version=$4
     ;;
   export)
     [[ $# == 4 ]] || fail 'Usage: macos-resume.sh export STATE DESTINATION VERSION'
     state=$2 destination=$3 resume_version=$4
     ;;
-  *) fail 'Usage: macos-resume.sh {init|verify-state|prepare|submit|finish|export} ...' ;;
+  *) fail 'Usage: macos-resume.sh {init|verify-state|begin|prepare|submit|finish|export} ...' ;;
 esac
 identity
 state=$(macos_signing_canonical_path "$state")
@@ -461,6 +465,7 @@ else
   verify_state
   case "$command" in
     verify-state) ;;
+    begin) require_stage; rm -f "$state/receipts/$stage.retry" "$state/receipts/$stage.status.json" ;;
     prepare) require_stage; prepare_stage ;;
     submit) require_stage; submit_stage ;;
     finish) require_stage; finish_stage ;;

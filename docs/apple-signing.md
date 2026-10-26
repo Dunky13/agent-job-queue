@@ -306,13 +306,18 @@ and [artifact API](https://docs.github.com/en/rest/actions/artifacts).
 15 minutes. It uses Actions write access to request a same-run failed-job retry;
 it has no Apple secrets or publication permission. A valid GitHub artifact
 digest, exact source/build/execution binding, newest checkpoint, and matching
-UUID/status/logs are required. Only explicit pending provider status or the
+UUID/status/logs are required. Pending status must come from a finite REST wait
+timeout in the current invocation. The outer signing wrapper must separately
+prove that its temporary credentials were cleaned up successfully. Preparation
+clears inherited retry status before accessing credentials. Malformed or
+mismatched later polls cannot retain an earlier pending result. Only explicit pending provider status or the
 classified CloudKit connection-loss failure can retry signing. Rejection,
 missing or ambiguous custody, malformed evidence and acceptance failures stop.
 Delivery-only failures can retry after both architecture acceptance jobs passed.
 The first continuation can run immediately; later attempts wait at least 15
 minutes after completion. Automatic recovery stops at attempt 48 or a candidate
-age of seven days, with exact refusal details in the observer log and summary. The original build lock and UUID are retained through every retry.
+age of seven days, with exact refusal details in the observer log and summary. The original build lock and UUID are retained through every retry. Export-time ticket verification has its
+own final checkpoint and classified continuation while preserving completed bytes.
 
 Build and signing jobs explicitly select Xcode 16.4 (16F6), verify that selection
 before credentials, and retain the actual SDK, Swift, Go, notary client and runner
@@ -327,7 +332,7 @@ CI gate. The protected environment stays main-only without recurring reviewers.
 Publication creates a private draft, binds its entire candidate inventory in the
 draft notes, and uploads without overwriting assets. It verifies exact remote
 inventory, source/tag identity and downloaded bytes before exposure. GitHub
-release immutability must be enabled. The same complete assets are checked again
+release immutability must be enabled and readable immediately before publication. The same complete assets are checked again
 after publication. An existing identical public release is verified read-only;
 a conflicting draft, tag or asset fails closed. Unfinished provider uploads are
 retained for explicit reconciliation. Homebrew delivery remains a separate

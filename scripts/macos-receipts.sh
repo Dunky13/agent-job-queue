@@ -37,13 +37,24 @@ if [[ -f $record ]]; then
   submission=$(jq -r '.submission_id' "$record")
   hash=$(jq -er '.archive_sha256' "$record")
   if [[ $phase == submitted && -f $state/receipts/$stage.status.json ]] &&
-    jq -e --arg id "$submission" 'keys == ["id","status"] and .id == $id and .status == "In Progress"' \
+    jq -e --arg id "$submission" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" '
+      .id == $id and .status == "In Progress" and .error == "timeout" and
+      .execution_id == $run and .execution_attempt == $attempt' \
       "$state/receipts/$stage.status.json" >/dev/null; then
     reason=pending
-  elif [[ $phase == accepted && -f $state/receipts/$stage.retry && ! -L $state/receipts/$stage.retry &&
+  elif [[ ( $phase == accepted || $phase == finished ) && -f $state/receipts/$stage.retry && ! -L $state/receipts/$stage.retry &&
     $(cat "$state/receipts/$stage.retry") == ticket-connection-loss ]]; then
     reason=ticket-connection-loss
   fi
+fi
+# Only the outer credential wrapper can establish successful cleanup. Its
+# current-invocation outcome lives outside the retained state and is never
+# restored from another runner. A preparation/setup failure has no such proof.
+if [[ $reason != none ]]; then
+  if [[ ! -f ${APPLE_SIGNING_RESULT_FILE:-} || -L ${APPLE_SIGNING_RESULT_FILE:-} ]] || ! jq -e \
+    --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg operation "$stage-finish" '
+      .cleanup == "success" and .execution_id == $run and .execution_attempt == $attempt and .operation == $operation
+    ' "$APPLE_SIGNING_RESULT_FILE" >/dev/null; then reason=none; fi
 fi
 # A rejection or log/UUID/hash disagreement always removes retry authority.
 if [[ $reason != none && -f $state/receipts/$stage.log.json ]] && ! jq -e --arg id "$submission" --arg hash "$hash" '

@@ -44,6 +44,13 @@ if [[ $# == 0 ]]; then
   printf '%s\n' 'Usage: with-apple-signing.sh command [arguments...]' >&2
   exit 1
 fi
+if [[ -n ${APPLE_SIGNING_RESULT_FILE:-} ]]; then
+  [[ $APPLE_SIGNING_RESULT_FILE == /* && ! -e $APPLE_SIGNING_RESULT_FILE && ! -L $APPLE_SIGNING_RESULT_FILE &&
+    -d $(dirname "$APPLE_SIGNING_RESULT_FILE") && ${APPLE_SIGNING_OPERATION:-} =~ ^(payload|installer|dmg)-finish$ ]] || {
+    printf '%s\n' 'A fresh external signing outcome path and fixed operation are required.' >&2
+    exit 1
+  }
+fi
 # shellcheck source=scripts/macos-keychain-search.sh
 source "$(dirname -- "$0")/macos-keychain-search.sh"
 for variable in APPLE_DEVELOPER_ID_P12_BASE64 APPLE_DEVELOPER_ID_P12_PASSWORD \
@@ -159,21 +166,35 @@ keychain=
 keychain_created=0
 child_pid=
 cleanup() {
-  local status=$1
+  local status=$1 command_status=$1 cleanup_status=success receipt
   trap - EXIT
   trap '' INT TERM
   if ! macos_keychain_search_restore; then
     status=1
+    cleanup_status=failed
   fi
   if [[ -n $keychain ]] && [[ $keychain_created == 1 || -e $keychain ]]; then
     if ! security delete-keychain "$keychain" >/dev/null 2>&1; then
       printf '%s\n' 'Could not delete the temporary Apple signing keychain.' >&2
       status=1
+      cleanup_status=failed
     fi
   fi
   if [[ -n $work ]] && ! rm -rf -- "$work"; then
     printf '%s\n' 'Could not remove temporary Apple signing credentials.' >&2
     status=1
+    cleanup_status=failed
+  fi
+  if [[ -n ${APPLE_SIGNING_RESULT_FILE:-} ]]; then
+    receipt=$(mktemp "$(dirname "$APPLE_SIGNING_RESULT_FILE")/.apple-outcome.XXXXXX") || exit 1
+    if ! jq -n --arg cleanup "$cleanup_status" --arg operation "$APPLE_SIGNING_OPERATION" \
+      --arg run "${GITHUB_RUN_ID:-}" --arg attempt "${GITHUB_RUN_ATTEMPT:-}" --argjson command_status "$command_status" \
+      '{cleanup:$cleanup,operation:$operation,execution_id:$run,execution_attempt:$attempt,command_status:$command_status}' > "$receipt" ||
+      ! ln "$receipt" "$APPLE_SIGNING_RESULT_FILE"; then
+      rm -f "$receipt"
+      exit 1
+    fi
+    rm -f "$receipt" || exit 1
   fi
   exit "$status"
 }

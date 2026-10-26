@@ -31,6 +31,9 @@ done
 cd "$PUBLISH_TEST_ROOT"
 printf '%s %s\n' "$method" "$endpoint" >> calls
 case "$method $endpoint" in
+  'GET repos/owner/project/immutable-releases')
+    [ "${PUBLISH_FAIL:-}" != 'policy unreadable' ] || exit 91
+    if [ "${PUBLISH_FAIL:-}" = 'policy disabled' ]; then printf '{"enabled":false}'; else printf '{"enabled":true}'; fi;;
   'GET repos/owner/project/releases?per_page=100')
     [ "$pagination" = ' --paginate --slurp' ] || exit 99
     [ "${PUBLISH_FAIL:-}" != list ] || exit 91
@@ -238,7 +241,7 @@ func TestDistributionPublishResumesInterruptedDraft(t *testing.T) {
 }
 
 func TestDistributionPublishRejectsCorruptionAndProviderAmbiguity(t *testing.T) {
-	for _, failure := range []string{"list", "malformed list", "tag", "tag ambiguous", "inventory", "read", "download", "corrupt", "malformed upload", "target changes", "inventory changes"} {
+	for _, failure := range []string{"list", "malformed list", "tag", "tag ambiguous", "inventory", "read", "download", "corrupt", "malformed upload", "target changes", "inventory changes", "policy disabled", "policy unreadable"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newPublishFixture(t)
 			f.publish(t, failure, false)

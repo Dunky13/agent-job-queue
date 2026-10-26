@@ -25,6 +25,11 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Start this stage invocation without inherited retry authority
+      shell: bash
+      env:
+        STAGE: ${{ inputs.stage }}
+      run: scripts/macos-resume.sh begin notarization-state "$STAGE" "$BUILD_VERSION"
     - name: Prepare exact signed archive
       id: prepare
       shell: bash
@@ -96,6 +101,8 @@ runs:
         APPLE_DEVELOPER_ID_P12_BASE64: ${{ inputs.certificate }}
         APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ inputs.certificate-password }}
         APPLE_NOTARY_KEY_P8: ${{ inputs.notary-key }}
+        APPLE_SIGNING_RESULT_FILE: ${{ runner.temp }}/apple-finish-${{ inputs.stage }}.json
+        APPLE_SIGNING_OPERATION: ${{ inputs.stage }}-finish
       run: scripts/with-apple-signing.sh scripts/macos-resume.sh finish notarization-state "$STAGE" "$BUILD_VERSION"
     - name: Snapshot latest state after the stage attempt
       id: finished-snapshot
@@ -120,6 +127,7 @@ runs:
         STAGE: ${{ inputs.stage }}
         CHECKPOINT_ID: ${{ steps.finished-upload.outputs.artifact-id }}
         CHECKPOINT_DIGEST: ${{ steps.finished-upload.outputs.artifact-digest }}
+        APPLE_SIGNING_RESULT_FILE: ${{ runner.temp }}/apple-finish-${{ inputs.stage }}.json
       run: scripts/macos-receipts.sh notarization-state "$RUNNER_TEMP/receipts-$STAGE-finished" "$STAGE" "$CHECKPOINT_ID" "$CHECKPOINT_DIGEST"
     - name: Retain small public stage receipts and diagnostics
       if: always() && steps.finished-upload.outcome == 'success'

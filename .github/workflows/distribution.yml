@@ -187,7 +187,36 @@ jobs:
           certificate-password: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
           notary-key: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
       - name: Export only completed notarized assets
+        id: export
         run: scripts/macos-resume.sh export notarization-state dist "$BUILD_VERSION"
+      - name: Snapshot final candidate after export verification
+        id: export-snapshot
+        if: always() && steps.export.outcome != 'skipped'
+        run: scripts/macos-checkpoint.sh snapshot notarization-state "$RUNNER_TEMP/checkpoint-export"
+      - name: Persist final candidate after export verification
+        id: export-upload
+        if: always() && steps.export-snapshot.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Apple-notarization-b${{ needs.source.outputs.run_id }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s10
+          path: ${{ runner.temp }}/checkpoint-export/*
+          if-no-files-found: error
+          retention-days: 90
+      - name: Select final candidate receipts and export continuation
+        if: always() && steps.export-upload.outcome == 'success'
+        env:
+          CHECKPOINT_ID: ${{ steps.export-upload.outputs.artifact-id }}
+          CHECKPOINT_DIGEST: ${{ steps.export-upload.outputs.artifact-digest }}
+          APPLE_SIGNING_RESULT_FILE: ${{ runner.temp }}/apple-finish-dmg.json
+        run: scripts/macos-receipts.sh notarization-state "$RUNNER_TEMP/receipts-export" dmg "$CHECKPOINT_ID" "$CHECKPOINT_DIGEST"
+      - name: Retain final candidate public receipts and diagnostics
+        if: always() && steps.export-upload.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Apple-receipts-b${{ needs.source.outputs.run_id }}-r${{ github.run_id }}-a${{ github.run_attempt }}-s10
+          path: ${{ runner.temp }}/receipts-export/*
+          if-no-files-found: error
+          retention-days: 90
       - name: Generate final immutable manifest and Homebrew cask
         run: |
           "$QUEUE_NOTARY_TOOL" render-cask \

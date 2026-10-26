@@ -94,7 +94,7 @@ func distributionRecoveryCandidate(f checkpointFixture, id, build int) *distribu
 		"metadata.json": map[string]any{"schema": 2, "repository": "owner/project", "source_sha": checkpointSHA, "run_id": fmt.Sprint(build), "run_number": "45",
 			"build_attempt": "1", "artifact_id": "800", "artifact_digest": r.recovery["build_artifact_digest"], "version": "0.1.0", "team": "ABCDEFGHIJ", "initial_sha256": strings.Repeat("f", 64)},
 		"stage-payload.json":  map[string]any{"stage": "payload", "phase": "submitted", "prepared_run_id": fmt.Sprint(id), "prepared_attempt": "2", "submission_id": r.recovery["submission_id"], "archive_sha256": r.recovery["archive_sha256"], "completed_sha256": ""},
-		"status-payload.json": map[string]any{"id": r.recovery["submission_id"], "status": "In Progress"},
+		"status-payload.json": map[string]any{"id": r.recovery["submission_id"], "status": "In Progress", "error": "timeout", "execution_id": fmt.Sprint(id), "execution_attempt": "2"},
 	}
 	r.artifacts = []map[string]any{
 		{"id": 900, "name": fmt.Sprintf("Apple-notarization-b%d-r%d-a2-s03", build, id), "expired": false, "digest": r.recovery["checkpoint_digest"], "workflow_run": provenance(id, sha)},
@@ -549,19 +549,20 @@ func TestDistributionRecoveryTicketAndDeliveryOnlyRetries(t *testing.T) {
 
 func TestDistributionRecoveryPermitsFinalBoundedAttempt(t *testing.T) {
 	f := newDistributionRecoveryFixture(t)
-	f.execution["run_attempt"] = 5
-	f.recovery["execution_attempt"] = "5"
-	f.document("stage-payload.json")["prepared_attempt"] = "5"
+	f.execution["run_attempt"] = 47
+	f.recovery["execution_attempt"] = "47"
+	f.document("stage-payload.json")["prepared_attempt"] = "47"
+	f.document("status-payload.json")["execution_attempt"] = "47"
 	for _, job := range f.jobs {
 		if job["run_attempt"] == 2 {
-			job["run_attempt"] = 5
+			job["run_attempt"] = 47
 		}
 	}
 	for _, artifact := range f.artifacts {
-		artifact["name"] = strings.ReplaceAll(artifact["name"].(string), "-a2-", "-a5-")
+		artifact["name"] = strings.ReplaceAll(artifact["name"].(string), "-a2-", "-a47-")
 	}
 	output, err := f.observe(t)
-	if err != nil || !strings.Contains(output, "next_attempt=6") {
+	if err != nil || !strings.Contains(output, "next_attempt=48") {
 		t.Fatalf("last permitted continuation: %v: %s", err, output)
 	}
 	f.assertMutations(t, 1)
