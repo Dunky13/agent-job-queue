@@ -93,6 +93,19 @@ jobs:
           cache: true
       - name: Go unit, ownership, SQLite, real daemon, HTTPS, and installer regressions
         run: go test -p 2 -parallel 2 -race ./cmd/... ./internal/... ./packaging/homebrew ./remote/static -timeout 12m
+
+  native-tests:
+    name: Native tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Native regression tests
         run: bash scripts/test-native.sh
 
@@ -164,7 +177,7 @@ jobs:
 
   ci-required:
     name: ci-required
-    needs: [commit-policy, lint, vulnerability-check, macos-tests, web-tests, installer]
+    needs: [commit-policy, lint, vulnerability-check, macos-tests, native-tests, web-tests, installer]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
