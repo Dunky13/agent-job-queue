@@ -39,9 +39,16 @@ func TestNotarizedHomebrew(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture, home, environment, owner := notarizedCaskFixture(t, team)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	t.Cleanup(cancel)
-	run := func(name string, args ...string) []byte {
+	parent := context.Background()
+	if deadline, ok := t.Deadline(); ok {
+		// Leave command owners time to reap children before Go's suite timeout.
+		var cancel context.CancelFunc
+		parent, cancel = context.WithDeadline(parent, deadline.Add(-10*time.Second))
+		t.Cleanup(cancel)
+	}
+	verificationCtx, cancelVerification := context.WithTimeout(parent, 2*time.Minute)
+	t.Cleanup(cancelVerification)
+	run := func(ctx context.Context, name string, args ...string) []byte {
 		t.Helper()
 		command, err := owner.start(ctx, environment, nil, name, args...)
 		if err != nil {
@@ -59,15 +66,15 @@ func TestNotarizedHomebrew(t *testing.T) {
 	if filepath.Join(installer, "Contents/Resources/payload") != payload {
 		t.Fatal("payload must come from the extracted final installer bundle")
 	}
-	run("/bin/bash", "../../scripts/macos-signing.sh", "verify-installer", installer, team)
+	run(verificationCtx, "/bin/bash", "../../scripts/macos-signing.sh", "verify-installer", installer, team)
 	executable := filepath.Join(payload, "source/bin/agent-heavy")
 	// Apple recommends codesign's notarized requirement for non-app code;
 	// spctl's execute assessment is intended for top-level application bundles.
 	requirement := fmt.Sprintf("=anchor apple generic and certificate leaf[subject.OU] = \"%s\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and notarized", team)
-	run("/usr/bin/codesign", "--verify", "--strict", "--all-architectures", "--check-notarization", "--test-requirement", requirement, executable)
+	run(verificationCtx, "/usr/bin/codesign", "--verify", "--strict", "--all-architectures", "--check-notarization", "--test-requirement", requirement, executable)
 	// A payload-only copy creates an incomplete enclosing .app. Gatekeeper can
 	// hold its nested executable before Go main, even when that binary is trusted.
-	run("/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", installer, filepath.Join(fixture, "Agent Job Queue Installer.app"))
+	run(verificationCtx, "/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", installer, filepath.Join(fixture, "Agent Job Queue Installer.app"))
 	metadata, err := os.ReadFile(filepath.Join(payload, "source/build-info.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -77,6 +84,11 @@ func TestNotarizedHomebrew(t *testing.T) {
 		t.Fatal(err)
 	}
 	cask := notarizedFixtureCask(t, fixture, identity.Version)
+	cancelVerification()
+	// Trust verification has its own deadline. Its duration must not consume
+	// the installation phase's reserved Homebrew command and cleanup budget.
+	ctx, cancel := context.WithTimeout(parent, 2*time.Minute)
+	t.Cleanup(cancel)
 	log, err := os.Create(filepath.Join(fixture, "daemon.log"))
 	if err != nil {
 		t.Fatal(err)
@@ -115,7 +127,7 @@ func TestNotarizedHomebrew(t *testing.T) {
 	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) < 75*time.Second {
 		t.Fatal("insufficient remaining time for the bounded Homebrew command owner")
 	}
-	output := run(brew, "ruby", "--", "../../packaging/homebrew/test-cask.rb", cask, fixture, "--quarantined-runtime")
+	output := run(ctx, brew, "ruby", "--", "../../packaging/homebrew/test-cask.rb", cask, fixture, "--quarantined-runtime")
 	var result struct {
 		AppInstalled bool           `json:"fixture_app_installed"`
 		Executed     bool           `json:"fixture_installer_executed"`
@@ -145,7 +157,7 @@ func TestNotarizedHomebrew(t *testing.T) {
 	// Ruby previously rehydrated these fixture-only settings. The native launch
 	// request now runs separately, so explicitly keep every service command on
 	// the private launchctl stub rather than the operator's login services.
-	run("/usr/bin/env", "AGENT_QUEUE_INSTALL_TEST_MODE=1", "AGENT_QUEUE_INSTALL_TEST_TOOLS="+filepath.Join(fixture, "tools"),
+	run(ctx, "/usr/bin/env", "AGENT_QUEUE_INSTALL_TEST_MODE=1", "AGENT_QUEUE_INSTALL_TEST_TOOLS="+filepath.Join(fixture, "tools"),
 		filepath.Join(app, "Contents/Resources/payload/source/bin/agent-heavy"), "install", "--app-bundle", app)
 	installed, err := os.ReadFile(filepath.Join(home, ".local/share/agent-heavy/build-info.json"))
 	if err != nil {
@@ -163,7 +175,7 @@ func TestNotarizedHomebrew(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, ".local/share/agent-heavy/install-in-progress.json")); !os.IsNotExist(err) {
 		t.Fatal("real installation did not finish its transaction")
 	}
-	run(filepath.Join(home, ".local/share/agent-heavy/bin/agent-heavy"), "status", "--json")
+	run(ctx, filepath.Join(home, ".local/share/agent-heavy/bin/agent-heavy"), "status", "--json")
 	select {
 	case <-daemon.done:
 		t.Fatalf("installation stopped the private daemon: %v", daemon.waitErr)
@@ -416,6 +428,34 @@ func notarizedFixtureCask(t *testing.T, fixture, version string) string {
 	return path
 }
 
+// PR CI has no signed payload, but must still exercise the service fixture
+// protocol used by the real installer's fail-closed ownership checks.
+func TestNotarizedHomebrewServiceFixture(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("installer service fixture requires macOS")
+	}
+	fixture, _, environment, owner := notarizedCaskFixture(t, "AAAAAAAAAA")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-remote"} {
+		t.Run(label, func(t *testing.T) {
+			command, err := owner.start(ctx, environment, nil, filepath.Join(fixture, "tools/launchctl"), "print", fmt.Sprintf("gui/%d/%s", os.Getuid(), label))
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, err := command.wait()
+			var exited *exec.ExitError
+			if !errors.As(err, &exited) || exited.ExitCode() != 113 {
+				t.Fatalf("missing service must return launchctl exit 113: %v\n%s", err, output)
+			}
+			expected := fmt.Sprintf("Bad request.\nCould not find service \"%s\" in domain for user gui: %d\n", label, os.Getuid())
+			if string(output) != expected {
+				t.Fatalf("missing service must provide exact ownership evidence: %q", output)
+			}
+		})
+	}
+}
+
 func notarizedCaskFixture(t *testing.T, team string) (string, string, []string, *notarizedCommandOwner) {
 	t.Helper()
 	// Keep Darwin's Unix socket path below 104 bytes, including the spaced HOME.
@@ -453,12 +493,14 @@ func notarizedCaskFixture(t *testing.T, team string) (string, string, []string, 
 set -eu
 printf '%%s\n' "$*" >> "$TEST_CALLS"
 case "$*" in
-  'print %[1]s/io.went.agent-heavy'|'print %[1]s/io.went.agent-resources'|'print %[1]s/io.went.agent-remote') exit 1 ;;
+  'print %[1]s/io.went.agent-heavy'|'print %[1]s/io.went.agent-resources'|'print %[1]s/io.went.agent-remote')
+    printf 'Bad request.\nCould not find service "%%s" in domain for user gui: %[2]d\n' "${2##*/}" >&2
+    exit 113 ;;
   "bootstrap %[1]s $HOME/Library/LaunchAgents/io.went.agent-heavy.plist"|"bootstrap %[1]s $HOME/Library/LaunchAgents/io.went.agent-resources.plist"|'kickstart -k %[1]s/io.went.agent-resources') exit 0 ;;
 esac
 printf 'UNEXPECTED %%s\n' "$*" >> "$TEST_CALLS"
 exit 97
-`, domain)
+`, domain, os.Getuid())
 	if err := os.WriteFile(filepath.Join(tools, "launchctl"), []byte(stub), 0700); err != nil {
 		t.Fatal(err)
 	}
