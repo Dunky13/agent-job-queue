@@ -29,8 +29,13 @@ type installer struct {
 	serviceSlot                                           string
 	testing                                               bool
 	appBundle                                             bool
+	disablePhoneAccess                                    bool
 	command                                               func(context.Context, []string) ([]byte, error)
 }
+
+var errInstallLegacyPhoneAccess = errors.New("Phone access from the previous installation must be disabled before setup can continue. Credentials and configuration will be preserved")
+
+const installDisablePhoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
 
 var installLegacyFiles = []string{"agent_heavy.py", "agent_integration.py", "resource_monitor.py", "job_profiles.py", "resource_scheduler.py", "learning_control.py", "app_updates.py", "release_metadata.py", "install-remote.sh", "scripts/migrate-installation.py", "remote/control.py", "remote/server.py", "remote/requirements.txt", "remote/requirements.lock"}
 var installLegacyDirectories = []string{".venv", "__pycache__", "remote/__pycache__", "remote/static"}
@@ -134,6 +139,16 @@ func (install *installer) commandEnvironment(args []string) []string {
 	environment := envMap()
 	environment["PATH"] = install.path
 	environment["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+	if slices.Equal(args, []string{filepath.Join(install.payload, "source/bin/agent-remote"), "disable"}) {
+		// Recovery targets this installation, including when launched from a
+		// developer shell with private remote-controller fixture overrides.
+		for key := range environment {
+			if strings.HasPrefix(key, "AGENT_REMOTE_") || strings.HasPrefix(key, "AGENT_HEAVY_") || strings.HasPrefix(key, "PUEUE_") {
+				delete(environment, key)
+			}
+		}
+		environment["HOME"] = install.home
+	}
 	if slices.Equal(args, []string{filepath.Join(install.root, "bin/agent-heavy"), "status", "--json"}) {
 		// Installation always targets this user's installed state. An ambient
 		// developer queue override must never establish readiness for that target.
@@ -1110,11 +1125,11 @@ func (install *installer) pythonMigration(ctx context.Context, node *yaml.Node) 
 			return false, errors.New("Cannot safely inspect remote access configuration")
 		}
 		if enabled {
-			return false, errors.New("Disable phone access in the existing app before migrating from Python. Its credentials and configuration will be preserved")
+			return false, errInstallLegacyPhoneAccess
 		}
 	}
 	if install.loaded(ctx, "io.went.agent-remote") {
-		return false, errors.New("Stop the existing phone access service before migrating from Python; its credentials will be preserved")
+		return false, errInstallLegacyPhoneAccess
 	}
 	loaded := install.loaded(ctx, "io.went.agent-heavy")
 	if loaded {
@@ -1705,6 +1720,18 @@ func (install *installer) execute(ctx context.Context) error {
 	}
 	slot := install.serviceSlot
 	migration, err := install.pythonMigration(ctx, node)
+	if errors.Is(err, errInstallLegacyPhoneAccess) && install.disablePhoneAccess {
+		if err := install.validateRetirement(); err != nil {
+			return err
+		}
+		// The bundled controller understands legacy process ownership. Never
+		// execute the old Python runtime or edit its enabled flag ourselves.
+		// Run before taking control.lock, which the controller acquires itself.
+		if _, err := install.run(ctx, filepath.Join(install.payload, "source/bin/agent-remote"), "disable"); err != nil {
+			return fmt.Errorf("Phone access could not be disabled; setup has not continued: %w", err)
+		}
+		migration, err = install.pythonMigration(ctx, node)
+	}
 	if err != nil {
 		return err
 	}
@@ -1878,8 +1905,13 @@ func (install *installer) execute(ctx context.Context) error {
 }
 
 func InstallMain(args []string) int {
+	disablePhoneAccess := false
+	if len(args) == 3 && args[2] == "--disable-phone-access" {
+		disablePhoneAccess = true
+		args = args[:2]
+	}
 	if len(args) != 2 || (args[0] != "--payload" && args[0] != "--app-bundle") || !filepath.IsAbs(args[1]) {
-		fmt.Fprintln(os.Stderr, "Usage: agent-heavy install --payload DIRECTORY | --app-bundle ABSOLUTE_APP_PATH")
+		fmt.Fprintln(os.Stderr, "Usage: agent-heavy install --payload DIRECTORY | --app-bundle ABSOLUTE_APP_PATH [--disable-phone-access]")
 		return 2
 	}
 	home, err := os.UserHomeDir()
@@ -1897,7 +1929,7 @@ func InstallMain(args []string) int {
 		}
 		path = tools + string(os.PathListSeparator) + path
 	}
-	install := &installer{home: home, payload: args[1], root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: filepath.Join(home, "Applications/Agent Queue.app"), path: path, testing: testing}
+	install := &installer{home: home, payload: args[1], root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: filepath.Join(home, "Applications/Agent Queue.app"), path: path, testing: testing, disablePhoneAccess: disablePhoneAccess}
 	if args[0] == "--app-bundle" {
 		install.appBundle = true
 		install.app = args[1]
@@ -1907,6 +1939,9 @@ func InstallMain(args []string) int {
 	defer cancel()
 	if err := install.execute(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "Agent Queue installer: %v\n", err)
+		if errors.Is(err, errInstallLegacyPhoneAccess) {
+			fmt.Fprintln(os.Stderr, installDisablePhoneAccessRecovery)
+		}
 		return 1
 	}
 	fmt.Println("Installed Agent Queue. Your queue is private; manage optional phone access in settings.")

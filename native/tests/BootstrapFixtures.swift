@@ -88,17 +88,29 @@ struct BootstrapFixtureIdentity: Encodable {
 
 actor BootstrapExecutorFixture {
     let fixture: BootstrapFixture
+    let phoneAccessBlocker: Bool
     private(set) var requests: [QueueBootstrapRequest] = []
     private var held: CheckedContinuation<Void, Never>?
     private var releases = 0
 
-    init(_ fixture: BootstrapFixture) { self.fixture = fixture }
+    init(_ fixture: BootstrapFixture, phoneAccessBlocker: Bool = false) {
+        self.fixture = fixture
+        self.phoneAccessBlocker = phoneAccessBlocker
+    }
 
     func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) async throws -> Data {
         requests.append(request)
         output(Data("Preparing private fixture services…".utf8))
         await withCheckedContinuation { held = $0 }
-        if releases == 1 { throw ClientError.message("Fixture service could not start. Correct the issue, then Retry.") }
+        if releases == 1 {
+            if phoneAccessBlocker {
+                throw ClientError.message("Agent Queue installer: Phone access from the previous installation must be disabled before setup can continue. Credentials and configuration will be preserved\nAGENT_QUEUE_SETUP_RECOVERY:disable-phone-access\n")
+            }
+            throw ClientError.message("Fixture service could not start. Correct the issue, then Retry.")
+        }
+        if phoneAccessBlocker && !request.arguments.contains("--disable-phone-access") {
+            throw ClientError.message("Fixture recovery did not request disabling phone access.")
+        }
         try fixture.install()
         return Data("Fixture setup complete.".utf8)
     }
