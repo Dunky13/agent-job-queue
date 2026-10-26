@@ -388,25 +388,24 @@ const caskTemplate = `cask "agent-job-queue" do
 
   # Preserve quarantine so macOS can assess the notarized release.
 
-  payload = "#{staged_path}/Agent Job Queue Installer.app/Contents/Resources/payload"
-  installer script: {
-    executable: "#{payload}/source/bin/agent-heavy",
-    args:       ["install", "--payload", payload],
-    sudo:       false,
-  }
+  application = "#{Dir.home}/Applications/Agent Queue.app"
+  app "Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app", target: application
 
   # Stable per-user wrappers survive staged cask cleanup and future upgrades.
   binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/links/agent-heavy"
   binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/links/agent-remote"
 
+  # The app artifact owns app removal and upgrade rollback.
   uninstall quit: "io.went.agent-queue",
-            delete: [
-              "#{Dir.home}/Applications/Agent Queue.app",
-              "#{Dir.home}/Library/LaunchAgents/io.went.agent-queue.plist",
-            ]
+            script: {
+              executable: "/bin/rm",
+              args: ["-f", "--", "#{Dir.home}/Library/LaunchAgents/io.went.agent-queue.plist"],
+              sudo: false,
+            }
 
   caveats <<~EOS
-    Installs and opens Agent Queue for this account without Python, uv, or a Go toolchain.
+    Installs Agent Queue for this account without Python, uv, or a Go toolchain.
+    Open Agent Queue to finish setup. Command-line tools are ready after setup completes.
     Release installer and app are Developer ID signed and notarized.
     Quarantine is retained. Phone access is off until enabled.
     Uninstall preserves the independent queue, jobs, credentials and remote access.

@@ -315,8 +315,8 @@ func TestRenderedCaskRetainsQuarantine(t *testing.T) {
 			t.Fatalf("rendered cask contains quarantine bypass: %s", unsafe)
 		}
 	}
-	if !strings.Contains(cask, `executable: "#{payload}/source/bin/agent-heavy"`) || !strings.Contains(cask, `args:       ["install", "--payload", payload]`) {
-		t.Fatal("rendered cask must enter through the signed Go installer")
+	if !strings.Contains(cask, `app "Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app", target: application`) || !strings.Contains(cask, "Open Agent Queue to finish setup") || strings.Contains(cask, "installer script:") || strings.Contains(cask, "postflight") || strings.Contains(cask, `"--payload"`) {
+		t.Fatal("rendered cask must install the Homebrew-managed app and defer setup to its native first launch")
 	}
 	if !strings.Contains(cask, "Developer ID signed and notarized") || !strings.Contains(cask, "Quarantine is retained") {
 		t.Fatal("rendered cask is missing notarized release provenance")

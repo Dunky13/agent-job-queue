@@ -31,7 +31,7 @@ On macOS 15 or later, install the app and CLI through the project's [Homebrew ta
 brew install --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
-Homebrew sets up your private queue and opens the menu-bar app. Both `agent-heavy` and `agent-remote` are linked into Homebrew's bin directory. No Xcode or manual installer window is needed.
+Homebrew installs the menu-bar app in your account's Applications folder and links `agent-heavy` and `agent-remote` into its bin directory. Open Agent Queue to complete its private queue setup; the command-line tools are ready once setup finishes. The app shows progress and lets you retry if setup fails. No Xcode or manual installer window is needed.
 
 New releases produced by the notarized release pipeline use Developer ID signatures and Apple notarization. Their Homebrew cask verifies the download's SHA-256 and retains quarantine for macOS assessment. It does not bypass Gatekeeper. Older published builds remain ad hoc signed; their historical casks are preserved until a newer release replaces them. See [Apple signing and notarization](docs/apple-signing.md) for the release requirements and verification limits.
 

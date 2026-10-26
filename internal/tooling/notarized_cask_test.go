@@ -117,12 +117,13 @@ func TestNotarizedHomebrew(t *testing.T) {
 	}
 	output := run(brew, "ruby", "--", "../../packaging/homebrew/test-cask.rb", cask, fixture, "--quarantined-runtime")
 	var result struct {
-		Executed bool           `json:"fixture_installer_executed"`
-		Attrs    map[string]int `json:"fixture_attributes"`
+		AppInstalled bool           `json:"fixture_app_installed"`
+		Executed     bool           `json:"fixture_installer_executed"`
+		Attrs        map[string]int `json:"fixture_attributes"`
 	}
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &result); err != nil || !result.Executed {
-		t.Fatalf("real cask installer did not complete: %v\n%s", err, output)
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &result); err != nil || !result.AppInstalled || result.Executed {
+		t.Fatalf("real cask did not relocate the app without running setup: %v\n%s", err, output)
 	}
 	if result.Attrs["entries"] == 0 || len(result.Attrs) != 5 {
 		t.Fatalf("missing staged attribute evidence: %v", result.Attrs)
@@ -132,6 +133,20 @@ func TestNotarizedHomebrew(t *testing.T) {
 			t.Fatalf("staged %s was not retained: %v", name, result.Attrs)
 		}
 	}
+	// Homebrew installs the app artifact without running setup in its restricted
+	// install-hook sandbox. First launch invokes this exact signed helper request
+	// through QueueBootstrapEnvironment and presents any failure with Retry.
+	// Exercise that request directly in the private home, without opening a menu
+	// app in the operator's graphical session.
+	app := filepath.Join(home, "Applications/Agent Queue.app")
+	if _, err := os.Stat(filepath.Join(home, ".local/share/agent-heavy/build-info.json")); !os.IsNotExist(err) {
+		t.Fatal("cask unexpectedly initialized the private backend")
+	}
+	// Ruby previously rehydrated these fixture-only settings. The native launch
+	// request now runs separately, so explicitly keep every service command on
+	// the private launchctl stub rather than the operator's login services.
+	run("/usr/bin/env", "AGENT_QUEUE_INSTALL_TEST_MODE=1", "AGENT_QUEUE_INSTALL_TEST_TOOLS="+filepath.Join(fixture, "tools"),
+		filepath.Join(app, "Contents/Resources/payload/source/bin/agent-heavy"), "install", "--app-bundle", app)
 	installed, err := os.ReadFile(filepath.Join(home, ".local/share/agent-heavy/build-info.json"))
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +173,7 @@ func TestNotarizedHomebrew(t *testing.T) {
 	if err != nil || strings.Contains(string(calls), "UNEXPECTED") || !strings.Contains(string(calls), "bootstrap") {
 		t.Fatalf("private launchctl boundary was not exercised safely: %v\n%s", err, calls)
 	}
-	t.Logf("Real quarantined cask install completed; %d staged entries retain both attributes and the private daemon remains healthy", result.Attrs["entries"])
+	t.Logf("Real quarantined app relocation and signed first-launch setup completed; %d entries retain both attributes and the private daemon remains healthy", result.Attrs["entries"])
 }
 
 func TestNotarizedHomebrewRejectsUnsignedPayload(t *testing.T) {

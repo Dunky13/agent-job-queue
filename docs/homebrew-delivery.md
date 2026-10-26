@@ -14,6 +14,18 @@ Refresh jobs serialize separately from PR validation. A 15-minute schedule and m
 
 When trusted templates change before a new app release, the tap retains a cask that matches its own historical public artifact, checked only as bounded data. It reports that the template change awaits a newer release. The next numbered build uses the updated trusted template. This preserves provenance across repeated tooling changes without rewriting a cask at the same build number.
 
+## App installation and upgrade recovery
+
+The cask declares the embedded menu app as a Homebrew `app` artifact, targeting the current account's Applications directory, and links the stable command wrappers. It does not run setup or open the app from an installation hook. Open Agent Queue after installation to finish setup; command-line tools become ready after setup completes. The app's existing first-launch flow runs its signed embedded controller with `install --app-bundle` and presents a Retry action if setup fails. Setup reads the installed app's payload rather than the shared Caskroom path. Apple Silicon, Intel, and custom Homebrew prefixes follow the same path without changing Homebrew directory permissions.
+
+Payload ownership, symlink rejection, private-state permissions, quarantine, signatures, and process ownership checks remain enforced. Homebrew owns app movement and backup; the controller owns private backend setup. Stable command wrappers continue to point to the private backend.
+
+For upgrades between these managed-app casks, Homebrew can restore the preceding app when installing later artifacts fails. Backend setup happens after the cask installation, so a first-launch failure keeps the newer app available for Retry. Preserve incomplete installation markers and retry the intended newer release after resolving its reported error. Uninstall removes the managed app and its login entry without elevation while retaining the independent queue and private state.
+
+Homebrew's modern install-hook sandbox blocks private Unix-socket access and app launching. Even a signed setup helper with declared network and product-directory access cannot complete daemon readiness there. The cask therefore uses normal app installation and the app's own setup flow instead of weakening that sandbox.
+
+The first upgrade from an older script-installer cask still executes that installed cask's deletion rules. Its rollback metadata does not describe an app artifact, so the new cask cannot guarantee restoration of the old app on that transition. Do not report this legacy transition as covered by managed-app rollback. Existing releases and casks remain immutable; merge the companion tap tooling before the source repair and publish a new validated numbered release.
+
 ## One-time GitHub App setup
 
 Complete this before merging the source workflow change. The companion tap tooling PR must also merge first. App creation and installation require the repository owner's GitHub session.
