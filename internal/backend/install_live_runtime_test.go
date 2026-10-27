@@ -109,15 +109,15 @@ func testInstallerManagedLiveUpgrade(t *testing.T, failure string) {
 	}
 	cli := filepath.Join(i.app, "Contents/MacOS/agent-heavy")
 	environment := i.commandEnvironment([]string{cli, "status", "--json"})
-	gate := i.liveGate(ctx)
-	if _, err := gate.QueueControl("limit", Object{"limit": 2}); err != nil {
+	initialControl := i.liveGate(ctx)
+	if _, err := initialControl.QueueControl("limit", Object{"limit": 2}); err != nil {
 		t.Fatal(err)
 	}
 	started, release, runs := filepath.Join(i.home, "started"), filepath.Join(i.home, "release"), filepath.Join(i.home, "attempts")
 	var blockerDone chan error
 	blockerRelease := filepath.Join(i.home, "blocker-release")
 	if queued {
-		if _, err := gate.QueueControl("limit", Object{"limit": 1}); err != nil {
+		if _, err := i.liveControl(ctx, "limit", Object{"limit": 1}); err != nil {
 			t.Fatal(err)
 		}
 		blockerStarted := filepath.Join(i.home, "blocker-started")
@@ -160,10 +160,10 @@ func testInstallerManagedLiveUpgrade(t *testing.T, failure string) {
 	})
 	if queued {
 		fixtureUntil(t, 8*time.Second, func() bool {
-			value, err := gate.Snapshot()
+			value, err := i.liveControl(ctx, "snapshot", nil)
 			return err == nil && len(obj(value["tasks"])) == 2
 		})
-		if _, err := gate.QueueControl("pause", nil); err != nil {
+		if _, err := i.liveControl(ctx, "pause", nil); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(blockerRelease, nil, 0600); err != nil {
@@ -223,10 +223,17 @@ func testInstallerManagedLiveUpgrade(t *testing.T, failure string) {
 		if _, err := os.Stat(started); !os.IsNotExist(err) {
 			t.Fatal("handover resumed a deliberately paused queue", err)
 		}
-		if _, err := gate.QueueControl("resume", nil); err != nil {
+		// An RPC budget belongs to one operation, not the entire upgrade.
+		// Expire the earlier client deterministically so a fast local run also
+		// covers the stale-client failure seen on slower hosted runners.
+		initialControl.ControlDeadline = time.Now().Add(-time.Second)
+		if _, err := initialControl.QueueControl("snapshot", nil); err == nil || err.Error() != "Queue control deadline expired" {
+			t.Fatal("expired initial control unexpectedly remained usable", err)
+		}
+		if _, err := i.liveControl(ctx, "resume", nil); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := gate.QueueControl("limit", Object{"limit": 2}); err != nil {
+		if _, err := i.liveControl(ctx, "limit", Object{"limit": 2}); err != nil {
 			t.Fatal(err)
 		}
 		fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(started); return err == nil })
