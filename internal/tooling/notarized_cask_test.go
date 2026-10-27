@@ -583,7 +583,9 @@ exit 97
 	}
 	// Allow only public process settings. Queue overrides and signing credentials
 	// never reach the private daemon, installer, Homebrew or its child processes.
-	environment := []string{"HOME=" + home, "HOMEBREW_DEVELOPER=1", "HOMEBREW_NO_AUTO_UPDATE=1", "HOMEBREW_NO_INSTALL_FROM_API=1", "TEST_CALLS=" + calls}
+	// Each fixture has a fresh HOME and runs brew only once. Building a cold
+	// Bootsnap cache consumes the command/cleanup budget without a later reuse.
+	environment := []string{"HOME=" + home, "HOMEBREW_DEVELOPER=1", "HOMEBREW_NO_AUTO_UPDATE=1", "HOMEBREW_NO_INSTALL_FROM_API=1", "HOMEBREW_NO_BOOTSNAP=1", "TEST_CALLS=" + calls}
 	for _, key := range []string{"PATH", "TMPDIR", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL"} {
 		if value, ok := os.LookupEnv(key); ok {
 			environment = append(environment, key+"="+value)
