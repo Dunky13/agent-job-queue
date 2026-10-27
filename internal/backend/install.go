@@ -27,6 +27,7 @@ import (
 type installer struct {
 	home, payload, root, state, config, launch, app, path string
 	identity                                              BuildInfo
+	pendingIdentity                                       *BuildInfo
 	serviceSlot                                           string
 	testing                                               bool
 	appBundle                                             bool
@@ -594,6 +595,15 @@ func (install *installer) validatePayload() error {
 	if err != nil {
 		return err
 	}
+	if install.pendingIdentity != nil && !identity.Equal(*install.pendingIdentity) {
+		return errors.New("The retained app changed from the exact pending build; recovery stopped")
+	}
+	if install.pendingIdentity != nil {
+		pending, err := installReadInfo(filepath.Join(install.root, "install-in-progress.json"))
+		if err != nil || !pending.Equal(*install.pendingIdentity) {
+			return errors.New("The pending installation changed; recovery stopped")
+		}
+	}
 	install.identity = identity
 	raw, err = install.readPayload(filepath.Join(app, "Contents/Resources/build-info.json"), 16384)
 	if err != nil {
@@ -676,7 +686,7 @@ func (install *installer) validatePayload() error {
 			}
 		}
 		if install.managed && marker == filepath.Join(install.root, "install-in-progress.json") && !identity.Equal(installed) {
-			return errors.New("Another candidate installation is pending; retry that exact build before replacing it")
+			return &installPendingError{identity: installed}
 		}
 	}
 	return nil

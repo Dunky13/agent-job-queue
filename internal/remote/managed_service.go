@@ -69,7 +69,7 @@ func (c *controller) managedServiceAction(action string) error {
 	if state == "enabled" {
 		return nil
 	}
-	if state != "notRegistered" {
+	if state != "notRegistered" && state != "notFound" {
 		return errors.New("The installed phone service definition is unavailable")
 	}
 	state, err = c.managedServiceState("register")

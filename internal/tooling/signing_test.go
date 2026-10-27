@@ -650,8 +650,8 @@ func TestMacOSSigningManagedHelpersInsideOut(t *testing.T) {
 			}
 		}
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|explicit-setup\n") || strings.Contains(record, "Applications->/Applications") {
-		t.Fatalf("managed release lost explicit installer layout: %s", record)
+	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
+		t.Fatalf("managed release lost drag-to-Applications layout: %s", record)
 	}
 	assertNotarySubmissionNames(t, record, "1.2.3")
 }

@@ -779,9 +779,6 @@ func (c *controller) enable() error {
 		if state == "requiresApproval" {
 			return errors.New("Allow Agent Queue's background services in Login Items settings before enabling phone access")
 		}
-		if state == "notFound" {
-			return errors.New("The installed phone service definition is unavailable")
-		}
 	}
 	if err := c.p.prepare(); err != nil {
 		return err

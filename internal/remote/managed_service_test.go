@@ -176,6 +176,38 @@ func TestManagedPhoneEnablePreservesRevokedApprovalAndConfiguration(t *testing.T
 	}
 }
 
+func TestManagedPhoneStartRegistersVerifiedNotFoundService(t *testing.T) {
+	c := fixtureManagedController(t)
+	var actions []string
+	c.managedCommand = func(args []string) ([]byte, error) {
+		actions = append(actions, args[2])
+		state := "notFound"
+		if args[2] == "register" {
+			state = "enabled"
+		}
+		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: state})
+	}
+	if err := c.managedServiceAction("start"); err != nil {
+		t.Fatal("explicit phone start refused verified service before registration", err)
+	}
+	if !slices.Equal(actions, []string{"status", "register"}) {
+		t.Fatal("phone registration did not attempt exactly once", actions)
+	}
+}
+
+func TestManagedPhoneEnableNotFoundStillRequiresCredentials(t *testing.T) {
+	c := fixtureManagedController(t)
+	c.managedCommand = func(args []string) ([]byte, error) {
+		if args[2] != "status" {
+			t.Fatal("unconfigured phone access attempted registration")
+		}
+		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: "notFound"})
+	}
+	if err := c.enable(); err == nil || !strings.Contains(err.Error(), "Configure a password") {
+		t.Fatal("lookup miss bypassed or obscured the credential requirement", err)
+	}
+}
+
 func TestManagedPhoneServiceFailsClosedOnNativeErrors(t *testing.T) {
 	for _, response := range []string{`{}`, `{"schemaVersion":1,"service":"queue","status":"enabled"}`, `{"schemaVersion":1,"service":"remote","status":"enabled","status":"notRegistered"}`} {
 		t.Run(response, func(t *testing.T) {

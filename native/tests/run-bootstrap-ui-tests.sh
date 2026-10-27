@@ -54,6 +54,11 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
     --open-window --temporary "$temporary" --output "$output/approved-repair" --approved-repair
 [[ "$(plutil -extract passed raw -o - "$output/approved-repair/verification.json")" == "true" ]]
+mkdir -p -- "$output/explicit-setup"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --open-window --temporary "$temporary" --output "$output/explicit-setup" --explicit-setup
+[[ "$(plutil -extract passed raw -o - "$output/explicit-setup/verification.json")" == "true" ]]
 {
   printf '# Bootstrap fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
   cat "$output/verification.json"

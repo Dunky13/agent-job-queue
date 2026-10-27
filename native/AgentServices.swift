@@ -126,11 +126,12 @@ enum QueueServiceManagement {
         case .register:
             let current = try adapter.status()
             switch current {
-            case .enabled, .requiresApproval, .notFound:
-                // A missing packaged service cannot be repaired by registration.
+            case .enabled, .requiresApproval:
                 // Revoked consent requires the user's action in System Settings.
                 status = current
-            case .notRegistered:
+            case .notRegistered, .notFound:
+                // A lookup miss is not a filesystem inspection. Let the API
+                // validate the bundled definition and preserve its exact error.
                 try adapter.register()
                 status = try adapter.status()
             }

@@ -253,7 +253,7 @@ struct ServiceManagementTests {
             }
         }
 
-        for current in [Management.Status.enabled, .requiresApproval, .notFound] {
+        for current in [Management.Status.enabled, .requiresApproval] {
             let fixture = Fixture(current)
             let result = try Management.handle(arguments: ["--service-management", "register", "login"],
                                                owningBundle: owner, makeAdapter: { _ in fixture.adapter })
@@ -261,6 +261,17 @@ struct ServiceManagementTests {
             try check(result?.exitCode == expectedCode && fixture.events == ["status"],
                       "register preserves \(current.rawValue) without retrying or overriding consent")
         }
+        let unresolved = Fixture(.notFound)
+        let registered = try Management.run(.init(action: .register, service: .queue), adapter: unresolved.adapter)
+        try check(registered.status == .enabled && unresolved.events == ["status", "register", "status"],
+                  "Explicit registration resolves a framework lookup miss and verifies its result")
+        let missingPlist = NSError(domain: SMAppServiceErrorDomain, code: Int(kSMErrorJobPlistNotFound))
+        let missingFixture = Fixture(.notFound)
+        missingFixture.registerError = missingPlist
+        try propagated(missingPlist, "Missing plist registration error propagates unchanged") {
+            _ = try Management.run(.init(action: .register, service: .queue), adapter: missingFixture.adapter)
+        }
+        try check(missingFixture.events == ["status", "register"], "A failed lookup registration is attempted only once")
         for end in Management.Status.allCases {
             let fixture = Fixture(.notRegistered)
             fixture.afterRegister = end

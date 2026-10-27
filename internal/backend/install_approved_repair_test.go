@@ -38,6 +38,9 @@ func TestInstallerApprovedRepairKnownIssueContract(t *testing.T) {
 		want  bool
 	}{
 		{"restore", approvedTestIssue("service-definitions-missing", installRestoreServices), true},
+		{"pending", approvedTestIssue("pending-installation", installFinishPending), true},
+		{"pending-unavailable", approvedTestIssue("pending-installation", "reveal"), false},
+		{"pending-foreign-action", approvedTestIssue("service-definitions-missing", installFinishPending), false},
 		{"phone", approvedTestIssue("legacy-phone-access", "disable-phone-access"), true},
 		{"remote-migration", approvedTestIssue("remote-migration", "disable-phone-access"), true},
 		{"start", approvedTestIssue("service-not-ready", "repair-service"), true},

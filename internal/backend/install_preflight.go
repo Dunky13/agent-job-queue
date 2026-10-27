@@ -130,7 +130,7 @@ func installParseOptions(args []string) (installOptions, error) {
 	if options.repairAndContinue && (options.preflight || options.recovery != "" || options.disablePhoneAccess) {
 		return options, usage
 	}
-	if options.recovery != "" && !slices.Contains([]string{"cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback", installRestoreServices}, options.recovery) {
+	if options.recovery != "" && !slices.Contains([]string{"cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback", installRestoreServices, installFinishPending}, options.recovery) {
 		return options, usage
 	}
 	if options.recovery != "" && ((options.recovery == "cancel-job" || options.recovery == "cleanup-job") != (options.jobID != nil)) {
@@ -157,6 +157,7 @@ func installAction(id string) installRecoveryAction {
 		"cleanup-job":          {ID: "cleanup-job", Title: "Run verified cleanup"},
 		"repair-service":       {ID: "repair-service", Title: "Start verified service"},
 		installRestoreServices: {ID: installRestoreServices, Title: "Restore verified service files", Destructive: true},
+		installFinishPending:   {ID: installFinishPending, Title: "Finish the retained pending installation", Destructive: true},
 		"disable-phone-access": {ID: "disable-phone-access", Title: "Disable phone access and continue"},
 		"reset-callback":       {ID: "reset-callback", Title: "Back up and replace callback", Destructive: true},
 		"review-configuration": {ID: "review-configuration", Title: "Review configuration"},
@@ -376,6 +377,15 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 		return report
 	}
 	if err := install.validatePayload(); err != nil {
+		var pending *installPendingError
+		if errors.As(err, &pending) {
+			actions := []string{"reveal"}
+			if _, recoveryErr := install.pendingInstallation(ctx); recoveryErr == nil {
+				actions = append([]string{installFinishPending}, actions...)
+			}
+			report.add("pending-installation", "Finish the previous installation", err.Error(), filepath.Join(install.root, "install-in-progress.json"), actions...)
+			return report
+		}
 		actions := []string{"download-release", "reveal"}
 		if install.appBundle && installValidateAppPath(install.home, install.app) != nil {
 			actions = []string{"move-app", "reveal"}
@@ -808,7 +818,7 @@ func installValidateRecoveryFiles(g *Gate, id int) error {
 }
 
 func (install *installer) recover(ctx context.Context, action string, jobID *int, revision string) error {
-	if !slices.Contains([]string{"cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback", installRestoreServices}, action) {
+	if !slices.Contains([]string{"cancel-job", "cleanup-job", "repair-service", "disable-phone-access", "reset-callback", installRestoreServices, installFinishPending}, action) {
 		return errors.New("Unsupported installation recovery action")
 	}
 	if (action == "cancel-job" || action == "cleanup-job") != (jobID != nil) {
@@ -816,6 +826,9 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 	}
 	if jobID != nil && *jobID < 0 {
 		return errors.New("Recovery job ID must be nonnegative")
+	}
+	if action == installFinishPending {
+		return install.finishPendingInstallation(ctx)
 	}
 	if err := install.validatePayload(); err != nil {
 		return err

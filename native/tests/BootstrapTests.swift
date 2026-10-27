@@ -54,6 +54,30 @@ struct BootstrapTests {
             }
         }
 
+        // Dragged apps must offer setup without granting startup any implicit
+        // mutation authority, including an existing app whose services vanished.
+        for scenario in ["legacy-fresh", "managed-fresh", "managed-unregistered"] {
+            let managed = scenario != "legacy-fresh"
+            let copied = try BootstrapFixture(parent: temporary, setupMode: false, managed: managed)
+            if scenario == "managed-unregistered" { try copied.installManaged() }
+            let executor = BootstrapExplicitSetupFixture(copied, managed: managed)
+            var completed = false
+            let model = QueueBootstrapModel(environment: copied.environment, execute: { request, _ in
+                try await executor.execute(request)
+            }) { completed = true }
+            try check(model.beginInstallation(confirmed: true) == nil, "Setup cannot start before a validated startup decision")
+            await model.start()?.value
+            let before = await executor.installations
+            try check(model.canBeginInstallation && !model.allowsInstallation && before == 0 && !completed,
+                "Copied \(scenario) offers explicit setup after read-only startup")
+            try check(model.beginInstallation(confirmed: false) == nil && !model.allowsInstallation,
+                "Cancelling setup preserves read-only authority for \(scenario)")
+            await model.beginInstallation(confirmed: true)?.value
+            let after = await executor.installations
+            try check(model.phase == .complete && completed && after == 1 && !model.canBeginInstallation,
+                "Confirmed \(scenario) setup installs exactly once and opens the queue")
+        }
+
         let stalled = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try stalled.installManaged()
         let stalledPID = temporary.appendingPathComponent("native-startup-read.pid")
@@ -105,6 +129,21 @@ struct BootstrapTests {
                     "Managed \(status) remains explicit and cannot trigger re-registration")
             }
         }
+
+        let externallyRepaired = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
+        try externallyRepaired.installManaged()
+        let changingStatus = BootstrapServiceStatusFixture(status: "notRegistered")
+        var externalCompleted = false
+        let externalModel = QueueBootstrapModel(environment: externallyRepaired.environment, execute: { request, _ in
+            try await changingStatus.execute(request)
+        }) { externalCompleted = true }
+        await externalModel.start()?.value
+        await changingStatus.updateStatus("enabled")
+        await externalModel.start()?.value
+        let externalRequests = await changingStatus.requests
+        try check(externalCompleted && externalModel.phase == .complete && !externalModel.allowsInstallation &&
+            externalRequests.allSatisfy({ $0.arguments.prefix(2) == ["--service-management", "status"] }),
+            "Check again observes externally restored services without installing or retaining a stale setup decision")
 
         let tamperedManaged = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try tamperedManaged.installManaged()
@@ -521,6 +560,23 @@ struct BootstrapTests {
         noRevision.review(configIssue.id)
         try check(noRevision.perform(actionID: "reset-callback", issueID: configIssue.id, confirmed: true) == nil,
             "A callback proposal without a verified current revision can never be applied")
+
+        let pendingIssue = QueueBootstrapIssue(id: "pending-installation", title: "Finish the previous installation",
+            detail: "Finish the retained exact build before upgrading.",
+            actions: [.init(id: "finish-pending-installation", title: "Finish the retained pending installation", destructive: false)])
+        let pendingFixture = try fixture()
+        let pendingExecutor = BootstrapPreflightExecutorFixture(pendingFixture,
+            report: .init(schemaVersion: 1, issues: [pendingIssue]), afterRecovery: .clear)
+        let pendingModel = QueueBootstrapModel(environment: pendingFixture.environment, execute: { request, output in
+            try await pendingExecutor.execute(request, output: output)
+        }) { summaryCompletions += 1 }
+        await pendingModel.start()?.value
+        try check(pendingModel.canRepairAndContinue && pendingModel.perform(actionID: "finish-pending-installation", issueID: pendingIssue.id) == nil,
+            "Finishing a retained pending installation requires consent regardless of the report flag")
+        await pendingModel.repairAndContinue(confirmed: true)?.value
+        let pendingRequests = await pendingExecutor.requests
+        try check(pendingModel.phase == .complete && pendingRequests.contains(where: { $0.arguments.suffix(2) == ["--recover", "finish-pending-installation"] }),
+            "Approved native setup finishes the retained build, rechecks requirements and installs")
 
         let missingDefinitions = QueueBootstrapIssue(id: "service-definitions-missing", title: "Restore missing background service files", detail: "Restore standard service files after verifying the loaded services. Running jobs stay active.",
             actions: [.init(id: "restore-service-definitions", title: "Restore verified service files", destructive: false)])

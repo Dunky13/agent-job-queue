@@ -37,7 +37,7 @@ installer. Our additional DMG distribution also receives its own ticket:
 2. Require acceptance, fetch the log, then staple and validate the menu app.
 3. Sign the outer installer, submit its ZIP, require acceptance, and staple it.
 4. Recreate the distribution ZIP with the stapled installer inside it.
-5. Package the stapled explicit installer in the managed DMG, sign the DMG, notarize it, and staple it. Retained historical drag-to-Applications images keep their original layout and verification path.
+5. Package the stapled owning app and Applications shortcut in the managed DMG, sign the DMG, notarize it, and staple it. The ZIP retains the explicit installer. Historical images retain their original layout and verification path.
 6. Generate final checksums and Homebrew metadata after all byte changes.
 
 Hosted Apple submissions use `Agent-Job-Queue-Payload-VERSION-build-N-SHA-universal.zip`,
@@ -56,7 +56,7 @@ first launch of the complete installed product remains a separate test.
 These requirements come from Apple's
 [custom notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
-The menu app carries support metadata and documents without duplicate helper binaries. Explicit setup can use its canonical bundled helpers; ordinary first launch only checks installation and approval state. Helpers are signed before sealing the app, and in-place setup never modifies the installed bundle. Both managed ZIP and DMG deliver the explicit installer, preserving signatures, tickets and quarantine. Homebrew delivers that installer and command links; runtime installation occurs explicitly outside its hook sandbox.
+The menu app carries support metadata and documents without duplicate helper binaries. Explicit setup can use its canonical bundled helpers; ordinary first launch only checks installation and approval state. The copied app offers a confirmed setup action. Helpers are signed before sealing the app, and in-place setup never modifies the installed bundle. Managed ZIPs deliver the explicit installer; DMGs deliver the owning app and Applications shortcut, preserving signatures, tickets and quarantine. Homebrew delivers the explicit installer and command links; runtime installation occurs explicitly outside its hook sandbox.
 
 The payload app is stapled before signing its parent because it lives under
 the installer's sealed resources. Production installation copies the app with
