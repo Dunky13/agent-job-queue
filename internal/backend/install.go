@@ -250,11 +250,7 @@ func installRemoteServiceAbsent(output []byte, exitCode int) bool {
 }
 
 func installServiceAbsent(output []byte, exitCode int, label string) bool {
-	if !slices.Contains([]string{"io.went.agent-remote", "io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-queue"}, label) {
-		return false
-	}
-	expected := fmt.Sprintf("Bad request.\nCould not find service \"%s\" in domain for user gui: %d", label, os.Getuid())
-	return exitCode == 113 && strings.TrimSpace(string(output)) == expected
+	return appservices.LaunchServiceAbsent(output, exitCode, label)
 }
 
 func (install *installer) domain() string { return fmt.Sprintf("gui/%d", os.Getuid()) }

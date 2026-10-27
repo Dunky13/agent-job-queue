@@ -16,15 +16,19 @@ The pending diagnostic now identifies the build, version and commit. When the ex
 
 The ZIP retains the explicit installer and can perform recovery before copying the replacement. If the pending app was already replaced or is missing, retrieve its exact build from release history and finish that installation first. Do not remove pending records or retained application backups to force an upgrade. Unknown backup custody, failed recovery, active work, source substitution and changed pending markers remain refusals.
 
-## Implementation entry points
+## Service lookup repair
 
 The build-126 error came from treating Apple's `notFound` lookup result as proof of a missing packaged plist and refusing explicit registration before asking the API. [Apple's status documentation](https://developer.apple.com/documentation/servicemanagement/smappservice/status-swift.enum/notfound) describes a framework lookup error, separately from the [bundled plist requirement](https://developer.apple.com/documentation/servicemanagement/smappservice/agent(plistname:)). The repair verifies the signed bundle and permits one explicit registration attempt from `notFound`, preserving the API's actual failure or approval state and requiring observed enabled status before readiness. Actual missing/malformed definitions still fail package verification. Replacement/removal retain their unresolved-status refusal. Disabled phone access is never registered to resolve a lookup miss; setup separately checks for a loaded remote job and retained remote cleanup before accepting an absent disabled service. Explicit phone enable/start uses the same lookup semantics while preserving credential and approval requirements.
 
-## Build-126 retained-app review hold
+## Build-126 retained-app review resolution
 
 The standards review found no actionable issues in its reviewed source snapshot. The spec review identified a real limit: exact pending recovery invokes the retained app's own native bridge. If that bridge is build 126 and still reports `notFound`, its old registration policy refuses the operation. The current controller cannot safely replace that signed native executable or register a different owning bundle to bypass it. A regression reproduces the old bridge refusal and proves the original pending identity, installed build and last-good backup survive unchanged. The recovery failure now explicitly reports that custody was retained.
 
-Release remains on hold for this unresolved affected-Mac case until its current pending state is reconciled. The user was asked whether the build-126 failure's pending state was also cleaned up; their earlier cleanup statement preceded this new failure. Do not infer that the new pending state is gone, delete its records, or claim the old native bridge is repaired by the newer controller.
+The user explicitly confirmed that the pending state from the build-126 failure was also cleaned up. This resolves the affected-Mac hold for the new installer's fresh setup path. The general recovery limitation remains explicit: the newer controller does not repair the retained signed build-126 native executable. If an older retained bridge still refuses registration, recovery preserves its pending identity and backup and reports the failure. No pending records were deleted by this change. Hosted checks, final review and the signed distribution gates still govern merge and release.
+
+Final standards review found a second issue in the configured phone flow: `enable()` and enabled migration stop existing owned work before starting it, and that stop still rejected `notFound`. Regressions through configured `enable()` and `migrate()` reproduced the shutdown failure with the previous source and pass with the repair. The stop now accepts only an independent exact `launchctl` user-domain absence witness, using the same parser as installation. Loaded jobs, permission/query errors, wrong labels, extra errors and unresolved owned child cleanup still block shutdown. Supervisor and child reconciliation remain in the existing shutdown sequence. Credentials and enabled intent survive both successful configured flows.
+
+## Implementation entry points
 
 - `scripts/macos-signing.sh`: signed app and Applications shortcut in the managed DMG; ZIP and Homebrew installer delivery remain supported.
 - `native/AgentBootstrap.swift`: confirmed setup in the copied app, missing-registration handling, pending recovery action and approved-repair sequence.

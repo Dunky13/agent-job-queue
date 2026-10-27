@@ -284,3 +284,14 @@ func DecodeStatus(raw []byte, expectedService string) (Status, error) {
 	}
 	return value, nil
 }
+
+// LaunchServiceAbsent accepts only launchctl's exact user-domain absence
+// witness. Permission errors, other labels and generic command failures cannot
+// establish that it is safe to proceed without unregistering a service.
+func LaunchServiceAbsent(output []byte, exitCode int, label string) bool {
+	if !slices.Contains([]string{"io.went.agent-remote", "io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-queue"}, label) {
+		return false
+	}
+	expected := fmt.Sprintf("Bad request.\nCould not find service \"%s\" in domain for user gui: %d", label, os.Getuid())
+	return exitCode == 113 && strings.TrimSpace(string(output)) == expected
+}
