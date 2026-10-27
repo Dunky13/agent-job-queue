@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// The actual current Go executable supplies the daemon, worker, caller and
+// The real product CLI supplies the daemon, worker, caller and
 // capability protocol. Only code-signing/native service registration are
 // injected. This exercises publication and worker outcome writes across the
 // replacement of the actual app files in a temporary private home.
@@ -21,25 +21,43 @@ func TestInstallerManagedLiveUpgradeRetainsRunningAttempts(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("managed service handover requires macOS process birth identities")
 	}
+	helper := buildManagedLiveFixtureCLI(t)
 	for _, failure := range []string{"", "queued", "lost commit acknowledgement", "unregister resources", "unregister login", "register resources"} {
 		name := failure
 		if name == "" {
 			name = "complete"
 		}
-		t.Run(name, func(t *testing.T) { testInstallerManagedLiveUpgrade(t, failure) })
+		t.Run(name, func(t *testing.T) { testInstallerManagedLiveUpgrade(t, helper, failure) })
 	}
+}
+
+func buildManagedLiveFixtureCLI(t *testing.T) string {
+	t.Helper()
+	helper := filepath.Join(t.TempDir(), "agent-heavy")
+	// Build once before any scenario changes HOME or starts its 60-second
+	// operation budget. Keep race detection while excluding test-only code and
+	// debug data from the bundle copied and hashed by every installer phase.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	command := exec.CommandContext(ctx, "go", "build", "-race", "-p", "2", "-ldflags=-s -w", "-o", helper, "./cmd/agent-heavy")
+	command.Dir = filepath.Join("..", "..")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("build live installer CLI fixture: %v: %s", err, output)
+	}
+	return helper
 }
 
 func TestInstallerPackagedLiveUpgrade(t *testing.T) {
 	if runtime.GOOS != "darwin" || os.Getenv("AGENT_QUEUE_TEST_INSTALLER_PAYLOAD") == "" {
 		t.Skip("requires a built macOS installer payload")
 	}
+	helper := filepath.Join(os.Getenv("AGENT_QUEUE_TEST_INSTALLER_PAYLOAD"), "source/bin/agent-heavy")
 	for _, failure := range []string{"", "queued", "register resources"} {
-		t.Run("packaged-"+failure, func(t *testing.T) { testInstallerManagedLiveUpgrade(t, failure) })
+		t.Run("packaged-"+failure, func(t *testing.T) { testInstallerManagedLiveUpgrade(t, helper, failure) })
 	}
 }
 
-func testInstallerManagedLiveUpgrade(t *testing.T, failure string) {
+func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 	queued := failure == "queued"
 	lostCommit := failure == "lost commit acknowledgement"
 	if queued || lostCommit {
@@ -69,13 +87,6 @@ func testInstallerManagedLiveUpgrade(t *testing.T, failure string) {
 	i.launch = filepath.Join(i.home, "Library/LaunchAgents")
 	i.app = filepath.Join(i.home, "Applications/Agent Queue.app")
 	i.path += ":/usr/bin:/bin"
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if payload := os.Getenv("AGENT_QUEUE_TEST_INSTALLER_PAYLOAD"); payload != "" {
-		executable = filepath.Join(payload, "source/bin/agent-heavy")
-	}
 	binary, err := os.ReadFile(executable)
 	if err != nil {
 		t.Fatal(err)
@@ -98,15 +109,23 @@ func testInstallerManagedLiveUpgrade(t *testing.T, failure string) {
 		}
 		return original(ctx, args)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	if _, err := runPackagedSetup(ctx, m.installFixture, i.execute); err != nil {
+	setupContext, finishSetup := context.WithTimeout(context.Background(), 60*time.Second)
+	defer finishSetup()
+	if _, err := runPackagedSetup(setupContext, m.installFixture, i.execute); err != nil {
 		for _, name := range []string{"daemon.log", "scheduler.log", "readiness.json"} {
 			data, _ := os.ReadFile(filepath.Join(i.home, name))
 			t.Log(name, string(data))
 		}
 		t.Fatal("initial private managed installation", err)
 	}
+	// Fresh installation owns its readiness budget. End it before creating
+	// accepted callers so setup cancellation cannot govern the live upgrade.
+	finishSetup()
+	if !errors.Is(setupContext.Err(), context.Canceled) {
+		t.Fatal("initial installation did not complete within its own readiness budget", setupContext.Err())
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	cli := filepath.Join(i.app, "Contents/MacOS/agent-heavy")
 	environment := i.commandEnvironment([]string{cli, "status", "--json"})
 	initialControl := i.liveGate(ctx)
