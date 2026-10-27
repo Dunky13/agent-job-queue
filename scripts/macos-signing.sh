@@ -470,9 +470,8 @@ macos_disk_image_source() {
   local installer=$1 directory=$2 app="$1/Contents/Resources/payload/Agent Queue.app"
   MACOS_DISK_IMAGE_SOURCE=$installer
   macos_app_payload_mode "$app" || return
-  # Managed setup is an explicit installation operation. Keep its installer as
-  # the disk-image entry point; retained self-installing apps keep their layout.
-  [[ $MACOS_APP_MANAGED != 1 ]] || return 0
+  # Copy the signed owning app. Opening it only checks readiness; the user
+  # starts installation explicitly from its setup screen.
   [[ $MACOS_APP_EMBEDDED == 1 ]] || return 0
   mkdir "$directory" || return
   ditto --rsrc --extattr --qtn --acl "$app" "$directory/Agent Queue.app" || return

@@ -972,7 +972,7 @@ func TestMacOSResumeManagedHelpersRemainInsidePayloadCheckpoint(t *testing.T) {
 			t.Fatalf("resumed release omitted canonical helper: %s", record)
 		}
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|explicit-setup\n") {
-		t.Fatal("managed resume lost explicit installer disk image layout")
+	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
+		t.Fatal("managed resume lost drag-to-Applications disk image layout")
 	}
 }

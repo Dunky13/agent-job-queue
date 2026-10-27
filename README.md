@@ -53,14 +53,18 @@ agent-heavy install --app-bundle "$HOME/Applications/Agent Queue.app" --unregist
 
 Use the app's actual absolute Applications path if it differs. Exit zero confirms service shutdown and retires generated command entry points. Queue history, configuration, credentials and certificate data are preserved. Quitting the menu app during ordinary use leaves the independent queue and enabled phone access running.
 
-### Installer app
+### Disk image and explicit setup
 
 1. Use macOS 15 or later on an Apple Silicon or Intel Mac.
 2. Download the DMG from [Releases](https://github.com/Dunky13/agent-job-queue/releases), then open it. Successful main CI builds trigger distribution; a prerelease appears after notarization and both architecture checks pass. CI runs also retain the installer as an artifact for 30 days.
-3. Open **Agent Job Queue Installer.app** and choose **Install**. It verifies the package and queue, installs the app, and registers its background services. Finish all queued and running jobs before installing over an existing queue.
+3. Drag **Agent Queue.app** to **Applications**, then open the copied app. Choose **Install and set up** and confirm to verify the package and queue and register its background services. Opening the app alone only checks readiness. Finish all queued and running jobs before replacing an existing app.
 4. Complete any background-service approval requested in System Settings, then finish installation. The app appears in your menu bar once setup succeeds. Add your local bin directory to your shell's `PATH` to use `agent-heavy` by name.
 
-The ZIP uses the same installer. Older drag-to-Applications images remain available, but copying a new managed app alone does not complete queue setup. Opening an incomplete app shows installation guidance and leaves the incomplete-installation marker intact.
+The ZIP and Homebrew retain **Agent Job Queue Installer.app**; open it and choose **Install**. Copying a managed app alone does not complete queue setup. The copied app offers the same explicit setup workflow without installing anything automatically.
+
+If setup reports a pending installation, **Finish the retained pending installation** completes that exact app before upgrading. **Repair and continue** can perform this verified recovery too. If the exact pending app is unavailable, the diagnostic identifies its build and commit; retrieve that build from the release history and finish setup before replacing it. Preserve pending installation records and retained application backups. The ZIP installer is useful for recovery because it can finish the retained app before copying its replacement.
+
+A retained app's older native service policy can also prevent recovery from completing. That failure preserves its pending identity and backup; the newer controller does not modify the retained signed app to bypass its policy.
 
 The app includes prebuilt universal executables and a Go queue daemon. The Go remote service embeds Caddy's HTTPS and authentication modules. Homebrew, Pueue, Python, uv, Xcode, and a Go toolchain are not required on the installed Mac. Backend setup runs in your user account without `sudo` and defaults to your account's Applications folder. Executable locations must be protected from replacement by other accounts; a group-writable shared Applications folder is refused without changing its permissions. The payload is self-contained, but first-launch Gatekeeper assessment can require Apple connectivity. Offline first launch of the standalone Go executables has not been verified.
 

@@ -23,6 +23,8 @@ func installApprovedIssue(issue installPreflightIssue) (installApprovedStep, boo
 	}
 	wait := func() (installApprovedStep, bool) { return installApprovedStep{}, has("wait") }
 	switch issue.ID {
+	case "pending-installation":
+		return installApprovedStep{action: installFinishPending}, has(installFinishPending)
 	case "service-definitions-missing":
 		return installApprovedStep{action: installRestoreServices}, has(installRestoreServices)
 	case "legacy-phone-access", "remote-migration":
@@ -73,7 +75,7 @@ func installApprovedNext(report installPreflightReport) (installApprovedStep, er
 		busy = busy || slices.Contains([]string{"installer-busy", "scheduling-busy", "remote-busy", "controller-stopping"}, issue.ID)
 	}
 	if !busy {
-		for _, action := range []string{installRestoreServices, "repair-service", "cleanup-job", "disable-phone-access"} {
+		for _, action := range []string{installFinishPending, installRestoreServices, "repair-service", "cleanup-job", "disable-phone-access"} {
 			for _, step := range steps {
 				if step.action == action {
 					return step, nil

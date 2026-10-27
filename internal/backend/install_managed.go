@@ -52,8 +52,15 @@ func (install *installer) managedAction(ctx context.Context, app, action, servic
 	if status == "requiresApproval" && !(action == "unregister" && install.unregisterServices) {
 		return fmt.Errorf("The %s service requires approval in System Settings; approve it before retrying setup", service)
 	}
-	if status == "notFound" {
+	if status == "notFound" && action != "register" {
 		return fmt.Errorf("The %s service definition was not found; setup is incomplete", service)
+	}
+	if status == "notFound" {
+		// This is a framework lookup result, not proof that a bundled plist is
+		// missing. Verify the actual signed package before one explicit attempt.
+		if err := install.managedVerify(ctx, app); err != nil {
+			return err
+		}
 	}
 	if action == "register" && status == "enabled" || action == "unregister" && status == "notRegistered" {
 		return nil
@@ -422,7 +429,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 				if err != nil {
 					return nil, err
 				}
-				if status == "requiresApproval" && !install.unregisterServices || status == "notFound" {
+				if status == "requiresApproval" && !install.unregisterServices || status == "notFound" && (install.prepareReplacement || install.unregisterServices) {
 					return nil, fmt.Errorf("The %s service is %s; resolve it before retrying setup", service, status)
 				}
 				p.statuses[service] = status
@@ -1500,7 +1507,21 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if remoteEnabled && remoteStatus != "enabled" || !remoteEnabled && remoteStatus != "notRegistered" {
+	if !remoteEnabled && remoteStatus == "notFound" {
+		// No registration is needed for disabled access. A lookup miss alone
+		// cannot prove shutdown: independently verify no loaded job or cleanup.
+		_, loaded, err := install.inspectService(ctx, "io.went.agent-remote")
+		if err != nil {
+			return err
+		}
+		cleanup, err := install.disabledRemoteCleanup(ctx)
+		if err != nil {
+			return err
+		}
+		if loaded || cleanup {
+			return errors.New("Phone access lookup is unresolved and owned work remains; setup remains incomplete")
+		}
+	} else if remoteEnabled && remoteStatus != "enabled" || !remoteEnabled && remoteStatus != "notRegistered" {
 		return errors.New("Phone access service does not match its retained enabled setting; setup remains incomplete")
 	}
 	if err := install.managedVerify(ctx, install.app); err != nil {

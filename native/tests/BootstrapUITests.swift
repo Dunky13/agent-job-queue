@@ -22,6 +22,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
                 try writeReport()
                 NSApp.terminate(nil)
             } catch {
+                if let window = production?.setupWindow { try? snapshot(window, name: "failure") }
                 try? writeReport(error: error.localizedDescription)
                 FileHandle.standardError.write(Data("Bootstrap UI fixture failed: \(error.localizedDescription)\n".utf8))
                 production?.applicationWillTerminate(notification)
@@ -64,6 +65,10 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
               URL(fileURLWithPath: privateHome).deletingLastPathComponent().standardizedFileURL == temporary.standardizedFileURL,
               ProcessInfo.processInfo.environment["CFFIXED_USER_HOME"] == privateHome else {
             throw ClientError.message("UI fixture requires --fixture, a temporary HOME and CFFIXED_USER_HOME from its runner.")
+        }
+        if CommandLine.arguments.contains("--explicit-setup") {
+            try await verifyExplicitSetup(notification)
+            return
         }
         if CommandLine.arguments.contains("--approved-repair") {
             try await verifyApprovedRepair(notification)
@@ -222,6 +227,46 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         try snapshot(queue, name: "04-normal-fixture-startup")
     }
 
+    private func verifyExplicitSetup(_ notification: Notification) async throws {
+        let fixture = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
+        let executor = BootstrapExplicitSetupFixture(fixture, managed: true)
+        let delegate = AppDelegate(environment: fixture.environment) { request, _ in
+            try await executor.execute(request)
+        }
+        production = delegate
+        delegate.applicationDidFinishLaunching(notification)
+        try await waitUntil { delegate.bootstrap?.phase == .setupRequired }
+        guard let setup = delegate.setupWindow, let model = delegate.bootstrap else {
+            throw ClientError.message("Copied app did not present explicit setup")
+        }
+        let initial = await executor.installations
+        try check(model.canBeginInstallation && initial == 0, "Copied app waits for explicit installation")
+        try snapshot(setup, name: "01-setup-required")
+        try sendReturn(to: setup)
+        try await waitUntil { self.alertButton("Install and set up", for: setup) != nil }
+        guard let alert = setup.attachedSheet ?? NSApp.modalWindow,
+              let cancel = alertButton("Cancel", for: setup) else {
+            throw ClientError.message("Explicit setup approval did not expose Cancel")
+        }
+        try snapshot(alert, name: "02-install-approval")
+        cancel.performClick(nil)
+        try await waitUntil { setup.attachedSheet == nil && NSApp.modalWindow == nil }
+        let declined = await executor.installations
+        try check(declined == 0 && !model.allowsInstallation, "Cancelling the setup dialog performs no installation")
+        try sendReturn(to: setup)
+        try await waitUntil { self.alertButton("Install and set up", for: setup) != nil }
+        guard let approve = alertButton("Install and set up", for: setup) else {
+            throw ClientError.message("Explicit setup approval disappeared")
+        }
+        approve.performClick(nil)
+        try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
+        let installed = await executor.installations
+        try check(installed == 1 && delegate.setupWindow == nil && AppRuntime.store.fixtureMode,
+            "Confirmed copied-app setup installs once and opens the simulated queue")
+        guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Explicit setup did not open its simulated queue") }
+        try snapshot(queue, name: "03-normal-fixture-startup")
+    }
+
     private func verifyApprovedRepair(_ notification: Notification) async throws {
         let fixture = try BootstrapFixture(parent: temporary)
         let busy = QueueBootstrapIssue(id: "installer-busy", title: "Another installation is running",
@@ -250,6 +295,9 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         }
         try check(model.canRepairAndContinue && model.repairAndContinue() == nil,
             "Known repairs are available but cannot begin without approval")
+        // A model phase change precedes the rendered SwiftUI action. Capture
+        // the ready controls before delivering their keyboard shortcut.
+        try snapshot(setup, name: "00-repair-ready")
         try sendReturn(to: setup)
         try await waitUntil { self.alertButton("Repair and continue", for: setup) != nil }
         guard let alert = setup.attachedSheet ?? NSApp.modalWindow,

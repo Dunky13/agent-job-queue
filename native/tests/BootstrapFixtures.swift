@@ -97,11 +97,40 @@ private struct BootstrapFixtureInstallation: Encodable {
     let serviceManagement = true
 }
 
+actor BootstrapExplicitSetupFixture {
+    let fixture: BootstrapFixture
+    let managed: Bool
+    private(set) var installations = 0
+
+    init(_ fixture: BootstrapFixture, managed: Bool) {
+        self.fixture = fixture
+        self.managed = managed
+    }
+
+    func execute(_ request: QueueBootstrapRequest) throws -> Data {
+        if request.arguments.prefix(2) == ["--service-management", "status"], let service = request.arguments.last {
+            return try JSONEncoder().encode(BootstrapFixtureServiceStatus(service: service, status: "notRegistered"))
+        }
+        if request.arguments.contains("--preflight") {
+            return try JSONEncoder().encode(QueueBootstrapReport.clear)
+        }
+        guard request.arguments == ["install", "--app-bundle", fixture.environment.app.path] else {
+            throw ClientError.message("Explicit setup used an unexpected request.")
+        }
+        installations += 1
+        if managed { try fixture.installManaged() }
+        else { try fixture.install() }
+        return Data("Explicit fixture setup complete.".utf8)
+    }
+}
+
 actor BootstrapServiceStatusFixture {
     private(set) var requests: [QueueBootstrapRequest] = []
-    let status: String
+    private var status: String
 
     init(status: String = "enabled") { self.status = status }
+
+    func updateStatus(_ value: String) { status = value }
 
     func execute(_ request: QueueBootstrapRequest) throws -> Data {
         requests.append(request)

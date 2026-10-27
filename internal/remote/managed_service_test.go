@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -173,6 +174,153 @@ func TestManagedPhoneEnablePreservesRevokedApprovalAndConfiguration(t *testing.T
 	after, err := os.ReadFile(c.p.config)
 	if err != nil || string(before) != string(after) || calls != 1 {
 		t.Fatalf("revoked approval mutated configuration or retried: %v %d", err, calls)
+	}
+}
+
+func TestManagedPhoneStartRegistersVerifiedNotFoundService(t *testing.T) {
+	c := fixtureManagedController(t)
+	var actions []string
+	c.managedCommand = func(args []string) ([]byte, error) {
+		actions = append(actions, args[2])
+		state := "notFound"
+		if args[2] == "register" {
+			state = "enabled"
+		}
+		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: state})
+	}
+	if err := c.managedServiceAction("start"); err != nil {
+		t.Fatal("explicit phone start refused verified service before registration", err)
+	}
+	if !slices.Equal(actions, []string{"status", "register"}) {
+		t.Fatal("phone registration did not attempt exactly once", actions)
+	}
+}
+
+func TestManagedPhoneEnableNotFoundStillRequiresCredentials(t *testing.T) {
+	c := fixtureManagedController(t)
+	c.managedCommand = func(args []string) ([]byte, error) {
+		if args[2] != "status" {
+			t.Fatal("unconfigured phone access attempted registration")
+		}
+		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: "notFound"})
+	}
+	if err := c.enable(); err == nil || !strings.Contains(err.Error(), "Configure a password") {
+		t.Fatal("lookup miss bypassed or obscured the credential requirement", err)
+	}
+}
+
+func TestManagedPhoneConfiguredEnableAfterLookupMiss(t *testing.T) {
+	for _, action := range []string{"enable", "migrate"} {
+		t.Run(action, func(t *testing.T) {
+			c := fixtureManagedController(t)
+			c.bootFn = func() (string, error) { return "fixture-boot", nil }
+			settings := testSettings()
+			settings.Enabled = action == "migrate"
+			if err := writePrivate(c.p.config, settings); err != nil {
+				t.Fatal(err)
+			}
+			var actions []string
+			c.managedCommand = func(args []string) ([]byte, error) {
+				actions = append(actions, args[2])
+				state := "notFound"
+				if args[2] == "register" {
+					state = "enabled"
+				}
+				return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: state})
+			}
+			absence := fmt.Sprintf("Bad request.\nCould not find service \"io.went.agent-remote\" in domain for user gui: %d\n", os.Getuid())
+			c.newCommand = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				if name != "/bin/launchctl" || !slices.Equal(args, []string{"print", fmt.Sprintf("gui/%d/io.went.agent-remote", os.Getuid())}) {
+					t.Fatal("absence probe escaped the owned service", name, args)
+				}
+				return exec.CommandContext(ctx, "/bin/sh", "-c", `printf '%s' "$1" >&2; exit 113`, "fixture", absence)
+			}
+			var err error
+			if action == "enable" {
+				err = c.enable()
+			} else {
+				err = c.migrate()
+			}
+			if err != nil {
+				t.Fatal("configured phone access did not reach registration after verified shutdown", err)
+			}
+			actual, err := loadSettings(c.p)
+			if err != nil || actual == nil || !actual.Enabled || actual.PasswordHash != settings.PasswordHash || actual.SecretKey != settings.SecretKey {
+				t.Fatal("phone recovery lost credentials or enabled intent", actual, err)
+			}
+			if !slices.Equal(actions, []string{"status", "status", "status", "register"}) {
+				t.Fatal("unexpected native lifecycle or duplicate registration", actions)
+			}
+		})
+	}
+}
+
+func TestManagedPhoneLookupMissRequiresExactAbsenceProof(t *testing.T) {
+	expected := fmt.Sprintf("Bad request.\nCould not find service \"io.went.agent-remote\" in domain for user gui: %d\n", os.Getuid())
+	for _, test := range []struct {
+		name, output string
+		code         int
+	}{
+		{"loaded", "program = unexpected\n", 0},
+		{"permission", "Operation not permitted\n", 1},
+		{"wrong-code", expected, 1},
+		{"wrong-label", strings.ReplaceAll(expected, "io.went.agent-remote", "another.service"), 113},
+		{"extra-error", expected + "Unexpected failure\n", 113},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := fixtureManagedController(t)
+			c.managedCommand = func(args []string) ([]byte, error) {
+				if args[2] != "status" {
+					t.Fatal("uncertain shutdown invoked a native mutation")
+				}
+				return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: "notFound"})
+			}
+			c.newCommand = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+				return exec.CommandContext(ctx, "/bin/sh", "-c", `printf '%s' "$1" >&2; exit "$2"`, "fixture", test.output, fmt.Sprint(test.code))
+			}
+			if err := c.serviceAction("stop"); err == nil {
+				t.Fatal("lookup miss bypassed independent loaded-service/uncertainty checks")
+			}
+		})
+	}
+}
+
+func TestManagedPhoneAbsentJobStillRequiresOwnedCleanup(t *testing.T) {
+	c := fixtureManagedController(t)
+	c.bootFn = func() (string, error) { return "fixture-boot", nil }
+	c.managedCommand = func(args []string) ([]byte, error) {
+		if args[2] != "status" {
+			t.Fatal("shutdown attempted registration")
+		}
+		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: "notFound"})
+	}
+	absence := fmt.Sprintf("Bad request.\nCould not find service \"io.went.agent-remote\" in domain for user gui: %d\n", os.Getuid())
+	c.newCommand = func(ctx context.Context, _ string, _ ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "/bin/sh", "-c", `printf '%s' "$1" >&2; exit 113`, "fixture", absence)
+	}
+	reconciled := false
+	c.reconcileFn = func(string) error {
+		reconciled = true
+		return errors.New("retained child ownership is unresolved")
+	}
+	if err := c.stopOwnedService(); err == nil || !strings.Contains(err.Error(), "retained child ownership is unresolved") || !reconciled {
+		t.Fatal("absent launch job bypassed owned process cleanup", err, reconciled)
+	}
+}
+
+func TestManagedPhoneAbsenceCannotOutliveCancellation(t *testing.T) {
+	c := fixtureManagedController(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	c.ctx = ctx
+	cancel()
+	absence := fmt.Sprintf("Bad request.\nCould not find service \"io.went.agent-remote\" in domain for user gui: %d\n", os.Getuid())
+	c.newCommand = func(context.Context, string, ...string) *exec.Cmd {
+		// Deliver a matching observation after cancellation to verify that it
+		// cannot authorize shutdown, even if the command already completed.
+		return exec.Command("/bin/sh", "-c", `printf '%s' "$1" >&2; exit 113`, "fixture", absence)
+	}
+	if err := c.managedServiceAbsent(); !errors.Is(err, context.Canceled) {
+		t.Fatal("late absence observation bypassed cancellation", err)
 	}
 }
 
