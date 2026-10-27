@@ -56,7 +56,7 @@ actor UpdateFixture {
         if arguments == ["updates", "install", "--build", "101", "--json"] {
             if failInstall { throw ClientError.message("Checksum mismatch") }
             return try encoder.encode(QueueInstallerResult(installerOpened: true, build: installerBuild,
-                message: "Installer opened. Finish queued and running jobs. Choose Install to continue; active work blocks managed service changes"))
+                message: "Installer opened. Setup continues automatically after queued and running jobs finish"))
         }
         throw ClientError.message("Unexpected update command")
     }
@@ -131,8 +131,8 @@ struct UpdateTests {
         let installedCalls = await fixture.calls
         try check(installedCalls.last == ["updates", "install", "--build", "101", "--json"],
             "Installer operation pins the exact release build shown to the user")
-        try check(store.installerOpened && !store.canInstall && store.notice?.contains("Choose Install") == true,
-            "Opening installer requires explicit human Install and does not claim completion")
+        try check(store.installerOpened && !store.canInstall && store.notice?.contains("continues automatically") == true,
+            "Opening the installer reports automatic setup without claiming installation has finished")
 
         await fixture.setCheckFailure(true)
         await store.checkForUpdates()?.value
@@ -186,8 +186,8 @@ struct UpdateTests {
             "Untracked controller cannot override a known newer published running app")
         await fixture.setInstallerBuild(101)
         await store.openInstaller()?.value
-        try check(store.installerOpened && store.notice?.contains("Choose Install") == true,
-            "Legacy replacement still only opens the pinned installer for explicit installation")
+        try check(store.installerOpened && store.notice?.contains("continues automatically") == true,
+            "Legacy replacement opens the pinned installer for automatic setup without claiming completion")
         await fixture.setInvalidRelease()
         await store.checkForUpdates()?.value
         try check(store.check == nil && store.error?.contains("invalid release") == true,

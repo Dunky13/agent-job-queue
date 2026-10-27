@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftUI
 
 // A distinct process with a disposable HOME drives the real delegate and window.
 // The installer is an injected closure; normal startup uses --fixture throughout.
@@ -66,8 +67,8 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
               ProcessInfo.processInfo.environment["CFFIXED_USER_HOME"] == privateHome else {
             throw ClientError.message("UI fixture requires --fixture, a temporary HOME and CFFIXED_USER_HOME from its runner.")
         }
-        if CommandLine.arguments.contains("--explicit-setup") {
-            try await verifyExplicitSetup(notification)
+        if CommandLine.arguments.contains("--installer-boundary") {
+            try await verifyInstallerBoundary(notification)
             return
         }
         if CommandLine.arguments.contains("--approved-repair") {
@@ -78,25 +79,6 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             try await verifyPreflight(notification)
             return
         }
-        let ordinary = try BootstrapFixture(parent: temporary, setupMode: false)
-        let counter = BootstrapCountingExecutorFixture()
-        let ordinaryDelegate = AppDelegate(environment: ordinary.environment) { request, output in
-            await counter.execute(request, output: output)
-        }
-        production = ordinaryDelegate
-        ordinaryDelegate.applicationDidFinishLaunching(notification)
-        try await waitUntil { ordinaryDelegate.bootstrap?.phase == .setupRequired }
-        guard let requiredWindow = ordinaryDelegate.setupWindow, let requiredModel = ordinaryDelegate.bootstrap else {
-            throw ClientError.message("Read-only startup did not show installation guidance")
-        }
-        await requiredModel.start()?.value
-        let ordinaryCalls = await counter.calls
-        try check(requiredWindow.isVisible && ordinaryCalls == 0 && !requiredModel.allowsInstallation &&
-                  ordinaryDelegate.applicationShouldTerminate(NSApp) == .terminateNow,
-                  "Normal startup shows installer guidance without executing setup and permits Quit")
-        try snapshot(requiredWindow, name: "00-installer-required")
-        requiredWindow.close()
-        ordinaryDelegate.applicationWillTerminate(notification)
         let fixture = try BootstrapFixture(parent: temporary)
         let phoneAccessBlocker = !CommandLine.arguments.contains("--generic-retry")
         let executor = BootstrapExecutorFixture(fixture, phoneAccessBlocker: phoneAccessBlocker)
@@ -227,44 +209,56 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         try snapshot(queue, name: "04-normal-fixture-startup")
     }
 
-    private func verifyExplicitSetup(_ notification: Notification) async throws {
+    private func verifyInstallerBoundary(_ notification: Notification) async throws {
         let fixture = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
-        let executor = BootstrapExplicitSetupFixture(fixture, managed: true)
-        let delegate = AppDelegate(environment: fixture.environment) { request, _ in
-            try await executor.execute(request)
-        }
+        let installer = fixture.directory.appendingPathComponent("Agent Job Queue Installer.app")
+        let controller = installer.appendingPathComponent("Contents/Resources/payload/source/bin/agent-heavy")
+        let definition: [String: Any] = ["CFBundleIdentifier": "io.went.agent-queue.installer-fixture",
+            "CFBundleExecutable": "Installer", "CFBundlePackageType": "APPL"]
+        try BootstrapFixture.write(try PropertyListSerialization.data(fromPropertyList: definition, format: .xml, options: 0),
+            to: installer.appendingPathComponent("Contents/Info.plist"))
+        try BootstrapFixture.write(Data("#!/bin/sh\nexit 99\n".utf8),
+            to: installer.appendingPathComponent("Contents/MacOS/Installer"), executable: true)
+        let script = """
+        #!/bin/sh
+        set -eu
+        [ "$#" -eq 4 ] && [ "$1" = install ] && [ "$2" = --payload ] && [ "$4" = --repair-and-continue ] || exit 91
+        printf '%s\n' 'AGENT_QUEUE_SETUP_STATE:requires-approval' 'Waiting for macOS background service approval. Installation will continue automatically.'
+        while [ ! -f "$0.release" ]; do /bin/sleep 0.05; done
+        printf '%s\n' 'Private fixture installation is complete.'
+        """
+        try BootstrapFixture.write(Data(script.utf8), to: controller, executable: true)
+        guard let bundle = Bundle(url: installer) else { throw ClientError.message("Could not open private installer fixture bundle") }
+        var installerCompleted = false
+        let model = InstallerModel(bundle: bundle) { installerCompleted = true }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 540),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.title = "Install Agent Job Queue"
+        window.contentView = NSHostingView(rootView: InstallerView(model: model))
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        try await waitUntil { model.running && model.requiresServiceApproval && model.output.contains("Waiting for macOS") }
+        try check(!model.completed && !installerCompleted && !model.output.contains("AGENT_QUEUE_SETUP_STATE"),
+            "Opening the outer installer starts automatic setup and exposes macOS settings without an Install confirmation")
+        try snapshot(window, name: "01-installer-automatic-progress")
+        try fixture.installManaged()
+        try BootstrapFixture.write(Data(), to: controller.appendingPathExtension("release"))
+        try await waitUntil { installerCompleted && model.completed && !model.running }
+        try check(!model.requiresServiceApproval, "Outer installer clears its approval hint only after its controller succeeds")
+        window.close()
+
+        let status = BootstrapServiceStatusFixture(status: "enabled")
+        let delegate = AppDelegate(environment: fixture.environment) { request, _ in try await status.execute(request) }
         production = delegate
         delegate.applicationDidFinishLaunching(notification)
-        try await waitUntil { delegate.bootstrap?.phase == .setupRequired }
-        guard let setup = delegate.setupWindow, let model = delegate.bootstrap else {
-            throw ClientError.message("Copied app did not present explicit setup")
-        }
-        let initial = await executor.installations
-        try check(model.canBeginInstallation && initial == 0, "Copied app waits for explicit installation")
-        try snapshot(setup, name: "01-setup-required")
-        try sendReturn(to: setup)
-        try await waitUntil { self.alertButton("Install and set up", for: setup) != nil }
-        guard let alert = setup.attachedSheet ?? NSApp.modalWindow,
-              let cancel = alertButton("Cancel", for: setup) else {
-            throw ClientError.message("Explicit setup approval did not expose Cancel")
-        }
-        try snapshot(alert, name: "02-install-approval")
-        cancel.performClick(nil)
-        try await waitUntil { setup.attachedSheet == nil && NSApp.modalWindow == nil }
-        let declined = await executor.installations
-        try check(declined == 0 && !model.allowsInstallation, "Cancelling the setup dialog performs no installation")
-        try sendReturn(to: setup)
-        try await waitUntil { self.alertButton("Install and set up", for: setup) != nil }
-        guard let approve = alertButton("Install and set up", for: setup) else {
-            throw ClientError.message("Explicit setup approval disappeared")
-        }
-        approve.performClick(nil)
-        try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
-        let installed = await executor.installations
-        try check(installed == 1 && delegate.setupWindow == nil && AppRuntime.store.fixtureMode,
-            "Confirmed copied-app setup installs once and opens the simulated queue")
-        guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Explicit setup did not open its simulated queue") }
-        try snapshot(queue, name: "03-normal-fixture-startup")
+        try await waitUntil { delegate.bootstrap?.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
+        let requests = await status.requests
+        try check(delegate.setupWindow == nil && AppRuntime.integrationWindow == nil && AppRuntime.store.fixtureMode && requests.count == 2 &&
+            requests.allSatisfy { $0.arguments.prefix(2) == ["--service-management", "status"] },
+            "After installer completion runtime opens directly with status reads, no setup and no integration wizard")
+        guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Installed runtime did not open the simulated queue") }
+        try snapshot(queue, name: "02-installed-runtime-read-only")
     }
 
     private func verifyApprovedRepair(_ notification: Notification) async throws {

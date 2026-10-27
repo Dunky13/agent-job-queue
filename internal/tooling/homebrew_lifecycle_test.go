@@ -14,8 +14,8 @@ import (
 	"github.com/Dunky13/agent-job-queue/internal/backend"
 )
 
-// Exercise actual Homebrew delivery movement and rollback, with executable
-// sentinels that fail if delivery attempts setup or any runtime operation.
+// Exercise Homebrew vendor installation, delivery movement and rollback with
+// a private controller sentinel and an injected signature-verification adapter.
 func TestHomebrewNativeAppLifecycle(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Homebrew app lifecycle requires macOS")
@@ -80,6 +80,8 @@ raise "Unexpected test home" unless Pathname(Dir.home) == home
 caskroom = fixture/prefix/"Caskroom"
 FileUtils.mkdir_p(caskroom)
 FileUtils.chmod(0o775, [caskroom.parent, caskroom])
+FixtureSystemCommand.configure(fixture)
+FixtureSystemCommand.verify_vendor_signatures = false
 shared_modes = [caskroom.parent, caskroom].map { |path| path.stat.mode & 0o777 }
 Cask::Caskroom.instance_variable_set(:@path, caskroom)
 
@@ -102,6 +104,23 @@ def stage_installer(cask, build, historical)
     path.write(forbidden)
     path.chmod(0o755)
   end
+  [source, payload/"Agent Queue.app"].each do |bundle|
+    (bundle/"Contents/Info.plist").write(<<~PLIST)
+      <?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>0.1.0</string><key>CFBundleVersion</key><string>#{build}</string></dict></plist>
+    PLIST
+  end
+  vendor = payload/"source/bin/agent-heavy"
+  vendor.write(<<~'SH')
+    #!/bin/sh
+    set -eu
+    [ "$#" = 4 ] && [ "$1" = install ] && [ "$2" = --payload ] && [ "$4" = --repair-and-continue ] || exit 93
+    case "$3" in /private/tmp/agent-queue-install.*/'Agent Job Queue Installer.app/Contents/Resources/payload') ;; *) exit 92;; esac
+    work=${3%/Agent Job Queue Installer.app/Contents/Resources/payload}
+    [ "$(/usr/bin/stat -f %Lp "$work")" = 700 ] || exit 91
+    printf '%s\n' "$work" >> "$HOME/vendor-calls"
+    [ ! -f "$HOME/fail-install" ] || exit 94
+  SH
+  vendor.chmod(0o755)
   (source/"build").write(build.to_s)
   %w[agent-heavy agent-remote].each do |name|
     path = payload/"source/links"/name
@@ -131,17 +150,64 @@ end
 witness = private_files.to_h { |path| [path, [path.binread, path.stat.ino, path.stat.mode]] }
 verify_runtime = lambda do
   witness.each { |path, expected| raise "Delivery moved/deleted/changed runtime #{path}" unless path.exist? && [path.binread, path.stat.ino, path.stat.mode] == expected }
-  raise "Delivery executed setup, queue or native command" if (home/"forbidden-execution").exist?
+  raise "Delivery executed an unrelated runtime/native command" if (home/"forbidden-execution").exist?
+  calls = (home/"vendor-calls").read.lines.map(&:strip)
+  raise "Vendor installer was not executed" if calls.empty?
+  staging = (home/"vendor-staging").read.lines.map(&:strip)
+  raise "Private installer staging survived completion" if staging.any? { |path| Pathname(path).exist? }
 end
 historical = prefix == "historical"
 old = load_cask(fixture, 1)
 old_source = stage_installer(old, 1, historical)
 old.metadata_main_container_path.mkpath
-old_installer = Cask::Installer.new(old, upgrade: true)
+old_installer = Cask::Installer.new(old, upgrade: true, command: FixtureSystemCommand)
 old_installer.install_artifacts
 app = old.artifacts.grep(Cask::Artifact::App).first
 raise "Installer was not relocated" unless app.source.symlink? && (app.target/"build").read == "1"
 verify_links(old, fixture)
+verify_runtime.call
+
+# A vendor failure must stop installation before app/link artifacts move.
+failed = load_cask(fixture, 2)
+stage_installer(failed, 2, historical)
+(home/"fail-install").write("fail")
+begin
+  Cask::Installer.new(failed, upgrade: true, command: FixtureSystemCommand).install_artifacts(predecessor: old)
+  raise "Vendor installation failure was swallowed"
+rescue ErrorDuringExecution
+  raise "Failed vendor install replaced delivered app" unless (app.target/"build").read == "1"
+ensure
+  (home/"fail-install").delete
+end
+verify_runtime.call
+
+# Failed trust must never enter the vendor controller.
+stage_installer(failed, 2, historical)
+count_before = (home/"vendor-calls").read.lines.length
+FixtureSystemCommand.reject_vendor_signatures = true
+begin
+  Cask::Installer.new(failed, upgrade: true, command: FixtureSystemCommand).install_artifacts(predecessor: old)
+  raise "Vendor trust failure was swallowed"
+rescue ErrorDuringExecution
+  raise "Untrusted package executed controller" unless (home/"vendor-calls").read.lines.length == count_before
+ensure
+  FixtureSystemCommand.reject_vendor_signatures = false
+end
+verify_runtime.call
+
+# A valid publisher cannot substitute a different release from writable staging.
+stage_installer(failed, 2, historical)
+source = failed.artifacts.grep(Cask::Artifact::App).first.source
+info = source/"Contents/Info.plist"
+original_info = info.binread
+info.write(original_info.sub("<string>2</string>", "<string>1</string>"))
+count_before = (home/"vendor-calls").read.lines.length
+begin
+  Cask::Installer.new(failed, upgrade: true, command: FixtureSystemCommand).install_artifacts(predecessor: old)
+  raise "Wrong signed release identity was accepted"
+rescue ErrorDuringExecution
+  raise "Wrong release executed its controller" unless (home/"vendor-calls").read.lines.length == count_before
+end
 verify_runtime.call
 
 # A later native artifact failure must roll back delivery alone.
@@ -152,7 +218,7 @@ old_installer.uninstall_artifacts(successor: new, quit: false)
 raise "Old installer was not backed up" unless old_source.directory? && !old_source.symlink?
 verify_runtime.call
 begin
-  Cask::Installer.new(new, upgrade: true).install_artifacts(predecessor: old)
+  Cask::Installer.new(new, upgrade: true, command: FixtureSystemCommand).install_artifacts(predecessor: old)
   raise "Delivery failure was swallowed"
 rescue RuntimeError => error
   raise unless error.message == "injected private binary-link failure"
@@ -165,7 +231,7 @@ verify_runtime.call
 
 new = load_cask(fixture, 2)
 stage_installer(new, 2, historical)
-new_installer = Cask::Installer.new(new, upgrade: true)
+new_installer = Cask::Installer.new(new, upgrade: true, command: FixtureSystemCommand)
 old_installer.uninstall_artifacts(successor: new, quit: false)
 new_installer.install_artifacts(predecessor: old)
 raise "Delivery upgrade did not replace installer" unless (app.target/"build").read == "2"

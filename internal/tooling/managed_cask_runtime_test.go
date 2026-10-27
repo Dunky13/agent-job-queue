@@ -23,6 +23,30 @@ import (
 	"github.com/Dunky13/agent-job-queue/internal/backend"
 )
 
+// Only the owned fixture protocol can enable the production private-native seam.
+// Homebrew filters environment variables before Ruby starts, so the bounded
+// fixture loader rehydrates this explicit value alongside its private HOME.
+func enableManagedCaskFixture(t *testing.T, root string) {
+	t.Helper()
+	filename := filepath.Join(root, "fixture-environment.json")
+	raw, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var environment map[string]string
+	if err := json.Unmarshal(raw, &environment); err != nil {
+		t.Fatal(err)
+	}
+	environment["AGENT_QUEUE_INSTALL_TEST_MANAGED"] = "private-native-lifecycle"
+	raw, err = json.Marshal(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type managedCaskReply struct {
 	Output string `json:"output"`
 	Code   int    `json:"code"`
@@ -429,31 +453,75 @@ func TestManagedInstallerPackagedNativeFixture(t *testing.T) {
 		}
 		return output
 	}
-	privatePayload := filepath.Join(root, "payload")
-	run("/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", payload, privatePayload)
+	installer := filepath.Dir(filepath.Dir(filepath.Dir(payload)))
+	if filepath.Join(installer, "Contents/Resources/payload") != payload {
+		t.Fatal("packaged payload must retain its enclosing installer bundle")
+	}
+	privateInstaller := filepath.Join(root, "Agent Job Queue Installer.app")
+	run("/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", installer, privateInstaller)
+	privatePayload := filepath.Join(privateInstaller, "Contents/Resources/payload")
 	environment = append(environment, "AGENT_QUEUE_INSTALL_TEST_MODE=1", "AGENT_QUEUE_INSTALL_TEST_MANAGED=private-native-lifecycle", "AGENT_QUEUE_INSTALL_TEST_TOOLS="+filepath.Join(root, "tools"))
 	app := filepath.Join(privatePayload, "Agent Queue.app")
-	// This read-only probe prevents running a mutating phase with an old helper
-	// that lacks the production seam. Native status alone cannot register.
 	proveManagedNativeFixture(t, owner, ctx, environment, root, app,
 		filepath.Join(app, "Contents/MacOS/agent-heavy"), filepath.Join(privatePayload, "source/bin/agent-heavy"))
-	run(filepath.Join(privatePayload, "source/bin/agent-heavy"), "install", "--payload", privatePayload)
+	enableManagedCaskFixture(t, root)
+	// This local artifact has ad hoc signatures. The fixture injects its trust
+	// adapter while running the actual cask Installer and isolated real helpers.
+	// The separate release acceptance above runs the real Apple verifiers.
+	protocol := filepath.Join(root, "fixture-environment.json")
+	rawProtocol, err := os.ReadFile(protocol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var protocolEnvironment map[string]string
+	if err := json.Unmarshal(rawProtocol, &protocolEnvironment); err != nil {
+		t.Fatal(err)
+	}
+	delete(protocolEnvironment, "AGENT_QUEUE_INSTALL_TEST_TEAM")
+	rawProtocol, err = json.Marshal(protocolEnvironment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(protocol, rawProtocol, 0600); err != nil {
+		t.Fatal(err)
+	}
+	brew, err := exec.LookPath("brew")
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := os.ReadFile(filepath.Join(privatePayload, "source/build-info.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := backend.ValidateBuildInfo(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cask := notarizedFixtureCask(t, root, identity.Version)
+	output := run(brew, "ruby", "--", "../../packaging/homebrew/test-cask.rb", cask, root)
+	var installed struct {
+		Executed bool `json:"fixture_installer_executed"`
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &installed); err != nil || !installed.Executed {
+		t.Fatalf("private packaged cask did not execute vendor installation: %v: %s", err, output)
+	}
 	cli := filepath.Join(home, ".local/bin/agent-heavy")
 	run(cli, "status", "--json")
 	native.mu.Lock()
 	daemon, scheduler := native.processes["queue"], native.processes["resources"]
 	native.mu.Unlock()
 	if daemon == nil || scheduler == nil {
-		t.Fatal("Explicit installer did not start both real packaged private services")
+		t.Fatal("Homebrew vendor installer did not start both real packaged private services")
 	}
-	// The explicit installer command has ended. Its parent-owned services must
+	// The Homebrew installer artifact has ended. Its parent-owned services must
 	// still accept a real job with exact arguments and exit status.
 	job, err := owner.start(ctx, append(slices.Clone(environment), "PACKAGED_TEST_VALUE=fixture-env"), nil, cli,
 		"run", "--label", "Private managed installer job", "--", "/bin/sh", "-c", `printf '%s|%s|%s\n' "$1" "$2" "$PACKAGED_TEST_VALUE"; exit 7`, "fixture", "argument with spaces", "literal;$HOME")
 	if err != nil {
 		t.Fatal(err)
 	}
-	output, err := job.wait()
+	output, err = job.wait()
 	var exited *exec.ExitError
 	if !errors.As(err, &exited) || exited.ExitCode() != 7 || !strings.Contains(string(output), "argument with spaces|literal;$HOME|fixture-env") {
 		t.Fatalf("private installer packaged job contract failed: %v: %s", err, output)
@@ -563,5 +631,5 @@ func TestManagedInstallerPackagedNativeFixture(t *testing.T) {
 			t.Fatalf("private installer removal retained generated location/wrapper %s: %v", name, err)
 		}
 	}
-	t.Log("Actual packaged helpers passed explicit installer setup and private runtime acceptance; native lifecycle was injected, actual OS registration remains unqualified")
+	t.Log("Actual packaged helpers passed noninteractive Homebrew setup and private runtime acceptance; trust/native lifecycle were injected, actual Apple trust and OS registration remain unqualified")
 }

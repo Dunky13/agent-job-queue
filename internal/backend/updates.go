@@ -841,7 +841,7 @@ func (client *UpdateClient) OpenInstaller(build int) (Object, error) {
 		return nil, err
 	}
 	temporary = ""
-	return Object{"installerOpened": true, "build": build, "message": "Installer opened. Finish queued and running jobs. Choose Install to continue; active work blocks managed service changes"}, nil
+	return Object{"installerOpened": true, "build": build, "message": "Installer opened. Setup starts automatically and waits for active jobs before updating background services"}, nil
 }
 
 func UpdatesMain(args []string) int {

@@ -76,8 +76,8 @@ func TestMacOSResumeDragInstallRetainsAppPayloadAndShortcut(t *testing.T) {
 	if !strings.Contains(record, "Agent Queue.app/Contents/Resources/payload/source/bin/agent-heavy") {
 		t.Fatalf("resumed release did not sign embedded helpers: %s", record)
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
-		t.Fatalf("resumed release lost the drag-install layout: %s", record)
+	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n") {
+		t.Fatalf("resumed release lost the automatic installer layout: %s", record)
 	}
 }
 
@@ -972,7 +972,7 @@ func TestMacOSResumeManagedHelpersRemainInsidePayloadCheckpoint(t *testing.T) {
 			t.Fatalf("resumed release omitted canonical helper: %s", record)
 		}
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
-		t.Fatal("managed resume lost drag-to-Applications disk image layout")
+	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n") {
+		t.Fatal("managed resume lost the automatic installer disk image layout")
 	}
 }

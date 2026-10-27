@@ -26,9 +26,10 @@ type queueRequest struct {
 	Payload   Object `json:"payload"`
 }
 type queueResponse struct {
-	Version int    `json:"version"`
-	Result  Object `json:"result"`
-	Error   string `json:"error,omitempty"`
+	Version   int    `json:"version"`
+	Result    Object `json:"result"`
+	Error     string `json:"error,omitempty"`
+	ErrorCode string `json:"errorCode,omitempty"`
 }
 
 func queueSocket(g *Gate) string { return filepath.Join(g.State, "run", "queue.sock") }
@@ -62,7 +63,7 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 		return g.queueControl(operation, payload)
 	}
 	if e := safeQueueSocket(queueSocket(g)); e != nil {
-		return nil, fmt.Errorf("Queue daemon unavailable; command was not run directly: %w", e)
+		return nil, fmt.Errorf("Queue daemon unavailable; command was not run directly: %w", queueTransportError(e))
 	}
 	deadline := time.Now().Add(15 * time.Second)
 	if !g.ControlDeadline.IsZero() && g.ControlDeadline.Before(deadline) {
@@ -74,7 +75,7 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 	dialer := net.Dialer{Deadline: deadline}
 	conn, e := dialer.DialContext(ctx, "unix", queueSocket(g))
 	if e != nil {
-		return nil, errors.New("Queue daemon unavailable; command was not run directly")
+		return nil, fmt.Errorf("Queue daemon unavailable; command was not run directly: %w", queueTransportError(e))
 	}
 	defer conn.Close()
 	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
@@ -83,18 +84,21 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 		return nil, e
 	}
 	if e = json.NewEncoder(conn).Encode(queueRequest{Version: 1, Operation: operation, Payload: payload}); e != nil {
-		return nil, e
+		return nil, queueTransportError(e)
 	}
 	var response queueResponse
 	decoder := json.NewDecoder(io.LimitReader(conn, 32*1024*1024+1))
 	decoder.UseNumber()
 	if e = decoder.Decode(&response); e != nil {
-		return nil, fmt.Errorf("Invalid queue daemon response: %w", e)
+		return nil, fmt.Errorf("Invalid queue daemon response: %w", queueTransportError(e))
 	}
 	if response.Version != 1 {
 		return nil, errors.New("Unsupported queue protocol")
 	}
 	if response.Error != "" {
+		if response.ErrorCode == "handover-busy" {
+			return nil, errQueueHandoverBusy
+		}
 		return nil, errors.New(response.Error)
 	}
 	if response.Result == nil {
@@ -104,13 +108,15 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 }
 
 type queueDaemon struct {
-	g        *Gate
-	store    *queueStore
-	mu       sync.Mutex
-	children map[int]*exec.Cmd
-	errors   map[int]string
-	cleaning map[int]bool
-	cleanup  sync.WaitGroup
+	g            *Gate
+	store        *queueStore
+	mu           sync.Mutex
+	children     map[int]*exec.Cmd
+	errors       map[int]string
+	cleaning     map[int]bool
+	cleanup      sync.WaitGroup
+	handover     *queueHandoverReceipt
+	handoverStop chan struct{}
 }
 
 func ServeQueue(g *Gate) error {
@@ -134,8 +140,12 @@ func ServeQueue(g *Gate) error {
 	if e != nil {
 		return e
 	}
+	adoption, e := queueAdoptHandover(g, store)
+	if e != nil {
+		return e
+	}
 	dirty, _ := integer(settings["dirty"])
-	if dirty != 0 {
+	if dirty != 0 && adoption == nil {
 		if _, e = store.db.Exec("UPDATE queue_settings SET status='Paused' WHERE id=1"); e != nil {
 			return e
 		}
@@ -172,9 +182,14 @@ func ServeQueue(g *Gate) error {
 		return e
 	}
 	defer os.Remove(path)
-	d := &queueDaemon{g: g, store: store, children: map[int]*exec.Cmd{}, errors: map[int]string{}, cleaning: map[int]bool{}}
+	d := &queueDaemon{g: g, store: store, children: map[int]*exec.Cmd{}, errors: map[int]string{}, cleaning: map[int]bool{}, handoverStop: make(chan struct{}, 1)}
 	if e = d.recover(); e != nil {
 		return e
+	}
+	if adoption != nil {
+		if e = consumeQueueHandover(g, adoption); e != nil {
+			return e
+		}
 	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
@@ -212,6 +227,9 @@ func ServeQueue(g *Gate) error {
 				response := queueResponse{Version: 1, Result: result}
 				if e != nil {
 					response.Error = e.Error()
+					if errors.Is(e, errQueueHandoverBusy) {
+						response.ErrorCode = "handover-busy"
+					}
 				}
 				json.NewEncoder(conn).Encode(response)
 			}()
@@ -221,6 +239,15 @@ func ServeQueue(g *Gate) error {
 	defer ticker.Stop()
 	for {
 		select {
+		case <-d.handoverStop:
+			cancel()
+			listener.Close()
+			servers.Wait()
+			d.cleanup.Wait()
+			d.mu.Lock()
+			e = d.releaseHandover()
+			d.mu.Unlock()
+			return e
 		case <-stop:
 			cancel()
 			listener.Close()
@@ -275,6 +302,26 @@ func (d *queueDaemon) control(op string, p Object) (Object, error) {
 func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	if e := queuePrivateFiles(d.store.path); e != nil {
 		return nil, e
+	}
+	if op == "handover-status" || op == "prepare-handover" || op == "commit-handover" || op == "cancel-handover" {
+		return d.handoverControl(op, p)
+	}
+	if d.handover != nil && op != "snapshot" {
+		if op == "submit" {
+			value := text(p["token"])
+			if !validToken(value) {
+				return nil, errors.New("Invalid submission token")
+			}
+			var id int
+			err := d.store.db.QueryRow("SELECT id FROM queue_jobs WHERE token=?", value).Scan(&id)
+			if err == nil {
+				return Object{"id": id}, nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+		}
+		return nil, errQueueHandoverBusy
 	}
 	if op == "snapshot" {
 		return d.store.snapshot()
@@ -451,6 +498,24 @@ func (d *queueDaemon) submit(p Object) (Object, error) {
 	if payload["token"] != value {
 		return nil, errors.New("Invalid private submission identity")
 	}
+	protocol, supported := integer(payload["client_handover_protocol"])
+	var caller *queueHandoverDaemon
+	if supported && protocol == queueHandoverProtocol {
+		caller, e = decodeQueueHandoverIdentity(payload["client_handover_caller"])
+		if e != nil {
+			return nil, e
+		}
+		alive, identityErr := queueHandoverDaemonAlive(*caller)
+		if identityErr != nil {
+			return nil, identityErr
+		}
+		if !alive {
+			return nil, errors.New("Original queue caller exited before submission")
+		}
+	}
+	if d.handover != nil && (!supported || protocol != queueHandoverProtocol) {
+		return nil, errors.New("A legacy caller cannot submit while a live queue handover is prepared")
+	}
 	argv, e := stringsFrom(payload["argv"])
 	if e != nil || len(argv) == 0 {
 		return nil, errors.New("Invalid private command")
@@ -469,6 +534,10 @@ func (d *queueDaemon) submit(p Object) (Object, error) {
 		return nil, errors.New("Queue job ID space exhausted")
 	}
 	task := Object{"token": value, "path": payload["cwd"], "label": payload["label"], "priority": 0, "group": "default", "created_at": queueNow(), "status": Object{state: Object{}}, "logPath": filepath.Join(d.g.State, "logs", strconv.Itoa(next)+".log")}
+	if supported && protocol == queueHandoverProtocol {
+		task["handoverProtocol"] = queueHandoverProtocol
+		task["handoverCaller"] = caller
+	}
 	data, e := queueJSON(task)
 	if e != nil {
 		return nil, e
@@ -498,6 +567,9 @@ func (d *queueDaemon) submit(p Object) (Object, error) {
 	return Object{"id": next}, nil
 }
 func (d *queueDaemon) launch(j queueJob) error {
+	if d.handover != nil {
+		return errors.New("Queue dispatch is frozen for live handover")
+	}
 	j.attempt = token()
 	j.task["status"] = Object{"Running": Object{"start": queueNow()}}
 	data, e := queueJSON(j.task)
@@ -603,6 +675,9 @@ func (d *queueDaemon) finish(j queueJob, code int) error {
 	return e
 }
 func (d *queueDaemon) tick() error {
+	if e := d.expireHandover(); e != nil {
+		return e
+	}
 	jobs, e := d.store.unfinishedJobs()
 	if e != nil {
 		return e
@@ -669,6 +744,9 @@ func (d *queueDaemon) tick() error {
 	settings, e := d.store.settings()
 	if e != nil {
 		return e
+	}
+	if d.handover != nil {
+		return nil
 	}
 	limit, _ := integer(settings["parallel_tasks"])
 	if settings["status"] != "Running" || active >= limit {
@@ -770,5 +848,5 @@ func ExecuteAttempt(g *Gate, id int, value, attempt string) (code int, err error
 		}
 		err = errors.Join(err, e)
 	}()
-	return Execute(g, value)
+	return executeWithAttempt(g, value, attempt)
 }

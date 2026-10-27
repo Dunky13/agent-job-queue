@@ -42,7 +42,7 @@ func TestManagedCaskTemplateParity(t *testing.T) {
 	}
 }
 
-func TestHomebrewDeliveryPreservesQuarantineWithoutExecutingPayload(t *testing.T) {
+func TestHomebrewInstallerPreservesQuarantineWithPrivateVendorAdapter(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Homebrew quarantine delivery requires macOS")
 	}
@@ -72,6 +72,9 @@ func TestHomebrewDeliveryPreservesQuarantineWithoutExecutingPayload(t *testing.T
 			}
 			installer := filepath.Join(root, "Agent Job Queue Installer.app")
 			payload := filepath.Join(installer, "Contents/Resources/payload")
+			for _, bundle := range []string{installer, filepath.Join(payload, "Agent Queue.app")} {
+				verificationWrite(t, filepath.Join(bundle, "Contents/Info.plist"), `<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>0.1.0</string><key>CFBundleVersion</key><string>123</string></dict></plist>`, 0600)
+			}
 			paths := []string{filepath.Join(installer, "Contents/MacOS/Installer"), filepath.Join(payload, "source/bin/agent-heavy"), filepath.Join(payload, "source/bin/agent-remote"), filepath.Join(payload, "Agent Queue.app/Contents/MacOS/AgentQueue")}
 			helperDir := "Agent Queue.app/Contents/MacOS"
 			if historical {
@@ -83,6 +86,7 @@ func TestHomebrewDeliveryPreservesQuarantineWithoutExecutingPayload(t *testing.T
 			for _, path := range paths {
 				verificationWrite(t, path, "#!/bin/sh\ntouch \"$HOME/forbidden-execution\"\nexit 95\n", 0700)
 			}
+			verificationWrite(t, filepath.Join(payload, "source/bin/agent-heavy"), "#!/bin/sh\n[ \"$1\" = install ] && [ \"$2\" = --payload ] && [ \"$4\" = --repair-and-continue ] || exit 94\ncase \"$3\" in /private/tmp/agent-queue-install.*/*) ;; *) exit 93;; esac\nprintf '%s\\n' \"$3\" > \"$HOME/vendor-payload\"\n", 0700)
 			runtime := filepath.Join(home, "Applications/Agent Queue.app/Contents/MacOS/AgentQueue")
 			verificationWrite(t, runtime, "live runtime sentinel", 0700)
 			before, err := os.Stat(runtime)
@@ -106,7 +110,7 @@ func TestHomebrewDeliveryPreservesQuarantineWithoutExecutingPayload(t *testing.T
 				Attrs     map[string]int `json:"fixture_attributes"`
 			}
 			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &result); err != nil || !result.Installed || result.Executed || len(result.Attrs) != 5 || result.Attrs["entries"] == 0 {
+			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &result); err != nil || !result.Installed || !result.Executed || len(result.Attrs) != 5 || result.Attrs["entries"] == 0 {
 				t.Fatalf("invalid delivery evidence: %v: %s", err, output)
 			}
 			for _, count := range result.Attrs {
@@ -119,7 +123,14 @@ func TestHomebrewDeliveryPreservesQuarantineWithoutExecutingPayload(t *testing.T
 				t.Fatal("delivery replaced the live runtime", err)
 			}
 			if _, err := os.Stat(filepath.Join(home, "forbidden-execution")); !os.IsNotExist(err) {
-				t.Fatal("delivery executed the installer or unsupported historical flags", err)
+				t.Fatal("installation executed an unrelated helper", err)
+			}
+			privatePayload, err := os.ReadFile(filepath.Join(home, "vendor-payload"))
+			if err != nil || !strings.HasPrefix(string(privatePayload), "/private/tmp/agent-queue-install.") {
+				t.Fatalf("vendor controller did not use protected staging: %v", err)
+			}
+			if _, err := os.Stat(strings.TrimSpace(string(privatePayload))); !os.IsNotExist(err) {
+				t.Fatal("successful vendor installation left private staging", err)
 			}
 		})
 	}
@@ -145,7 +156,11 @@ func TestManagedCaskLoaderRejectsHookDrift(t *testing.T) {
 		{"runtime-target", `Applications/Agent Job Queue Installer.app`, `Applications/Agent Queue.app`},
 		{"preflight", "  caveats <<~EOS", "  preflight_steps do\n    run \"/bin/true\"\n  end\n  caveats <<~EOS"},
 		{"postflight", "  caveats <<~EOS", "  postflight_steps do\n    run \"/bin/true\"\n  end\n  caveats <<~EOS"},
-		{"uninstall", "  caveats <<~EOS", "  uninstall quit: \"io.went.agent-queue\"\n  caveats <<~EOS"},
+		{"uninstall", `uninstall script: { executable: "/usr/bin/true", sudo: false, must_succeed: true }`, `uninstall quit: "io.went.agent-queue"`},
+		{"installer-command", `executable: "/bin/sh"`, `executable: "/bin/bash"`},
+		{"installer-flags", `--repair-and-continue`, `--unregister-services`},
+		{"publisher", `U9GXK89565`, `AAAAAAAAAA`},
+		{"sudo", `sudo: false`, `sudo: true`},
 		{"removal", "  caveats <<~EOS", "  uninstall_preflight_steps do\n    run \"/bin/true\"\n  end\n  caveats <<~EOS"},
 		{"binary", "source/links/agent-heavy", "source/bin/agent-heavy"},
 		{"binary-target", `source/links/agent-heavy"`, `source/links/agent-heavy", target: "unexpected"`},

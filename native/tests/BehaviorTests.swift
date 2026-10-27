@@ -104,16 +104,11 @@ struct BehaviorTests {
         let remote = RemoteAccessStore(fixtureMode: true)
         try check(remote.fixtureMode && !remote.configure(password: "word", enable: true), "Fixture cannot change actual remote credentials")
 
-        let suite = "agent-queue-onboarding-test-\(UUID().uuidString)"
-        guard let defaults = UserDefaults(suiteName: suite) else { throw ClientError.message("No isolated defaults") }
-        defer { defaults.removePersistentDomain(forName: suite) }
-        try check(AgentOnboarding.shouldOffer(defaults: defaults, fixtureMode: false), "New users receive integration setup")
-        try check(!AgentOnboarding.shouldOffer(defaults: defaults, fixtureMode: true), "Fixtures never trigger real onboarding")
-        defaults.set(true, forKey: AgentOnboarding.offeredKey)
-        try check(!AgentOnboarding.shouldOffer(defaults: defaults, fixtureMode: false), "Dismissed onboarding stays dismissed")
-
         let integrationFixture = IntegrationFixture()
         let integration = AgentIntegrationStore(command: { try await integrationFixture.load($0) })
+        let initialIntegrationCalls = await integrationFixture.calls
+        try check(initialIntegrationCalls.isEmpty && !integration.canSave && QueueAppAction.settings.contains(.integration),
+            "Agent integration remains opt-in through settings and performs no implicit I/O")
         await integration.refresh()
         try check(integration.selected.isEmpty && !integration.canSave, "Integration starts with no runners selected")
         integration.select("codex", enabled: true)

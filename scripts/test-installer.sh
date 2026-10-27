@@ -12,7 +12,7 @@ ditto -x -k "$archive" "$work"
 installer="$work/Agent Job Queue Installer.app"
 go run -p 2 ./cmd/queue-tool verify-installer --installer "$installer"
 AGENT_QUEUE_TEST_INSTALLER_PAYLOAD="$installer/Contents/Resources/payload" \
-  go test -p 2 -parallel 2 ./internal/backend -run '^TestInstallerPackaged(Payload|AppBundle)$' -count=1 -v -timeout 3m
+  go test -p 2 -parallel 2 ./internal/backend -run '^TestInstallerPackaged(Payload|AppBundle|LiveUpgrade)$' -count=1 -v -timeout 3m
 AGENT_QUEUE_TEST_INSTALLER_PAYLOAD="$installer/Contents/Resources/payload" \
   go test -p 2 -parallel 2 ./internal/remote -run '^TestRemotePackagedGateway$' -count=1 -v -timeout 3m
 AGENT_QUEUE_TEST_INSTALLER_PAYLOAD="$installer/Contents/Resources/payload" \

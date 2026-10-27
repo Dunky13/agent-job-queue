@@ -670,9 +670,11 @@ func testDistributionRecoveryCandidateBudget(t *testing.T, postResult string) {
 	t.Helper()
 	f := newDistributionRecoveryFixture(t)
 	runs := []map[string]any{}
+	candidates := []*distributionRecoveryFixture{}
 	for i := 0; i < 6; i++ {
 		candidate := distributionRecoveryCandidate(f.checkpointFixture, 999+i, 123+i)
 		candidate.write(t)
+		candidates = append(candidates, candidate)
 		runs = append(runs, candidate.execution)
 	}
 	// A second page is required, including during the pre-mutation recheck.
@@ -701,8 +703,10 @@ case "$1" in
  *) exit 98;;
 esac
 `)
-	for i := 0; i < 6; i++ {
-		candidate := distributionRecoveryCandidate(f.checkpointFixture, 999+i, 123+i)
+	// Reuse the exact executions advertised by the inventory. Recreating them
+	// would advance created_at/updated_at across a wall-clock second and rightly
+	// trip the observer's immutable-execution check under concurrent test load.
+	for i, candidate := range candidates {
 		candidate.write(t)
 		data, err := os.ReadFile(filepath.Join(f.root, "artifact-901.zip"))
 		if err != nil {

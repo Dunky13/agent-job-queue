@@ -224,7 +224,14 @@ enum QueueClient {
         // A verified update includes a bounded download and signature checks. The
         // backend has a 120-second aggregate deadline; normal queue I/O is unchanged.
         if budget == .updates && controller == .heavy && arguments.first == "updates" { return 130 }
-        if budget == .setup { return 330 }
+        if budget == .setup {
+            // The backend bounds each inspection and mutation independently.
+            // Waiting for existing work to drain has no aggregate deadline.
+            if controller == .heavy && arguments.count == 4 && arguments[0] == "install" &&
+                ["--app-bundle", "--payload"].contains(arguments[1]) &&
+                arguments[2].hasPrefix("/") && arguments[3] == "--repair-and-continue" { return .infinity }
+            return 330
+        }
         // Phone lifecycle owns up to 120 seconds for native stop/start and
         // readiness. Its caller must allow startup and result delivery too.
         return arguments.first == "status" ? 8 : (controller == .remote ? 125 : 25)
@@ -1909,10 +1916,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } else {
             if arguments.contains("--open-window") { AppRuntime.showWindow() }
-            if AgentOnboarding.shouldOffer(defaults: .standard, fixtureMode: AppRuntime.store.fixtureMode) {
-                AppRuntime.showIntegrationWindow()
-                UserDefaults.standard.set(true, forKey: AgentOnboarding.offeredKey)
-            }
         }
     }
 

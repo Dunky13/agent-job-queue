@@ -19,6 +19,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 )
@@ -395,6 +396,10 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 	if install.managed {
 		return install.preflightManaged(ctx, report)
 	}
+	return install.preflightLegacy(ctx, report)
+}
+
+func (install *installer) preflightLegacy(ctx context.Context, report installPreflightReport) installPreflightReport {
 	privateSafe := true
 	for _, directory := range []string{install.root, filepath.Join(install.root, "bin"), install.state, filepath.Join(install.state, "pueue"), install.config, install.launch, filepath.Join(install.home, ".local/bin")} {
 		if err := installInspectDirectory(directory); err != nil {
@@ -857,6 +862,15 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 	}
 	if action == installRestoreServices {
 		return install.restoreServiceDefinitions(ctx)
+	}
+	if action == "cleanup-job" && install.managed {
+		previous, err := appservices.Load(install.home)
+		if err != nil {
+			return err
+		}
+		if previous != nil {
+			return install.recoverManagedCleanup(ctx, *jobID)
+		}
 	}
 	if err := install.validateLoadedServices(ctx); err != nil {
 		return err

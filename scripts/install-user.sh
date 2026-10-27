@@ -10,4 +10,4 @@ payload=$2
   echo 'Incomplete installer payload: Go controller is missing.' >&2
   exit 1
 }
-exec "$payload/source/bin/agent-heavy" install --payload "$payload"
+exec "$payload/source/bin/agent-heavy" install --payload "$payload" --repair-and-continue

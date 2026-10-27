@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -11,11 +12,12 @@ import (
 )
 
 type installApprovedStep struct {
-	action string
-	jobID  *int
+	action   string
+	jobID    *int
+	revision string
 }
 
-// Keep this fixed issue/action contract aligned with the native setup model.
+// The native automatic flow delegates this fixed issue/action contract here.
 // An action advertised by an unrelated blocker never grants repair authority.
 func installApprovedIssue(issue installPreflightIssue) (installApprovedStep, bool) {
 	has := func(id string) bool {
@@ -29,6 +31,8 @@ func installApprovedIssue(issue installPreflightIssue) (installApprovedStep, boo
 		return installApprovedStep{action: installRestoreServices}, has(installRestoreServices)
 	case "legacy-phone-access", "remote-migration":
 		return installApprovedStep{action: "disable-phone-access"}, has("disable-phone-access")
+	case "custom-callback":
+		return installApprovedStep{action: "reset-callback"}, has("reset-callback")
 	case "service-not-ready":
 		if has("repair-service") {
 			return installApprovedStep{action: "repair-service"}, true
@@ -43,7 +47,7 @@ func installApprovedIssue(issue installPreflightIssue) (installApprovedStep, boo
 			return installApprovedStep{action: "cleanup-job", jobID: &id}, true
 		}
 		return wait()
-	case "legacy-jobs":
+	case "legacy-jobs", "managed-jobs":
 		if len(issue.Jobs) == 0 {
 			return installApprovedStep{}, false
 		}
@@ -53,7 +57,7 @@ func installApprovedIssue(issue installPreflightIssue) (installApprovedStep, boo
 			}
 		}
 		return wait()
-	case "installer-busy", "scheduling-busy", "remote-busy", "controller-stopping":
+	case "installer-busy", "scheduling-busy", "remote-busy", "controller-stopping", "service-approval":
 		return wait()
 	default:
 		return installApprovedStep{}, false
@@ -66,16 +70,30 @@ func installApprovedNext(report installPreflightReport) (installApprovedStep, er
 	}
 	steps := make([]installApprovedStep, 0, len(report.Issues))
 	busy := false
+	draining := false
 	for _, issue := range report.Issues {
 		step, supported := installApprovedIssue(issue)
 		if !supported {
 			return installApprovedStep{}, fmt.Errorf("Automatic setup requires review: %s. %s", issue.Title, issue.Detail)
 		}
+		if step.action == "reset-callback" {
+			if decoded, err := hex.DecodeString(report.Revision); err != nil || len(decoded) != 32 {
+				return installApprovedStep{}, errors.New("Automatic callback replacement requires the exact configuration revision")
+			}
+			step.revision = report.Revision
+		}
 		steps = append(steps, step)
 		busy = busy || slices.Contains([]string{"installer-busy", "scheduling-busy", "remote-busy", "controller-stopping"}, issue.ID)
+		draining = draining || (step.action == "" && slices.Contains([]string{"legacy-jobs", "managed-jobs", "pending-cleanup", "service-approval"}, issue.ID))
 	}
 	if !busy {
-		for _, action := range []string{installFinishPending, installRestoreServices, "repair-service", "cleanup-job", "disable-phone-access"} {
+		for _, action := range []string{installFinishPending, installRestoreServices, "repair-service", "cleanup-job", "disable-phone-access", "reset-callback"} {
+			// Restoring a verified service and cleaning a completed job can help
+			// the queue drain. Configuration and phone changes require that drain
+			// to finish first, just as their authoritative recovery paths do.
+			if draining && !slices.Contains([]string{installRestoreServices, "repair-service", "cleanup-job"}, action) {
+				continue
+			}
 			for _, step := range steps {
 				if step.action == action {
 					return step, nil
@@ -88,6 +106,9 @@ func installApprovedNext(report installPreflightReport) (installApprovedStep, er
 
 func installRunApprovedRepair(ctx context.Context, inspect func(context.Context) installPreflightReport, recover func(context.Context, string, *int, string) error, execute func(context.Context) error, pause func(context.Context) error, progress func(string)) error {
 	performed := map[string]bool{}
+	var pendingApproval error
+	approvalObserved := false
+	approvalResumed := map[string]bool{}
 	lastMessage := ""
 	reportProgress := func(message string) {
 		if message != lastMessage {
@@ -108,14 +129,37 @@ func installRunApprovedRepair(ctx context.Context, inspect func(context.Context)
 			return err
 		}
 		if len(report.Issues) == 0 {
+			if pendingApproval != nil && !approvalObserved {
+				var approval *installApprovalError
+				if !errors.As(pendingApproval, &approval) || approvalResumed[approval.service] {
+					return pendingApproval
+				}
+				// Consent can be granted before the first status poll. Permit
+				// one custody-checked resume, but fence repeated no-progress exits.
+				approvalResumed[approval.service] = true
+			}
 			reportProgress("Setup requirements are clear. Continuing installation…")
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return execute(ctx)
+			err := execute(ctx)
+			var approval *installApprovalError
+			if errors.As(err, &approval) {
+				// Registration can legitimately pause the exact pending candidate
+				// for macOS approval. Reinspect it without retrying registration
+				// while consent is denied; resume only after read-only status clears.
+				pendingApproval, approvalObserved = err, false
+				continue
+			}
+			return err
 		}
 		if step.action == "" {
-			reportProgress("Waiting for queue work and setup requirements. Installation will continue automatically; active jobs are preserved.")
+			if slices.ContainsFunc(report.Issues, func(issue installPreflightIssue) bool { return issue.ID == "service-approval" }) {
+				approvalObserved = true
+				reportProgress("AGENT_QUEUE_SETUP_STATE:requires-approval\nWaiting for macOS background service approval. Allow Agent Queue in System Settings > General > Login Items & Extensions. Installation will continue automatically.")
+			} else {
+				reportProgress("Waiting for queue work and setup requirements. Installation will continue automatically; active jobs are preserved.")
+			}
 			if err := pause(ctx); err != nil {
 				return err
 			}
@@ -136,14 +180,40 @@ func installRunApprovedRepair(ctx context.Context, inspect func(context.Context)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := recover(ctx, step.action, step.jobID, ""); err != nil {
+		if err := recover(ctx, step.action, step.jobID, step.revision); err != nil {
 			return err
 		}
 	}
 }
 
 func (install *installer) repairAndExecute(ctx context.Context) error {
-	return installRunApprovedRepair(ctx, install.preflight, install.recover, install.execute, func(ctx context.Context) error {
+	previous := install.automaticSetup
+	install.automaticSetup = true
+	defer func() { install.automaticSetup = previous }()
+	// Queue drain can take as long as the running workload. Each individual
+	// inspection, repair and installation still has a finite execution budget.
+	return installRunApprovedRepair(ctx, func(ctx context.Context) installPreflightReport {
+		operation, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		report := install.preflight(operation)
+		if err := operation.Err(); err != nil {
+			report.add("inspection-failed", "Installation inspection did not complete", err.Error(), "")
+		}
+		return report
+	}, func(ctx context.Context, action string, jobID *int, revision string) error {
+		if action == installFinishPending {
+			// Its retained installer owns bounded individual operations and
+			// may need an arbitrarily long drain or OS approval wait.
+			return install.recover(ctx, action, jobID, revision)
+		}
+		operation, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		return install.recover(operation, action, jobID, revision)
+	}, func(ctx context.Context) error {
+		operation, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		return install.execute(operation)
+	}, func(ctx context.Context) error {
 		timer := time.NewTimer(2 * time.Second)
 		defer timer.Stop()
 		select {

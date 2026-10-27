@@ -29,6 +29,7 @@ type managedPlan struct {
 	node                  *yaml.Node
 	python, pueue, remote bool
 	remoteCleanup         bool
+	live                  *managedLiveUpgrade
 }
 
 func (install *installer) managedStatus(ctx context.Context, app, service string) (string, error) {
@@ -50,6 +51,9 @@ func (install *installer) managedAction(ctx context.Context, app, action, servic
 		return err
 	}
 	if status == "requiresApproval" && !(action == "unregister" && install.unregisterServices) {
+		if action == "register" {
+			return &installApprovalError{service: service}
+		}
 		return fmt.Errorf("The %s service requires approval in System Settings; approve it before retrying setup", service)
 	}
 	if status == "notFound" && action != "register" {
@@ -71,6 +75,14 @@ func (install *installer) managedAction(ctx context.Context, app, action, servic
 	}
 	// The native bridge waits for asynchronous unregistration completion.
 	if _, err := install.run(ctx, args...); err != nil {
+		// The real native bridge exits 2 for a registered service awaiting
+		// consent. Confirm that precise state with a read-only query before
+		// treating a failed command as a resumable approval pause.
+		if action == "register" {
+			if current, readErr := install.managedStatus(ctx, app, service); readErr == nil && current == "requiresApproval" {
+				return &installApprovalError{service: service}
+			}
+		}
 		return err
 	}
 	status, err = install.managedStatus(ctx, app, service)
@@ -82,6 +94,9 @@ func (install *installer) managedAction(ctx context.Context, app, action, servic
 		expected = "notRegistered"
 	}
 	if status != expected {
+		if action == "register" && status == "requiresApproval" {
+			return &installApprovalError{service: service}
+		}
 		return fmt.Errorf("The %s service is %s after %s; setup is incomplete", service, status, action)
 	}
 	return nil
@@ -132,12 +147,18 @@ func (install *installer) managedLegacyDefinition(label string, value Object) er
 			allowed["PATH"] = ToolPath
 			for name, field := range env {
 				if !reflect.DeepEqual(field, allowed[name]) {
+					if install.automaticSetup {
+						continue // The verified legacy definition is backed up and retired after drain.
+					}
 					return fmt.Errorf("Legacy service environment %s cannot be retained by the managed bundle", name)
 				}
 			}
 			continue
 		}
 		if !managedValuesEqual(raw, expected[key]) {
+			if install.automaticSetup {
+				continue
+			}
 			return fmt.Errorf("Legacy service option %s is customized; review it before managed migration", key)
 		}
 	}
@@ -215,6 +236,12 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 	if p.pueue {
 		return nil
 	} // queueMigration already applies the Pueue drain and cleanup gates.
+	if live, err := install.resumeManagedLive(ctx, p); err != nil {
+		return err
+	} else if live != nil {
+		p.live = live
+		return nil
+	}
 	exists, err := updateExists(filepath.Join(install.state, "queue.sqlite3"))
 	if err != nil {
 		return err
@@ -234,7 +261,26 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		return errors.New("Cannot verify drained queue: invalid queue snapshot")
 	}
 	if err := installRequireDrained(tasks); err != nil {
+		var drain *installDrainPendingError
+		if errors.As(err, &drain) {
+			live, liveErr := install.planManagedLive(ctx, p)
+			if liveErr != nil {
+				return liveErr
+			}
+			if live != nil {
+				p.live = live
+				return nil
+			}
+		}
 		return err
+	}
+	// A command can have a durable terminal result while its original caller
+	// is still reading output. Its executable requires the same retained bundle.
+	if live, err := install.planManagedLive(ctx, p); err != nil {
+		return err
+	} else if live != nil {
+		p.live = live
+		return nil
 	}
 	return install.requireLegacyCleanup()
 }
@@ -335,7 +381,13 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 			return nil, err
 		}
 		if !install.standardCleanupCallback(callback) {
-			return nil, errors.New("Custom cleanup callback cannot be retained by managed migration; review it before retrying")
+			if !install.automaticSetup || p.previous == nil {
+				return nil, errInstallCustomCallback
+			}
+			// The managed Go runtime never executes Pueue callbacks. Preserve
+			// an obsolete customized config byte-for-byte instead of treating
+			// it as a legacy service or rewriting inactive operator settings.
+			p.node = nil
 		}
 	}
 	if err := install.validateServices(); err != nil {
@@ -429,7 +481,10 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 				if err != nil {
 					return nil, err
 				}
-				if status == "requiresApproval" && !install.unregisterServices || status == "notFound" && (install.prepareReplacement || install.unregisterServices) {
+				if status == "requiresApproval" && !install.unregisterServices {
+					return nil, &installApprovalError{service: service}
+				}
+				if status == "notFound" && (install.prepareReplacement || install.unregisterServices) {
 					return nil, fmt.Errorf("The %s service is %s; resolve it before retrying setup", service, status)
 				}
 				p.statuses[service] = status
@@ -1211,6 +1266,14 @@ func managedReadiness(raw []byte) error {
 // quiesceManaged runs with install.lock, scheduling.lock and remote control.lock
 // held. It never publishes a bundle, rewrites wrappers or registers services.
 func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) error {
+	if p.live != nil {
+		if p.live.adopted {
+			return nil
+		}
+		if err := install.beginManagedLive(ctx, p.live); err != nil {
+			return err
+		}
+	}
 	for _, service := range []string{"resources", "remote", "queue", "login"} {
 		if p.statuses[service] == "enabled" || install.unregisterServices && p.statuses[service] == "requiresApproval" {
 			if label := map[string]string{"queue": "io.went.agent-heavy", "resources": "io.went.agent-resources", "remote": "io.went.agent-remote"}[service]; label != "" {
@@ -1224,6 +1287,11 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 					}
 				}
 			}
+			if service == "queue" && p.live != nil {
+				if err := install.commitManagedLive(ctx, p.live); err != nil {
+					return err
+				}
+			}
 			if err := install.managedAction(ctx, install.app, "unregister", service); err != nil {
 				return err
 			}
@@ -1235,7 +1303,11 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 	if exists, err := updateExists(QueueDatabasePath(install.state)); err != nil {
 		return err
 	} else if exists {
-		if err := install.managedOfflineDrain(ctx); err != nil {
+		if p.live != nil {
+			if err := install.validateManagedLive(ctx, p.live); err != nil {
+				return err
+			}
+		} else if err := install.managedOfflineDrain(ctx); err != nil {
 			return err
 		}
 	}
@@ -1367,6 +1439,11 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if install.automaticSetup {
+		if err := install.managedBackupLegacyDefinitions(p); err != nil {
+			return err
+		}
+	}
 	raw, err := json.MarshalIndent(install.identity, "", "  ")
 	if err != nil {
 		return err
@@ -1374,6 +1451,12 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	raw = append(raw, '\n')
 	if err := installAtomic(filepath.Join(install.root, "install-in-progress.json"), raw, 0600); err != nil {
 		return err
+	}
+	if err := install.cleanupManagedRuntimes(ctx); err != nil {
+		return err
+	}
+	if p.live != nil {
+		defer install.cancelManagedLive(p.live)
 	}
 	if err := install.quiesceManaged(ctx, p); err != nil {
 		return err
@@ -1555,6 +1638,11 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err := installAtomic(filepath.Join(install.root, "build-info.json"), raw, 0600); err != nil {
 		return err
 	}
+	if p.live != nil {
+		if err := install.retainManagedRuntime(ctx, p.live.Attempts); err != nil {
+			return err
+		}
+	}
 	if err := install.managedCleanupBackup(); err != nil {
 		return err
 	}
@@ -1569,6 +1657,11 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	root.Close()
 	if err != nil {
 		return err
+	}
+	if p.live != nil {
+		if err := install.finishManagedLive(p.live); err != nil {
+			return err
+		}
 	}
 	// mainApp registration only arranges subsequent logins. This one-shot,
 	// explicit installer launch runs after durable completion, never as an agent.
@@ -1697,8 +1790,42 @@ func (install *installer) preflightManaged(ctx context.Context, report installPr
 		report.add("payload-invalid", "Review the signed application package", err.Error(), source, "reveal")
 		return report
 	}
+	if missing, err := install.missingServiceDefinitions(ctx); err == nil && len(missing) > 0 {
+		report.add("service-definitions-missing", "Restoring verified background service files", "Loaded legacy services have missing standard definitions. Setup will restore them without interrupting their jobs.", install.launch, installRestoreServices)
+		return report
+	}
 	if _, err := install.planManaged(ctx); err != nil {
-		report.add("managed-setup-blocked", "Review managed service setup", err.Error(), install.app, "reveal", "wait")
+		var approval *installApprovalError
+		var drain *installDrainPendingError
+		switch {
+		case errors.As(err, &approval):
+			report.add("service-approval", "Allow Agent Queue background services", err.Error(), "", "wait")
+		case errors.Is(err, errInstallPendingCleanup):
+			if previous, loadErr := appservices.Load(install.home); loadErr == nil && previous != nil {
+				snapshot, readErr := install.managedSnapshot(ctx)
+				if readErr != nil || obj(snapshot["tasks"]) == nil {
+					report.add("managed-setup-blocked", "Cannot inspect completed queue jobs", "The queue snapshot is unavailable or invalid; cleanup evidence was retained.", install.state, "reveal")
+					break
+				}
+				report.add("pending-cleanup", "Finishing completed queue cleanup", err.Error(), install.state, "wait")
+				install.preflightCleanupJobs(&report, true, obj(snapshot["tasks"]))
+				break
+			}
+			return install.preflightLegacy(ctx, report)
+		case errors.Is(err, errInstallCustomCallback), errors.Is(err, errInstallLegacyPhoneAccess):
+			return install.preflightLegacy(ctx, report)
+		case errors.As(err, &drain):
+			install.preflightJobs(&report, drain.tasks, false)
+			for i := range report.Issues {
+				if report.Issues[i].ID == "legacy-jobs" {
+					report.Issues[i].ID = "managed-jobs"
+					report.Issues[i].Title = "Waiting for queue jobs"
+					report.Issues[i].Detail = "Existing jobs continue while setup waits. Installation will resume automatically once the queue is drained. Paused or stashed jobs require an operator decision."
+				}
+			}
+		default:
+			report.add("managed-setup-blocked", "Review managed service setup", err.Error(), install.app, "reveal", "wait")
+		}
 	}
 	return report
 }

@@ -29,8 +29,9 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 sed '/^@main$/d' "$root/native/AgentQueue.swift" > "$temporary/AgentQueue.swift"
+sed '/^@main$/d' "$root/native/Installer.swift" > "$temporary/Installer.swift"
 xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -framework SwiftUI -framework AppKit -framework ServiceManagement \
-  "$root/native/QueueBrand.swift" "$temporary/AgentQueue.swift" "$root/native/AgentIntegration.swift" "$root/native/AgentUpdates.swift" \
+  "$root/native/QueueBrand.swift" "$temporary/AgentQueue.swift" "$temporary/Installer.swift" "$root/native/AgentIntegration.swift" "$root/native/AgentUpdates.swift" \
   "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/AgentServices.swift" \
   "$root/native/tests/BootstrapFixtures.swift" "$root/native/tests/BootstrapUITests.swift" -o "$app/Contents/MacOS/BootstrapUITests"
 if [[ "${1:-}" == "--build-only" ]]; then exit 0; fi
@@ -54,11 +55,11 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
     --open-window --temporary "$temporary" --output "$output/approved-repair" --approved-repair
 [[ "$(plutil -extract passed raw -o - "$output/approved-repair/verification.json")" == "true" ]]
-mkdir -p -- "$output/explicit-setup"
+mkdir -p -- "$output/installer-boundary"
 HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
-    --open-window --temporary "$temporary" --output "$output/explicit-setup" --explicit-setup
-[[ "$(plutil -extract passed raw -o - "$output/explicit-setup/verification.json")" == "true" ]]
+    --open-window --temporary "$temporary" --output "$output/installer-boundary" --installer-boundary
+[[ "$(plutil -extract passed raw -o - "$output/installer-boundary/verification.json")" == "true" ]]
 {
   printf '# Bootstrap fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
   cat "$output/verification.json"
