@@ -10,12 +10,14 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Dunky13/agent-job-queue/internal/appservices"
@@ -33,15 +35,30 @@ type installer struct {
 	appBundle                                             bool
 	managed                                               bool
 	queueSnapshot                                         func(context.Context) (Object, error)
+	queueControl                                          func(context.Context, string, Object) (Object, error)
 	disablePhoneAccess                                    bool
 	prepareReplacement                                    bool
 	unregisterServices                                    bool
+	automaticSetup                                        bool
 	command                                               func(context.Context, []string) ([]byte, error)
 }
 
 var errInstallLegacyPhoneAccess = errors.New("Phone access from the previous installation must be disabled before setup can continue. Credentials and configuration will be preserved")
 var errInstallServiceNotLoaded = errors.New("Launch service is not loaded")
 var errInstallPendingCleanup = errors.New("Queue migration must wait for queue work and cleanup to finish. Retained receipts or owned lease markers may still belong to running jobs. Existing files were preserved.")
+var errInstallCustomCallback = errors.New("Custom cleanup callback cannot be retained by managed migration; it will be backed up before replacement")
+
+type installDrainPendingError struct{ tasks Object }
+
+func (err *installDrainPendingError) Error() string {
+	return "Queue migration requires a drained queue. Finish or cancel all queued, stashed, running, and paused jobs, then retry the installer"
+}
+
+type installApprovalError struct{ service string }
+
+func (err *installApprovalError) Error() string {
+	return fmt.Sprintf("The %s service is requiresApproval; allow Agent Queue in System Settings before setup can finish", err.service)
+}
 
 type installCleanupPendingError struct{ path string }
 
@@ -829,6 +846,7 @@ func installDecodeLegacySnapshot(raw []byte) (Object, error) {
 }
 
 func installRequireDrained(tasks Object) error {
+	unfinished := false
 	for _, raw := range tasks {
 		task := obj(raw)
 		if task == nil {
@@ -839,8 +857,11 @@ func installRequireDrained(tasks Object) error {
 			return err
 		}
 		if status != "Done" {
-			return errors.New("Queue migration requires a drained queue. Finish or cancel all queued, stashed, running, and paused jobs, then retry the installer")
+			unfinished = true
 		}
+	}
+	if unfinished {
+		return &installDrainPendingError{tasks: tasks}
 	}
 	return nil
 }
@@ -2176,8 +2197,13 @@ func InstallMain(args []string) int {
 		install.app = args[1]
 		install.payload = filepath.Join(install.app, "Contents/Resources/payload")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if !options.repairAndContinue {
+		bounded, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		ctx = bounded
+	}
 	if options.preflight || options.recovery != "" {
 		if options.recovery != "" {
 			if err := install.recover(ctx, options.recovery, options.jobID, options.revision); err != nil {

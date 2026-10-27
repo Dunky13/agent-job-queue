@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
-# Load the real Homebrew DSL. Optional fixture mode moves its app and verifies
-# its bytes with a temporary HOME and shared Caskroom supplied by tests.
+# Load the real Homebrew DSL. Optional fixture mode executes its Installer
+# artifact and moves its app with a temporary HOME and shared Caskroom.
 # --quarantined verifies data only. --quarantined-runtime requires a notarized
-# Developer ID payload and verifies relocated installer bytes. Explicit setup
-# and simulated native lifecycle run separately in the parent, outside Homebrew.
+# Developer ID payload. Native lifecycle stays in the parent-owned private
+# adapter; no fixture may register real Service Management jobs.
 require "json"
 require "find"
 require "cask/cask_loader"
@@ -14,11 +14,13 @@ require "cask/caskroom"
 # private fixture's groups bounded even when an installer leaves descendants.
 class FixtureSystemCommand < SystemCommand
   class << self
-    attr_accessor :fixture, :deadline
+    attr_accessor :fixture, :deadline, :verify_vendor_signatures, :reject_vendor_signatures
 
     def configure(fixture, seconds: 60)
       self.fixture = fixture
       self.deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds
+      self.verify_vendor_signatures = true
+      self.reject_vendor_signatures = false
     end
 
     def record(safe, pid = nil)
@@ -33,6 +35,20 @@ class FixtureSystemCommand < SystemCommand
       remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
       raise Timeout::Error, "Private cask command deadline exceeded" unless remaining.positive?
 
+      # Synthetic PR fixtures exercise the exact shell/copy/controller path with
+      # an injected trust adapter. Release fixtures execute the real verifiers.
+      if executable.to_s == "/bin/sh" && options.fetch(:args, [])[1] == unattended_installer_script && !verify_vendor_signatures
+        args = options.fetch(:args).dup
+        args[1] = args[1].gsub("/usr/bin/codesign", reject_vendor_signatures ? "/usr/bin/false" : "/usr/bin/true").gsub("/usr/sbin/spctl", "/usr/bin/true")
+        args[1] = args[1].sub("trap 'exit 1' HUP INT TERM", "trap 'exit 1' HUP INT TERM\necho \"$work\" >> \"$HOME/vendor-staging\"")
+        unless ENV["AGENT_QUEUE_INSTALL_TEST_MANAGED"] == "private-native-lifecycle"
+          # A quarantined unsigned shell sentinel is data, not trusted native
+          # release code. Interpret only this synthetic controller through the
+          # fixture adapter; preserve every quarantine attribute on disk.
+          args[1] = args[1].sub('"$payload/source/bin/agent-heavy" install', '/bin/sh "$payload/source/bin/agent-heavy" install')
+        end
+        options = options.merge(args: args)
+      end
       super(executable, **options.merge(timeout: [options.fetch(:timeout, remaining), remaining].min))
     end
   end
@@ -80,8 +96,7 @@ class FixtureSystemCommand < SystemCommand
   end
 end
 
-# Homebrew delivers the explicit installer. Only its native App movement and
-# two CLI symlinks are allowed; setup and runtime lifecycle belong to the user.
+# Keep the documented vendor installer artifact distinct from sandboxed hooks.
 def verify_delivery_cask_contract(cask)
   installer = cask.staged_path/"Agent Job Queue Installer.app"
   applications = cask.artifacts.grep(Cask::Artifact::App)
@@ -89,9 +104,26 @@ def verify_delivery_cask_contract(cask)
   unless applications.length == 1 && applications.first.source == installer && applications.first.target == target
     raise "The cask must deliver only the explicit installer app to this user's Applications directory"
   end
-  allowed = [Cask::Artifact::App, Cask::Artifact::Binary]
+  allowed = [Cask::Artifact::App, Cask::Artifact::Binary, Cask::Artifact::Installer, Cask::Artifact::Uninstall]
   unless cask.artifacts.all? { |artifact| allowed.include?(artifact.class) }
-    raise "Delivery-only cask cannot contain executable hooks, uninstall directives or other artifacts"
+    raise "The cask cannot contain flight-step hooks or other artifacts"
+  end
+  installers = cask.artifacts.grep(Cask::Artifact::Installer)
+  raise "Exactly one automatic installer artifact is required" unless installers.length == 1
+
+  setup = installers.first
+  script = setup.args.fetch(:args)
+  unless setup.path == Pathname("/bin/sh") && setup.args.slice(:sudo, :must_succeed, :print_stdout) == { sudo: false, must_succeed: true, print_stdout: true } &&
+         setup.args.keys.sort == %i[args must_succeed print_stdout sudo].sort &&
+         script.length == 6 && script[0] == "-c" && script[2] == "agent-job-queue-install" && script[3] == cask.staged_path.to_s && script[4] == cask.version.csv.first && script[5] == cask.version.csv.second
+    raise "Automatic installation must use the exact protected noninteractive vendor command"
+  end
+  expected_script = unattended_installer_script
+  raise "Automatic installer script differs from the trusted contract" unless script[1] == expected_script
+
+  removals = cask.artifacts.grep(Cask::Artifact::Uninstall)
+  unless removals.length == 1 && removals.first.directives == { script: { executable: "/usr/bin/true", sudo: false, must_succeed: true }, signal: [] }
+    raise "Homebrew removal must retain the independent runtime without lifecycle changes"
   end
   binaries = cask.artifacts.grep(Cask::Artifact::Binary)
   source = installer/"Contents/Resources/payload/source/links"
@@ -100,9 +132,41 @@ def verify_delivery_cask_contract(cask)
     raise "Both canonical CLI links are required"
   end
   artifacts = cask.artifacts.to_a
-  unless binaries.all? { |binary| artifacts.index(applications.first) < artifacts.index(binary) }
+  unless artifacts.index(setup) < artifacts.index(applications.first) && binaries.all? { |binary| artifacts.index(applications.first) < artifacts.index(binary) }
     raise "Installer delivery must precede its CLI links"
   end
+end
+
+def unattended_installer_script
+  <<~'SCRIPT'
+    set -eu
+    work=$(/usr/bin/mktemp -d /private/tmp/agent-queue-install.XXXXXXXX)
+    cleanup() {
+      result=$?
+      trap - EXIT
+      /bin/rm -rf -- "$work" || exit 1
+      exit "$result"
+    }
+    trap cleanup EXIT
+    trap 'exit 1' HUP INT TERM
+    installer="$work/Agent Job Queue Installer.app"
+    /usr/bin/ditto --rsrc --extattr --qtn --acl "$1/Agent Job Queue Installer.app" "$installer"
+    payload="$installer/Contents/Resources/payload"
+    requirement='=anchor apple generic and certificate leaf[subject.OU] = "U9GXK89565" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and notarized'
+    /usr/bin/codesign --verify --strict --deep --all-architectures --check-notarization --test-requirement "$requirement and identifier \"io.went.agent-queue.installer\"" "$installer"
+    /usr/bin/codesign --verify --strict --deep --all-architectures --check-notarization --test-requirement "$requirement and identifier \"io.went.agent-queue\"" "$payload/Agent Queue.app"
+    /usr/bin/codesign --verify --strict --all-architectures --check-notarization --test-requirement "$requirement" "$payload/source/bin/agent-heavy"
+    /usr/bin/codesign --verify --strict --all-architectures --check-notarization --test-requirement "$requirement" "$payload/source/bin/agent-remote"
+    /usr/sbin/spctl --assess --type execute "$installer"
+    for bundle in "$installer" "$payload/Agent Queue.app"; do
+      [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$bundle/Contents/Info.plist")" = "$2" ] &&
+        [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$bundle/Contents/Info.plist")" = "$3" ] || {
+          echo 'The copied installer differs from the requested Homebrew release.' >&2
+          exit 1
+        }
+    done
+    "$payload/source/bin/agent-heavy" install --payload "$payload" --repair-and-continue
+  SCRIPT
 end
 
 # Allow the timeout regression to use this exact command owner without running
@@ -165,12 +229,17 @@ if ARGV[1]
   environment = JSON.parse(environment_path.read)
   expected_keys = %w[HOME AGENT_QUEUE_INSTALL_TEST_MODE AGENT_QUEUE_INSTALL_TEST_TOOLS TEST_PYTHON_PREFIX TEST_CALLS TEST_PYTHON]
   expected_keys << "AGENT_QUEUE_INSTALL_TEST_TEAM" if runtime_fixture
+  expected_keys << "AGENT_QUEUE_INSTALL_TEST_MANAGED" if environment.key?("AGENT_QUEUE_INSTALL_TEST_MANAGED")
+  if environment.key?("AGENT_QUEUE_INSTALL_TEST_MANAGED") && environment.fetch("AGENT_QUEUE_INSTALL_TEST_MANAGED") != "private-native-lifecycle"
+    raise "Invalid private native lifecycle adapter"
+  end
   raise "Unexpected fixture environment fields" unless environment.keys.sort == expected_keys.sort
   raise "Fixture HOME was not preserved" unless Pathname(environment.fetch("HOME")).realpath == fixture/"User With Spaces"
   raise "Fixture tools must be private" unless Pathname(environment.fetch("AGENT_QUEUE_INSTALL_TEST_TOOLS")).realpath == fixture/"tools"
   raise "Fixture mode is required" unless environment.fetch("AGENT_QUEUE_INSTALL_TEST_MODE") == "1"
 
   FixtureSystemCommand.configure(fixture)
+  FixtureSystemCommand.verify_vendor_signatures = runtime_fixture
   fixture_command = FixtureSystemCommand
   if runtime_fixture
     team = environment.fetch("AGENT_QUEUE_INSTALL_TEST_TEAM")
@@ -225,6 +294,8 @@ if ARGV[1]
   end
   # Recheck the actual quarantined staged bytes before native app relocation.
   verify_runtime_installer(cask.staged_path/"Agent Job Queue Installer.app", team, fixture_command) if runtime_fixture
+  cask.artifacts.grep(Cask::Artifact::Installer).first.install_phase(command: fixture_command)
+  fixture_installer_executed = true
   applications.first.install_phase
   verify_runtime_installer(application, team, fixture_command) if runtime_fixture
   fixture_app_installed = true

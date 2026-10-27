@@ -24,59 +24,63 @@ struct BootstrapTests {
             catch { return error.localizedDescription.contains(text) }
         }
 
-        // Ordinary launch must never use the installation/recovery executor,
-        // including repeated launches after security software removed helpers.
-        for incomplete in [false, true] {
-            let ordinary = try BootstrapFixture(parent: temporary, setupMode: false)
-            if incomplete {
-                try BootstrapFixture.write(ordinary.identity,
-                    to: ordinary.environment.root.appendingPathComponent("install-in-progress.json"))
+        // Runtime launch never performs installation. Only the installer stage
+        // may mutate state, including when this app carries a newer payload.
+        for scenario in ["legacy-fresh", "legacy-incomplete", "managed-fresh", "managed-upgrade", "legacy-missing-helper"] {
+            let managed = scenario.hasPrefix("managed")
+            let copied = try BootstrapFixture(parent: temporary, setupMode: false, managed: managed)
+            if scenario == "managed-upgrade" {
+                try copied.installManaged()
+                try BootstrapFixture.write(try JSONEncoder().encode(BootstrapFixtureIdentity(version: "1.2.3",
+                    commit: String(repeating: "b", count: 40), build: 41)),
+                    to: copied.environment.root.appendingPathComponent("build-info.json"))
             }
-            let counter = BootstrapCountingExecutorFixture()
-            var completed = false
-            let startup = QueueBootstrapModel(environment: ordinary.environment, execute: { request, output in
-                await counter.execute(request, output: output)
-            }) { completed = true }
-            await startup.start()?.value
-            await startup.start()?.value
-            let calls = await counter.calls
-            try check(startup.phase == .setupRequired && !completed && calls == 0,
-                "Ordinary \(incomplete ? "incomplete" : "fresh") startup directs the user to the installer without executing setup")
-            try check(startup.start(disablePhoneAccess: true) == nil && startup.waitAndContinue() == nil &&
-                startup.repairAndContinue(confirmed: true) == nil,
-                "Ordinary startup cannot enter mutation or recovery through hidden actions")
-            try check(!FileManager.default.fileExists(atPath: ordinary.environment.root.appendingPathComponent("bin").path) &&
-                !FileManager.default.fileExists(atPath: ordinary.environment.home.appendingPathComponent("Library/LaunchAgents").path),
-                "Ordinary startup creates neither private executables nor launch definitions")
-            if incomplete {
-                try check(FileManager.default.fileExists(atPath: ordinary.environment.root.appendingPathComponent("install-in-progress.json").path),
-                    "Ordinary startup preserves the incomplete-install marker")
+            if scenario == "legacy-incomplete" {
+                try BootstrapFixture.write(copied.identity,
+                    to: copied.environment.root.appendingPathComponent("install-in-progress.json"))
+            }
+            if scenario == "legacy-missing-helper" {
+                try copied.install()
+                try FileManager.default.removeItem(at: copied.environment.root.appendingPathComponent("bin/agent-heavy"))
+            }
+            let executor = BootstrapCountingExecutorFixture()
+            var completions = 0
+            let model = QueueBootstrapModel(environment: copied.environment, execute: { request, output in
+                await executor.execute(request, output: output)
+            }) { completions += 1 }
+            await model.start()?.value
+            await model.start()?.value
+            let calls = await executor.calls
+            try check(model.phase == .setupRequired && completions == 0 && calls == 0 && !model.allowsInstallation &&
+                model.message.contains("installer must finish"),
+                "Runtime \(scenario) remains read-only and directs incomplete installation to the installer")
+            try check(model.start(disablePhoneAccess: true) == nil && model.waitAndContinue() == nil &&
+                model.repairAndContinue(confirmed: true) == nil,
+                "Runtime \(scenario) cannot acquire mutation authority through recovery actions")
+            if scenario == "legacy-incomplete" {
+                try check(FileManager.default.fileExists(atPath: copied.environment.root.appendingPathComponent("install-in-progress.json").path),
+                    "Runtime startup preserves the incomplete installation marker")
             }
         }
 
-        // Dragged apps must offer setup without granting startup any implicit
-        // mutation authority, including an existing app whose services vanished.
-        for scenario in ["legacy-fresh", "managed-fresh", "managed-unregistered"] {
-            let managed = scenario != "legacy-fresh"
-            let copied = try BootstrapFixture(parent: temporary, setupMode: false, managed: managed)
-            if scenario == "managed-unregistered" { try copied.installManaged() }
-            let executor = BootstrapExplicitSetupFixture(copied, managed: managed)
-            var completed = false
-            let model = QueueBootstrapModel(environment: copied.environment, execute: { request, _ in
-                try await executor.execute(request)
-            }) { completed = true }
-            try check(model.beginInstallation(confirmed: true) == nil, "Setup cannot start before a validated startup decision")
-            await model.start()?.value
-            let before = await executor.installations
-            try check(model.canBeginInstallation && !model.allowsInstallation && before == 0 && !completed,
-                "Copied \(scenario) offers explicit setup after read-only startup")
-            try check(model.beginInstallation(confirmed: false) == nil && !model.allowsInstallation,
-                "Cancelling setup preserves read-only authority for \(scenario)")
-            await model.beginInstallation(confirmed: true)?.value
-            let after = await executor.installations
-            try check(model.phase == .complete && completed && after == 1 && !model.canBeginInstallation,
-                "Confirmed \(scenario) setup installs exactly once and opens the queue")
-        }
+        let streaming = try BootstrapFixture(parent: temporary)
+        let streamingExecutor = BootstrapInstallerProgressFixture(streaming)
+        var streamingComplete = false
+        let streamingModel = QueueBootstrapModel(environment: streaming.environment, execute: { request, output in
+            try await streamingExecutor.execute(request, output: output)
+        }) { streamingComplete = true }
+        let streamingTask = streamingModel.start()
+        try await waitUntil { streamingModel.requiresServiceApproval && streamingModel.output.contains("Waiting for macOS") }
+        let streamingCalls = await streamingExecutor.installations
+        try check(streamingModel.phase == .installing && !streamingComplete && streamingCalls == 1 &&
+            !streamingModel.output.contains("AGENT_QUEUE_SETUP_STATE") && streamingModel.start() == nil,
+            "Actual installer streaming exposes the Settings action without displaying protocol markers, retrying or establishing readiness")
+        await streamingExecutor.release()
+        await streamingTask?.value
+        try check(streamingComplete && streamingModel.phase == .complete && !streamingModel.requiresServiceApproval,
+            "Successful installation readback clears the streamed approval hint")
+        try check(!QueueSetupProgress.parse("Diagnostic contains " + QueueSetupProgress.approvalMarker).requiresServiceApproval,
+            "Approval display hints require their exact protocol line")
 
         let stalled = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try stalled.installManaged()
@@ -106,7 +110,7 @@ struct BootstrapTests {
             "Stopping ordinary startup cancels and reaps the actual private native status child")
 
         for status in ["enabled", "requiresApproval", "notRegistered", "notFound", "invalid"] {
-            let managed = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
+            let managed = try BootstrapFixture(parent: temporary, setupMode: status == "requiresApproval", managed: true)
             try managed.installManaged()
             let readback = BootstrapServiceStatusFixture(status: status)
             var completed = false
@@ -126,24 +130,45 @@ struct BootstrapTests {
             } else {
                 try check(startup.phase == .setupRequired && !completed &&
                     startup.requiresServiceApproval == (status == "requiresApproval"),
-                    "Managed \(status) remains explicit and cannot trigger re-registration")
+                    "Managed \(status) respects macOS approval and cannot trigger re-registration")
             }
         }
 
         let externallyRepaired = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try externallyRepaired.installManaged()
-        let changingStatus = BootstrapServiceStatusFixture(status: "notRegistered")
+        let changingStatus = BootstrapServiceStatusFixture(status: "requiresApproval")
         var externalCompleted = false
         let externalModel = QueueBootstrapModel(environment: externallyRepaired.environment, execute: { request, _ in
             try await changingStatus.execute(request)
         }) { externalCompleted = true }
-        await externalModel.start()?.value
+        let approvalTask = externalModel.start()
+        try await waitUntil { externalModel.phase == .waiting }
+        let pendingApprovalRequests = await changingStatus.requests
+        try check(externalModel.requiresServiceApproval && !pendingApprovalRequests.isEmpty &&
+            pendingApprovalRequests.allSatisfy({ $0.arguments.prefix(2) == ["--service-management", "status"] }),
+            "Runtime startup waits for macOS approval using only service status reads")
         await changingStatus.updateStatus("enabled")
-        await externalModel.start()?.value
+        await approvalTask?.value
         let externalRequests = await changingStatus.requests
         try check(externalCompleted && externalModel.phase == .complete && !externalModel.allowsInstallation &&
             externalRequests.allSatisfy({ $0.arguments.prefix(2) == ["--service-management", "status"] }),
-            "Check again observes externally restored services without installing or retaining a stale setup decision")
+            "Granting macOS approval automatically continues startup without Check again or service mutation")
+
+        let denied = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
+        try denied.installManaged()
+        let deniedStatus = BootstrapServiceStatusFixture(status: "requiresApproval")
+        var deniedCompleted = false
+        let deniedModel = QueueBootstrapModel(environment: denied.environment, execute: { request, _ in
+            try await deniedStatus.execute(request)
+        }, waitInterval: .milliseconds(1)) { deniedCompleted = true }
+        let deniedTask = deniedModel.start()
+        try await waitUntil { deniedModel.phase == .waiting }
+        deniedModel.cancelWaiting()
+        await deniedTask?.value
+        let deniedRequests = await deniedStatus.requests
+        try check(!deniedCompleted && !deniedModel.isRunning &&
+            deniedRequests.allSatisfy({ $0.arguments.prefix(2) == ["--service-management", "status"] }),
+            "Cancelling macOS approval waiting stops polling without registering or enabling a denied service")
 
         let tamperedManaged = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try tamperedManaged.installManaged()

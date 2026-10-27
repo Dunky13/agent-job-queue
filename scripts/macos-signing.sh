@@ -467,16 +467,12 @@ macos_sign_app_helpers() {
 }
 
 macos_disk_image_source() {
-  local installer=$1 directory=$2 app="$1/Contents/Resources/payload/Agent Queue.app"
+  local installer=$1 app="$1/Contents/Resources/payload/Agent Queue.app"
   MACOS_DISK_IMAGE_SOURCE=$installer
   macos_app_payload_mode "$app" || return
-  # Copy the signed owning app. Opening it only checks readiness; the user
-  # starts installation explicitly from its setup screen.
-  [[ $MACOS_APP_EMBEDDED == 1 ]] || return 0
-  mkdir "$directory" || return
-  ditto --rsrc --extattr --qtn --acl "$app" "$directory/Agent Queue.app" || return
-  ln -s /Applications "$directory/Applications" || return
-  MACOS_DISK_IMAGE_SOURCE=$directory
+  # Keep every setup operation inside the signed installer. The runtime app
+  # opens only after installation and readiness succeed, and never self-installs
+  # during ordinary startup. The DMG and ZIP carry the same complete installer.
 }
 
 macos_verify_installer_distribution() {

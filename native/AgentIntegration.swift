@@ -15,13 +15,6 @@ struct AgentIntegrationSnapshot: Codable, Sendable {
     let instruction: String
 }
 
-enum AgentOnboarding {
-    static let offeredKey = "agentIntegrationOffered.v1"
-    static func shouldOffer(defaults: UserDefaults, fixtureMode: Bool) -> Bool {
-        !fixtureMode && !defaults.bool(forKey: offeredKey)
-    }
-}
-
 @MainActor
 final class AgentIntegrationStore: ObservableObject {
     @Published private(set) var snapshot: AgentIntegrationSnapshot?

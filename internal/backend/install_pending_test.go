@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestManagedApprovedRepairFinishesRetainedPendingBuild(t *testing.T) {
@@ -115,7 +116,9 @@ func TestManagedApprovedRepairPreservesUnrecoverablePending(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := i.repairAndExecute(context.Background()); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			if err := i.repairAndExecute(ctx); err == nil {
 				t.Fatal("unresolved pending installation was replaced")
 			}
 			after, err := os.ReadFile(filepath.Join(i.root, "install-in-progress.json"))
@@ -123,6 +126,38 @@ func TestManagedApprovedRepairPreservesUnrecoverablePending(t *testing.T) {
 				t.Fatal("recovery lost original pending identity", err)
 			}
 		})
+	}
+}
+
+func TestManagedAutomaticRetainedCandidateWaitsForApprovalThenUpgrades(t *testing.T) {
+	m := managedTestFixture(t)
+	m.approval = "resources"
+	if err := m.run(t); err == nil {
+		t.Fatal("expected pending approval")
+	}
+	i := m.installer
+	managedCandidate(t, m, "124")
+	original := i.command
+	statusReads := 0
+	i.command = func(ctx context.Context, args []string) ([]byte, error) {
+		if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" && args[3] == "resources" && m.statuses["resources"] == "requiresApproval" {
+			statusReads++
+			if statusReads == 3 {
+				m.approval = ""
+				m.statuses["resources"] = "enabled"
+				m.loaded["io.went.agent-resources"] = true
+			}
+		}
+		return original(ctx, args)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	if err := i.repairAndExecute(ctx); err != nil {
+		t.Fatal("retained approval did not resume automatically", err)
+	}
+	completed, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
+	if err != nil || completed.Build == nil || *completed.Build != 124 {
+		t.Fatal("new candidate did not follow approved retained candidate", completed, err)
 	}
 }
 

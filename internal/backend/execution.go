@@ -42,7 +42,15 @@ func Drain(path string, offset int64) (int64, error) {
 	return offset + n, err
 }
 func WaitCleanup(g *Gate, id int) error {
+	receipt, err := g.Receipt(id)
+	if err != nil {
+		return err
+	}
+	return waitCleanupWithToken(g, id, text(receipt["token"]))
+}
+func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
 	deadline := time.Now().Add(12 * time.Second)
+	waitingForHandover := false
 	for {
 		receipt, err := g.Receipt(id)
 		if err != nil {
@@ -52,15 +60,35 @@ func WaitCleanup(g *Gate, id int) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
+			_, rpcError := g.Task(id)
+			if errors.Is(rpcError, errQueueTransportUnavailable) {
+				_, allowed, handoverError := queueHandoverFollowTask(g, id, expectedToken)
+				if handoverError != nil {
+					return handoverError
+				}
+				if allowed {
+					waitingForHandover = true
+					deadline = time.Now().Add(400 * time.Millisecond)
+					continue
+				}
+			} else if rpcError == nil && waitingForHandover {
+				waitingForHandover = false
+				deadline = time.Now().Add(12 * time.Second)
+				continue
+			}
 			return fmt.Errorf("Job %d finished but cleanup did not complete; shared slot retained", id)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
+	return followWithToken(g, id, signals, "")
+}
+func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken string) (int, error) {
 	offset := int64(0)
 	notice := time.Now()
 	path := g.LogPath(id)
+	var pendingSignal os.Signal
 	for {
 		var err error
 		offset, err = Drain(path, offset)
@@ -68,8 +96,28 @@ func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
 			return 125, err
 		}
 		task, err := g.Task(id)
+		rpcAvailable := err == nil
+		if err != nil && errors.Is(err, errQueueTransportUnavailable) {
+			retained, allowed, handoverError := queueHandoverFollowTask(g, id, expectedToken)
+			if handoverError != nil {
+				return 125, handoverError
+			}
+			if allowed {
+				task, err = retained, nil
+			}
+		}
 		if err != nil {
 			return 125, err
+		}
+		if expectedToken == "" {
+			expectedToken = text(task["token"])
+		}
+		if pendingSignal != nil && rpcAvailable {
+			if err := Cancel(g, id); err == nil {
+				return 128 + int(pendingSignal.(syscall.Signal)), nil
+			} else if !errors.Is(err, errQueueHandoverBusy) {
+				return 125, err
+			}
 		}
 		name, details, err := TaskStatus(task)
 		if err != nil {
@@ -80,7 +128,7 @@ func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
 			if err != nil {
 				return 125, fmt.Errorf("Job %d disappeared before its result could be read", id)
 			}
-			if err = WaitCleanup(g, id); err != nil {
+			if err = waitCleanupWithToken(g, id, expectedToken); err != nil {
 				return 125, err
 			}
 			_, err = Drain(path, offset)
@@ -93,7 +141,7 @@ func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
 			}
 			return code, nil
 		}
-		if name == "Done" {
+		if name == "Done" && pendingSignal == nil {
 			offset, err = Drain(path, offset)
 			if err != nil {
 				return 125, err
@@ -102,7 +150,7 @@ func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
 			if err != nil {
 				return 125, err
 			}
-			if err = WaitCleanup(g, id); err != nil {
+			if err = waitCleanupWithToken(g, id, expectedToken); err != nil {
 				return 125, err
 			}
 			_, err = Drain(path, offset)
@@ -122,7 +170,15 @@ func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
 		}
 		select {
 		case sig := <-signals:
+			if !rpcAvailable {
+				pendingSignal = sig
+				continue
+			}
 			if err := Cancel(g, id); err != nil {
+				if errors.Is(err, errQueueHandoverBusy) {
+					pendingSignal = sig
+					continue
+				}
 				return 125, err
 			}
 			return 128 + int(sig.(syscall.Signal)), nil
@@ -299,7 +355,11 @@ func Run(g *Gate, argv []string, label string) (code int, err error) {
 			forwarded[k] = v
 		}
 	}
-	content := Object{"argv": argv, "cwd": cwd, "env": forwarded, "token": jobToken, "label": description["title"], "explicit_label": label != ""}
+	caller, err := queueHandoverIdentity()
+	if err != nil {
+		return 125, err
+	}
+	content := Object{"argv": argv, "cwd": cwd, "env": forwarded, "token": jobToken, "label": description["title"], "explicit_label": label != "", "client_handover_protocol": queueHandoverProtocol, "client_handover_caller": caller}
 	if err = WriteJobPayload(path, content); err != nil {
 		return 125, err
 	}
@@ -326,11 +386,14 @@ func Run(g *Gate, argv []string, label string) (code int, err error) {
 	added, err := g.QueueControl("submit", Object{"token": jobToken})
 	// A lost response does not establish whether submission committed. Reconcile
 	// using the same immutable token; the daemon returns the original identity.
-	for retry := 0; err != nil && retry < 2; retry++ {
+	for retry := 0; err != nil && !errors.Is(err, errQueueHandoverBusy) && retry < 2; retry++ {
 		added, err = g.QueueControl("submit", Object{"token": jobToken})
 	}
 	if err != nil {
 		unlock()
+		if errors.Is(err, errQueueHandoverBusy) {
+			submitted = false
+		}
 		return 125, err
 	}
 	var acknowledged bool
@@ -342,9 +405,12 @@ func Run(g *Gate, argv []string, label string) (code int, err error) {
 	}
 	unlock()
 	fmt.Fprintf(os.Stderr, "agent-heavy: job %d queued\n", id)
-	return Follow(g, id, signals)
+	return followWithToken(g, id, signals, jobToken)
 }
 func Execute(g *Gate, value string) (int, error) {
+	return executeWithAttempt(g, value, "")
+}
+func executeWithAttempt(g *Gate, value, attempt string) (int, error) {
 	if err := g.Prepare(); err != nil {
 		return 125, err
 	}
@@ -442,15 +508,24 @@ func Execute(g *Gate, value string) (int, error) {
 		default:
 		}
 		capacity, err := LeaseCapacity(g)
-		if err != nil {
-			return 125, err
+		if err == nil {
+			var acquired bool
+			acquired, err = AcquireLease(g, marker, capacity)
+			if err == nil && acquired {
+				break
+			}
 		}
-		acquired, err := AcquireLease(g, marker, capacity)
 		if err != nil {
-			return 125, err
-		}
-		if acquired {
-			break
+			if !errors.Is(err, errQueueTransportUnavailable) || !validToken(attempt) {
+				return 125, err
+			}
+			allowed, handoverErr := queueHandoverWorkerWait(g, id, value, attempt)
+			if handoverErr != nil {
+				return 125, handoverErr
+			}
+			if !allowed {
+				return 125, err
+			}
 		}
 		select {
 		case <-interrupts:

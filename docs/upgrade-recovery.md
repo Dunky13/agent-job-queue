@@ -1,43 +1,44 @@
-# Guided installation and upgrade recovery
+# Automatic installation and upgrade recovery
 
-Normal app launch checks installation and background-service authorization without installing or repairing files. Use the installer, or explicitly invoke the app with `--setup`, to enter the installation workflow. Explicit setup checks the installation before changing it. When requirements need attention, the setup window lists them together with the affected jobs, service, or file. A clean preflight permits an installation attempt; the installer repeats its authoritative checks before publication, and the app verifies the installed state before opening the queue.
+Homebrew install and upgrade run the vendor installer automatically. Opening the complete installer from a DMG or ZIP also starts setup automatically. The package includes the queue, resource controller and HTTPS runtime; installed users need no development toolchain or separately installed Python, Pueue or Caddy executable.
 
-## Approve repair once
+All setup finishes inside the installer before it opens the runtime app. Ordinary runtime launch performs readiness and authorization reads only; it never starts installation, recovery, helper copying or service registration. An incomplete runtime directs the operator back to the installer.
 
-In explicit setup, choose **Repair and continue** to approve the verified repairs in one step. Setup restores missing standard service files, runs verified cleanup for completed jobs, starts a verified stopped service, and disables phone access when migration requires it. Ordinary startup cannot approve or run these repairs. Credentials and trusted certificates are preserved. Phone access remains off until enabled again in settings. Lost custom startup settings cannot be recovered from missing files.
+Setup inspects ownership and readiness, performs supported repairs, selects a compatible live handover or waits for jobs to finish, and verifies installation before opening the queue. It restores verified missing service definitions, cleans completed jobs through the normal ownership checks, starts a verified stopped legacy Go service, and disables incompatible phone access when migration requires it. Credentials, trusted certificates, history and queue settings remain retained.
 
-After approval, setup rechecks ownership before each operation, waits for active work, and continues through installation and readback automatically. **Stop waiting** cancels waiting and revokes that approval. An accepted repair is allowed to finish. A failed repair, repeated operation without progress, unknown ownership, custom configuration, or deliberately paused/stashed work stops the automatic flow for review. Approval never authorizes cancelling jobs, resuming held work, or replacing a custom callback.
+For an incompatible legacy cleanup callback, automatic setup backs up the exact original configuration privately before replacing the callback. Its SHA-256 revision is checked again under the installation locks. Incompatible options in verified legacy service definitions are backed up before those definitions are retired. Backups use content-derived names in the private configuration directory. An existing changed backup blocks the operation before services are stopped. Setup does not replace another installation's commands or environment paths. An existing managed Go runtime never executes a retained Pueue callback; automatic upgrades preserve that inactive custom configuration unchanged.
 
-The ZIP installer's **Install** button approves the same bounded repair policy. Command-line callers can explicitly opt in with the trailing `--repair-and-continue` flag. Controller commands keep their existing finite deadline; app waiting remains cancellable while active jobs finish.
+## Upgrading while jobs continue
 
-## Available choices
+A managed upgrade can hand over without waiting for running or queued jobs when the installed daemon, target controller and every outstanding job caller support handover protocol 1 and queue schema 2. The installer authenticates the transfer against the exact target, database and attempt identities before replacing services. Existing workers finish their original attempts, callers retain their original outcomes and exit statuses, and queued jobs remain queued. Pause state and the parallel limit survive the transfer. No attempt is replayed. New queue mutations can be briefly rejected before acceptance while the handover is in progress.
 
-- **Wait and continue** rechecks transient blockers for a bounded period. **Stop waiting** cancels the read-only check without stopping queue jobs or an accepted repair. Retained receipts and lease markers can belong to active work as well as completed cleanup. The report shows the actual blocking path; external lease paths require manual inspection because setup only opens files within the account or app folder. Paused and stashed legacy jobs still need attention in the existing queue.
-- **Review jobs** shows the unfinished legacy jobs. Cancelling a selected job requires confirmation because running work may be stopped. Managed Go upgrades also require a drained queue before changing service registration. Active work blocks those changes.
-- **Run verified cleanup** uses the established ownership-checked cleanup path for a selected completed job. Setup does not remove receipts, leases, or lock files merely to bypass a blocker.
-- **Start verified service** starts a confirmed stopped, canonical installed Go service. An already loaded service or uncertain job attempt is not restarted by recovery; its diagnostics remain available for inspection.
-- **Restore verified service files** is offered when a background service is still loaded but its startup file is missing, and its loaded command and installation paths can be verified. Confirmation restores standard startup files using the verified commands. Lost custom startup settings cannot be recovered. Existing files are preserved, and recovery does not stop, restart, or reload services. Setup checks all migration requirements again afterward, including unfinished jobs and phone access. A loaded service that cannot be verified still requires operator review.
-- **Disable phone access and continue** preserves credentials, configuration, and trusted certificates. It covers the Python migration blocker and a failed enabled remote migration during a Go upgrade. Access can be enabled again in settings after setup.
-- **Review configuration** opens the affected file and explains the proposed callback replacement. **Back up and replace callback** requires a separate confirmation, preserves the complete original privately, and checks that the configuration is still the version reviewed. The custom callback's behavior will no longer run after replacement. Arbitrary custom service definitions and missing configuration remain guided repairs rather than guessed defaults.
-- **Show affected file**, **Open Applications**, and **Download current release** provide a path forward for unsafe private paths, misplaced apps, damaged packages, or a downgrade attempt. Use a complete signed installer to finish setup; a Finder copy alone does not register its services. Setup does not relax signature checks or take ownership of unknown files.
+The installer retains each complete previous signed app needed by outstanding callers or workers visibly under `~/Applications/Agent Queue Runtimes`. A private durable record binds its device, inode, build and digest to the original attempts; matching names or content alone do not authorize adoption. Multiple upgrades may retain multiple generations. Only a later installer operation removes a generation after matching terminal attempts and dead original callers and owned workers are established. Missing or uncertain evidence keeps the generation. The app and daemon never delete executable code.
 
-Recovery failures retain the original diagnostic and refresh the preflight choices. A successful recovery is followed by a new preflight before installation continues. None of these choices authorizes an unidentified process to be killed, a shared lock to be removed, or a custom configuration to be silently overwritten.
+Legacy releases or outstanding callers without this protocol require one drained upgrade before live handover becomes available. Unsupported capabilities or schemas fall back to drain. Uncertain attempts, ownership or changed custody still fail closed; setup never discards their evidence. Removal and preparation for external app replacement always require a drained queue.
 
-If an interrupted publication retains an owned backup and receipt, finish the exact pending setup before preparing an external replacement or removing the runtime. Those operations refuse before service changes while the backup is needed for recovery. Do not delete the receipt or pending marker to bypass the refusal. A partial first installation without a backup can still unregister denied services; it retires candidate-only custody while preserving the app and queue data.
+## Waiting and platform approval
 
-## Controller contract
+When a transition requires drain, running and queued work continues while automatic setup waits. Each inspection, recovery and installation operation retains a finite five-minute budget; waiting for work to finish has no aggregate five-minute limit. Installation does not automatically cancel, resume or retry job attempts. Deliberately paused or stashed jobs can therefore need an operator decision on a drained transition. A compatible live handover preserves a paused queue without resuming it. Receipts, lease files and locks are never deleted to bypass a blocker.
 
-The bundled `agent-heavy` controller supports the existing installation targets with a read-only preflight mode:
+macOS may require approval for background services. Setup displays the requirement, reads status without re-registering denied services, and resumes the exact pending candidate after approval. The app offers a shortcut to Login Items settings. Application code cannot approve this operating-system decision or bypass endpoint-protection policy. A completed setup opens the queue only after readback succeeds.
+
+An interrupted publication retains its candidate, backup and receipt. Automatic recovery finishes that exact pending build before applying a newer candidate. Changed or missing custody evidence remains a failure. Do not delete the receipt or pending marker to force an upgrade. Removal still requires the ownership-checked service-removal command to succeed before deleting the runtime app.
+
+## Diagnostic workflow
+
+The optional `--setup` app argument retains guided diagnosis and individual recovery controls. It can show affected files and jobs, run a reviewed recovery, or perform a cancellable read-only wait. Destructive manual actions, including job cancellation and callback replacement, retain their confirmations. Fixtures and developer builds never install into the real queue.
+
+The bundled controller supports read-only preflight and automatic installation:
 
 ```sh
 agent-heavy install --app-bundle ABSOLUTE_APP_PATH --preflight --json
-agent-heavy install --payload DIRECTORY --preflight --json
-agent-heavy install --payload DIRECTORY --repair-and-continue
+agent-heavy install --payload ABSOLUTE_PAYLOAD_PATH --preflight --json
+agent-heavy install --payload ABSOLUTE_PAYLOAD_PATH --repair-and-continue
 ```
 
-A successful invocation returns a schema-versioned JSON report with an `issues` array. Each issue has a stable ID, title, explanation, optional affected path or jobs, and a list of supported actions. An empty array allows an installation attempt; it does not establish completed installation.
+Preflight returns a schema-versioned JSON report with an `issues` array. Each issue has a stable ID, title, explanation, optional affected path or jobs, and supported actions. An empty array permits an installation attempt; it does not establish completed installation. Automatic setup emits progress and returns success only after installation completes.
 
-Recovery operations use the same installation target and a fixed action name:
+Individual recovery commands remain available for diagnosis:
 
 ```sh
 agent-heavy install --app-bundle ABSOLUTE_APP_PATH --recover cancel-job --job-id JOB_ID
@@ -48,10 +49,8 @@ agent-heavy install --app-bundle ABSOLUTE_APP_PATH --recover disable-phone-acces
 agent-heavy install --app-bundle ABSOLUTE_APP_PATH --recover reset-callback --expected-revision REVIEWED_SHA256
 ```
 
-Each operation rechecks current eligibility and ownership. Callback replacement requires the revision supplied by the reviewed report. Recovery returns a fresh report and does not itself finish installation. Navigation and waiting are native UI operations, not arbitrary controller command execution.
-
-The native transport treats exact read-only preflight and native service-status commands as cancellable. Installation and recovery retain the existing accepted-mutation behavior. Unsupported schemas, unknown action IDs, malformed job IDs, and invalid paths are rejected before execution. Executable locations with group- or world-writable ancestors are refused; setup does not change shared Applications permissions to bypass that refusal.
+Each recovery rechecks current eligibility and ownership, then returns a fresh preflight report. Manual callback replacement requires the exact revision from that report. Unknown action IDs, invalid paths and malformed job IDs are rejected. Installation never relaxes filesystem ownership, signature checks, Gatekeeper, or shared directory permissions.
 
 ## Verification
 
-Use the shared heavy-job queue for the finite validation batch documented in CONTRIBUTING.md. Headless bootstrap regressions cover report parsing, multiple blockers, explicit consent, recovery rechecks, waiting cancellation, stale responses, and installation readback. Transport tests exercise real private children to distinguish cancelled preflight reads from accepted mutations. The graphical bootstrap fixture uses disposable homes, injected setup executors, and simulated queue jobs. Backend tests use private installation and launch-service fixtures rather than the installed queue.
+Run the finite shared-queue validation batch documented in CONTRIBUTING.md. Backend regressions cover automatic legacy migration, original configuration and service backups, live queued/running jobs and original caller results, pause and limit preservation, legacy fallback, interrupted handover and publication, retained runtime custody and later installer reclamation, approval waiting without repeated registration, stale revisions, changed backup evidence and unrelated ownership. Native regressions exercise read-only packaged launch across fresh, incomplete and stale installations, missing registration, approval resumption, diagnostic isolation and installation readback. Graphical fixtures use disposable homes and injected executors; Homebrew fixtures exercise the real Installer artifact and private lifecycle adapters. These local proofs do not establish native Service Management worker survival, Apple signing, notarization, release publication, SentinelOne acceptance or live registration on another account or architecture.

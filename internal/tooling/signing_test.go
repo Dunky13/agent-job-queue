@@ -187,8 +187,8 @@ func TestMacOSSigningDragInstallSignsEmbeddedHelpersBeforeApp(t *testing.T) {
 			t.Fatalf("embedded helper was not signed before sealing the app: %s", record)
 		}
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
-		t.Fatalf("disk image did not contain the standalone app and Applications shortcut: %s", record)
+	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n") {
+		t.Fatalf("disk image did not contain the complete automatic installer: %s", record)
 	}
 }
 
@@ -591,7 +591,7 @@ case "$tool" in
         printf 'disk-image-layout|Agent Queue.app|Applications->/Applications\n' >> "$SIGNING_TEST_EVENTS"
       elif [[ -f "$image_source/Contents/MacOS/Installer" ]]; then
         [[ ! -e "$image_source/Applications" && ! -e "$image_source/Agent Queue.app" ]]
-        printf 'disk-image-layout|Agent Job Queue Installer.app|explicit-setup\n' >> "$SIGNING_TEST_EVENTS"
+        printf 'disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n' >> "$SIGNING_TEST_EVENTS"
       else
         exit 91
       fi
@@ -650,8 +650,8 @@ func TestMacOSSigningManagedHelpersInsideOut(t *testing.T) {
 			}
 		}
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
-		t.Fatalf("managed release lost drag-to-Applications layout: %s", record)
+	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n") {
+		t.Fatalf("managed release lost the automatic installer layout: %s", record)
 	}
 	assertNotarySubmissionNames(t, record, "1.2.3")
 }

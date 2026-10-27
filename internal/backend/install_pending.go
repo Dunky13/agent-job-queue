@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 )
 
 const installFinishPending = "finish-pending-installation"
@@ -73,7 +74,15 @@ func (install *installer) finishPendingInstallation(ctx context.Context) error {
 	}
 	// execute revalidates the exact identity under its normal locks and retains
 	// all drain, signature, ownership, custody, approval and readiness gates.
-	if err := retained.execute(ctx); err != nil {
+	execute := retained.execute
+	if install.automaticSetup && retained.managed {
+		execute = retained.repairAndExecute
+	} else {
+		bounded, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+		ctx = bounded
+	}
+	if err := execute(ctx); err != nil {
 		return fmt.Errorf("The retained pending installation could not complete; its build identity and application custody were preserved: %w", err)
 	}
 	return nil

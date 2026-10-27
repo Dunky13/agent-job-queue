@@ -141,6 +141,15 @@ func TestNotarizedHomebrew(t *testing.T) {
 	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) < 75*time.Second {
 		t.Fatal("insufficient remaining time for the bounded Homebrew command owner")
 	}
+	runtimeEnvironment := append(slices.Clone(environment), "AGENT_QUEUE_INSTALL_TEST_MODE=1", "AGENT_QUEUE_INSTALL_TEST_TOOLS="+filepath.Join(fixture, "tools"))
+	if managed {
+		enableManagedCaskFixture(t, fixture)
+		runtimeEnvironment = append(runtimeEnvironment, "AGENT_QUEUE_INSTALL_TEST_MANAGED=private-native-lifecycle")
+		privatePayload := filepath.Join(fixture, "Agent Job Queue Installer.app/Contents/Resources/payload")
+		privateApp := filepath.Join(privatePayload, "Agent Queue.app")
+		proveManagedNativeFixture(t, owner, ctx, runtimeEnvironment, fixture, privateApp,
+			filepath.Join(privateApp, "Contents/MacOS/agent-heavy"), filepath.Join(privatePayload, "source/bin/agent-heavy"))
+	}
 	output := run(ctx, brew, "ruby", "--", "../../packaging/homebrew/test-cask.rb", cask, fixture, "--quarantined-runtime")
 	var result struct {
 		AppInstalled bool           `json:"fixture_app_installed"`
@@ -148,8 +157,8 @@ func TestNotarizedHomebrew(t *testing.T) {
 		Attrs        map[string]int `json:"fixture_attributes"`
 	}
 	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &result); err != nil || !result.AppInstalled || result.Executed {
-		t.Fatalf("real cask did not deliver only the explicit installer: %v\n%s", err, output)
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &result); err != nil || !result.AppInstalled || !result.Executed {
+		t.Fatalf("real cask did not complete its noninteractive vendor installer: %v\n%s", err, output)
 	}
 	if result.Attrs["entries"] == 0 || len(result.Attrs) != 5 {
 		t.Fatalf("missing staged attribute evidence: %v", result.Attrs)
@@ -158,26 +167,6 @@ func TestNotarizedHomebrew(t *testing.T) {
 		if count != result.Attrs["entries"] {
 			t.Fatalf("staged %s was not retained: %v", name, result.Attrs)
 		}
-	}
-	if calls, err := os.ReadFile(filepath.Join(fixture, "calls")); err == nil && len(calls) != 0 || err != nil && !os.IsNotExist(err) {
-		t.Fatalf("Homebrew delivery called queue/native lifecycle: %v: %s", err, calls)
-	}
-	// Explicit setup occurs outside Homebrew and its sandbox, only after
-	// delivery and quarantine readback have completed successfully.
-	deliveredPayload := filepath.Join(home, "Applications/Agent Job Queue Installer.app/Contents/Resources/payload")
-	runtimeEnvironment := append(slices.Clone(environment), "AGENT_QUEUE_INSTALL_TEST_MODE=1", "AGENT_QUEUE_INSTALL_TEST_TOOLS="+filepath.Join(fixture, "tools"))
-	if managed {
-		runtimeEnvironment = append(runtimeEnvironment, "AGENT_QUEUE_INSTALL_TEST_MANAGED=private-native-lifecycle")
-		deliveredApp := filepath.Join(deliveredPayload, "Agent Queue.app")
-		proveManagedNativeFixture(t, owner, ctx, runtimeEnvironment, fixture, deliveredApp,
-			filepath.Join(deliveredApp, "Contents/MacOS/agent-heavy"), filepath.Join(deliveredPayload, "source/bin/agent-heavy"))
-	}
-	setup, err := owner.start(ctx, runtimeEnvironment, nil, filepath.Join(deliveredPayload, "source/bin/agent-heavy"), "install", "--payload", deliveredPayload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if output, err := setup.wait(); err != nil {
-		t.Fatalf("explicit signed private installer setup failed outside Homebrew: %v: %s", err, output)
 	}
 	installed, err := os.ReadFile(filepath.Join(home, ".local/share/agent-heavy/build-info.json"))
 	if err != nil {
@@ -240,7 +229,7 @@ func TestNotarizedHomebrew(t *testing.T) {
 		}
 		t.Log("Native lifecycle and loaded-service readback were injected; actual OS ServiceManagement registration remains UNQUALIFIED and needs an isolated login-session gate")
 	}
-	t.Logf("Real quarantined installer delivery and separate explicit signed private setup completed; %d entries retain both attributes and the private daemon remains healthy", result.Attrs["entries"])
+	t.Logf("Real quarantined Homebrew vendor installation completed; %d entries retain both attributes and the private daemon remains healthy", result.Attrs["entries"])
 }
 
 func TestNotarizedHomebrewRejectsUnsignedPayload(t *testing.T) {
@@ -472,9 +461,30 @@ puts "owned installer group cleaned"
 func notarizedFixtureCask(t *testing.T, fixture, version string) string {
 	t.Helper()
 	build, commit := 123, strings.Repeat("a", 40)
-	cask, err := RenderCask(backend.Manifest{BuildInfo: backend.BuildInfo{SchemaVersion: 1, Repository: backend.ReleaseRepository, Version: version, Commit: &commit, Build: &build}, Tag: "build-123-aaaaaaa", Asset: "Agent-Job-Queue-Installer-" + version + "-universal.zip", SHA256: strings.Repeat("b", 64)})
+	untracked := false
+	metadata := filepath.Join(fixture, "Agent Job Queue Installer.app/Contents/Resources/payload/source/build-info.json")
+	if raw, err := os.ReadFile(metadata); err == nil {
+		identity, err := backend.ValidateBuildInfo(raw)
+		if err != nil || identity.Version != version {
+			t.Fatal("invalid cask fixture identity", err)
+		}
+		if identity.Build != nil {
+			build, commit = *identity.Build, *identity.Commit
+		} else {
+			untracked = true
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	cask, err := RenderCask(backend.Manifest{BuildInfo: backend.BuildInfo{SchemaVersion: 1, Repository: backend.ReleaseRepository, Version: version, Commit: &commit, Build: &build}, Tag: fmt.Sprintf("build-%d-%.7s", build, commit), Asset: "Agent-Job-Queue-Installer-" + version + "-universal.zip", SHA256: strings.Repeat("b", 64)})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if untracked {
+		// This local ad hoc package is deliberately not a publishable release.
+		// Its synthetic cask receipt must match CFBundleVersion 0 while still
+		// exercising the production script's exact candidate comparison.
+		cask = strings.Replace(cask, fmt.Sprintf("version %q", version+","+strconv.Itoa(build)), fmt.Sprintf("version %q", version+",0"), 1)
 	}
 	path := filepath.Join(fixture, "agent-job-queue.rb")
 	if err := os.WriteFile(path, []byte(cask), 0600); err != nil {

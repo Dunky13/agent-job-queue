@@ -256,7 +256,7 @@ struct QueueUpdatesSettings: View {
                         Label(message, systemImage: store.running.metadataError == nil ? "info.circle" : "exclamationmark.triangle")
                             .font(.callout).foregroundStyle(store.running.metadataError == nil ? Color.secondary : Color.orange)
                     }
-                    Text("Updates download a verified installer. You choose Install in that window. Jobs continue independently during installation.")
+                    Text("Updates download a verified installer and continue setup automatically. Existing jobs finish before background services are updated.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let error = store.error {
                         Label(error, systemImage: "exclamationmark.triangle").font(.callout)

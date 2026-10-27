@@ -4,6 +4,21 @@ import Darwin
 import Foundation
 import ServiceManagement
 
+// A display hint from the verified installer. It cannot authorize registration
+// or establish readiness; those still require native status and install readback.
+enum QueueSetupProgress {
+    static let approvalMarker = "AGENT_QUEUE_SETUP_STATE:requires-approval"
+
+    static func parse(_ text: String) -> (output: String, requiresServiceApproval: Bool) {
+        let lines = text.components(separatedBy: .newlines)
+        let waiting = lines.contains(approvalMarker)
+        let visible = lines.filter { line in
+            line != approvalMarker && !(line.hasPrefix("AGENT_QUEUE_") && approvalMarker.hasPrefix(line))
+        }
+        return (visible.joined(separator: "\n"), waiting)
+    }
+}
+
 /// Native CLI arguments exclude argv[0]. Call before starting NSApplication.
 /// A nil result means this is an ordinary app launch. Print result.json to stdout
 /// and exit with result.exitCode. On a thrown error, print to stderr and exit 1.

@@ -1,15 +1,259 @@
 package backend
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestInstallerAutomaticRepairBacksUpCustomCallbackAndInstalls(t *testing.T) {
+	f := installTestFixture(t)
+	f.legacy(t)
+	config := f.installer.freshConfig()
+	config["daemon"].(Object)["callback"] = "custom-hook {{ id }}"
+	path := filepath.Join(f.installer.config, "pueue.yml")
+	original := mustMetadataJSON(t, config)
+	integrationTestWrite(t, path, original)
+	report := f.installer.preflight(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := f.installer.repairAndExecute(ctx); err != nil {
+		t.Fatalf("automatic installation still requires callback confirmation: %v", err)
+	}
+	backup := filepath.Join(f.installer.config, "pueue.before-upgrade-"+report.Revision+".yml")
+	if !bytes.Equal(original, integrationTestRead(t, backup)) || !f.installer.embeddedDefinition() {
+		t.Fatal("automatic migration must preserve the complete original configuration and finish installation")
+	}
+}
+
+func TestInstallerAutomaticManagedMigrationRepairsLegacyCallback(t *testing.T) {
+	m := managedTestFixture(t)
+	m.legacy(t)
+	servicePath := filepath.Join(m.installer.launch, "io.went.agent-resources.plist")
+	serviceOriginal := integrationTestRead(t, servicePath)
+	config := m.installer.freshConfig()
+	config["daemon"].(Object)["callback"] = "custom-hook {{ id }}"
+	path := filepath.Join(m.installer.config, "pueue.yml")
+	original := mustMetadataJSON(t, config)
+	integrationTestWrite(t, path, original)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.installer.repairAndExecute(ctx); err != nil {
+		t.Fatalf("managed installer still requires manual legacy repair: %v", err)
+	}
+	backups, err := filepath.Glob(filepath.Join(m.installer.config, "pueue.before-upgrade-*.yml"))
+	if err != nil || len(backups) != 1 || !bytes.Equal(original, integrationTestRead(t, backups[0])) {
+		t.Fatal("managed migration lost the original callback configuration", err)
+	}
+	serviceBackups, err := filepath.Glob(filepath.Join(m.installer.config, "legacy-service-io.went.agent-resources-*.plist"))
+	if err != nil || len(serviceBackups) != 1 || !bytes.Equal(serviceOriginal, integrationTestRead(t, serviceBackups[0])) {
+		t.Fatal("managed migration lost incompatible original service options", err)
+	}
+}
+
+func TestInstallerAutomaticLegacyServiceBackupRefusesChangedEvidence(t *testing.T) {
+	m := managedTestFixture(t)
+	m.legacy(t)
+	filename := filepath.Join(m.installer.launch, "io.went.agent-resources.plist")
+	original := integrationTestRead(t, filename)
+	hash := sha256.Sum256(original)
+	backup := filepath.Join(m.installer.config, "legacy-service-io.went.agent-resources-"+hex.EncodeToString(hash[:])+".plist")
+	integrationTestWrite(t, backup, []byte("substituted backup"))
+	if err := m.installer.repairAndExecute(context.Background()); err == nil {
+		t.Fatal("automatic setup overwrote changed legacy backup evidence")
+	}
+	if !bytes.Equal(original, integrationTestRead(t, filename)) || string(integrationTestRead(t, backup)) != "substituted backup" {
+		t.Fatal("failed automatic backup changed original or retained evidence")
+	}
+	for _, call := range m.calls {
+		if len(call) > 2 && ((call[0] == "launchctl" && call[1] == "bootout") || (call[1] == "--service-management" && call[2] != "status")) {
+			t.Fatal("automatic setup stopped a service before retaining its original definition", call)
+		}
+	}
+}
+
+func TestInstallerAutomaticLegacyOptionsCannotBypassInstallationOwnership(t *testing.T) {
+	m := managedTestFixture(t)
+	m.legacy(t)
+	filename := filepath.Join(m.installer.launch, "io.went.agent-resources.plist")
+	definition, err := updatePlist(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition["EnvironmentVariables"] = Object{"CUSTOM_OPTION": "retire me", "AGENT_HEAVY_STATE": filepath.Join(m.installer.home, "unrelated-state")}
+	if err := m.installer.writePlist(filename, definition); err != nil {
+		t.Fatal(err)
+	}
+	before := installTreeWitness(t, m.installer.home)
+	if err := m.installer.repairAndExecute(context.Background()); err == nil {
+		t.Fatal("automatic option retirement accepted an unrelated installation")
+	}
+	if !reflect.DeepEqual(before, installTreeWitness(t, m.installer.home)) {
+		t.Fatal("ownership refusal changed installation files")
+	}
+}
+
+func TestInstallerAutomaticManagedUpgradeWaitsForActiveJobs(t *testing.T) {
+	m := managedTestFixture(t)
+	if err := m.run(t); err != nil {
+		t.Fatal(err)
+	}
+	m.tasks = Object{"7": Object{"id": 7, "status": Object{"Running": Object{}}}}
+	waits := 0
+	err := installRunApprovedRepair(context.Background(), m.installer.preflight, m.installer.recover, m.installer.execute,
+		func(context.Context) error {
+			waits++
+			for _, call := range m.calls {
+				if len(call) > 2 && call[1] == "--service-management" && call[2] == "unregister" {
+					t.Fatal("upgrade interrupted active work before drain")
+				}
+			}
+			m.tasks = Object{}
+			return nil
+		}, func(string) {})
+	if err != nil || waits != 1 {
+		t.Fatalf("managed upgrade did not drain automatically: waits=%d err=%v", waits, err)
+	}
+}
+
+func TestInstallerAutomaticManagedApprovalWaitsWithoutReregistering(t *testing.T) {
+	m := managedTestFixture(t)
+	m.approval = "resources"
+	nativeExit := exec.Command("/bin/sh", "-c", "exit 2").Run()
+	if nativeExit == nil {
+		t.Fatal("approval fixture did not reproduce native exit 2")
+	}
+	original := m.installer.command
+	m.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
+		output, err := original(ctx, args)
+		if err == nil && len(args) == 4 && args[1] == "--service-management" && args[2] == "register" && m.statuses[args[3]] == "requiresApproval" {
+			return output, nativeExit
+		}
+		return output, err
+	}
+	waits, registrations := 0, 0
+	err := installRunApprovedRepair(context.Background(), m.installer.preflight, m.installer.recover, m.installer.execute,
+		func(context.Context) error {
+			waits++
+			calls := 0
+			for _, call := range m.calls {
+				if len(call) == 4 && call[1] == "--service-management" && call[2] == "register" && call[3] == "resources" {
+					calls++
+				}
+			}
+			if calls != 1 {
+				t.Fatalf("approval caused registration retry: %d", calls)
+			}
+			if waits == 3 {
+				m.approval = ""
+				m.statuses["resources"] = "enabled"
+				m.loaded["io.went.agent-resources"] = true
+			}
+			registrations = calls
+			return nil
+		}, func(string) {})
+	if err != nil || waits != 3 || registrations != 1 {
+		t.Fatalf("approval did not resume automatically: waits=%d err=%v", waits, err)
+	}
+	if _, err := os.Stat(filepath.Join(m.installer.root, "install-in-progress.json")); !os.IsNotExist(err) {
+		t.Fatal("approved installation did not finish", err)
+	}
+}
+
+func TestInstallerAutomaticApprovalFastReadbackAndNoProgressFence(t *testing.T) {
+	for _, succeeds := range []bool{false, true} {
+		calls := 0
+		err := installRunApprovedRepair(context.Background(), func(context.Context) installPreflightReport { return approvedTestReport() },
+			func(context.Context, string, *int, string) error { t.Fatal("unexpected repair"); return nil },
+			func(context.Context) error {
+				calls++
+				if succeeds && calls == 2 {
+					return nil
+				}
+				return &installApprovalError{service: "queue"}
+			}, func(context.Context) error { t.Fatal("already enabled consent should not wait"); return nil }, func(string) {})
+		if calls != 2 || succeeds && err != nil || !succeeds && err == nil {
+			t.Fatalf("approval readback resumed incorrectly: success=%v calls=%d err=%v", succeeds, calls, err)
+		}
+	}
+}
+
+func TestInstallerAutomaticManagedCleanupUsesBundleOwnership(t *testing.T) {
+	m := managedTestFixture(t)
+	if err := m.run(t); err != nil {
+		t.Fatal(err)
+	}
+	m.tasks = Object{"7": Object{"id": 7, "status": Object{"Done": Object{"result": "Success"}}}}
+	path := filepath.Join(m.installer.state, "receipts/7.json")
+	integrationTestWrite(t, path, []byte(`{"task_id":7,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
+	if err := m.installer.repairAndExecute(context.Background()); err != nil {
+		t.Fatal("managed cleanup required legacy ownership", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("managed completed receipt was not cleaned", err)
+	}
+}
+
+func TestInstallerAutomaticManagedUpgradePreservesInactiveLegacyCallback(t *testing.T) {
+	m := managedTestFixture(t)
+	if err := m.run(t); err != nil {
+		t.Fatal(err)
+	}
+	config := m.installer.freshConfig()
+	config["daemon"].(Object)["callback"] = "inactive-operator-hook {{ id }}"
+	original := mustMetadataJSON(t, config)
+	path := filepath.Join(m.installer.config, "pueue.yml")
+	integrationTestWrite(t, path, original)
+	if err := m.installer.repairAndExecute(context.Background()); err != nil {
+		t.Fatal("inactive Pueue config blocked a managed upgrade", err)
+	}
+	if !bytes.Equal(original, integrationTestRead(t, path)) {
+		t.Fatal("managed upgrade rewrote inactive operator settings")
+	}
+}
+
+func TestInstallerAutomaticRepairWaitsBeforeChangingCallbackOrPhoneAccess(t *testing.T) {
+	for _, action := range []string{"reset-callback", "disable-phone-access"} {
+		t.Run(action, func(t *testing.T) {
+			stage, waits, repairs, installs := 0, 0, 0, 0
+			revision := strings.Repeat("a", 64)
+			err := installRunApprovedRepair(context.Background(), func(context.Context) installPreflightReport {
+				issue := "custom-callback"
+				if action == "disable-phone-access" {
+					issue = "legacy-phone-access"
+				}
+				report := approvedTestReport()
+				report.Revision = revision
+				if stage < 2 {
+					report.Issues = append(report.Issues, approvedTestIssue(issue, action))
+				}
+				if stage == 0 {
+					report.Issues = append(report.Issues, approvedTestIssue("legacy-jobs", "wait", installRecoveryJob{ID: 7, Status: "Running"}))
+				}
+				return report
+			}, func(_ context.Context, got string, _ *int, gotRevision string) error {
+				if stage != 1 || got != action || action == "reset-callback" && gotRevision != revision || action != "reset-callback" && gotRevision != "" {
+					t.Fatal("automatic repair changed state before drain or lost configuration revision")
+				}
+				repairs++
+				stage++
+				return nil
+			}, func(context.Context) error { installs++; return nil }, func(context.Context) error { waits++; stage++; return nil }, func(string) {})
+			if err != nil || waits != 1 || repairs != 1 || installs != 1 {
+				t.Fatalf("automatic repair failed: waits=%d repairs=%d installs=%d err=%v", waits, repairs, installs, err)
+			}
+		})
+	}
+}
 
 func TestInstallerApprovedRepairOptions(t *testing.T) {
 	args := []string{"--payload", "/fixture/payload", "--repair-and-continue"}
@@ -53,7 +297,7 @@ func TestInstallerApprovedRepairKnownIssueContract(t *testing.T) {
 		{"stashed", approvedTestIssue("legacy-jobs", "wait", installRecoveryJob{ID: 7, Status: "Stashed"}), false},
 		{"no-jobs", approvedTestIssue("legacy-jobs", "wait"), false},
 		{"unknown", approvedTestIssue("unknown", "wait"), false},
-		{"custom", approvedTestIssue("custom-callback", "reset-callback"), false},
+		{"custom", approvedTestIssue("custom-callback", "reset-callback"), true},
 		{"cancel", approvedTestIssue("legacy-jobs", "cancel-job", installRecoveryJob{ID: 7, Status: "Running"}), false},
 		{"negative-job", approvedTestIssue("pending-cleanup", "cleanup-job", installRecoveryJob{ID: -1, Status: "Done"}), false},
 		{"foreign-action", approvedTestIssue("service-definitions-missing", "reset-callback"), false},
@@ -63,6 +307,21 @@ func TestInstallerApprovedRepairKnownIssueContract(t *testing.T) {
 				t.Fatalf("approval eligibility %v; want %v", ok, test.want)
 			}
 		})
+	}
+}
+
+func TestInstallerAutomaticCallbackRequiresExactRevisionAndNoOtherBlockers(t *testing.T) {
+	for _, revision := range []string{"", "not-a-hash", strings.Repeat("g", 64), strings.Repeat("a", 63)} {
+		report := approvedTestReport(approvedTestIssue("custom-callback", "reset-callback"))
+		report.Revision = revision
+		if _, err := installApprovedNext(report); err == nil {
+			t.Fatal("automatic callback replacement accepted invalid configuration revision")
+		}
+	}
+	report := approvedTestReport(approvedTestIssue("custom-callback", "reset-callback"), approvedTestIssue("private-path-unsafe", "reveal"))
+	report.Revision = strings.Repeat("a", 64)
+	if _, err := installApprovedNext(report); err == nil {
+		t.Fatal("automatic callback repair ignored uncertain file ownership")
 	}
 }
 

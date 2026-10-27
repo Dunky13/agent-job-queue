@@ -25,6 +25,15 @@ struct TransportTests {
         let executable = URL(fileURLWithPath: CommandLine.arguments[0])
         let transport = QueueClient.Transport(executable: executable, timeout: 2)
         let short = QueueClient.Transport(executable: executable, timeout: 0.15)
+        let automaticInstall = ["install", "--app-bundle", "/Applications/Agent Queue.app", "--repair-and-continue"]
+        try check(QueueClient.timeout(for: automaticInstall, budget: .setup).isInfinite,
+                  "Automatic installation can wait for existing queue work without an aggregate deadline")
+        for arguments in [Array(automaticInstall.dropLast()), automaticInstall + ["--preflight", "--json"],
+                          ["install", "--app-bundle", "/Applications/Agent Queue.app", "--preflight", "--json"],
+                          ["install", "--app-bundle", "/Applications/Agent Queue.app", "--recover", "repair-service"]] {
+            try check(QueueClient.timeout(for: arguments, budget: .setup) == 330,
+                      "Diagnostic and ambiguous setup commands retain a finite deadline")
+        }
         func arguments(_ scenario: String, _ marker: URL, mutation: Bool = false) -> [String] {
             (mutation ? ["profiles", "edit"] : ["status"]) + ["--stub", scenario, marker.path]
         }

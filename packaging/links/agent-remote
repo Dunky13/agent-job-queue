@@ -2,7 +2,7 @@
 set -eu
 entry="${HOME:?}/.local/bin/agent-remote"
 if [ ! -x "$entry" ]; then
-  echo 'Agent Queue needs setup. Open Agent Job Queue Installer from Applications and choose Install.' >&2
+  echo 'Agent Queue installation is incomplete. Reopen Agent Job Queue Installer to resume automatic setup.' >&2
   exit 125
 fi
 exec "$entry" "$@"

@@ -97,31 +97,30 @@ private struct BootstrapFixtureInstallation: Encodable {
     let serviceManagement = true
 }
 
-actor BootstrapExplicitSetupFixture {
+actor BootstrapInstallerProgressFixture {
     let fixture: BootstrapFixture
-    let managed: Bool
     private(set) var installations = 0
+    private var held: CheckedContinuation<Void, Never>?
 
-    init(_ fixture: BootstrapFixture, managed: Bool) {
-        self.fixture = fixture
-        self.managed = managed
-    }
+    init(_ fixture: BootstrapFixture) { self.fixture = fixture }
 
-    func execute(_ request: QueueBootstrapRequest) throws -> Data {
-        if request.arguments.prefix(2) == ["--service-management", "status"], let service = request.arguments.last {
-            return try JSONEncoder().encode(BootstrapFixtureServiceStatus(service: service, status: "notRegistered"))
-        }
-        if request.arguments.contains("--preflight") {
+    func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) async throws -> Data {
+        if request.arguments.suffix(2) == ["--preflight", "--json"] {
             return try JSONEncoder().encode(QueueBootstrapReport.clear)
         }
         guard request.arguments == ["install", "--app-bundle", fixture.environment.app.path] else {
-            throw ClientError.message("Explicit setup used an unexpected request.")
+            throw ClientError.message("Diagnostic setup used an unexpected request.")
         }
         installations += 1
-        if managed { try fixture.installManaged() }
-        else { try fixture.install() }
-        return Data("Explicit fixture setup complete.".utf8)
+        output(Data("AGENT_QUEUE_SETUP_STATE:requires-".utf8))
+        output(Data((QueueSetupProgress.approvalMarker + "\nWaiting for macOS background service approval. Setup will continue automatically.").utf8))
+        await withCheckedContinuation { held = $0 }
+        try fixture.install()
+        return Data("Diagnostic fixture setup complete.".utf8)
     }
+
+    func release() { held?.resume(); held = nil }
+    var isHeld: Bool { held != nil }
 }
 
 actor BootstrapServiceStatusFixture {

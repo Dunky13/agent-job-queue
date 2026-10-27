@@ -1,27 +1,38 @@
 import AppKit
 import SwiftUI
 import Foundation
+import ServiceManagement
 
 @MainActor
 enum InstallerActivity { static var running = false }
 
 @MainActor
 final class InstallerModel: ObservableObject {
-    @Published var output = "Install Agent Queue for your macOS account.\n\nChoosing Install approves the verified setup repairs required to continue: finish the exact retained pending installation before upgrading, restore missing standard service files, clean up completed jobs, start a verified stopped service, and disable phone access when migration requires it. Lost custom startup settings cannot be recovered. Credentials and trusted certificates will be preserved; phone access can be enabled again in settings. Unknown ownership or custom configuration still requires review.\n\nInstallation and managed upgrades wait for queued and running jobs to finish before changing background services. Includes its queue and HTTPS runtime. macOS may need an internet connection for first-open verification.\n"
+    @Published var output = "Preparing Agent Queue…\n"
     @Published var running = false
     @Published var completed = false
+    @Published private(set) var requiresServiceApproval = false
     private var process: Process?
     private var pipe: Pipe?
+    private var progressOutput = ""
+    private let bundle: Bundle
+    private let installationCompleted: @MainActor () -> Void
+
+    init(bundle: Bundle = .main,
+         installationCompleted: @escaping @MainActor () -> Void = { NSApplication.shared.terminate(nil) }) {
+        self.bundle = bundle
+        self.installationCompleted = installationCompleted
+    }
 
     func install() {
         guard !running, !completed else { return }
-        guard let resources = Bundle.main.resourceURL else {
+        guard let resources = bundle.resourceURL else {
             output += "\nInstaller resources are missing. Download the installer again.\n"
             return
         }
         let payload = resources.appendingPathComponent("payload")
         let controller = payload.appendingPathComponent("source/bin/agent-heavy")
-        guard QueueExecutableNamespace.allows(executable: controller, root: Bundle.main.bundleURL) else {
+        guard QueueExecutableNamespace.allows(executable: controller, root: bundle.bundleURL) else {
             output += "\nThe installer location permits unsafe executable replacement. Open it from a protected download or your account's Applications folder. No installation was started.\n"
             return
         }
@@ -48,11 +59,15 @@ final class InstallerModel: ObservableObject {
                 self.running = false
                 InstallerActivity.running = false
                 self.completed = status == 0
-                self.output += status == 0 ? "\nInstallation complete. Agent Queue is in your menu bar.\n" : "\nInstallation failed (exit \(status)). Review the log above, correct the issue, then try again.\n"
+                self.requiresServiceApproval = false
+                self.append(status == 0 ? "\nInstallation complete. Agent Queue is in your menu bar.\n" : "\nInstallation failed (exit \(status)). Review the log above, correct the issue, then try again.\n")
                 self.process = nil
+                if self.completed { self.installationCompleted() }
             }
         }
         output = "Starting installation...\n"
+        progressOutput = output
+        requiresServiceApproval = false
         running = true
         InstallerActivity.running = true
         process = task
@@ -63,13 +78,16 @@ final class InstallerModel: ObservableObject {
             running = false
             InstallerActivity.running = false
             process = nil
-            output += "\nCould not start installer: \(error.localizedDescription)\n"
+            append("\nCould not start installer: \(error.localizedDescription)\n")
         }
     }
 
     private func append(_ message: String) {
-        output += message
-        if output.count > 200_000 { output = String(output.suffix(200_000)) }
+        progressOutput += message
+        if progressOutput.count > 200_000 { progressOutput = String(progressOutput.suffix(200_000)) }
+        let progress = QueueSetupProgress.parse(progressOutput)
+        if running { requiresServiceApproval = requiresServiceApproval || progress.requiresServiceApproval }
+        output = progress.output
     }
 }
 
@@ -84,7 +102,9 @@ struct InstallerWindowState: NSViewRepresentable {
 }
 
 struct InstallerView: View {
-    @StateObject private var model = InstallerModel()
+    @StateObject private var model: InstallerModel
+
+    init(model: InstallerModel = InstallerModel()) { _model = StateObject(wrappedValue: model) }
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Label("Agent Job Queue", systemImage: QueueBrand.symbolName)
@@ -98,15 +118,19 @@ struct InstallerView: View {
             HStack {
                 if model.running { ProgressView().controlSize(.small); Text("Installing...") }
                 Spacer()
+                if model.requiresServiceApproval {
+                    Button("Login Items settings") { SMAppService.openSystemSettingsLoginItems() }
+                }
                 Button(model.completed ? "Done" : "Quit") { NSApplication.shared.terminate(nil) }
                     .disabled(model.running)
                 if !model.completed {
-                    Button("Install") { model.install() }.buttonStyle(.borderedProminent)
+                    Button("Retry") { model.install() }.buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction).disabled(model.running)
                 }
             }
         }.padding(24).frame(minWidth: 650, minHeight: 480)
             .background(InstallerWindowState(installing: model.running))
+            .task { model.install() }
     }
 }
 
