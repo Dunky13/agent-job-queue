@@ -948,7 +948,8 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
     private var menuTrackingObservations: [AnyCancellable] = []
     private var menuTrackingDepth = 0
     private var eventMonitor: Any?
-    var isMonitoringEvents: Bool { eventMonitor != nil }
+    private var globalMouseMonitor: Any?
+    var isMonitoringEvents: Bool { eventMonitor != nil || globalMouseMonitor != nil }
     private var isTornDown = false
     private let store: QueueStore
     private var registeredVisibleSurface = false
@@ -1051,10 +1052,19 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
             }
             return suppress ? nil : event
         }
+        // An accessory app can show its popover without becoming active. In
+        // that state an outside click produces no local event or deactivation.
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.menuTrackingDepth == 0 else { return }
+                self.closePopover()
+            }
+        }
     }
 
     private func stopMonitoringEvents() {
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
+        if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor); self.globalMouseMonitor = nil }
     }
 
     @objc private func selectMenuAction(_ sender: NSMenuItem) {
@@ -1445,7 +1455,7 @@ struct QueuePanel: View {
                     Text(QueueAppAction.quitExplanation)
                     Divider()
                     Button(QueueAppAction.quit.title, systemImage: QueueAppAction.quit.symbol) { AppRuntime.perform(.quit) }.keyboardShortcut("q")
-                } label: { Image(systemName: "gearshape") }.menuStyle(.borderlessButton).fixedSize().help("Application options").accessibilityLabel("Application options")
+                } label: { Image(systemName: "gearshape") }.menuStyle(.borderlessButton).allowsWindowActivationEvents(true).fixedSize().help("Application options").accessibilityLabel("Application options")
             }.font(.caption).foregroundStyle(.secondary)
         }.padding(.horizontal, 18).padding(.vertical, 12)
     }

@@ -2,7 +2,7 @@
 # Run only simulated jobs in a separate graphical fixture executable.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
-report=${1:?Usage: native/tests/run-menu-bar-ui-tests.sh OUTPUT.json [--require-foreground]}
+report=${1:?Usage: native/tests/run-menu-bar-ui-tests.sh OUTPUT.json [--require-foreground] [--require-system-events] [--interaction-regressions] [--settings-chevron]}
 shift
 report="$(cd -- "$(dirname -- "$report")" && pwd)/$(basename -- "$report")"
 temporary=$(mktemp -d)
@@ -43,12 +43,15 @@ cat > "$fixture_app/Contents/Info.plist" <<'PLIST'
 PLIST
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier io.went.agentqueue.fixture.$(uuidgen)" "$fixture_app/Contents/Info.plist"
 sed '/^@main$/d' "$root/native/AgentQueue.swift" > "$temporary/AgentQueue.swift"
-xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -framework SwiftUI -framework AppKit -framework ServiceManagement \
+xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -target "$(uname -m)-apple-macos15.0" -framework SwiftUI -framework AppKit -framework ServiceManagement \
   "$root/native/QueueBrand.swift" "$temporary/AgentQueue.swift" "$root/native/AgentIntegration.swift" "$root/native/AgentUpdates.swift" \
   "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/AgentServices.swift" "$root/native/tests/MenuBarUITests.swift" -o "$fixture_binary"
 rm -f -- "$report"
-open -W -n --stdout "$temporary/stdout.log" --stderr "$temporary/stderr.log" "$fixture_app" \
-  --args --fixture "$root/native/tests/fixtures/queue.json" --report "$report" --pid-file "$fixture_pid_file" "$@" &
+# Direct launch keeps process ownership and existing terminal event permissions
+# with this runner. The fixture never asks for additional input permissions.
+"$fixture_binary" --fixture "$root/native/tests/fixtures/queue.json" \
+  --report "$report" --pid-file "$fixture_pid_file" --fixture-root "$temporary" "$@" \
+  > "$temporary/stdout.log" 2> "$temporary/stderr.log" &
 fixture_launch_pid=$!
 for ((attempt = 0; attempt < 90; attempt++)); do
   if ! kill -0 "$fixture_launch_pid" 2>/dev/null; then break; fi

@@ -13,6 +13,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     private var trackedMenu: NSMenu?
     private var childSelections = 0
     private var outsideClicks = 0
+    private var footerMenuOpenCount = 0
+    private var footerMenu: NSMenu?
     private let applicationMenuDelegate = AppDelegate()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -64,6 +66,20 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     @objc private func selectChildMenu(_ sender: NSMenuItem) { childSelections += 1 }
     @objc private func selectOutsideButton(_ sender: NSButton) { outsideClicks += 1 }
 
+    @objc private func footerMenuBeganTracking(_ notification: Notification) {
+        guard let menu = notification.object as? NSMenu, menu !== controller?.menu else { return }
+        footerMenuOpenCount += 1
+        footerMenu = menu
+        let timer = Timer(timeInterval: 0.08, target: self,
+                          selector: #selector(closeFooterMenu(_:)), userInfo: nil, repeats: false)
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    @objc private func closeFooterMenu(_ timer: Timer) {
+        footerMenu?.cancelTracking()
+        footerMenu = nil
+    }
+
     private func check(_ passed: Bool, _ name: String) throws {
         results[name] = passed
         FileHandle.standardOutput.write(Data("\(passed ? "PASS" : "FAIL") \(name)\n".utf8))
@@ -114,6 +130,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await settle()
         try check(AppRuntime.store.visibleSurfaces == 0 && !controller.isMonitoringEvents,
                   "hiddenPopoverStartsWithoutVisibleQueueSurfaceOrInputMonitor")
+        try await verifySystemInteractions(controller)
+        if CommandLine.arguments.contains("--interaction-regressions") { return }
         let interval = NSEvent.doubleClickInterval + 0.15
         try click()
         try await settle(0.03)
@@ -242,6 +260,111 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         AppRuntime.menuBarController = nil
     }
 
+    private func verifySystemInteractions(_ controller: QueueMenuBarController) async throws {
+        guard CGPreflightPostEventAccess() else {
+            let reason = "System click checks need existing event-posting permission for the invoking terminal; the fixture never requests it."
+            for name in ["settingsFixtureStartsWithInactivePopover", "firstSettingsClickOpensMenuInInactivePopover",
+                         "externalClickStartsWithShownPopover",
+                         "externalClickReachesOwnedHelper", "externalClickDismissesPopoverWithoutApplicationDeactivation"] {
+                skippedChecks[name] = reason
+                print("SKIP \(name): \(reason)")
+            }
+            if CommandLine.arguments.contains("--require-system-events") { throw ClientError.message(reason) }
+            return
+        }
+        let cursor = CGEvent(source: nil)?.location
+        defer { if let cursor { CGWarpMouseCursorPosition(cursor) } }
+        try await verifySettingsFirstClick(controller)
+        try await verifyExternalClick(controller)
+    }
+
+    private func verifySettingsFirstClick(_ controller: QueueMenuBarController) async throws {
+        NotificationCenter.default.addObserver(self, selector: #selector(footerMenuBeganTracking(_:)),
+            name: NSMenu.didBeginTrackingNotification, object: nil)
+        defer {
+            NotificationCenter.default.removeObserver(self, name: NSMenu.didBeginTrackingNotification, object: nil)
+            controller.closePopover()
+        }
+        // Each hit target runs in a fresh fixture process. A previous system
+        // click can grant activation to subsequent NSApp.activate() requests.
+        NSApp.deactivate()
+        try await settle()
+        try click()
+        try await settle()
+        guard let view = controller.popover.contentViewController?.view, let window = view.window else {
+            throw ClientError.message("Settings first-click verification requires the real popover")
+        }
+        window.resignKey()
+        try check(!NSApp.isActive && !window.isKeyWindow && controller.popover.isShown,
+                  "settingsFixtureStartsWithInactivePopover")
+        let offset = CommandLine.arguments.contains("--settings-chevron") ? 25.0 : 40.0
+        let point = NSPoint(x: view.bounds.maxX - offset,
+                            y: view.isFlipped ? view.bounds.maxY - 22 : view.bounds.minY + 22)
+        try postSystemClick(in: window, at: view.convert(point, to: nil))
+        try await settle(0.3)
+        try check(footerMenuOpenCount == 1 && controller.popover.isShown,
+                  "firstSettingsClickOpensMenuInInactivePopover")
+    }
+
+    private func postSystemClick(in window: NSWindow, at point: NSPoint) throws {
+        guard CGPreflightPostEventAccess(), let screen = NSScreen.screens.first else {
+            throw ClientError.message("System mouse-event verification requires existing event-posting permission and a graphical session.")
+        }
+        let location = window.convertPoint(toScreen: point)
+        let screenPoint = CGPoint(x: location.x, y: screen.frame.maxY - location.y)
+        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            guard let event = CGEvent(mouseEventSource: nil, mouseType: type,
+                                      mouseCursorPosition: screenPoint, mouseButton: .left) else {
+                throw ClientError.message("Could not create system fixture click")
+            }
+            event.post(tap: .cghidEventTap)
+        }
+    }
+
+    private func verifyExternalClick(_ controller: QueueMenuBarController) async throws {
+        guard let index = CommandLine.arguments.firstIndex(of: "--fixture-root"),
+              CommandLine.arguments.indices.contains(index + 1) else {
+            throw ClientError.message("Outside-click verification requires a temporary root owned by its runner")
+        }
+        let temporary = URL(fileURLWithPath: CommandLine.arguments[index + 1]).appendingPathComponent("outside-click")
+        try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false)
+        let ready = temporary.appendingPathComponent("ready")
+        let clicked = temporary.appendingPathComponent("clicked")
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+        helper.arguments = ["--outside-click-helper", ready.path, clicked.path]
+        try helper.run()
+        defer {
+            if helper.isRunning { helper.terminate() }
+            helper.waitUntilExit()
+        }
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        while !FileManager.default.fileExists(atPath: ready.path) {
+            guard helper.isRunning, ProcessInfo.processInfo.systemUptime < deadline else {
+                throw ClientError.message("Outside-click fixture did not become ready")
+            }
+            try await settle(0.02)
+        }
+        controller.activate(.accessible)
+        try await settle()
+        try check(controller.popover.isShown, "externalClickStartsWithShownPopover")
+        // Click only the owned helper. Its nonactivating panel does not send
+        // an application-deactivation notification to the queue fixture.
+        guard let screen = NSScreen.screens.first else { throw ClientError.message("No fixture screen") }
+        let location = CGPoint(x: 175, y: screen.frame.maxY - 140)
+        for type in [CGEventType.leftMouseDown, .leftMouseUp] {
+            guard let event = CGEvent(mouseEventSource: nil, mouseType: type,
+                                      mouseCursorPosition: location, mouseButton: .left) else {
+                throw ClientError.message("Could not create outside fixture click")
+            }
+            event.post(tap: .cghidEventTap)
+        }
+        try await settle(0.3)
+        try check(FileManager.default.fileExists(atPath: clicked.path), "externalClickReachesOwnedHelper")
+        try check(!controller.popover.isShown && !controller.isMonitoringEvents,
+                  "externalClickDismissesPopoverWithoutApplicationDeactivation")
+    }
+
     private func verifyPopoverDismissal(_ controller: QueueMenuBarController) async throws {
         controller.activate(.accessible)
         try await settle()
@@ -330,8 +453,10 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         }
         editor.insertText("Fixture editor", replacementRange: NSRange(location: 0, length: 0))
         edit.update()
-        guard let select = edit.items.first(where: { $0.title == "Select All" }),
-              let undo = edit.items.first(where: { $0.title == "Undo" }) else {
+        // AppKit updates Undo's title to include the operation once the editor
+        // becomes active. Find responder actions by selector, not that title.
+        guard let select = edit.items.first(where: { $0.action == NSSelectorFromString("selectAll:") }),
+              let undo = edit.items.first(where: { $0.action == NSSelectorFromString("undo:") }) else {
             throw ClientError.message("Editing actions are missing")
         }
         edit.performActionForItem(at: edit.index(of: select))
@@ -368,6 +493,14 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
 @main
 struct MenuBarUITests {
     @MainActor static func main() {
+        if CommandLine.arguments.contains("--outside-click-helper") {
+            let application = NSApplication.shared
+            application.setActivationPolicy(.accessory)
+            let delegate = OutsideClickFixtureDelegate()
+            application.delegate = delegate
+            withExtendedLifetime(delegate) { application.run() }
+            return
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--pid-file"), CommandLine.arguments.indices.contains(index + 1) {
             do {
                 try Data("\(ProcessInfo.processInfo.processIdentifier)\n".utf8)
@@ -379,5 +512,32 @@ struct MenuBarUITests {
         let delegate = MenuBarFixtureDelegate()
         application.delegate = delegate
         withExtendedLifetime(delegate) { application.run() }
+    }
+}
+
+@MainActor
+final class OutsideClickFixtureDelegate: NSObject, NSApplicationDelegate {
+    private var panel: NSPanel?
+    private let parentPID = getppid()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let panel = NSPanel(contentRect: NSRect(x: 100, y: 100, width: 150, height: 80),
+            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.contentView = NSButton(title: "Private outside-click fixture", target: self, action: #selector(clicked(_:)))
+        panel.isReleasedWhenClosed = false
+        panel.orderFrontRegardless()
+        self.panel = panel
+        Timer.scheduledTimer(timeInterval: 1, target: self, selector: #selector(checkParent(_:)), userInfo: nil, repeats: true)
+        do { try Data("ready".utf8).write(to: URL(fileURLWithPath: CommandLine.arguments[2])) }
+        catch { exit(EXIT_FAILURE) }
+    }
+
+    @objc private func checkParent(_ timer: Timer) {
+        if getppid() != parentPID { NSApp.terminate(nil) }
+    }
+
+    @objc private func clicked(_ sender: NSButton) {
+        do { try Data("clicked".utf8).write(to: URL(fileURLWithPath: CommandLine.arguments[3])) }
+        catch { exit(EXIT_FAILURE) }
     }
 }
