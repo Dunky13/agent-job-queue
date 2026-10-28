@@ -447,7 +447,7 @@ func IdentifyWorkload(argv []string, cwd string, env map[string]string) (Object,
 	}
 	environment := map[string]string{}
 	for key, value := range env {
-		if containsString([]string{"PWD", "OLDPWD", "SHLVL", "_", "TMPDIR", "TERM", "TERM_PROGRAM", "TERM_SESSION_ID"}, key) || strings.HasPrefix(key, "AGENT_HEAVY_") || strings.HasPrefix(key, "PUEUE_") {
+		if profileIncidentalEnvironment(key) {
 			continue
 		}
 		environment[key] = profileRelative(value, root, alias)
@@ -459,7 +459,9 @@ func IdentifyWorkload(argv []string, cwd string, env map[string]string) (Object,
 	if selected, ok := toolchain[0].(string); ok {
 		toolchain[0] = profileRelative(selected, root, alias)
 	}
-	variant := profileDigest([]any{"variant-v1", family, command, revision, provenance, environment, toolchain})
+	// Source commits describe freshness, not a different resource workload. Keep
+	// setup, arguments, toolchain and semantic environment in the exact variant.
+	variant := profileDigest([]any{"variant-v2", family, command, provenance, environment, toolchain})
 	caches := []any{}
 	for _, name := range []string{"node_modules", ".venv", "target", "build", ".pytest_cache", ".next", ".turbo"} {
 		info, e := os.Stat(filepath.Join(directory, name))
@@ -471,7 +473,15 @@ func IdentifyWorkload(argv []string, cwd string, env map[string]string) (Object,
 			caches = append(caches, []any{name, info.ModTime().UnixNano(), info.Size()})
 		}
 	}
-	return Object{"family": family, "variant": variant, "context": profileDigest([]any{"context-v1", caches})}, nil
+	return Object{"family": family, "variant": variant, "context": profileDigest([]any{"context-v2", revision, caches})}, nil
+}
+
+func profileIncidentalEnvironment(key string) bool {
+	return containsString([]string{
+		"PWD", "OLDPWD", "SHLVL", "_", "TMPDIR", "TERM", "TERM_PROGRAM", "TERM_SESSION_ID",
+		"CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+		"CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "T3CODE_CLI_PATH",
+	}, key) || strings.HasPrefix(key, "AGENT_HEAVY_") || strings.HasPrefix(key, "PUEUE_")
 }
 func errorsOptionalPath(e error) bool {
 	return os.IsNotExist(e) || strings.Contains(e.Error(), "not a directory") || strings.Contains(e.Error(), "file name too long")

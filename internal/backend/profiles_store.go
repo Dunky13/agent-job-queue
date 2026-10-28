@@ -89,7 +89,7 @@ func NewProfileStore(state string, readonly bool) (*ProfileStore, error) {
 			return fmt.Errorf("Unsupported resource history schema")
 		}
 		if !readonly {
-			if _, e := c.ExecContext(profileContext, profileDecisionSchema+profileLearningSchema); e != nil {
+			if _, e := c.ExecContext(profileContext, profileDecisionSchema+profileLearningSchema+profileSimilaritySchema); e != nil {
 				return e
 			}
 		}
@@ -350,7 +350,10 @@ func profileRegistrySlot(c profileSQL) (bool, error) {
 	if e = profileExec(c, "DELETE FROM learning_members WHERE family=?", candidate["family"]); e != nil {
 		return false, e
 	}
-	e = profileExec(c, "DELETE FROM learning_profiles WHERE id=?", candidate["profile"])
+	if e = profileExec(c, "DELETE FROM learning_similarity WHERE family=?", candidate["family"]); e != nil {
+		return false, e
+	}
+	e = profileExec(c, "DELETE FROM learning_profiles WHERE id=? AND NOT EXISTS(SELECT 1 FROM learning_members WHERE profile=?)", candidate["profile"], candidate["profile"])
 	return e == nil, e
 }
 func profileRegister(c profileSQL, family string, description Object, required bool) (Object, error) {
@@ -396,7 +399,7 @@ func profileDescription(identity, description Object) (Object, error) {
 		return nil, fmt.Errorf("Invalid workload identity")
 	}
 	for key := range description {
-		if !containsString([]string{"title", "project", "executable"}, key) {
+		if !containsString([]string{"title", "project", "executable", "learningScope", "learningKind"}, key) {
 			return nil, fmt.Errorf("Invalid safe workload description")
 		}
 	}
@@ -412,7 +415,7 @@ func profileDescription(identity, description Object) (Object, error) {
 		}
 		clean[key] = value
 	}
-	return clean, nil
+	return clean, profileValidateSimilarityDescription(clean, description)
 }
 func profileDescriptionChanged(prior, clean Object) bool {
 	if prior == nil {
@@ -423,26 +426,36 @@ func profileDescriptionChanged(prior, clean Object) bool {
 			return true
 		}
 	}
+	if prior["learningScope"] == nil && clean["learningScope"] != nil {
+		return true
+	}
 	return false
 }
 func profileObserve(c profileSQL, family string, clean Object) error {
-	prior, e := profileRow(c, "SELECT * FROM learning_members WHERE family=?", family)
+	prior, e := profileMember(c, family)
 	if e != nil {
 		return e
 	}
 	if prior == nil {
-		_, e = profileRegister(c, family, clean, false)
-		return e
-	}
-	if !profileDescriptionChanged(prior, clean) {
-		return nil
-	}
-	for _, key := range []string{"title", "project", "executable"} {
-		if clean[key] == nil {
-			clean[key] = prior[key]
+		prior, e = profileRegister(c, family, clean, false)
+		if e != nil || prior == nil {
+			return e
+		}
+	} else if profileDescriptionChanged(prior, clean) {
+		for _, key := range []string{"title", "project", "executable"} {
+			if clean[key] == nil {
+				clean[key] = prior[key]
+			}
+		}
+		if e = profileExec(c, "UPDATE learning_members SET title=?,project=?,executable=?,updated=? WHERE family=?", clean["title"], clean["project"], clean["executable"], resourceNow(), family); e != nil {
+			return e
 		}
 	}
-	return profileExec(c, "UPDATE learning_members SET title=?,project=?,executable=?,updated=? WHERE family=?", clean["title"], clean["project"], clean["executable"], resourceNow(), family)
+	changed, e := profileRememberSimilarity(c, family, clean)
+	if e != nil || !changed {
+		return e
+	}
+	return profileChanged(c)
 }
 func (s *ProfileStore) Observe(identity, description Object) error {
 	clean, e := profileDescription(identity, description)
@@ -455,7 +468,7 @@ func (s *ProfileStore) Observe(identity, description Object) error {
 	family := text(identity["family"])
 	changed := false
 	if e = s.connection(false, func(c profileSQL) error {
-		prior, err := profileRow(c, "SELECT * FROM learning_members WHERE family=?", family)
+		prior, err := profileMember(c, family)
 		changed = profileDescriptionChanged(prior, clean)
 		return err
 	}); e != nil || !changed {
@@ -497,7 +510,7 @@ func (s *ProfileStore) Match(identity Object) (Object, error) {
 		if e != nil || !has {
 			return e
 		}
-		row, e := profileRow(c, "SELECT m.*,p.label FROM learning_members m JOIN learning_profiles p ON p.id=m.profile WHERE family=?", family)
+		row, e := profileRow(c, "SELECT m.*,p.label,p.pinned FROM learning_members m JOIN learning_profiles p ON p.id=m.profile WHERE family=?", family)
 		if e != nil || row == nil {
 			return e
 		}
@@ -508,6 +521,9 @@ func (s *ProfileStore) Match(identity Object) (Object, error) {
 		reason := "Automatic workload family"
 		if len(members) > 1 || text(row["profile"]) != family {
 			reason = "Operator grouping"
+			if metric(row["pinned"]) == 0 {
+				reason = "Automatic similar workloads"
+			}
 		}
 		result = Object{"id": row["profile"], "label": profileGroupLabel(Object{"id": row["profile"], "label": row["label"]}, members), "reason": reason}
 		return nil

@@ -29,6 +29,7 @@ private struct EditInput: Decodable {
         explicitCPUNull = try values.contains(.cpuFloorCores) && values.decodeNil(forKey: .cpuFloorCores)
     }
 }
+private struct CombineInput: Decodable { let revision: Int; let profileIds: [String]; let families: [String] }
 private struct MergeInput: Decodable { let revision: Int; let targetId: String }
 private struct SplitInput: Decodable { let revision: Int; let family: String }
 private struct ResetInput: Decodable { let revision: Int; let confirm: Bool }
@@ -86,8 +87,26 @@ private actor LearningFixture {
         }
         if operation == "show" {
             if shouldFailRead { throw ClientError.message("Profile no longer available") }
-            return try encoder.encode(testDetail(id: arguments[2], revision: revision,
-                label: arguments[2] == sourceID ? "Web tests" : "Build tests"))
+            let detail = testDetail(id: arguments[2], revision: revision,
+                label: arguments[2] == sourceID ? "Web tests" : "Build tests")
+            if let index = arguments.firstIndex(of: "--family") {
+                let family = arguments[index + 1]
+                return try encoder.encode(LearningDetail(revision: revision, profile: detail.profile,
+                    members: detail.members.filter { $0.family == family },
+                    variants: detail.variants.filter { $0.family == family }, runs: detail.runs.filter { $0.family == family },
+                    prediction: detail.prediction, predictionMachine: detail.predictionMachine, truncated: detail.truncated,
+                    inspectedFamily: family))
+            }
+            if let index = arguments.firstIndex(of: "--members-query") {
+                let query = arguments[index + 1]
+                let offset = arguments.firstIndex(of: "--members-offset").flatMap { Int(arguments[$0 + 1]) } ?? 0
+                return try encoder.encode(LearningDetail(revision: revision, profile: detail.profile,
+                    members: detail.members.filter { query.isEmpty || $0.label.localizedCaseInsensitiveContains(query) },
+                    variants: detail.variants, runs: detail.runs, prediction: detail.prediction,
+                    predictionMachine: detail.predictionMachine, truncated: detail.truncated,
+                    memberPage: LearningMemberPage(total: 1, offset: offset, limit: 256, query: query)))
+            }
+            return try encoder.encode(detail)
         }
         guard let input else { throw ClientError.message("Missing private mutation input") }
         if shouldFail { throw ClientError.message("This workload changed. Reload and review the latest revision.") }
@@ -96,6 +115,7 @@ private actor LearningFixture {
         case "edit":
             let edit = try JSONDecoder().decode(EditInput.self, from: input)
             return try encoder.encode(testDetail(revision: revision, label: edit.label, memory: edit.memoryFloorBytes, cpu: edit.cpuFloorCores))
+        case "combine": return try encoder.encode(testDetail(id: arguments[2], revision: revision, label: "Combined destination"))
         case "merge": return try encoder.encode(testDetail(id: targetID, revision: revision, label: "Build tests"))
         case "split": return try encoder.encode(testDetail(id: splitID, revision: revision, label: "Separated web tests"))
         case "reset": return try encoder.encode(testDetail(revision: revision))
@@ -174,6 +194,93 @@ struct LearningTests {
             "Pending controller revision is visible without claiming corrections are active")
         try check(store.draftMemory == "2" && store.draftCPU.isEmpty && store.draftLabel == "Web tests",
             "Operator minimums populate distinct editable fields and automatic remains blank")
+
+        let inspectingFixture = LearningFixture()
+        let inspecting = LearningStore(command: { try await inspectingFixture.load($0, $1) })
+        await inspecting.select(sourceID)?.value
+        inspecting.draftLabel = "Unsaved group name"
+        await inspecting.inspectMember(familyID)?.value
+        try check(inspecting.memberDetail?.inspectedFamily == familyID && inspecting.memberDetail?.members.count == 1 &&
+            inspecting.memberDetail?.runs.allSatisfy { $0.family == familyID } == true && inspecting.draftLabel == "Unsaved group name",
+            "Inspecting a member uses its own bounded history and preserves the group correction draft")
+        try check(inspecting.inspectMember(String(repeating: "9", count: 64)) == nil,
+            "A workload outside the visible group cannot be inspected")
+        await inspectingFixture.failRead(true)
+        await inspecting.inspectMember(familyID)?.value
+        try check(inspecting.memberDetail == nil && inspecting.memberError?.contains("no longer available") == true && !inspecting.isMemberLoading,
+            "Failed member reads expose retryable errors without stale evidence")
+        await inspectingFixture.failRead(false)
+        inspecting.memberQuery = "Related"
+        await inspecting.loadMembers()?.value
+        try check(inspecting.detail?.members.count == 1 && inspecting.detail?.members.first?.label == "Related tests" &&
+            inspecting.draftLabel == "Unsaved group name" && inspecting.inspectedFamily == nil,
+            "Searching all group members preserves unsaved corrections and closes the old inspection")
+        inspecting.memberQuery = ""
+        await inspecting.loadMembers()?.value
+        await inspectingFixture.holdNextCall()
+        let obsoleteMember = inspecting.inspectMember(familyID)
+        await inspectingFixture.waitUntilHeld()
+        let currentMember = inspecting.inspectMember(String(repeating: "2", count: 64))
+        await inspectingFixture.release()
+        await obsoleteMember?.value
+        await currentMember?.value
+        try check(inspecting.memberDetail?.inspectedFamily == String(repeating: "2", count: 64) && inspecting.memberError == nil,
+            "A cancelled member read cannot replace a newer inspection")
+        await inspectingFixture.holdNextCall()
+        let obsoletePage = inspecting.loadMembers()
+        await inspectingFixture.waitUntilHeld()
+        await inspecting.select(targetID)?.value
+        await inspectingFixture.release()
+        await obsoletePage?.value
+        try check(inspecting.detail?.profile.id == targetID && inspecting.memberDetail == nil && !inspecting.isMemberPageLoading,
+            "A cancelled member page cannot overwrite a newly selected group")
+        let inspectionCalls = await inspectingFixture.calls
+        try check(inspectionCalls.allSatisfy { $0.input == nil && $0.arguments[1] == "show" } &&
+            inspectionCalls.contains { $0.arguments == ["profiles", "show", sourceID, "--family", familyID, "--json"] },
+            "Inspection and member search send only read commands with bounded explicit options")
+
+        let bulkFixture = LearningFixture()
+        let bulk = LearningStore(command: { try await bulkFixture.load($0, $1) })
+        await bulk.select(sourceID)?.value
+        let selectedGroup = LearningMergeItem(identity: sourceID, label: "Web group", isGroup: true, sourceGroup: sourceID, revision: 7)
+        let selectedTarget = LearningMergeItem(identity: targetID, label: "Build group", isGroup: true, sourceGroup: targetID, revision: 7)
+        let selectedWorkload = LearningMergeItem(identity: familyID, label: "Selected run workload", isGroup: false, sourceGroup: sourceID, revision: 7)
+        bulk.toggleMergeItem(selectedGroup)
+        bulk.toggleMergeItem(selectedTarget)
+        bulk.toggleMergeItem(selectedWorkload)
+        await bulk.select(targetID)?.value
+        try check(bulk.mergeSelection.count == 3 && bulk.canMergeSelection,
+            "Mixed group and run-workload selections persist when changing the visible group")
+        let reviewed = bulk.mergeSelection
+        bulk.toggleMergeItem(selectedWorkload)
+        try check(bulk.combine(into: targetID, reviewed: reviewed) == nil && bulk.error?.contains("selection changed") == true,
+            "A changed selection cannot execute an obsolete merge confirmation")
+        bulk.toggleMergeItem(selectedWorkload)
+        bulk.draftLabel = "Unsaved destination draft"
+        try check(bulk.combine(into: targetID) == nil && bulk.mergeSelection.count == 3,
+            "Bulk merge preserves and blocks on unsaved correction drafts")
+        await bulk.reloadSelection()?.value
+        await bulkFixture.failNextMutation(true)
+        await bulk.combine(into: targetID)?.value
+        try check(bulk.mergeSelection.count == 3 && bulk.error != nil,
+            "A rejected bulk merge retains the reviewed items for recovery")
+        await bulkFixture.failNextMutation(false)
+        await bulk.combine(into: targetID)?.value
+        let bulkCalls = await bulkFixture.calls
+        guard let combineCall = bulkCalls.last(where: { $0.arguments[1] == "combine" }), let combineData = combineCall.input else {
+            throw ClientError.message("Missing bulk merge input")
+        }
+        let combined = try JSONDecoder().decode(CombineInput.self, from: combineData)
+        try check(combineCall.arguments == ["profiles", "combine", targetID, "--json"] && combined.revision == 7 &&
+            combined.profileIds == [sourceID] && combined.families == [familyID] && bulk.mergeSelection.isEmpty &&
+            bulk.detail?.profile.id == targetID && bulk.detail?.profile.label == "Combined destination",
+            "One private mutation merges groups and run workloads, excludes the chosen destination, and follows its identity")
+        bulk.toggleMergeItem(selectedGroup)
+        bulk.toggleMergeItem(LearningMergeItem(identity: splitID, label: "Newer group", isGroup: true, sourceGroup: splitID, revision: 8))
+        try check(bulk.mergeSelection.count == 1 && bulk.error?.contains("Learning changed") == true,
+            "Selections from different learning revisions cannot be silently combined")
+        bulk.clearMergeSelection()
+        try check(bulk.mergeSelection.isEmpty, "Clearing the bulk selection removes stale items")
 
         store.query = "tests"
         await store.loadPage(offset: 50)?.value
@@ -255,7 +362,7 @@ struct LearningTests {
         let splitData = splitCalls.last(where: { $0.arguments[1] == "split" })?.input ?? Data()
         let split = try JSONDecoder().decode(SplitInput.self, from: splitData)
         try check(split.family == familyID && split.revision == 10 && store.selectedID == splitID &&
-            store.detail?.profile.id == splitID, "Separating a member sends its family identity and follows the newly returned profile")
+            store.detail?.profile.id == splitID && store.ungroupedFrom?.id == targetID, "Separating a member sends its family identity and follows the newly returned profile")
         try check(store.split(family: String(repeating: "9", count: 64)) == nil,
             "A family outside the selected profile cannot be split")
         await store.select(sourceID)?.value

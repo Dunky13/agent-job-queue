@@ -297,8 +297,8 @@ func (api *queueAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
 	if len(parts) >= 3 && parts[0] == "api" && parts[1] == "profiles" {
-		if len(parts) == 3 && readOnly && profileID.MatchString(parts[2]) && r.URL.RawQuery == "" {
-			api.invoke(w, r, []string{"profiles", "show", parts[2], "--json"}, nil)
+		if len(parts) == 3 && readOnly && profileID.MatchString(parts[2]) {
+			api.profileDetail(w, r, parts[2])
 			return
 		}
 		if len(parts) == 4 && r.Method == http.MethodPost {
@@ -358,6 +358,52 @@ func (api *queueAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	jsonError(w, 404, "Not Found")
 }
 
+func (api *queueAPI) profileDetail(w http.ResponseWriter, r *http.Request, id string) {
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		jsonError(w, 400, "Invalid group inspection query")
+		return
+	}
+	flags := map[string]string{"family": "--family", "membersOffset": "--members-offset", "membersLimit": "--members-limit", "membersQuery": "--members-query"}
+	for key, values := range query {
+		if _, known := flags[key]; !known {
+			jsonError(w, 404, "Unknown workload profile query")
+			return
+		}
+		if len(values) != 1 {
+			jsonError(w, 400, "Duplicate group inspection query")
+			return
+		}
+	}
+	if query.Has("family") && (!profileID.MatchString(query.Get("family")) || query.Get("membersQuery") != "" || query.Has("membersOffset") && query.Get("membersOffset") != "0") {
+		jsonError(w, 400, "Invalid workload to inspect")
+		return
+	}
+	if query.Has("membersOffset") && !pageOffset.MatchString(query.Get("membersOffset")) {
+		jsonError(w, 400, "Invalid group member offset")
+		return
+	}
+	if query.Has("membersLimit") {
+		n, err := strconv.Atoi(query.Get("membersLimit"))
+		if err != nil || !pageLimit.MatchString(query.Get("membersLimit")) || n < 1 || n > 256 {
+			jsonError(w, 400, "Invalid group member limit")
+			return
+		}
+	}
+	search := query.Get("membersQuery")
+	if utf8.RuneCountInString(search) > 120 || !printable(search) {
+		jsonError(w, 400, "Invalid group member search")
+		return
+	}
+	arguments := []string{"profiles", "show", id}
+	for _, key := range []string{"family", "membersOffset", "membersLimit", "membersQuery"} {
+		if query.Has(key) {
+			arguments = append(arguments, flags[key], query.Get(key))
+		}
+	}
+	api.invoke(w, r, append(arguments, "--json"), nil)
+}
+
 func (api *queueAPI) profiles(w http.ResponseWriter, r *http.Request) {
 	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -386,7 +432,7 @@ func (api *queueAPI) profiles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (api *queueAPI) profileAction(w http.ResponseWriter, r *http.Request, id, action string) {
-	fields := map[string][]string{"edit": {"revision", "label", "memoryFloorBytes", "cpuFloorCores"}, "merge": {"revision", "targetId"}, "split": {"revision", "family"}, "reset": {"revision", "confirm"}}
+	fields := map[string][]string{"edit": {"revision", "label", "memoryFloorBytes", "cpuFloorCores"}, "merge": {"revision", "targetId"}, "combine": {"revision", "profileIds", "families"}, "split": {"revision", "family"}, "reset": {"revision", "confirm"}}
 	keys, known := fields[action]
 	if !known || !profileID.MatchString(id) {
 		jsonError(w, 404, "Unknown workload profile action")
@@ -415,6 +461,28 @@ func (api *queueAPI) profileAction(w http.ResponseWriter, r *http.Request, id, a
 		}
 		if !valid {
 			jsonError(w, 400, "Use a valid name and positive memory or CPU floors, or null for automatic")
+			return
+		}
+	case "combine":
+		total := 0
+		for _, key := range []string{"profileIds", "families"} {
+			var ids []string
+			if bytes.Equal(bytes.TrimSpace(value[key]), []byte("null")) || json.Unmarshal(value[key], &ids) != nil {
+				jsonError(w, 400, "Choose valid groups and workloads")
+				return
+			}
+			seen := map[string]bool{}
+			for _, identifier := range ids {
+				if !profileID.MatchString(identifier) || seen[identifier] {
+					jsonError(w, 400, "Choose each valid merge item only once")
+					return
+				}
+				seen[identifier] = true
+			}
+			total += len(ids)
+		}
+		if total < 1 || total > 32 {
+			jsonError(w, 400, "Choose between 1 and 32 groups or workloads")
 			return
 		}
 	case "merge", "split":
@@ -531,7 +599,7 @@ func validQueueLogPath(home, logPath string, id int64) bool {
 }
 
 func (api *queueAPI) asset(w http.ResponseWriter, r *http.Request, name string) {
-	if !fs.ValidPath(name) || name != path.Clean(name) || name != "app-icon.png" && name != "favicon.png" && name != "apple-touch-icon.png" && name != "index.html" && name != "app.css" && name != "app.js" && name != "profiles.js" && name != "schema.mjs" && name != "vendor/zod.mjs" && name != "vendor/ZOD-LICENSE" {
+	if !fs.ValidPath(name) || name != path.Clean(name) || name != "app-icon.png" && name != "favicon.png" && name != "apple-touch-icon.png" && name != "index.html" && name != "app.css" && name != "app.js" && name != "profiles.js" && name != "profile-selection.js" && name != "schema.mjs" && name != "vendor/zod.mjs" && name != "vendor/ZOD-LICENSE" {
 		jsonError(w, 404, "Not Found")
 		return
 	}

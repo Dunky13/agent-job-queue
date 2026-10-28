@@ -77,7 +77,12 @@ export const profileCatalogSchema = z.object({
 });
 export const profileDetailSchema = z.object({
   revision: integer.nonnegative(), profile: profileSchema, ...controllerFields,
-  members: z.array(z.object({ family: identitySchema, label: labelSchema, project: z.string().max(120), executable: z.string().max(120) })).max(256),
+  members: z.array(z.object({ family: identitySchema, label: labelSchema, project: z.string().max(120), executable: z.string().max(120),
+    measurements: z.object({ variantCount: integer.nonnegative(), successCount: integer.nonnegative(), incompleteCount: integer.nonnegative(),
+      peakMemoryBytes: integer.nonnegative(), peakCpuCores: nonnegative, lastRunAt: nonnegative.nullable() }).optional(),
+  })).max(256),
+  memberPage: z.object({ total: integer.nonnegative(), offset: integer.nonnegative(), limit: integer.min(1).max(256), query: z.string().max(120) }).optional(),
+  inspectedFamily: identitySchema.optional(),
   variants: z.array(z.object({ id: identitySchema, family: identitySchema, successCount: integer.nonnegative(),
     incompleteCount: integer.nonnegative(), lastRunAt: nonnegative.nullable(), peakMemoryBytes: integer.nonnegative(), peakCpuCores: nonnegative })).max(256),
   runs: z.array(z.object({ id: z.string().min(1).max(128), family: identitySchema, variant: identitySchema, machine: identitySchema,

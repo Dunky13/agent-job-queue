@@ -104,6 +104,7 @@ func ProjectDescription(g *Gate, directory string) Object {
 		}
 	}
 	result["project"] = DisplayText(text(result["project"]), 120)
+	result["learningScope"] = profileDirectoryScope(directory)
 	g.ProjectCache[directory] = result
 	return result
 }
@@ -126,6 +127,9 @@ func MakeDescription(g *Gate, argv []string, directory, label string) (Object, e
 	}
 	result["title"] = title
 	result["executable"] = executable
+	if kind := profileCommandKind(argv, title, executable); kind != "" {
+		result["learningKind"] = kind
+	}
 	return result, nil
 }
 func payloadLabel(payload Object) string {
