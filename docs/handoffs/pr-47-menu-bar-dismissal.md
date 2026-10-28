@@ -1,10 +1,10 @@
-# Menu bar dismissal and Settings clicks
+# PR 47: Menu bar dismissal and Settings clicks
 
 ## Result
 
 The queue popover now observes outside mouse clicks even when the menu bar app never became active. The Settings menu explicitly accepts the click that activates its window. Focused graphical validation passed before delivery review; hosted validation and merge are recorded on the pull request.
 
-The authorized endpoint is a signed commit, push, pull request and protected merge after required checks pass. Release, installation and deployment are separate from this task.
+[PR 47](https://github.com/Dunky13/agent-job-queue/pull/47) carries this change. The authorized endpoint is a signed commit, push, pull request and protected merge after required checks pass. Release, installation and deployment are separate from this task.
 
 ## Diagnosis and change
 
@@ -31,7 +31,7 @@ The fixture also now finds Undo by its responder selector because AppKit can cha
 - Swift 6 compilation passed with warnings as errors and the macOS 15 deployment target on Apple Silicon.
 - Public-source boundary check, ShellCheck, Bash syntax and whitespace checks passed.
 
-The broad headless native suite, universal optimized build, Intel runtime, hosted CI and packaged distribution were not run for this local fix. The installed queue and its jobs were preserved. macOS emitted sandbox-extension diagnostics during graphical fixture startup, but all required input and foreground checks passed.
+The broad headless native suite, universal optimized build and Intel runtime were not run locally. Hosted CI runs the required native, runtime, tooling and installer matrices on the PR head; its results remain separate from local evidence and packaged distribution acceptance. The installed queue and its jobs were preserved. macOS emitted sandbox-extension diagnostics during graphical fixture startup, but all required input and foreground checks passed.
 
 ## Reproduce validation
 
@@ -46,5 +46,7 @@ bash -n native/tests/run-menu-bar-ui-tests.sh
 go run -p 2 ./cmd/queue-tool check-source
 git diff --check
 ```
+
+Standards and Spec source reviews completed. The cleanup finding was repaired before delivery by placing helper scratch beneath the shell runner's cleanup root. Matching screenshots were captured after the same outside click from the reconstructed base and fixed source; attachment status is recorded in the PR description.
 
 The JSON receipts record individual checks and skipped checks. A complete standalone HTML copy of this handoff is supplied as a local chat deliverable, outside version control.
