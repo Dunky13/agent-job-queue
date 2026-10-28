@@ -221,7 +221,10 @@ func newManagedCaskController(t *testing.T, root, home string, environment []str
 	}
 	quote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 	for _, tool := range []string{"service-management", "launchctl"} {
-		wrapper := "#!/bin/sh\nexec " + quote(executable) + " -test.run='^TestManagedCaskFixtureClient$' -- " + quote(socket) + " " + quote(tool) + " \"$@\"\n"
+		// Every query starts this test binary again. Keep race detection and
+		// inherited options, but avoid paying its default one-second exit sleep
+		// for every successful fixture reply within the acceptance deadline.
+		wrapper := "#!/bin/sh\nGORACE=\"${GORACE:+$GORACE }atexit_sleep_ms=0\"\nexport GORACE\nexec " + quote(executable) + " -test.run='^TestManagedCaskFixtureClient$' -- " + quote(socket) + " " + quote(tool) + " \"$@\"\n"
 		verificationWrite(t, filepath.Join(root, "tools", tool), wrapper, 0700)
 	}
 	return c
@@ -339,6 +342,9 @@ func TestManagedCaskPrivateNativeLifecycle(t *testing.T) {
 	}
 	root, home, environment, owner := notarizedCaskFixture(t, "AAAAAAAAAA")
 	c := newManagedCaskController(t, root, home, environment, owner)
+	// Under -race this delay exceeds each command's bound. Both generated
+	// wrappers must remove only the exit sleep while retaining race detection.
+	environment = append(environment, "GORACE=atexit_sleep_ms=30000")
 	invoke := func(tool string, code int, args ...string) string {
 		t.Helper()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
