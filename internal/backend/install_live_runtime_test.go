@@ -126,9 +126,13 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// Accepted callers belong to the fixture lifecycle, independently of any
+	// installer operation. Their existing cleanup releases and reaps them.
+	callersContext, finishCallers := context.WithCancel(context.Background())
+	defer finishCallers()
 	cli := filepath.Join(i.app, "Contents/MacOS/agent-heavy")
 	environment := i.commandEnvironment([]string{cli, "status", "--json"})
-	initialControl := i.liveGate(ctx)
+	initialControl := i.liveGate(context.Background())
 	if _, err := initialControl.QueueControl("limit", Object{"limit": 2}); err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +144,7 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 			t.Fatal(err)
 		}
 		blockerStarted := filepath.Join(i.home, "blocker-started")
-		blocker := exec.CommandContext(ctx, cli, "run", "--", "/bin/sh", "-c", `touch "$1"; while [ ! -f "$2" ]; do sleep .05; done`, "fixture", blockerStarted, blockerRelease)
+		blocker := exec.CommandContext(callersContext, cli, "run", "--", "/bin/sh", "-c", `touch "$1"; while [ ! -f "$2" ]; do sleep .05; done`, "fixture", blockerStarted, blockerRelease)
 		blocker.Env = environment
 		if err := blocker.Start(); err != nil {
 			t.Fatal(err)
@@ -155,7 +159,7 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 		})
 		fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(blockerStarted); return err == nil })
 	}
-	old := exec.CommandContext(ctx, cli, "run", "--label", "Active across upgrade", "--", "/bin/sh", "-c", `printf 'once\n' >> "$1"; touch "$2"; while [ ! -f "$3" ]; do sleep .05; done; printf 'original outcome\n'; exit 23`, "fixture", runs, started, release)
+	old := exec.CommandContext(callersContext, cli, "run", "--label", "Active across upgrade", "--", "/bin/sh", "-c", `printf 'once\n' >> "$1"; touch "$2"; while [ ! -f "$3" ]; do sleep .05; done; printf 'original outcome\n'; exit 23`, "fixture", runs, started, release)
 	old.Env = environment
 	var output bytes.Buffer
 	old.Stdout, old.Stderr = &output, &output
@@ -209,9 +213,17 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 			return response, err
 		}
 	}
+	upgrade := func() error {
+		// An injected failed installation and the subsequent repair are distinct
+		// operations. Busy retries within either one retain its original budget.
+		operationContext, finishOperation := context.WithTimeout(context.Background(), 60*time.Second)
+		defer finishOperation()
+		_, err := runPackagedSetup(operationContext, m.installFixture, i.repairAndExecute)
+		return err
+	}
 	if failure != "" {
 		m.nativeFailure = failure
-		if _, err := runPackagedSetup(ctx, m.installFixture, i.repairAndExecute); err == nil {
+		if err := upgrade(); err == nil {
 			t.Fatal("injected native failure unexpectedly completed")
 		}
 		select {
@@ -222,7 +234,7 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 		}
 		m.nativeFailure = ""
 	}
-	if _, err := runPackagedSetup(ctx, m.installFixture, i.repairAndExecute); err != nil {
+	if err := upgrade(); err != nil {
 		t.Fatal("compatible upgrade waited for or interrupted active work", err)
 	}
 	select {
@@ -238,6 +250,11 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 	if err := managedRequireBundle(i.runtimeGenerationPath(before), before); err != nil {
 		t.Fatal("active worker lost its exact previous signed bundle", err)
 	}
+	// Completed installer operations must not own later queue callers. Force the
+	// earlier budget to expire even on fast machines before verifying work.
+	cancel()
+	ctx, finishVerification := context.WithTimeout(context.Background(), 60*time.Second)
+	defer finishVerification()
 	if queued {
 		if _, err := os.Stat(started); !os.IsNotExist(err) {
 			t.Fatal("handover resumed a deliberately paused queue", err)
