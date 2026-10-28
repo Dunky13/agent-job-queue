@@ -31,7 +31,44 @@ struct LearningMember: Codable, Identifiable, Sendable {
     let label: String
     let project: String
     let executable: String
+    var measurements: LearningMeasurements? = nil
     var id: String { family }
+}
+
+struct LearningMeasurements: Codable, Sendable {
+    let variantCount: Int
+    let successCount: Int
+    let incompleteCount: Int
+    let peakMemoryBytes: Int64
+    let peakCpuCores: Double
+    let lastRunAt: Double?
+}
+
+struct LearningMemberPage: Codable, Sendable {
+    let total: Int
+    let offset: Int
+    let limit: Int
+    let query: String
+}
+
+struct LearningGroupReference: Sendable {
+    let id: String
+    let label: String
+}
+
+struct LearningMergeItem: Identifiable, Equatable, Sendable {
+    let identity: String
+    let label: String
+    let isGroup: Bool
+    let sourceGroup: String
+    let revision: Int
+    var id: String { "\(isGroup ? "group" : "workload"):\(identity)" }
+}
+
+private struct LearningCombine: Encodable {
+    let revision: Int
+    let profileIds: [String]
+    let families: [String]
 }
 
 struct LearningVariant: Codable, Identifiable, Sendable {
@@ -74,6 +111,8 @@ struct LearningDetail: Codable, Sendable {
     let truncated: LearningTruncation
     var controllerAppliedRevision: Int? = nil
     var controllerStatus: String? = nil
+    var memberPage: LearningMemberPage? = nil
+    var inspectedFamily: String? = nil
 }
 
 struct JobLearningReference: Codable, Equatable, Sendable {
@@ -117,6 +156,14 @@ final class LearningStore: ObservableObject {
     @Published private(set) var isMutating = false
     @Published private(set) var error: String?
     @Published private(set) var notice: String?
+    @Published private(set) var inspectedFamily: String?
+    @Published private(set) var memberDetail: LearningDetail?
+    @Published private(set) var memberError: String?
+    @Published private(set) var isMemberLoading = false
+    @Published private(set) var isMemberPageLoading = false
+    @Published private(set) var ungroupedFrom: LearningGroupReference?
+    @Published private(set) var mergeSelection: [LearningMergeItem] = []
+    @Published var memberQuery = ""
     @Published var query = ""
     @Published var draftLabel = ""
     @Published var draftMemory = ""
@@ -126,6 +173,8 @@ final class LearningStore: ObservableObject {
     let pageSize = 50
     private var selectionGeneration = 0
     private var selectionTask: Task<Void, Never>?
+    private var memberGeneration = 0
+    private var memberTask: Task<Void, Never>?
     private let command: @Sendable ([String], Data?) async throws -> Data
 
     init(fixtureMode: Bool = false, command: @escaping @Sendable ([String], Data?) async throws -> Data = {
@@ -143,7 +192,7 @@ final class LearningStore: ObservableObject {
         }
     }
 
-    var canSave: Bool { !fixtureMode && !isLoading && !isMutating && detail != nil }
+    var canSave: Bool { !fixtureMode && !isLoading && !isMutating && !isMemberPageLoading && detail != nil }
     var hasPrevious: Bool { (catalog?.offset ?? 0) > 0 }
     var hasNext: Bool {
         guard let catalog else { return false }
@@ -195,6 +244,9 @@ final class LearningStore: ObservableObject {
     @discardableResult
     func select(_ id: String) -> Task<Void, Never>? {
         guard !fixtureMode else { return nil }
+        closeMember()
+        ungroupedFrom = nil
+        memberQuery = ""
         let previous = selectionTask
         previous?.cancel()
         selectionGeneration += 1
@@ -231,6 +283,136 @@ final class LearningStore: ObservableObject {
         guard !isMutating else { return nil }
         if let selectedID { return select(selectedID) }
         return loadPage()
+    }
+
+    func closeMember() {
+        memberTask?.cancel()
+        memberGeneration += 1
+        inspectedFamily = nil
+        memberDetail = nil
+        memberError = nil
+        isMemberLoading = false
+        isMemberPageLoading = false
+    }
+
+    @discardableResult
+    func inspectMember(_ family: String) -> Task<Void, Never>? {
+        guard !isMutating, !isLoading, !isDetailLoading, !isMemberPageLoading, let detail,
+              let member = detail.members.first(where: { $0.family == family }) else { return nil }
+        let previous = memberTask
+        closeMember()
+        inspectedFamily = family
+        if fixtureMode {
+            memberDetail = LearningDetail(revision: detail.revision, profile: detail.profile, members: [member],
+                variants: detail.variants.filter { $0.family == family }, runs: detail.runs.filter { $0.family == family },
+                prediction: detail.prediction, predictionMachine: detail.predictionMachine, truncated: detail.truncated,
+                inspectedFamily: family)
+            return nil
+        }
+        let sourceID = detail.profile.id
+        let revision = detail.revision
+        let generation = memberGeneration
+        isMemberLoading = true
+        let task = Task {
+            defer { if memberGeneration == generation { isMemberLoading = false } }
+            do {
+                await previous?.value
+                try Task.checkCancellation()
+                let next = try JSONDecoder().decode(LearningDetail.self, from: try await command(
+                    ["profiles", "show", sourceID, "--family", family, "--json"], nil))
+                try Task.checkCancellation()
+                guard next.profile.id == sourceID, next.inspectedFamily == family,
+                      next.members.count == 1, next.members.first?.family == family else {
+                    throw ClientError.message("The backend returned a different workload. Reload the group before trying again.")
+                }
+                guard next.revision == revision else {
+                    throw ClientError.message("This group changed. Reload it to review the current members.")
+                }
+                if memberGeneration == generation && selectedID == sourceID { memberDetail = next }
+            } catch is CancellationError {
+                // An obsolete member read must not replace another selection.
+            } catch {
+                if memberGeneration == generation && selectedID == sourceID { memberError = error.localizedDescription }
+            }
+        }
+        memberTask = task
+        return task
+    }
+
+    @discardableResult
+    func loadMembers(offset: Int = 0) -> Task<Void, Never>? {
+        guard !fixtureMode, !isMutating, !isLoading, !isDetailLoading, !isMemberPageLoading, let detail else { return nil }
+        let query = memberQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard query.count <= 120, !query.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            memberError = "Search with up to 120 printable characters."
+            return nil
+        }
+        let previous = memberTask
+        closeMember()
+        let generation = memberGeneration, sourceID = detail.profile.id, revision = detail.revision
+        isMemberPageLoading = true
+        let task = Task {
+            defer { if memberGeneration == generation { isMemberPageLoading = false } }
+            do {
+                await previous?.value
+                try Task.checkCancellation()
+                let next = try JSONDecoder().decode(LearningDetail.self, from: try await command(
+                    ["profiles", "show", sourceID, "--members-query", query, "--members-offset", String(max(0, offset)), "--json"], nil))
+                try Task.checkCancellation()
+                guard next.profile.id == sourceID, next.revision == revision else {
+                    throw ClientError.message("This group changed. Reload it to review the latest members; your draft is preserved.")
+                }
+                guard next.memberPage?.offset == max(0, offset), next.memberPage?.query == query else {
+                    throw ClientError.message("The backend did not return the requested member page. Update the app and reload the group.")
+                }
+                if memberGeneration == generation && selectedID == sourceID {
+                    self.detail = next // Preserve unsaved name and reservation fields.
+                    memberQuery = query
+                }
+            } catch is CancellationError {
+            } catch {
+                if memberGeneration == generation && selectedID == sourceID { memberError = error.localizedDescription }
+            }
+        }
+        memberTask = task
+        return task
+    }
+
+    var canMergeSelection: Bool {
+        !fixtureMode && !isLoading && !isDetailLoading && !isMutating && !isMemberPageLoading && !mergeSelection.isEmpty
+    }
+    var hasUnsavedCorrections: Bool {
+        guard let detail else { return false }
+        guard let edit = try? editPayload() else { return true }
+        return edit.label != detail.profile.label || edit.memoryFloorBytes != detail.profile.memoryFloorBytes || edit.cpuFloorCores != detail.profile.cpuFloorCores
+    }
+    func toggleMergeItem(_ item: LearningMergeItem) {
+        guard !fixtureMode, !isLoading, !isMutating else { return }
+        if let index = mergeSelection.firstIndex(where: { $0.id == item.id }) { mergeSelection.remove(at: index); return }
+        guard mergeSelection.count < 32 else { error = "Select at most 32 groups or workloads per merge."; return }
+        guard mergeSelection.first?.revision == nil || mergeSelection.first?.revision == item.revision else {
+            error = "Learning changed. Clear the selection, reload and review the items again."; return
+        }
+        mergeSelection.append(item)
+    }
+    func clearMergeSelection() { mergeSelection = [] }
+    @discardableResult
+    func combine(into targetID: String, reviewed: [LearningMergeItem]? = nil) -> Task<Void, Never>? {
+        guard canMergeSelection, let revision = mergeSelection.first?.revision else { return nil }
+        guard !hasUnsavedCorrections else { error = "Save your correction draft before merging the selection."; return nil }
+        guard reviewed == nil || reviewed == mergeSelection else { error = "The merge selection changed. Review it again before confirming."; return nil }
+        guard targetID.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else { return nil }
+        let profiles = mergeSelection.filter { $0.isGroup && $0.identity != targetID }.map(\.identity)
+        let families = mergeSelection.filter { !$0.isGroup }.map(\.identity)
+        guard !profiles.isEmpty || !families.isEmpty else { error = "Select another group or workload for this destination."; return nil }
+        guard !mergeSelection.contains(where: { !$0.isGroup && $0.sourceGroup == targetID }) else {
+            error = "A selected workload already belongs to this destination. Remove it from the selection first."; return nil
+        }
+        do {
+            return mutate("combine", payload: try JSONEncoder().encode(LearningCombine(revision: revision, profileIds: profiles, families: families)),
+                success: "Selected groups and workloads merged. History and minimum reservations are preserved.", changesSelection: true,
+                expectedTarget: targetID, requestID: targetID)
+        } catch { self.error = error.localizedDescription; return nil }
     }
 
     func changeMemoryUnit(_ unit: LearningMemoryUnit) {
@@ -296,7 +478,8 @@ final class LearningStore: ObservableObject {
               detail.members.contains(where: { $0.family == family }) else { return nil }
         do {
             return mutate("split", payload: try JSONEncoder().encode(LearningSplit(revision: detail.revision, family: family)),
-                success: "Job family separated into its own workload.", changesSelection: true)
+                success: "Workload ungrouped. Its measurements are preserved and it stays out of automatic grouping.", changesSelection: true,
+                returnGroup: LearningGroupReference(id: detail.profile.id, label: detail.profile.label))
         } catch { self.error = error.localizedDescription; return nil }
     }
 
@@ -309,9 +492,11 @@ final class LearningStore: ObservableObject {
         } catch { self.error = error.localizedDescription; return nil }
     }
 
-    private func mutate(_ operation: String, payload: Data, success: String, changesSelection: Bool = false, expectedTarget: String? = nil) -> Task<Void, Never>? {
-        guard !fixtureMode, !isMutating, let sourceID = selectedID else { return nil }
+    private func mutate(_ operation: String, payload: Data, success: String, changesSelection: Bool = false, expectedTarget: String? = nil, returnGroup: LearningGroupReference? = nil, requestID: String? = nil) -> Task<Void, Never>? {
+        guard !fixtureMode, !isMutating, let sourceID = requestID ?? selectedID else { return nil }
+        let originalSelection = selectedID
         let sourceGeneration = selectionGeneration
+        closeMember()
         isMutating = true
         error = nil
         notice = nil
@@ -325,9 +510,12 @@ final class LearningStore: ObservableObject {
                       operation != "split" || result.profile.id != sourceID else {
                     throw ClientError.message("Controller returned a different workload. Reload before trying again.")
                 }
-                if selectedID == sourceID && selectionGeneration == sourceGeneration {
+                clearMergeSelection()
+                if selectedID == originalSelection && selectionGeneration == sourceGeneration {
                     if changesSelection { selectedID = result.profile.id }
                     apply(result)
+                    if let returnGroup { ungroupedFrom = returnGroup }
+                    else if operation == "merge" || operation == "combine" { ungroupedFrom = nil }
                     notice = success
                 }
                 do { catalog = try await readCatalog(offset: catalog?.offset ?? 0, query: query) }
@@ -345,7 +533,7 @@ final class LearningStore: ObservableObject {
     private func readDetail(_ id: String) async throws -> LearningDetail {
         try JSONDecoder().decode(LearningDetail.self, from: try await command(["profiles", "show", id, "--json"], nil))
     }
-    private func apply(_ next: LearningDetail) { detail = next; restoreDraft(next) }
+    private func apply(_ next: LearningDetail) { closeMember(); detail = next; memberQuery = next.memberPage?.query ?? ""; restoreDraft(next) }
     private func clearDraft() { draftLabel = ""; draftMemory = ""; draftCPU = "" }
     private func restoreDraft(_ next: LearningDetail) {
         draftLabel = next.profile.label
@@ -374,7 +562,9 @@ final class LearningStore: ObservableObject {
             variantCount: 3, successCount: 18, incompleteCount: 2, peakMemoryBytes: 1_342_177_280,
             peakCpuCores: 1.6, lastRunAt: 1_790_000_000, memoryFloorBytes: 2_147_483_648, cpuFloorCores: nil)
         return LearningDetail(revision: 4, profile: profile,
-            members: [LearningMember(family: family, label: "Web tests", project: "Sample project", executable: "npm")],
+            members: [LearningMember(family: family, label: "Web tests", project: "Sample project", executable: "npm",
+                measurements: LearningMeasurements(variantCount: 3, successCount: 18, incompleteCount: 2,
+                    peakMemoryBytes: 1_342_177_280, peakCpuCores: 1.6, lastRunAt: 1_790_000_000))],
             variants: [LearningVariant(id: variant, family: family, successCount: 18, incompleteCount: 2,
                 lastRunAt: 1_790_000_000, peakMemoryBytes: 1_342_177_280, peakCpuCores: 1.6)],
             runs: [LearningRun(id: String(repeating: "d", count: 64), family: family, variant: variant, machine: "preview-machine", sampledAt: 1_790_000_000,
@@ -389,25 +579,27 @@ final class LearningStore: ObservableObject {
 }
 
 private enum LearningConfirmation: Identifiable {
-    case merge(id: String, label: String), split(family: String, label: String), reset
+    case merge(id: String, label: String), combine(id: String, label: String, items: [LearningMergeItem]), split(family: String, label: String), reset
     var id: String {
-        switch self { case .merge(let id, _): "merge-\(id)"; case .split(let family, _): "split-\(family)"; case .reset: "reset" }
+        switch self { case .merge(let id, _): "merge-\(id)"; case .combine(let id, _, _): "combine-\(id)"; case .split(let family, _): "split-\(family)"; case .reset: "reset" }
     }
     var title: String {
-        switch self { case .merge: "Share learning?"; case .split: "Separate this job family?"; case .reset: "Reset measured history?" }
+        switch self { case .merge: "Share learning?"; case .combine: "Merge selected items?"; case .split: "Ungroup this workload?"; case .reset: "Reset measured history?" }
     }
     var message: String {
         switch self {
         case .merge(_, let label):
             "Move this workload's job families into ‘\(label)’. Their future predictions will share conservative learning. Commands and exact-variant success counts stay independent."
+        case .combine(_, let label, let items):
+            "Merge \(items.count) selected groups and workloads into ‘\(label)’. Keep its name and preserve the highest minimum reservations. All matching history moves together and future runs share learning. Unselected workloads stay in their source group. Active jobs continue. Selected: \(items.prefix(3).map(\.label).joined(separator: ", "))\(items.count > 3 ? " and \(items.count - 3) more" : ""). Review the full list before confirming."
         case .split(_, let label):
-            "Give ‘\(label)’ its own workload profile again, using its original measurements. Existing jobs continue."
+            "Move ‘\(label)’ to its own group with all of its variants and measurements. It will stay excluded from automatic grouping. Active jobs continue."
         case .reset:
             "Remove this workload's measured history and return it to conservative cold-start learning. Names, grouping and minimum reservations stay in place. Active jobs continue and can add new measurements."
         }
     }
     var actionLabel: String {
-        switch self { case .merge: "Share learning"; case .split: "Separate family"; case .reset: "Reset measurements" }
+        switch self { case .merge: "Share learning"; case .combine: "Merge selected items"; case .split: "Ungroup workload"; case .reset: "Reset measurements" }
     }
 }
 
@@ -416,6 +608,7 @@ struct LearningWindow: View {
     var onDone: () -> Void
     @State private var confirmation: LearningConfirmation?
     @State private var choosingTarget = false
+    @State private var pickingSelection = false
     @State private var pendingConfirmation: LearningConfirmation?
     @State private var confirmationSource: String?
     @State private var confirmationRevision: Int?
@@ -433,6 +626,10 @@ struct LearningWindow: View {
                 Button("Done", action: onDone).keyboardShortcut(.defaultAction)
             }.padding(20)
             Divider()
+            if !store.mergeSelection.isEmpty {
+                selectionPanel
+                Divider()
+            }
             if let error = store.error {
                 HStack(alignment: .top) {
                     Label(error, systemImage: "exclamationmark.triangle").textSelection(.enabled)
@@ -474,8 +671,8 @@ struct LearningWindow: View {
                 self.pendingConfirmation = nil
             }
         }) {
-            LearningTargetPicker(sourceID: store.selectedID ?? "", fixtureMode: store.fixtureMode) { id, label in
-                pendingConfirmation = .merge(id: id, label: label)
+            LearningTargetPicker(sourceID: pickingSelection ? "" : store.selectedID ?? "", fixtureMode: store.fixtureMode) { id, label in
+                pendingConfirmation = pickingSelection ? .combine(id: id, label: label, items: store.mergeSelection) : .merge(id: id, label: label)
                 choosingTarget = false
             } onCancel: { choosingTarget = false }
         }
@@ -483,10 +680,13 @@ struct LearningWindow: View {
             get: { confirmation != nil }, set: { if !$0 { confirmation = nil } })) {
                 if let confirmation {
                     Button(confirmation.actionLabel, role: confirmation.id == "reset" ? .destructive : nil) {
-                        if let confirmationSource, let confirmationRevision {
+                        if case .combine(let id, _, let items) = confirmation {
+                            store.combine(into: id, reviewed: items)
+                        } else if let confirmationSource, let confirmationRevision {
                             store.confirm(sourceID: confirmationSource, revision: confirmationRevision) {
                                 switch confirmation {
                                 case .merge(let id, _): store.merge(into: id)
+                                case .combine: break
                                 case .split(let family, _): store.split(family: family)
                                 case .reset: store.reset()
                                 }
@@ -497,6 +697,26 @@ struct LearningWindow: View {
                 }
                 Button("Cancel", role: .cancel) { confirmation = nil }
             } message: { Text(confirmation?.message ?? "") }
+    }
+
+    private var selectionPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("\(store.mergeSelection.count) selected across groups and pages").font(.callout)
+                Spacer()
+                Button("Merge selected…") { pickingSelection = true; choosingTarget = true }.disabled(!store.canMergeSelection)
+                Button("Clear selection") { store.clearMergeSelection() }.disabled(store.isMutating)
+            }
+            DisclosureGroup("Review selected items") {
+                ForEach(store.mergeSelection) { item in
+                    HStack {
+                        Text("\(item.isGroup ? "Group" : "Workload"): \(item.label)").font(.caption)
+                        Spacer()
+                        Button("Remove") { store.toggleMergeItem(item) }.help("Remove \(item.label) from the merge selection")
+                    }.disabled(store.isMutating)
+                }
+            }
+        }.padding(12)
     }
 
     private var catalog: some View {
@@ -510,16 +730,19 @@ struct LearningWindow: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
                     ForEach(store.catalog?.profiles ?? []) { profile in
-                        Button { store.select(profile.id) } label: {
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text(profile.label).font(.headline).lineLimit(2)
-                                Text("\(profile.memberCount) families · \(profile.variantCount) variants")
-                                Text("\(profile.successCount) successful · \(profile.incompleteCount) incomplete")
-                            }.font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                                .contentShape(Rectangle())
-                                .background(store.selectedID == profile.id ? Color.accentColor.opacity(0.13) : Color.clear)
-                                .clipShape(RoundedRectangle(cornerRadius: 7))
-                        }.buttonStyle(.plain).disabled(store.fixtureMode)
+                        HStack(alignment: .top, spacing: 6) {
+                            mergeToggle(LearningMergeItem(identity: profile.id, label: profile.label, isGroup: true, sourceGroup: profile.id, revision: store.catalog?.revision ?? 0))
+                            Button { store.select(profile.id) } label: {
+                                VStack(alignment: .leading, spacing: 5) {
+                                    Text(profile.label).font(.headline).lineLimit(2)
+                                    Text("\(profile.memberCount) families · \(profile.variantCount) variants")
+                                    Text("\(profile.successCount) successful · \(profile.incompleteCount) incomplete")
+                                }.font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                                    .contentShape(Rectangle())
+                                    .background(store.selectedID == profile.id ? Color.accentColor.opacity(0.13) : Color.clear)
+                                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                            }.buttonStyle(.plain).disabled(store.fixtureMode)
+                        }
                     }
                 }
             }
@@ -543,6 +766,10 @@ struct LearningWindow: View {
 
     private func detailView(_ detail: LearningDetail) -> some View {
         VStack(alignment: .leading, spacing: 22) {
+            if let group = store.ungroupedFrom, group.id != detail.profile.id {
+                Button("Back to group: \(group.label)", systemImage: "chevron.left") { store.select(group.id) }
+                    .disabled(store.isMutating)
+            }
             VStack(alignment: .leading, spacing: 7) {
                 Text(detail.profile.label).font(.title3.weight(.semibold)).textSelection(.enabled)
                 Text("\(detail.profile.memberCount) job families · \(detail.profile.variantCount) variants")
@@ -555,8 +782,8 @@ struct LearningWindow: View {
             }
             measuredSection(detail)
             predictionSection(detail)
-            editorSection(detail)
             membershipSection(detail)
+            editorSection(detail)
             variantSection(detail)
             runsSection(detail)
             Divider()
@@ -636,39 +863,117 @@ struct LearningWindow: View {
     private func membershipSection(_ detail: LearningDetail) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("Job families").font(.headline)
+                Text("Group members").font(.headline)
                 Spacer()
                 Button("Share learning with…") {
                     confirmationSource = store.selectedID
                     confirmationRevision = store.detail?.revision
+                    pickingSelection = false
                     choosingTarget = true
                 }.disabled(!store.canSave)
             }
-            ForEach(detail.members) { member in
-                VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        Text(member.label).font(.callout.weight(.medium)).textSelection(.enabled)
-                        Spacer()
-                        if detail.profile.memberCount > 1 {
-                            Button("Separate…") { request(.split(family: member.family, label: member.label)) }
-                                .disabled(!store.canSave)
-                        }
-                    }
-                    Text([member.project, member.executable].filter { !$0.isEmpty }.joined(separator: " · "))
-                        .font(.caption).foregroundStyle(.secondary)
-                    Text(member.family).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
-                }.padding(.vertical, 4)
+            Text("Expand a workload to inspect its own measurements. Ungroup mismatches to keep their learning independent.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                TextField("Find a member in this group", text: $store.memberQuery).textFieldStyle(.roundedBorder)
+                    .onSubmit { store.loadMembers() }
+                Button("Search members") { store.loadMembers() }
+            }.disabled(store.fixtureMode || store.isMutating || store.isMemberPageLoading)
+            if let error = store.memberError, store.inspectedFamily == nil {
+                Text(error).font(.caption).foregroundStyle(.orange)
             }
-            if detail.truncated.members { truncated("families") }
+            if store.isMemberPageLoading { ProgressView("Loading group members…").controlSize(.small) }
+            ForEach(detail.members) { member in
+                HStack(alignment: .top, spacing: 8) {
+                    mergeToggle(LearningMergeItem(identity: member.family, label: member.label, isGroup: false, sourceGroup: detail.profile.id, revision: detail.revision))
+                    memberRow(member, group: detail)
+                }
+            }
+            if detail.members.isEmpty { Text("No members match this search. Try another name or clear the search.").font(.caption).foregroundStyle(.secondary) }
+            if let page = detail.memberPage {
+                HStack {
+                    Button("Previous members") { store.loadMembers(offset: max(0, page.offset - page.limit)) }
+                        .disabled(page.offset == 0)
+                    Text(detail.members.isEmpty ? "No members on this page" : "\(page.offset + 1)–\(page.offset + detail.members.count) of \(page.total) members")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Next members") { store.loadMembers(offset: page.offset + page.limit) }
+                        .disabled(page.offset + detail.members.count >= page.total)
+                }.disabled(store.fixtureMode || store.isMutating || store.isMemberPageLoading)
+            } else if detail.truncated.members {
+                Text("Update the app to search and page through every group member.").font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
+    private func mergeToggle(_ item: LearningMergeItem) -> some View {
+        Toggle("Select \(item.isGroup ? "group" : "workload"): \(item.label)", isOn: Binding(
+            get: { store.mergeSelection.contains { $0.id == item.id } },
+            set: { _ in store.toggleMergeItem(item) }))
+            .toggleStyle(.checkbox).labelsHidden()
+            .accessibilityLabel("Select \(item.isGroup ? "group" : "workload"): \(item.label)")
+            .help("Select for merging. Workloads include all their run history and future matching runs.")
+            .disabled(store.fixtureMode || store.isLoading || store.isMutating)
+    }
+
+    private func memberRow(_ member: LearningMember, group: LearningDetail) -> some View {
+        DisclosureGroup(isExpanded: Binding(get: { store.inspectedFamily == member.family }, set: { expanded in
+            if expanded { store.inspectMember(member.family) }
+            else if store.inspectedFamily == member.family { store.closeMember() }
+        })) {
+            memberEvidence(member, group: group)
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(member.label).font(.callout.weight(.medium))
+                Text([member.project, member.executable].filter { !$0.isEmpty }.joined(separator: " · "))
+                    .font(.caption).foregroundStyle(.secondary)
+                if let stats = member.measurements {
+                    Text("\(stats.successCount) successful · \(stats.incompleteCount) incomplete or failed · \(resourceBytes(stats.peakMemoryBytes)) peak · \(resourceCores(stats.peakCpuCores))")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }.padding(.vertical, 5).disabled(store.isMutating || store.isDetailLoading || store.isMemberPageLoading)
+    }
+
+    private func memberEvidence(_ member: LearningMember, group: LearningDetail) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if store.isMemberLoading {
+                ProgressView("Loading workload measurements…").controlSize(.small)
+            } else if let error = store.memberError {
+                Text(error).font(.caption).foregroundStyle(.orange)
+                Button("Retry inspection") { store.inspectMember(member.family) }
+            } else if let inspected = store.memberDetail, inspected.inspectedFamily == member.family {
+                Text("Measurements for this workload").font(.callout.weight(.semibold))
+                if let stats = inspected.members.first?.measurements {
+                    Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 6) {
+                        row("Successful runs", String(stats.successCount))
+                        row("Incomplete or failed", String(stats.incompleteCount))
+                        row("Variants", String(stats.variantCount))
+                        row("Peak RAM", resourceBytes(stats.peakMemoryBytes))
+                        row("Peak CPU", resourceCores(stats.peakCpuCores))
+                        if let last = stats.lastRunAt { row("Last run", learningDate(last)) }
+                    }.font(.caption)
+                }
+                Text("Only this workload's retained history is shown. Machine identifiers distinguish where each run was measured.")
+                    .font(.caption).foregroundStyle(.secondary)
+                variantSection(inspected)
+                runsSection(inspected)
+                Text("Workload ID: \(member.family)").font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary).textSelection(.enabled)
+                if group.profile.memberCount > 1 {
+                    Button("Ungroup workload…") { request(.split(family: member.family, label: member.label)) }
+                        .disabled(!store.canSave)
+                }
+            }
+        }.padding(.top, 10).frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private func variantSection(_ detail: LearningDetail) -> some View {
-        DisclosureGroup("Variants (\(detail.profile.variantCount))") {
+        let count = detail.inspectedFamily == nil ? detail.profile.variantCount : detail.members.first?.measurements?.variantCount ?? detail.variants.count
+        return DisclosureGroup("Variants (\(count))") {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(detail.variants) { variant in
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("\(variant.id.prefix(14))…").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                        Text("\(memberLabel(variant.family, in: detail)) · \(variant.id.prefix(14))…").font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                         Text("\(variant.successCount) successful · \(variant.incompleteCount) incomplete · \(resourceBytes(variant.peakMemoryBytes)) · \(resourceCores(variant.peakCpuCores))")
                             .font(.caption).foregroundStyle(.secondary)
                     }
@@ -683,10 +988,13 @@ struct LearningWindow: View {
             VStack(alignment: .leading, spacing: 12) {
                 ForEach(detail.runs) { run in
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("\(learningDate(run.sampledAt)) · \(run.success ? "Successful" : "Incomplete or failed")")
+                        Text("\(memberLabel(run.family, in: detail)) · \(learningDate(run.sampledAt)) · \(run.success ? "Successful" : "Incomplete or failed")")
                             .font(.caption.weight(.medium))
                         Text("\(resourceBytes(run.memoryBytes)) · \(resourceCores(run.cpuCores)) · \(run.cpuSeconds.formatted(.number.precision(.fractionLength(0...1)))) CPU-seconds over \(run.durationSeconds.formatted(.number.precision(.fractionLength(0...1)))) seconds")
                             .font(.caption).foregroundStyle(.secondary)
+                        Button("Select this run’s workload") {
+                            store.toggleMergeItem(LearningMergeItem(identity: run.family, label: memberLabel(run.family, in: detail), isGroup: false, sourceGroup: detail.profile.id, revision: detail.revision))
+                        }.disabled(store.fixtureMode || store.isMutating || store.isLoading)
                         Text("Variant \(run.variant.prefix(12))… · machine \(run.machine.prefix(12))…")
                             .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
                     }
@@ -701,6 +1009,10 @@ struct LearningWindow: View {
         confirmationSource = store.selectedID
         confirmationRevision = store.detail?.revision
         confirmation = value
+    }
+
+    private func memberLabel(_ family: String, in detail: LearningDetail) -> String {
+        detail.members.first(where: { $0.family == family })?.label ?? "Workload \(family.prefix(12))"
     }
 
     private func row(_ title: String, _ value: String) -> some View {

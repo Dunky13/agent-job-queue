@@ -12,14 +12,15 @@ import (
 )
 
 type Controller struct {
-	gate          *Gate
-	sampler       *ResourceSampler
-	store         *ProfileStore
-	boot          string
-	recoveryUntil time.Time
-	runs          map[string]Object
-	finalized     map[string]bool
-	groups        map[string]int
+	gate           *Gate
+	sampler        *ResourceSampler
+	store          *ProfileStore
+	boot           string
+	recoveryUntil  time.Time
+	runs           map[string]Object
+	finalized      map[string]bool
+	groups         map[string]int
+	learningScopes map[string]string
 }
 
 func NewController(g *Gate, sampler *ResourceSampler, store *ProfileStore) (*Controller, error) {
@@ -36,7 +37,7 @@ func NewController(g *Gate, sampler *ResourceSampler, store *ProfileStore) (*Con
 			return nil, e
 		}
 	}
-	return &Controller{gate: g, sampler: sampler, store: store, boot: boot, runs: map[string]Object{}, finalized: map[string]bool{}, groups: map[string]int{}}, nil
+	return &Controller{gate: g, sampler: sampler, store: store, boot: boot, runs: map[string]Object{}, finalized: map[string]bool{}, groups: map[string]int{}, learningScopes: map[string]string{}}, nil
 }
 func (c *Controller) SampleRun(id int, value string, marker, host, prediction Object) (Object, error) {
 	run := c.runs[value]
@@ -226,19 +227,10 @@ func (c *Controller) Tick() (Object, error) {
 		} else if e != nil {
 			return nil, e
 		}
-		safe := Object{}
-		for _, key := range []string{"title", "project", "executable"} {
-			maxLength := 80
-			if key == "title" {
-				maxLength = 120
-			}
-			label := DisplayText(text(description[key]), maxLength)
-			if label == "" {
-				safe[key] = nil
-			} else {
-				safe[key] = label
-			}
+		if c.learningScopes == nil {
+			c.learningScopes = map[string]string{}
 		}
+		safe := profileSimilarityDescription(description, c.learningScopes)
 		// Predictions are read together after every completion has been recorded.
 		prediction := Object{}
 		resources := Object{"prediction": prediction, "observed": nil, "decision": nil}
@@ -371,6 +363,19 @@ func (c *Controller) Tick() (Object, error) {
 	admissions, e := SchedulingLedger(g, configuration)
 	if e != nil {
 		return nil, e
+	}
+	previousStatus, e := ReadPrivate(filepath.Join(g.State, "resource-status.json"))
+	if e != nil && !os.IsNotExist(e) {
+		return nil, e
+	}
+	if previous, ok := schedulingInteger(previousStatus["learningRevision"]); !ok || previous != learningRevision {
+		// Automatic observation can join a family before this tick acquires the
+		// scheduling locks. Retire old pending predictions before publishing the
+		// new revision, just as explicit corrections retire pending grants. A
+		// missing revision after startup or collection failure is stale as well.
+		if e = retainActiveGrants(g, admissions); e != nil {
+			return nil, e
+		}
 	}
 	current, e := g.Snapshot()
 	if e != nil {
@@ -666,9 +671,23 @@ func serveScheduler(g *Gate, sampler *ResourceSampler, once bool) error {
 		return e
 	}
 	defer controller.Close()
+	backfilled := false
 	for {
 		started := time.Now()
-		_, e = controller.Tick()
+		state, tickError := controller.Tick()
+		e = tickError
+		regrouped := false
+		// Publish this controller's revision support before the first migration.
+		// The migration rotates pending grants; a fresh tick adopts its grouping.
+		if e == nil && !backfilled {
+			e = controller.store.backfillSimilarity(g)
+			if e == nil {
+				backfilled = true
+				var revision int
+				revision, e = controller.store.Revision()
+				regrouped = metric(state["learningRevision"]) != float64(revision)
+			}
+		}
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -688,7 +707,7 @@ func serveScheduler(g *Gate, sampler *ResourceSampler, once bool) error {
 				return e
 			}
 		}
-		if once {
+		if once && !regrouped {
 			return nil
 		}
 		delay := 2*time.Second - time.Since(started)

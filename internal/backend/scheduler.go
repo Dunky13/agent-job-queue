@@ -31,6 +31,11 @@ func validPrediction(v Object) bool {
 	}
 	memory, ok := schedulingInteger(v["memoryBytes"])
 	samples, sok := schedulingInteger(v["samples"])
+	if value, exists := v["familySamples"]; exists {
+		if count, valid := schedulingInteger(value); !valid || count < 0 {
+			return false
+		}
+	}
 	return ok && memory > 0 && schedulingNumber(v["cpuCores"], true) && sok && samples >= 0 && containsString([]string{"variant", "family", "prior"}, text(v["source"])) && containsString([]string{"unknown", "low", "medium", "high"}, text(v["confidence"])) && (v["durationSeconds"] == nil || schedulingNumber(v["durationSeconds"], false))
 }
 func validHost(v Object) bool {
@@ -278,6 +283,7 @@ func ResourceDecision(host, prediction Object, active []Object, limit int) (bool
 	}
 	return true, "Predicted resource demand fits the current headroom"
 }
+
 func schedulingGroup(snapshot Object) (Object, int, error) {
 	group := obj(obj(snapshot["groups"])["default"])
 	limit, ok := schedulingInteger(group["parallel_tasks"])

@@ -80,6 +80,12 @@ test("learning schemas accept bounded numeric evidence and reject malformed prof
   }
   assert.equal(profileDetailSchema.safeParse({ ...detail, runs: [{ ...detail.runs[0], success: "false" }] }).success, false);
   assert.equal(profileDetailSchema.safeParse({ ...detail, members: Array(257).fill(detail.members[0]) }).success, false);
+  const measurements = { variantCount: 2, successCount: 0, incompleteCount: 1, peakMemoryBytes: 1024, peakCpuCores: 0.5, lastRunAt: null };
+  const inspected = { ...detail, members: [{ ...detail.members[0], measurements }],
+    memberPage: { total: 1, offset: 0, limit: 256, query: "" }, inspectedFamily: detail.members[0].family };
+  assert.deepEqual(profileDetailSchema.parse(inspected), inspected);
+  assert.equal(profileDetailSchema.safeParse({ ...inspected, memberPage: { ...inspected.memberPage, limit: 257 } }).success, false);
+  assert.equal(profileDetailSchema.safeParse({ ...inspected, members: [{ ...inspected.members[0], measurements: { ...measurements, successCount: -1 } }] }).success, false);
   const learnedJob = { ...job, resources: { ...resources, learning: { id: profile.id, label: profile.label, reason: "Operator shared this family" } } };
   assert.deepEqual(snapshotSchema.parse({ ...snapshot, jobs: [learnedJob] }).jobs[0], learnedJob);
 });

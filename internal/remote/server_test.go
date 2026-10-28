@@ -318,7 +318,7 @@ func TestProductionQueueLogLocations(t *testing.T) {
 
 func TestAPIStaticAndProductionSecurity(t *testing.T) {
 	f := newAPIFixture(t)
-	for _, item := range []struct{ path, mime string }{{"/static/app-icon.png", "image/png"}, {"/static/favicon.png", "image/png"}, {"/static/apple-touch-icon.png", "image/png"}, {"/", "text/html"}, {"/static/app.css", "text/css"}, {"/static/app.js", "javascript"}, {"/static/profiles.js", "javascript"}, {"/static/schema.mjs", "javascript"}, {"/static/vendor/zod.mjs", "javascript"}} {
+	for _, item := range []struct{ path, mime string }{{"/static/app-icon.png", "image/png"}, {"/static/favicon.png", "image/png"}, {"/static/apple-touch-icon.png", "image/png"}, {"/", "text/html"}, {"/static/app.css", "text/css"}, {"/static/app.js", "javascript"}, {"/static/profiles.js", "javascript"}, {"/static/profile-selection.js", "javascript"}, {"/static/schema.mjs", "javascript"}, {"/static/vendor/zod.mjs", "javascript"}} {
 		w := f.request("GET", item.path, "", nil)
 		if w.Code != 200 || !strings.Contains(w.Header().Get("Content-Type"), item.mime) {
 			t.Fatal(item.path, w.Code, w.Header())
@@ -378,5 +378,56 @@ func TestControllerRunnerPrivateStdinAndBoundedFailures(t *testing.T) {
 	}
 	if _, err := readConfigurationInput(io.LimitReader(strings.NewReader(strings.Repeat("x", 4097)), 4097)); err == nil {
 		t.Fatal("accepted oversized configure input")
+	}
+}
+
+func TestAPIProfileMemberInspectionIsBoundedAndReadOnly(t *testing.T) {
+	f := newAPIFixture(t)
+	id := strings.Repeat("a", 64)
+	family := strings.Repeat("b", 64)
+	for _, query := range []string{"family=" + family, "membersOffset=256&membersLimit=50&membersQuery=Browser%20tests"} {
+		if w := f.request("GET", "/api/profiles/"+id+"?"+query, "", nil); w.Code != 200 {
+			t.Fatal(w.Code, w.Body.String())
+		}
+	}
+	expected := [][]string{{"profiles", "show", id, "--family", family, "--json"}, {"profiles", "show", id, "--members-offset", "256", "--members-limit", "50", "--members-query", "Browser tests", "--json"}}
+	for i, call := range f.calls {
+		if !reflect.DeepEqual(call.args, expected[i]) || len(call.input) != 0 {
+			t.Fatal("Inspection mutated or forwarded wrong flags", call)
+		}
+	}
+	for _, query := range []string{"family=bad", "family=" + family + "&family=" + family, "family=" + family + "&membersQuery=tests", "membersLimit=257", "membersLimit=0", "membersOffset=-1", "membersOffset=00", "membersQuery=%00", "membersQuery=%C2%85", "membersQuery=" + strings.Repeat("x", 121)} {
+		if w := f.request("GET", "/api/profiles/"+id+"?"+query, "", nil); w.Code != 400 {
+			t.Fatal("Invalid member query accepted", query, w.Code)
+		}
+	}
+	if len(f.calls) != 2 {
+		t.Fatal("Invalid inspection invoked backend")
+	}
+}
+
+func TestAPIProfileCombineBoundsAndPrivateInput(t *testing.T) {
+	f := newAPIFixture(t)
+	target := strings.Repeat("a", 64)
+	source := strings.Repeat("b", 64)
+	family := strings.Repeat("c", 64)
+	body := `{"revision":7,"profileIds":["` + source + `"],"families":["` + family + `"]}`
+	if w := f.request("POST", "/api/profiles/"+target+"/combine", body, nil); w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	if len(f.calls) != 1 || !reflect.DeepEqual(f.calls[0].args, []string{"profiles", "combine", target, "--json"}) {
+		t.Fatal("Combine did not use the allowlisted destination action", f.calls)
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(f.calls[0].input, &sent); err != nil || sent["revision"] != float64(7) {
+		t.Fatal("Missing private revision-bound input", sent, err)
+	}
+	for _, invalid := range []string{`{"revision":7,"profileIds":[],"families":[]}`, `{"revision":7,"profileIds":null,"families":["` + family + `"]}`, `{"revision":7,"profileIds":[true],"families":[]}`, `{"revision":7,"profileIds":["bad"],"families":[]}`, `{"revision":7,"profileIds":["` + source + `","` + source + `"],"families":[]}`, `{"revision":7,"profileIds":["` + source + `"],"families":[],"extra":true}`} {
+		if w := f.request("POST", "/api/profiles/"+target+"/combine", invalid, nil); w.Code != 400 {
+			t.Fatal("Malformed bulk merge accepted", invalid, w.Code)
+		}
+	}
+	if len(f.calls) != 1 {
+		t.Fatal("Invalid bulk merge invoked controller")
 	}
 }

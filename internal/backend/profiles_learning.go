@@ -145,9 +145,32 @@ func (s *ProfileStore) Catalog(offset, limit int, query string) (Object, error) 
 	})
 	return result, e
 }
+
+type ProfileDetailOptions struct {
+	Family       string
+	MemberOffset int
+	MemberLimit  int
+	MemberQuery  string
+}
+
 func (s *ProfileStore) Detail(id, machine string) (Object, error) {
+	return s.Inspect(id, machine, ProfileDetailOptions{MemberLimit: 256})
+}
+
+func (s *ProfileStore) Inspect(id, machine string, options ProfileDetailOptions) (Object, error) {
 	if e := profileID(id); e != nil {
 		return nil, e
+	}
+	if options.Family != "" {
+		if e := profileID(options.Family); e != nil {
+			return nil, e
+		}
+		if options.MemberOffset != 0 || options.MemberQuery != "" {
+			return nil, fmt.Errorf("Choose a workload or search group members separately")
+		}
+	}
+	if options.MemberOffset < 0 || options.MemberLimit < 1 || options.MemberLimit > 256 || len([]rune(options.MemberQuery)) > 120 || !profilePrintable(options.MemberQuery) {
+		return nil, fmt.Errorf("Invalid group member page or search")
 	}
 	if s.empty {
 		return nil, fmt.Errorf("Workload profile was not found")
@@ -165,6 +188,29 @@ func (s *ProfileStore) Detail(id, machine string) (Object, error) {
 		summary, e := profileSummary(profile, group)
 		if e != nil {
 			return e
+		}
+		originalGroup := group
+		if options.Family != "" {
+			filtered := &profileGroup{}
+			for _, member := range group.members {
+				if text(member["family"]) == options.Family {
+					filtered.members = append(filtered.members, member)
+				}
+			}
+			if len(filtered.members) != 1 {
+				return fmt.Errorf("That workload does not belong to this group; refresh learning")
+			}
+			for _, row := range group.runs {
+				if text(row["family"]) == options.Family {
+					filtered.runs = append(filtered.runs, row)
+				}
+			}
+			for _, row := range group.envelopes {
+				if text(row["family"]) == options.Family {
+					filtered.envelopes = append(filtered.envelopes, row)
+				}
+			}
+			group = filtered
 		}
 		sort.Slice(group.members, func(i, j int) bool { return text(group.members[i]["family"]) < text(group.members[j]["family"]) })
 		variants := map[string]Object{}
@@ -208,9 +254,9 @@ func (s *ProfileStore) Detail(id, machine string) (Object, error) {
 			}
 			return text(a["token"]) < text(b["token"])
 		})
-		members := []Object{}
-		for _, member := range group.members[:min(256, len(group.members))] {
-			members = append(members, Object{"family": member["family"], "label": profileLabel(text(member["family"]), member), "project": text(member["project"]), "executable": text(member["executable"])})
+		members, memberPage, e := profileMemberPage(group, options)
+		if e != nil {
+			return e
 		}
 		runs := []Object{}
 		for _, row := range group.runs[:min(30, len(group.runs))] {
@@ -220,7 +266,7 @@ func (s *ProfileStore) Detail(id, machine string) (Object, error) {
 		var hashedMachine any
 		if machine != "" {
 			hashedMachine = profileDigest([]any{"machine-v1", machine})
-			prediction, e = profilePrediction(c, text(group.members[0]["family"]), profileDigest([]any{"group-estimate-v1", id}), text(hashedMachine))
+			prediction, e = profilePrediction(c, text(originalGroup.members[0]["family"]), profileDigest([]any{"group-estimate-v1", id}), text(hashedMachine))
 			if e != nil {
 				return e
 			}
@@ -229,10 +275,51 @@ func (s *ProfileStore) Detail(id, machine string) (Object, error) {
 		if e != nil {
 			return e
 		}
-		result = Object{"revision": revision, "profile": summary, "members": members, "variants": variantList[:min(100, len(variantList))], "runs": runs, "prediction": prediction, "predictionMachine": hashedMachine, "truncated": Object{"members": len(group.members) > 256, "variants": len(variantList) > 100, "runs": len(group.runs) > 30}}
+		result = Object{"revision": revision, "profile": summary, "members": members, "memberPage": memberPage, "variants": variantList[:min(100, len(variantList))], "runs": runs, "prediction": prediction, "predictionMachine": hashedMachine, "truncated": Object{"members": metric(memberPage["total"]) > float64(len(members)), "variants": len(variantList) > 100, "runs": len(group.runs) > 30}}
+		if options.Family != "" {
+			result["inspectedFamily"] = options.Family
+		}
 		return nil
 	})
 	return result, e
+}
+
+func profileMemberPage(group *profileGroup, options ProfileDetailOptions) ([]Object, Object, error) {
+	byFamily := map[string]*profileGroup{}
+	for _, member := range group.members {
+		byFamily[text(member["family"])] = &profileGroup{members: []Object{member}}
+	}
+	for _, row := range group.runs {
+		family := text(row["family"])
+		byFamily[family].runs = append(byFamily[family].runs, row)
+	}
+	for _, row := range group.envelopes {
+		family := text(row["family"])
+		byFamily[family].envelopes = append(byFamily[family].envelopes, row)
+	}
+	needle := cases.Fold().String(strings.TrimSpace(options.MemberQuery))
+	matching := []Object{}
+	for _, member := range group.members {
+		if needle == "" || strings.Contains(cases.Fold().String(strings.Join([]string{profileLabel(text(member["family"]), member), text(member["project"]), text(member["executable"]), text(member["family"])}, " ")), needle) {
+			matching = append(matching, member)
+		}
+	}
+	start := min(options.MemberOffset, len(matching))
+	end := start + min(options.MemberLimit, len(matching)-start)
+	result := []Object{}
+	for _, member := range matching[start:end] {
+		family := text(member["family"])
+		summary, e := profileSummary(Object{"id": family}, byFamily[family])
+		if e != nil {
+			return nil, nil, e
+		}
+		measurements := Object{}
+		for _, key := range []string{"variantCount", "successCount", "incompleteCount", "peakMemoryBytes", "peakCpuCores", "lastRunAt"} {
+			measurements[key] = summary[key]
+		}
+		result = append(result, Object{"family": family, "label": profileLabel(family, member), "project": text(member["project"]), "executable": text(member["executable"]), "measurements": measurements})
+	}
+	return result, Object{"total": len(matching), "offset": options.MemberOffset, "limit": options.MemberLimit, "query": options.MemberQuery}, nil
 }
 func profileExpectedRevision(c profileSQL, revision int) error {
 	if revision < 0 {

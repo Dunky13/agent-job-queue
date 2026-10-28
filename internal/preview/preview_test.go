@@ -172,3 +172,87 @@ func TestPreviewStateReplacesProfilesAndSchedulerRatherThanMerging(t *testing.T)
 		t.Fatal("cleared profiles remained visible", result, err)
 	}
 }
+
+func TestPreviewMemberInspectionAndSplitKeepEvidenceWithItsOwner(t *testing.T) {
+	q := &fakeQueue{root: t.TempDir()}
+	if err := q.reset(); err != nil {
+		t.Fatal(err)
+	}
+	id, family := strings.Repeat("a", 64), strings.Repeat("d", 64)
+	detail, err := q.run(context.Background(), []string{"profiles", "show", id, "--family", family, "--json"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := members(detail["runs"])
+	if err != nil || len(rows) != 0 || detail["inspectedFamily"] != family || len(q.events) != 0 {
+		t.Fatal("Inspection leaked sibling measurements or mutated", detail, err)
+	}
+	result, err := q.run(context.Background(), []string{"profiles", "split", id, "--json"}, []byte(`{"revision":4,"family":"`+family+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, _ := object(result["profile"])
+	if profile["successCount"] != float64(0) || profile["peakMemoryBytes"] != float64(0) {
+		t.Fatal("Empty member inherited sibling measurements", result)
+	}
+	remaining, _ := object(q.profiles[id]["profile"])
+	if remaining["successCount"] != float64(5) {
+		t.Fatal("Remaining group lost measurements", remaining)
+	}
+}
+
+func TestPreviewLargeMemberFixtureUsesBoundedControlInput(t *testing.T) {
+	q := &fakeQueue{root: t.TempDir()}
+	if err := q.reset(); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	q.ServeHTTP(w, httptest.NewRequest("POST", "/__fixture/state", strings.NewReader(`{"profileMemberCount":300}`)))
+	if w.Code != 200 {
+		t.Fatal(w.Code, w.Body.String())
+	}
+	id := strings.Repeat("a", 64)
+	detail, err := q.run(context.Background(), []string{"profiles", "show", id, "--json"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, _ := object(detail["memberPage"])
+	all, err := members(detail["members"])
+	if err != nil || len(all) != 256 || page["total"] != 300 {
+		t.Fatal("Large fixture was not paged", detail, err)
+	}
+	detail, err = q.run(context.Background(), []string{"profiles", "show", id, "--members-query", "Member 299", "--json"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err = members(detail["members"])
+	if err != nil || len(all) != 1 || all[0]["label"] != "Member 299" {
+		t.Fatal("Large fixture search missed hidden member", detail, err)
+	}
+}
+
+func TestPreviewCombineGroupsAndWorkloadsRetainsSiblings(t *testing.T) {
+	q := &fakeQueue{root: t.TempDir()}
+	if err := q.reset(); err != nil {
+		t.Fatal(err)
+	}
+	destination, source, family := strings.Repeat("b", 64), strings.Repeat("a", 64), strings.Repeat("c", 64)
+	result, err := q.run(context.Background(), []string{"profiles", "combine", destination, "--json"}, []byte(`{"revision":4,"profileIds":[],"families":["`+family+`"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, _ := object(result["profile"])
+	if profile["id"] != destination || profile["memberCount"] != float64(2) || profile["successCount"] != float64(10) || result["revision"] != 5 {
+		t.Fatal("Fixture combine lost history or destination", result)
+	}
+	remaining, err := members(q.profiles[source]["members"])
+	if err != nil || len(remaining) != 1 || remaining[0]["family"] != strings.Repeat("d", 64) {
+		t.Fatal("Fixture moved an unselected sibling", remaining, err)
+	}
+	before, _ := json.Marshal(q.profiles)
+	_, err = q.run(context.Background(), []string{"profiles", "combine", destination, "--json"}, []byte(`{"revision":5,"profileIds":["`+strings.Repeat("f", 64)+`"],"families":[]}`))
+	after, _ := json.Marshal(q.profiles)
+	if err == nil || !bytes.Equal(before, after) || q.profileRevision != 5 || len(q.events) != 1 {
+		t.Fatal("Failed fixture combine committed changes", err)
+	}
+}

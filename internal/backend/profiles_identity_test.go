@@ -114,6 +114,9 @@ esac
 	}
 	a := identityForTest(t, []string{"npm", "test", "--prefix=" + first}, first, map[string]string{"PATH": "/nonexistent", "CUSTOM": first + "/file"})
 	b := identityForTest(t, []string{"npm", "test", "--prefix=" + second}, second, map[string]string{"PATH": "/nonexistent", "CUSTOM": second + "/file"})
+	if profileDirectoryScope(first) != profileDirectoryScope(second) {
+		t.Fatal("Linked worktrees do not share a learning scope")
+	}
 	if a["family"] != b["family"] || a["variant"] != b["variant"] {
 		t.Fatalf("Linked checkout names leaked into identity: %v %v", a, b)
 	}
@@ -129,5 +132,26 @@ esac
 	b = identityForTest(t, []string{executable, "test"}, first, map[string]string{"PATH": bin})
 	if a["family"] != b["family"] || a["variant"] == b["variant"] {
 		t.Fatal("Toolchain replacement not detected")
+	}
+}
+
+func TestWorkloadIdentityIgnoresAgentInvocationMetadata(t *testing.T) {
+	directory := t.TempDir()
+	first := identityForTest(t, []string{"go", "test", "./..."}, directory, map[string]string{
+		"PATH": "/nonexistent", "CODEX_SESSION_ID": "session-a", "CODEX_THREAD_ID": "thread-a",
+		"CODEX_TOOL_CALL_ID": "call-a", "SSH_AUTH_SOCK": "/private/socket-a", "GOMAXPROCS": "2",
+	})
+	second := identityForTest(t, []string{"go", "test", "./..."}, directory, map[string]string{
+		"PATH": "/nonexistent", "CODEX_SESSION_ID": "session-b", "CODEX_THREAD_ID": "thread-b",
+		"CODEX_TOOL_CALL_ID": "call-b", "SSH_AUTH_SOCK": "/private/socket-b", "GOMAXPROCS": "2",
+	})
+	if first["family"] != second["family"] || first["variant"] != second["variant"] {
+		t.Fatal("Agent invocation metadata prevents repeated workload learning")
+	}
+	resourceChange := identityForTest(t, []string{"go", "test", "./..."}, directory, map[string]string{
+		"PATH": "/nonexistent", "GOMAXPROCS": "8",
+	})
+	if resourceChange["variant"] == second["variant"] {
+		t.Fatal("Resource controls were discarded with invocation metadata")
 	}
 }

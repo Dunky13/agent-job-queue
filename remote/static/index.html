@@ -27,6 +27,7 @@
         <div class="section-title"><div><h2 id="profiles-title" tabindex="-1">Learned workloads</h2><p class="learning-copy">Inspect what your Mac has measured and correct how similar jobs share learning.</p></div><button id="profiles-refresh" type="button" class="quiet-button">Refresh learning</button></div>
         <p id="profiles-error" class="notice error" role="alert" hidden></p>
         <p id="profiles-controller" class="notice" role="status"></p>
+        <section id="profile-combine" class="profile-panel" aria-label="Merge selection" hidden></section>
         <div id="profiles-catalog">
           <form id="profiles-search-form" action="/api/profiles" method="get" class="profile-search"><label for="profiles-query">Find a workload</label><div class="button-row"><input id="profiles-query" name="query" type="search" maxlength="120" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"><button type="submit">Search</button></div></form>
           <p id="profiles-count" class="learning-copy"></p><ul id="profiles-list" class="job-list" role="list"></ul>

@@ -16,7 +16,7 @@ import (
 const maxLearningInput = 16384
 
 func ValidateLearningRequest(operation string, value Object) (Object, error) {
-	fields := map[string][]string{"edit": {"revision", "label", "memoryFloorBytes", "cpuFloorCores"}, "merge": {"revision", "targetId"}, "split": {"revision", "family"}, "reset": {"revision", "confirm"}}
+	fields := map[string][]string{"edit": {"revision", "label", "memoryFloorBytes", "cpuFloorCores"}, "merge": {"revision", "targetId"}, "combine": {"revision", "profileIds", "families"}, "split": {"revision", "family"}, "reset": {"revision", "confirm"}}
 	expected, ok := fields[operation]
 	if !ok || value == nil || len(value) != len(expected) {
 		return nil, fmt.Errorf("Invalid workload correction fields")
@@ -57,6 +57,19 @@ func ValidateLearningRequest(operation string, value Object) (Object, error) {
 		if e := profileID(text(value["targetId"])); e != nil {
 			return nil, e
 		}
+	} else if operation == "combine" {
+		profiles, err := learningSelectionIDs(value["profileIds"])
+		if err != nil {
+			return nil, err
+		}
+		families, err := learningSelectionIDs(value["families"])
+		if err != nil {
+			return nil, err
+		}
+		if err = validateLearningSelection(profiles, families); err != nil {
+			return nil, err
+		}
+		result["profileIds"], result["families"] = profiles, families
 	} else if operation == "split" {
 		if e := profileID(text(value["family"])); e != nil {
 			return nil, e
@@ -84,7 +97,7 @@ func learningController(g *Gate) (string, any, string) {
 	}
 	return machine, applied, reason
 }
-func LearningInspect(g *Gate, identity string, offset, limit int, query string) (Object, error) {
+func LearningInspect(g *Gate, identity string, offset, limit int, query string, detailOptions ...ProfileDetailOptions) (Object, error) {
 	machine, applied, status := learningController(g)
 	store, e := NewProfileStore(g.State, true)
 	if e != nil {
@@ -96,7 +109,11 @@ func LearningInspect(g *Gate, identity string, offset, limit int, query string) 
 		if e = profileID(identity); e != nil {
 			return nil, e
 		}
-		result, e = store.Detail(identity, machine)
+		options := ProfileDetailOptions{MemberLimit: 256}
+		if len(detailOptions) > 0 {
+			options = detailOptions[0]
+		}
+		result, e = store.Inspect(identity, machine, options)
 	} else {
 		result, e = store.Catalog(offset, limit, query)
 	}
@@ -168,32 +185,12 @@ func LearningCorrect(g *Gate, operation, identity string, value Object) (Object,
 			return nil, fmt.Errorf("Choose a member family from a shared profile to separate")
 		}
 	}
-	previous, e := SchedulingSettings(g)
-	if e != nil {
-		return nil, e
-	}
-	if previous["mode"] == "adaptive" {
-		state, e := SchedulingView(g)
-		if e != nil {
+	if operation == "combine" {
+		if e = store.CheckCombine(identity, revision, request["profileIds"].([]string), request["families"].([]string)); e != nil {
 			return nil, e
 		}
-		if _, ok := schedulingInteger(state["learningRevision"]); !ok {
-			return nil, fmt.Errorf("Wait for the updated resource controller before correcting adaptive learning, or select Fixed scheduling")
-		}
 	}
-	admissions, e := SchedulingLedger(g, previous)
-	if e != nil {
-		return nil, e
-	}
-	configuration := Object{"mode": previous["mode"], "generation": token()}
-	admissions["generation"] = configuration["generation"]
-	if e = retainActiveGrants(g, admissions); e != nil {
-		return nil, e
-	}
-	if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
-		return nil, e
-	}
-	if e = WritePrivate(filepath.Join(g.State, "scheduling.json"), configuration); e != nil {
+	if e = invalidateLearningAdmissions(g); e != nil {
 		return nil, e
 	}
 	switch operation {
@@ -202,6 +199,8 @@ func LearningCorrect(g *Gate, operation, identity string, value Object) (Object,
 	case "merge":
 		e = store.Merge(identity, text(request["targetId"]), revision)
 		identity = text(request["targetId"])
+	case "combine":
+		e = store.Combine(identity, revision, request["profileIds"].([]string), request["families"].([]string))
 	case "split":
 		identity, e = store.Split(identity, text(request["family"]), revision)
 	case "reset":
@@ -211,6 +210,36 @@ func LearningCorrect(g *Gate, operation, identity string, value Object) (Object,
 		return nil, e
 	}
 	return LearningInspect(g, identity, 0, 100, "")
+}
+
+// Callers hold scheduling.lock and lease.lock, and have checked the revision.
+func invalidateLearningAdmissions(g *Gate) error {
+	previous, e := SchedulingSettings(g)
+	if e != nil {
+		return e
+	}
+	if previous["mode"] == "adaptive" {
+		state, e := SchedulingView(g)
+		if e != nil {
+			return e
+		}
+		if _, ok := schedulingInteger(state["learningRevision"]); !ok {
+			return fmt.Errorf("Wait for the updated resource controller before correcting adaptive learning, or select Fixed scheduling")
+		}
+	}
+	admissions, e := SchedulingLedger(g, previous)
+	if e != nil {
+		return e
+	}
+	configuration := Object{"mode": previous["mode"], "generation": token()}
+	admissions["generation"] = configuration["generation"]
+	if e = retainActiveGrants(g, admissions); e != nil {
+		return e
+	}
+	if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
+		return e
+	}
+	return WritePrivate(filepath.Join(g.State, "scheduling.json"), configuration)
 }
 func learningJSONValue(decoder *json.Decoder, depth int) (any, error) {
 	if depth > 64 {
@@ -320,15 +349,61 @@ func LearningCLI(gate *Gate, args []string, input io.Reader, output, errors io.W
 		return fail(fmt.Errorf("A workload profile operation is required"))
 	}
 	operation := args[0]
-	if !containsString([]string{"list", "show", "edit", "merge", "split", "reset"}, operation) {
+	if !containsString([]string{"list", "show", "edit", "merge", "combine", "split", "reset", "regroup"}, operation) {
 		return fail(fmt.Errorf("Invalid workload profile operation"))
 	}
 	identity, query := "", ""
 	offset, limit := 0, 100
+	detailOptions := ProfileDetailOptions{MemberLimit: 256}
+	seenDetailOptions := map[string]bool{}
+	apply := false
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--json" {
 			continue
+		}
+		if operation == "show" {
+			key, value, attached := strings.Cut(arg, "=")
+			if containsString([]string{"--family", "--members-query", "--members-offset", "--members-limit"}, key) {
+				if seenDetailOptions[key] {
+					return fail(fmt.Errorf("Duplicate group inspection option"))
+				}
+				seenDetailOptions[key] = true
+				if !attached {
+					i++
+					if i >= len(args) {
+						return fail(fmt.Errorf("Missing group inspection option value"))
+					}
+					value = args[i]
+				}
+				switch key {
+				case "--family":
+					if e := profileID(value); e != nil {
+						return fail(e)
+					}
+					detailOptions.Family = value
+				case "--members-query":
+					detailOptions.MemberQuery = value
+				case "--members-offset", "--members-limit":
+					n, e := strconv.Atoi(value)
+					if e != nil {
+						return fail(fmt.Errorf("Invalid group member page"))
+					}
+					if key == "--members-offset" {
+						detailOptions.MemberOffset = n
+					} else {
+						detailOptions.MemberLimit = n
+					}
+				}
+				continue
+			}
+		}
+		if operation == "regroup" {
+			if arg == "--apply" && !apply {
+				apply = true
+				continue
+			}
+			return fail(fmt.Errorf("Invalid workload regroup argument"))
 		}
 		if operation == "list" {
 			key, value, attached := strings.Cut(arg, "=")
@@ -363,13 +438,21 @@ func LearningCLI(gate *Gate, args []string, input io.Reader, output, errors io.W
 		}
 		return fail(fmt.Errorf("Invalid workload profile argument"))
 	}
-	if operation != "list" && identity == "" {
+	if operation != "list" && operation != "regroup" && identity == "" {
 		return fail(fmt.Errorf("A workload profile identity is required"))
 	}
 	var result Object
 	var e error
-	if operation == "list" || operation == "show" {
-		result, e = LearningInspect(gate, identity, offset, limit, query)
+	if operation == "regroup" {
+		var request Object
+		if apply {
+			request, e = ReadLearningInput(input)
+		}
+		if e == nil {
+			result, e = LearningRegroup(gate, apply, request)
+		}
+	} else if operation == "list" || operation == "show" {
+		result, e = LearningInspect(gate, identity, offset, limit, query, detailOptions)
 	} else {
 		var request Object
 		request, e = ReadLearningInput(input)

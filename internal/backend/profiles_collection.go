@@ -216,7 +216,7 @@ func (s *ProfileStore) collectProfiles(requests []profileRequest, machine string
 		if err != nil || !has || len(families) == 0 {
 			return err
 		}
-		rows, err := profileRows(c, "SELECT * FROM learning_members WHERE family IN (SELECT value FROM json_each(?))", profileFamilySet(families))
+		rows, err := profileMemberRows(c, " WHERE m.family IN (SELECT value FROM json_each(?))", profileFamilySet(families))
 		if err != nil {
 			return err
 		}
@@ -318,7 +318,7 @@ func (c *profileCollection) read(db profileSQL, requests []profileRequest, famil
 		}
 		envelopes = append(envelopes, retained...)
 	}
-	runs, e := profileRows(db, "SELECT * FROM runs WHERE machine=? AND family IN (SELECT value FROM json_each(?)) AND sampled>=?", machine, profileFamilySet(families), resourceNow()-90*profileDay)
+	runs, e := profileRows(db, "SELECT * FROM runs WHERE machine=? AND family IN (SELECT value FROM json_each(?)) AND sampled>=?", machine, profileFamilySet(expanded), resourceNow()-90*profileDay)
 	if e != nil {
 		return e
 	}
@@ -326,7 +326,7 @@ func (c *profileCollection) read(db profileSQL, requests []profileRequest, famil
 	if e != nil {
 		return e
 	}
-	envelopesByGroup, runsByVariant := map[string][]Object{}, map[string][]Object{}
+	envelopesByGroup, runsByGroup := map[string][]Object{}, map[string][]Object{}
 	for _, row := range envelopes {
 		family := text(row["family"])
 		group := family
@@ -336,8 +336,12 @@ func (c *profileCollection) read(db profileSQL, requests []profileRequest, famil
 		envelopesByGroup[group] = append(envelopesByGroup[group], row)
 	}
 	for _, row := range runs {
-		key := text(row["family"]) + text(row["variant"])
-		runsByVariant[key] = append(runsByVariant[key], row)
+		family := text(row["family"])
+		group := family
+		if members[family] != nil {
+			group = text(members[family]["profile"])
+		}
+		runsByGroup[group] = append(runsByGroup[group], row)
 	}
 	estimates, matches := map[string]Object{}, map[string]Object{}
 	for i, request := range requests {
@@ -355,6 +359,9 @@ func (c *profileCollection) read(db profileSQL, requests []profileRequest, famil
 				reason := "Automatic workload family"
 				if len(groups[group]) > 1 || group != family {
 					reason = "Operator grouping"
+					if metric(profiles[group]["pinned"]) == 0 {
+						reason = "Automatic similar workloads"
+					}
 				}
 				match = Object{"id": group, "label": profileGroupLabel(profiles[group], groups[group]), "reason": reason}
 			}
@@ -366,7 +373,7 @@ func (c *profileCollection) read(db profileSQL, requests []profileRequest, famil
 			if metric(profiles[group]["ignore_legacy"]) != 0 {
 				selectedFloors = nil
 			}
-			estimates[key] = profileEstimate(family, variant, profiles[group], envelopesByGroup[group], runsByVariant[key], selectedFloors)
+			estimates[key] = profileEstimate(family, variant, profiles[group], envelopesByGroup[group], runsByGroup[group], selectedFloors)
 		}
 		// Each job owns its map because live process sampling raises its reservation.
 		c.predictions[i] = maps.Clone(estimates[key])

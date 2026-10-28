@@ -79,7 +79,11 @@ func learningProfiles() map[string]map[string]any {
 	detail := func(id, label string, families []string) map[string]any {
 		members := make([]map[string]any, 0, len(families))
 		for index, family := range families {
-			members = append(members, map[string]any{"family": family, "label": fmt.Sprintf("%s task %d", label, index+1), "project": "example-project", "executable": "go"})
+			measurements := map[string]any{"variantCount": 0, "successCount": 0, "incompleteCount": 0, "peakMemoryBytes": 0, "peakCpuCores": 0, "lastRunAt": nil}
+			if index == 0 {
+				measurements = map[string]any{"variantCount": 1, "successCount": 5, "incompleteCount": 1, "peakMemoryBytes": 1610612736, "peakCpuCores": 1.5, "lastRunAt": 1792404000}
+			}
+			members = append(members, map[string]any{"family": family, "label": fmt.Sprintf("%s task %d", label, index+1), "project": "example-project", "executable": "go", "measurements": measurements})
 		}
 		return map[string]any{
 			"revision": 4,
@@ -143,7 +147,10 @@ func (q *fakeQueue) profilesCall(arguments []string, input []byte) (map[string]a
 		return nil, errors.New("Workload profile no longer exists; refresh learning")
 	}
 	if action == "show" {
-		result := clone(detail)
+		result, err := inspectProfile(detail, arguments[3:])
+		if err != nil {
+			return nil, err
+		}
 		result["revision"] = q.profileRevision
 		return result, nil
 	}
@@ -153,6 +160,9 @@ func (q *fakeQueue) profilesCall(arguments []string, input []byte) (map[string]a
 	}
 	if value["revision"] != float64(q.profileRevision) {
 		return nil, errors.New("Learning changed; refresh before saving corrections")
+	}
+	if action == "combine" {
+		return q.combineProfiles(id, value, arguments)
 	}
 	q.events = append(q.events, append([]string(nil), arguments...))
 	profile, ok := object(detail["profile"])
@@ -171,6 +181,14 @@ func (q *fakeQueue) profilesCall(arguments []string, input []byte) (map[string]a
 			profile[key] = 0
 		}
 		profile["lastRunAt"] = nil
+		all, err := members(detail["members"])
+		if err != nil {
+			return nil, err
+		}
+		for _, member := range all {
+			member["measurements"] = map[string]any{"variantCount": 0, "successCount": 0, "incompleteCount": 0, "peakMemoryBytes": 0, "peakCpuCores": 0, "lastRunAt": nil}
+		}
+		detail["members"] = all
 	case "merge":
 		targetID, _ := value["targetId"].(string)
 		target, exists := q.profiles[targetID]
@@ -187,6 +205,20 @@ func (q *fakeQueue) profilesCall(arguments []string, input []byte) (map[string]a
 		}
 		merged = append(merged, added...)
 		target["members"] = merged
+		for _, key := range []string{"variants", "runs"} {
+			existing, err := members(target[key])
+			if err != nil {
+				return nil, err
+			}
+			added, err := members(detail[key])
+			if err != nil {
+				return nil, err
+			}
+			target[key] = append(existing, added...)
+		}
+		if err := retainProfileMembers(target); err != nil {
+			return nil, err
+		}
 		targetProfile, ok := object(target["profile"])
 		if !ok {
 			return nil, errors.New("Invalid fixture profile")
@@ -204,10 +236,10 @@ func (q *fakeQueue) profilesCall(arguments []string, input []byte) (map[string]a
 			return nil, errors.New("Fixture member no longer exists")
 		}
 		member := all[index]
+		separate := clone(detail)
 		all = slices.Delete(all, index, index+1)
 		detail["members"] = all
 		profile["memberCount"] = len(all)
-		separate := clone(detail)
 		separateProfile, ok := object(separate["profile"])
 		if !ok {
 			return nil, errors.New("Invalid fixture profile")
@@ -216,6 +248,11 @@ func (q *fakeQueue) profilesCall(arguments []string, input []byte) (map[string]a
 		separateProfile["label"] = member["label"]
 		separateProfile["memberCount"] = 1
 		separate["members"] = []map[string]any{member}
+		for _, entry := range []map[string]any{detail, separate} {
+			if err := retainProfileMembers(entry); err != nil {
+				return nil, err
+			}
+		}
 		q.profiles[strings.Repeat("3", 64)] = separate
 		detail = separate
 	default:
@@ -225,6 +262,119 @@ func (q *fakeQueue) profilesCall(arguments []string, input []byte) (map[string]a
 	result := clone(detail)
 	result["revision"] = q.profileRevision
 	return result, nil
+}
+
+func inspectProfile(detail map[string]any, arguments []string) (map[string]any, error) {
+	result := clone(detail)
+	family, query, offset, limit := "", "", 0, 256
+	for i := 0; i < len(arguments); i++ {
+		key := arguments[i]
+		if key == "--json" {
+			continue
+		}
+		i++
+		if i >= len(arguments) {
+			return nil, errors.New("Missing fixture inspection value")
+		}
+		switch key {
+		case "--family":
+			family = arguments[i]
+		case "--members-query":
+			query = arguments[i]
+		case "--members-offset":
+			offset, _ = strconv.Atoi(arguments[i])
+		case "--members-limit":
+			limit, _ = strconv.Atoi(arguments[i])
+		default:
+			return nil, errors.New("Unknown fixture inspection option")
+		}
+	}
+	if offset < 0 || limit < 1 || limit > 256 {
+		return nil, errors.New("Invalid fixture member page")
+	}
+	all, err := members(result["members"])
+	if err != nil {
+		return nil, err
+	}
+	matching := []map[string]any{}
+	for _, member := range all {
+		if family != "" && member["family"] != family {
+			continue
+		}
+		if family != "" || query == "" || strings.Contains(strings.ToLower(fmt.Sprint(member["label"], " ", member["project"], " ", member["executable"], " ", member["family"])), strings.ToLower(query)) {
+			matching = append(matching, member)
+		}
+	}
+	if family != "" {
+		if len(matching) != 1 {
+			return nil, errors.New("That workload does not belong to this group")
+		}
+		result["inspectedFamily"] = family
+	}
+	start := min(offset, len(matching))
+	end := start + min(limit, len(matching)-start)
+	result["members"] = matching[start:end]
+	result["memberPage"] = map[string]any{"total": len(matching), "offset": offset, "limit": limit, "query": query}
+	truncated := map[string]any{"members": len(matching) > end-start, "variants": false, "runs": false}
+	for key, maximum := range map[string]int{"variants": 100, "runs": 30} {
+		rows, err := members(result[key])
+		if err != nil {
+			return nil, err
+		}
+		if family != "" {
+			rows = slices.DeleteFunc(rows, func(row map[string]any) bool { return row["family"] != family })
+		}
+		truncated[key] = len(rows) > maximum
+		result[key] = rows[:min(maximum, len(rows))]
+	}
+	result["truncated"] = truncated
+	return result, nil
+}
+
+func retainProfileMembers(detail map[string]any) error {
+	all, err := members(detail["members"])
+	if err != nil {
+		return err
+	}
+	families := map[string]bool{}
+	for _, member := range all {
+		family, _ := member["family"].(string)
+		families[family] = true
+	}
+	for _, key := range []string{"variants", "runs"} {
+		rows, err := members(detail[key])
+		if err != nil {
+			return err
+		}
+		detail[key] = slices.DeleteFunc(rows, func(row map[string]any) bool { family, _ := row["family"].(string); return !families[family] })
+	}
+	profile, ok := object(detail["profile"])
+	if !ok {
+		return errors.New("Invalid fixture profile")
+	}
+	for _, key := range []string{"variantCount", "successCount", "incompleteCount", "peakMemoryBytes", "peakCpuCores"} {
+		profile[key] = float64(0)
+	}
+	profile["lastRunAt"] = nil
+	for _, member := range all {
+		measurements, ok := object(member["measurements"])
+		if !ok {
+			return errors.New("Fixture member has no measurements")
+		}
+		for _, key := range []string{"variantCount", "successCount", "incompleteCount"} {
+			value, _ := measurements[key].(float64)
+			current, _ := profile[key].(float64)
+			profile[key] = current + value
+		}
+		for _, key := range []string{"peakMemoryBytes", "peakCpuCores", "lastRunAt"} {
+			value, ok := measurements[key].(float64)
+			current, _ := profile[key].(float64)
+			if ok && value > current {
+				profile[key] = value
+			}
+		}
+	}
+	return nil
 }
 
 func (q *fakeQueue) run(_ context.Context, arguments []string, input []byte) (map[string]any, error) {
@@ -342,7 +492,7 @@ func (q *fakeQueue) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "Invalid fixture state"})
 		return
 	}
-	fields := []string{"profileFloors", "profileRevision", "profileCount", "profiles", "offline", "title", "scheduler", "resources"}
+	fields := []string{"profileFloors", "profileRevision", "profileCount", "profileMemberCount", "profiles", "offline", "title", "scheduler", "resources"}
 	for key := range values {
 		if !slices.Contains(fields, key) {
 			writeJSON(w, 400, map[string]any{"error": "Unknown fixture state field"})
@@ -385,8 +535,54 @@ func (q *fakeQueue) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					profile, _ := object(detail["profile"])
 					profile["id"] = id
 					profile["label"] = fmt.Sprintf("Workload %d", index)
+					all, memberErr := members(detail["members"])
+					if memberErr != nil {
+						err = memberErr
+						break
+					}
+					for memberIndex, member := range all {
+						oldFamily := member["family"]
+						family := fmt.Sprintf("%064x", 1000000+index*2+memberIndex)
+						member["family"] = family
+						member["label"] = fmt.Sprintf("Workload %d task %d", index, memberIndex+1)
+						for _, key := range []string{"variants", "runs"} {
+							rows, rowErr := members(detail[key])
+							if rowErr != nil {
+								err = rowErr
+								break
+							}
+							for _, row := range rows {
+								if row["family"] == oldFamily {
+									row["family"] = family
+								}
+							}
+							detail[key] = rows
+						}
+					}
+					detail["members"] = all
 					q.profiles[id] = detail
 				}
+			}
+		case "profileMemberCount":
+			var count int
+			err = json.Unmarshal(value, &count)
+			if err == nil && (count < 1 || count > 10000) {
+				err = errors.New("Invalid fixture member count")
+			}
+			if err == nil {
+				detail, exists := q.profiles[strings.Repeat("a", 64)]
+				if !exists {
+					err = errors.New("Missing fixture profile")
+					break
+				}
+				all := make([]map[string]any, 0, count)
+				for index := range count {
+					all = append(all, map[string]any{"family": fmt.Sprintf("%064x", index), "label": fmt.Sprintf("Member %03d", index), "project": "example-project", "executable": "go", "measurements": map[string]any{"variantCount": 0, "successCount": 0, "incompleteCount": 0, "peakMemoryBytes": 0, "peakCpuCores": 0, "lastRunAt": nil}})
+				}
+				detail["members"] = all
+				profile, _ := object(detail["profile"])
+				profile["memberCount"] = count
+				err = retainProfileMembers(detail)
 			}
 		case "profiles":
 			var profiles map[string]map[string]any

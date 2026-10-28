@@ -20,7 +20,7 @@ const usage = `Usage: agent-heavy <command>
   limit COUNT
   scheduling fixed|shadow|adaptive
   scheduler [--once]
-  profiles list|show|edit|merge|split|reset
+  profiles list|show|edit|merge|combine|split|reset|regroup
   agents status|install|remove [--runner codex|claude] [--json]
   version [--json]
   handover-capabilities --json
