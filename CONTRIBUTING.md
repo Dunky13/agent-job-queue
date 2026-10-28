@@ -120,4 +120,12 @@ For this repository's maintainer, use `Marc Went <marc@went.io>` as the author a
 
 For maintainer-owned PRs, select `marc@went.io` as the final squash author email in GitHub, or pass `--author-email marc@went.io` to the otherwise approved `gh pr merge --squash` command. Verify the resulting author, single maintainer trailer, and signature after merging. This replaces the earlier dual-address workaround; historical commits retain their original metadata.
 
+After owner approval, prefer the guarded command from the repository root:
+
+```sh
+sh scripts/merge-pr.sh PR_NUMBER REVIEWED_HEAD SQUASH_BODY_FILE
+```
+
+Replace the placeholders with the PR number, full reviewed commit SHA, and a prepared text file containing the squash body. The body must contain exactly one `Signed-off-by: Marc Went <marc@went.io>` trailer and no other maintainer alias; retain other contributors' certifications. The command accepts only a maintainer-owned PR targeting `main`, pins the reviewed head, and passes the primary author email and validated body together. GitHub still enforces required checks and branch protection. A changed head or CLI failure aborts the command; it never requests an administrator bypass or automatic merge. Verify the resulting merge metadata as described above. The command does not grant merge authorization.
+
 For a Dependabot-owned PR, recreating its commits under a maintainer identity and supplying `gh pr merge --author-email` does not guarantee that GitHub changes the squash author. PR 12 retained Dependabot's noreply author while carrying the maintainer's DCO trailer. When taking over a bot update with a maintainer certification, open a maintainer-owned replacement PR from the validated changes and close the bot PR. Preserve the actual certifier's sign-off; do not synthesize a bot certification. Verify the resulting merge author, trailer, and GitHub signature after merging.
