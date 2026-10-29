@@ -503,10 +503,15 @@ func (c *Controller) Tick() (Object, error) {
 	// A lane at its own concurrency cannot start anything, so it never holds
 	// back other lanes. Limit-sharing work keeps today's head-of-line fairness
 	// among itself; a lane outside the limit only queues behind its own work.
+	// A command the daemon already started holds its lane slot and is counted
+	// in the lane's running total, so only its admission grant is pending.
 	laneFull := func(task Object) bool {
 		name := taskLane(task)
 		lane := snapshotLane(current, name)
 		if name == defaultLaneName || lane == nil {
+			return false
+		}
+		if state, _, e := taskState(task); e == nil && !taskIsLease(task) && (state == "Running" || state == "Paused") {
 			return false
 		}
 		concurrency, _ := integer(lane["concurrency"])
