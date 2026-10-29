@@ -229,6 +229,59 @@ func ResourceDecision(host, prediction Object, active []Object, limit int) (bool
 // have no measured workers, so these stand in for their resource use.
 type leaseReservations struct{ memoryBytes, cpuCores float64 }
 
+// hostHeadroom is the headroom computation shared by job and lease admission:
+// the host budgets and the growth active work may still claim.
+type hostHeadroom struct {
+	host                          Object
+	reserve, cpuBudget            float64
+	memoryGrowth, cpuGrowth       float64
+	heldMemoryBytes, heldCPUCores float64
+}
+
+// hostSettled reports why the host cannot take new work right now, or "".
+func hostSettled(host Object) string {
+	if !boolean(host["complete"]) {
+		return "Collecting a complete resource interval"
+	}
+	if host["memoryPressure"] != "normal" {
+		return "Waiting for memory pressure to recover"
+	}
+	if metric(host["swapOutBytesPerSecond"]) > 1024*1024 {
+		return "Waiting for active swapping to settle"
+	}
+	return ""
+}
+
+func newHostHeadroom(host Object, held leaseReservations) hostHeadroom {
+	return hostHeadroom{host: host, reserve: max(float64(GiB), math.Trunc(metric(host["totalMemoryBytes"])*.15)), cpuBudget: max(1.0, metric(host["cpuCores"])*.8), heldMemoryBytes: held.memoryBytes, heldCPUCores: held.cpuCores}
+}
+
+// reserveGrowth charges each active job's predicted growth beyond its current
+// measurement. It fails when an active reservation is not valid.
+func (h *hostHeadroom) reserveGrowth(active []Object) bool {
+	for _, job := range active {
+		pred, observed := obj(job["prediction"]), obj(job["observed"])
+		if !validPrediction(pred) || !schedulingNumber(observed["memoryBytes"], false) || !schedulingNumber(observed["cpuCores"], false) {
+			return false
+		}
+		h.memoryGrowth += max(0.0, metric(pred["memoryBytes"])-metric(observed["memoryBytes"]))
+		h.cpuGrowth += max(0.0, min(h.cpuBudget, metric(pred["cpuCores"]))-metric(observed["cpuCores"]))
+	}
+	return true
+}
+
+func (h hostHeadroom) exceedsMemoryBudget(memoryBytes float64) bool {
+	return memoryBytes > metric(h.host["totalMemoryBytes"])-h.reserve
+}
+
+func (h hostHeadroom) memoryFits(memoryBytes float64) bool {
+	return memoryBytes+h.reserve+h.memoryGrowth+h.heldMemoryBytes <= metric(h.host["availableMemoryBytes"])
+}
+
+func (h hostHeadroom) cpuFits(cpuCores float64) bool {
+	return metric(h.host["cpuBusyCores"])+h.cpuGrowth+h.heldCPUCores+cpuCores <= h.cpuBudget
+}
+
 // resourceDecision is ResourceDecision with lane accounting: occupied counts
 // only work that shares the global limit (negative when the candidate's lane
 // does not share it), and held lease reservations reduce headroom.
@@ -239,20 +292,14 @@ func resourceDecision(host, prediction Object, active []Object, occupied, limit 
 	if occupied >= 0 && occupied >= limit {
 		return false, "Waiting for the parallel job limit"
 	}
-	if !boolean(host["complete"]) {
-		return false, "Collecting a complete resource interval"
+	if reason := hostSettled(host); reason != "" {
+		return false, reason
 	}
-	if host["memoryPressure"] != "normal" {
-		return false, "Waiting for memory pressure to recover"
-	}
-	if metric(host["swapOutBytesPerSecond"]) > 1024*1024 {
-		return false, "Waiting for active swapping to settle"
-	}
-	reserve := max(float64(GiB), math.Trunc(metric(host["totalMemoryBytes"])*.15))
-	if metric(prediction["memoryBytes"]) > metric(host["totalMemoryBytes"])-reserve {
+	headroom := newHostHeadroom(host, held)
+	if headroom.exceedsMemoryBudget(metric(prediction["memoryBytes"])) {
 		return false, "Predicted memory exceeds this machine's budget; reduce workers or inspect Start now"
 	}
-	if metric(host["diskFreeBytes"]) < max(float64(GiB), reserve) {
+	if metric(host["diskFreeBytes"]) < max(float64(GiB), headroom.reserve) {
 		return false, "Waiting for free disk space"
 	}
 	if len(active) > 0 {
@@ -270,26 +317,19 @@ func resourceDecision(host, prediction Object, active []Object, occupied, limit 
 			return false, "Waiting for complete measurements of active jobs"
 		}
 	}
-	memoryGrowth, cpuGrowth := 0.0, 0.0
-	cpuBudget := max(1.0, metric(host["cpuCores"])*.8)
-	for _, job := range active {
-		pred, observed := obj(job["prediction"]), obj(job["observed"])
-		if !validPrediction(pred) || !schedulingNumber(observed["memoryBytes"], false) || !schedulingNumber(observed["cpuCores"], false) {
-			return false, "Waiting for valid active resource reservations"
-		}
-		memoryGrowth += max(0.0, metric(pred["memoryBytes"])-metric(observed["memoryBytes"]))
-		cpuGrowth += max(0.0, min(cpuBudget, metric(pred["cpuCores"]))-metric(observed["cpuCores"]))
+	if !headroom.reserveGrowth(active) {
+		return false, "Waiting for valid active resource reservations"
 	}
-	if metric(prediction["memoryBytes"])+reserve+memoryGrowth+held.memoryBytes > metric(host["availableMemoryBytes"]) {
+	if !headroom.memoryFits(metric(prediction["memoryBytes"])) {
 		return false, "Waiting for predicted peak memory headroom"
 	}
 	if len(active) == 0 && metric(host["cpuBusyCores"]) > metric(host["cpuCores"])*.6 {
 		return false, "Waiting for background CPU activity to settle"
 	}
-	if metric(prediction["cpuCores"]) > cpuBudget {
+	if metric(prediction["cpuCores"]) > headroom.cpuBudget {
 		return false, "Predicted CPU demand exceeds this machine's budget; reduce workers or inspect Start now"
 	}
-	if metric(host["cpuBusyCores"])+cpuGrowth+held.cpuCores+metric(prediction["cpuCores"]) > cpuBudget {
+	if !headroom.cpuFits(metric(prediction["cpuCores"])) {
 		return false, "Waiting for predicted CPU headroom"
 	}
 	return true, "Predicted resource demand fits the current headroom"
@@ -304,33 +344,20 @@ func leaseDecision(host Object, memoryBytes, cpuCores float64, active []Object, 
 	if !validHost(host) {
 		return false, "Waiting for valid resource observations"
 	}
-	if !boolean(host["complete"]) {
-		return false, "Collecting a complete resource interval"
+	if reason := hostSettled(host); reason != "" {
+		return false, reason
 	}
-	if host["memoryPressure"] != "normal" {
-		return false, "Waiting for memory pressure to recover"
-	}
-	if metric(host["swapOutBytesPerSecond"]) > 1024*1024 {
-		return false, "Waiting for active swapping to settle"
-	}
-	reserve := max(float64(GiB), math.Trunc(metric(host["totalMemoryBytes"])*.15))
-	cpuBudget := max(1.0, metric(host["cpuCores"])*.8)
-	if memoryBytes > metric(host["totalMemoryBytes"])-reserve || cpuCores > cpuBudget {
+	headroom := newHostHeadroom(host, held)
+	if headroom.exceedsMemoryBudget(memoryBytes) || cpuCores > headroom.cpuBudget {
 		return false, "Lane reservation exceeds this machine's budget"
 	}
-	memoryGrowth, cpuGrowth := 0.0, 0.0
-	for _, job := range active {
-		pred, observed := obj(job["prediction"]), obj(job["observed"])
-		if !validPrediction(pred) || !schedulingNumber(observed["memoryBytes"], false) || !schedulingNumber(observed["cpuCores"], false) {
-			return false, "Waiting for valid active resource reservations"
-		}
-		memoryGrowth += max(0.0, metric(pred["memoryBytes"])-metric(observed["memoryBytes"]))
-		cpuGrowth += max(0.0, min(cpuBudget, metric(pred["cpuCores"]))-metric(observed["cpuCores"]))
+	if !headroom.reserveGrowth(active) {
+		return false, "Waiting for valid active resource reservations"
 	}
-	if memoryBytes+reserve+memoryGrowth+held.memoryBytes > metric(host["availableMemoryBytes"]) {
+	if !headroom.memoryFits(memoryBytes) {
 		return false, "Waiting for memory headroom for the lane reservation"
 	}
-	if metric(host["cpuBusyCores"])+cpuGrowth+held.cpuCores+cpuCores > cpuBudget {
+	if !headroom.cpuFits(cpuCores) {
 		return false, "Waiting for CPU headroom for the lane reservation"
 	}
 	return true, "Lane reservation fits the current headroom"

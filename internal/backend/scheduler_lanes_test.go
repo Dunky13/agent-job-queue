@@ -164,3 +164,42 @@ func TestControllerAdmitsUnreservedLeaseWhenHostSampleFails(t *testing.T) {
 		t.Fatalf("a command was granted without host telemetry: %v", fmt.Sprint(grant))
 	}
 }
+
+// Job and lease admission share one headroom computation: for the same host,
+// active work and held reservations, a demand that fits or misses for a job
+// fits or misses the same way as a lease reservation.
+func TestJobAndLeaseAdmissionShareHeadroom(t *testing.T) {
+	active := []Object{resourceActive(Object{"memoryBytes": 3 * GiB, "cpuCores": 2.0, "durationSeconds": 10.0, "samples": 12, "confidence": "high", "source": "variant"}, GiB, 1, true)}
+	held := leaseReservations{memoryBytes: float64(GiB), cpuCores: 0.5}
+	for _, entry := range []struct {
+		name                 string
+		available, busy      float64
+		memoryBytes, cpu     float64
+		jobReason, leaseNote string
+	}{
+		{"fits", float64(8 * GiB), 1, float64(GiB), 1, "fits the current headroom", "fits the current headroom"},
+		{"memory", float64(5 * GiB), 1, float64(GiB), 1, "peak memory headroom", "memory headroom for the lane reservation"},
+		{"cpu", float64(8 * GiB), 4.5, float64(GiB), 1, "predicted CPU headroom", "CPU headroom for the lane reservation"},
+		{"pressure", float64(8 * GiB), 1, float64(GiB), 1, "memory pressure", "memory pressure"},
+		{"budget", float64(8 * GiB), 1, float64(15 * GiB), 1, "exceeds this machine's budget", "exceeds this machine's budget"},
+	} {
+		t.Run(entry.name, func(t *testing.T) {
+			host := fixtureResourceHost()
+			host["availableMemoryBytes"] = int64(entry.available)
+			host["cpuBusyCores"] = entry.busy
+			if entry.name == "pressure" {
+				host["memoryPressure"] = "warning"
+			}
+			prediction := fixturePrediction()
+			prediction["memoryBytes"], prediction["cpuCores"] = int64(entry.memoryBytes), entry.cpu
+			jobAllowed, jobReason := resourceDecision(host, prediction, active, 0, 4, held)
+			leaseAllowed, leaseReason := leaseDecision(host, entry.memoryBytes, entry.cpu, active, held)
+			if jobAllowed != leaseAllowed || jobAllowed != (entry.name == "fits") {
+				t.Fatalf("job %v %q, lease %v %q", jobAllowed, jobReason, leaseAllowed, leaseReason)
+			}
+			if !strings.Contains(jobReason, entry.jobReason) || !strings.Contains(leaseReason, entry.leaseNote) {
+				t.Fatalf("job %q, lease %q", jobReason, leaseReason)
+			}
+		})
+	}
+}
