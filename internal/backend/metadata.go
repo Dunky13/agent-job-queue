@@ -125,8 +125,8 @@ func ValidateManifest(data []byte) (Manifest, error) {
 	if json.Unmarshal(values["tag"], &manifest.Tag) != nil || manifest.Tag != fmt.Sprintf("build-%d-%.7s", *info.Build, *info.Commit) {
 		return manifest, errors.New("Release tag does not match the build and commit")
 	}
-	if json.Unmarshal(values["asset"], &manifest.Asset) != nil || manifest.Asset != fmt.Sprintf("Agent-Job-Queue-Installer-%s-universal.zip", info.Version) {
-		return manifest, errors.New("Unexpected installer asset")
+	if json.Unmarshal(values["asset"], &manifest.Asset) != nil || manifest.Asset != fmt.Sprintf("Agent-Queue-%s-universal.zip", info.Version) {
+		return manifest, errors.New("Unexpected app asset")
 	}
 	return manifest, nil
 }

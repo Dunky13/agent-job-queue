@@ -257,7 +257,7 @@ enum QueueClient {
             let app = Bundle.main.bundleURL
             let executable = app.appendingPathComponent("Contents/MacOS/\(controller.rawValue)")
             guard try QueueBootstrapFiles.safeExecutable(executable, scope: .init(root: app, bundled: true)) else {
-                throw ClientError.message("The bundled controller is missing or unsafe. Use a complete installer to repair Agent Queue.")
+                throw ClientError.message("The bundled controller is missing or unsafe. Download Agent Queue again and drag it into Applications.")
             }
             process.executableURL = executable
         } else {
@@ -311,7 +311,7 @@ enum QueueClient {
                     throw ClientError.message("Setup did not finish within \(Int(timeout)) seconds. Quit and reopen Agent Queue, or retry setup.\n" + String(decoding: response.suffix(8_000), as: UTF8.self))
                 }
                 if budget == .updates {
-                    throw ClientError.message("The update operation did not finish within \(Int(timeout)) seconds. Check whether the installer opened, then check for updates before retrying.")
+                    throw ClientError.message("The update operation did not finish within \(Int(timeout)) seconds. Check your Downloads folder, then check for updates before retrying.")
                 }
                 throw ClientError.message("The queue did not respond within \(Int(timeout)) seconds. Jobs continue independently. Refresh to check whether the change was applied.")
             }
@@ -1935,7 +1935,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        bootstrap?.isRunning == true ? .terminateCancel : .terminateNow
+        guard bootstrap?.isRunning == true else { return .terminateNow }
+        // Silent setup has no window; explain why quitting or logout waits.
+        showSetupWindow()
+        return .terminateCancel
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard let bootstrap, bootstrap.phase != .complete, bootstrap.phase != .idle else { return true }
+        showSetupWindow()
+        return false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

@@ -38,7 +38,7 @@ Unfamiliar jobs run alone until comparable successful evidence accumulates. Reso
 
 Missing or stale resource telemetry holds new adaptive starts. The UI preserves monitoring failure separately from queue connectivity, and Fixed and Learn only remain selectable. Returning to Fixed returns managed jobs to fixed scheduling and preserves an intentionally paused queue. Existing force-start, cancellation, legacy-owner exclusion and daemon crash ownership rules remain in force. Suspending a process would not reclaim its memory, so adaptive admission does not use suspension as recovery.
 
-The installer ships the resource modules and a separate resource-controller login entry without replacing or restarting a running queue daemon. Local development can run the controller against a deliberately isolated queue with agent-heavy scheduler; production installation starts it independently. Do not point test controllers at the operator's real queue.
+The app ships the resource modules and a separate bundle-owned resource-controller login service without replacing or restarting a running queue daemon. Local development can run the controller against a deliberately isolated queue with agent-heavy scheduler; production setup registers and starts it independently. Do not point test controllers at the operator's real queue.
 
 ## Validation
 

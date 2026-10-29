@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,9 +21,17 @@ func TestManagedSystemPublicationParentRequiresProtection(t *testing.T) {
 		{Mode: unix.S_IFDIR | 0777, Uid: 0},
 		{Mode: unix.S_IFDIR | 0757, Uid: 0},
 	} {
-		err := managedSystemPublicationParentInfo(&info)
+		err := managedSystemPublicationParentInfo(&info, false)
 		if (err == nil) != (uint32(info.Mode)&0022 == 0) {
 			t.Fatalf("mode %o: %v", info.Mode, err)
+		}
+		admin := info
+		admin.Gid = appservices.AdminGroup
+		if stock := managedSystemPublicationParentInfo(&admin, true); (stock == nil) != (uint32(info.Mode)&0002 == 0) {
+			t.Fatalf("stock Applications mode %o: %v", info.Mode, stock)
+		}
+		if managedSystemPublicationParentInfo(&admin, false) != nil && err == nil {
+			t.Fatalf("admin group changed the root decision for mode %o", info.Mode)
 		}
 		if err != nil && (!strings.Contains(err.Error(), "per-user Applications") || !strings.Contains(err.Error(), "approved protected location")) {
 			t.Fatal("namespace error is not actionable", err)

@@ -17,7 +17,7 @@ type distributionRecoveryFixture struct {
 	execution, source, recovery map[string]any
 	documents                   map[string]any
 	artifacts, originals        []map[string]any
-	jobs, gates, installer      []map[string]any
+	jobs, gates, app            []map[string]any
 	otherRuns                   []map[string]any
 	extraEntries                []checkpointEntry
 	archive                     []byte
@@ -52,7 +52,7 @@ case "$1" in
    tail=${1#*/runs/}; id=${tail%%/*}
    case "$tail" in
      */artifacts\?*) cat "$CHECKPOINT_TEST_ROOT/artifacts-$id.json";;
-     */attempts/*/jobs\?*) cat "$CHECKPOINT_TEST_ROOT/installer-$id.json";;
+     */attempts/*/jobs\?*) cat "$CHECKPOINT_TEST_ROOT/app-$id.json";;
      */jobs\?filter=latest\&*) cat "$CHECKPOINT_TEST_ROOT/jobs-$id.json";;
      *\?*) exit 96;;
      *) cat "$CHECKPOINT_TEST_ROOT/run-$id.json";;
@@ -87,20 +87,20 @@ func distributionRecoveryCandidate(f checkpointFixture, id, build int) *distribu
 		"build_run_number": "45", "build_attempt": "1", "build_artifact_id": "800", "build_artifact_digest": "sha256:" + strings.Repeat("c", 64),
 		"version": "0.1.0", "team": "ABCDEFGHIJ", "execution_id": fmt.Sprint(id), "execution_attempt": "2", "automation_sha": sha,
 		"checkpoint_id": "900", "checkpoint_digest": "sha256:" + strings.Repeat("d", 64),
-		"stage": "payload", "phase": "submitted", "reason": "pending", "submission_id": "00000000-0000-0000-0000-000000000001", "archive_sha256": strings.Repeat("e", 64),
+		"stage": "app", "phase": "submitted", "reason": "pending", "submission_id": "00000000-0000-0000-0000-000000000001", "archive_sha256": strings.Repeat("e", 64),
 	}
 	r.documents = map[string]any{
 		"recovery.json": r.recovery,
 		"metadata.json": map[string]any{"schema": 2, "repository": "owner/project", "source_sha": checkpointSHA, "run_id": fmt.Sprint(build), "run_number": "45",
 			"build_attempt": "1", "artifact_id": "800", "artifact_digest": r.recovery["build_artifact_digest"], "version": "0.1.0", "team": "ABCDEFGHIJ", "initial_sha256": strings.Repeat("f", 64)},
-		"stage-payload.json":  map[string]any{"stage": "payload", "phase": "submitted", "prepared_run_id": fmt.Sprint(id), "prepared_attempt": "2", "submission_id": r.recovery["submission_id"], "archive_sha256": r.recovery["archive_sha256"], "completed_sha256": ""},
-		"status-payload.json": map[string]any{"id": r.recovery["submission_id"], "status": "In Progress", "error": "timeout", "execution_id": fmt.Sprint(id), "execution_attempt": "2"},
+		"stage-app.json":  map[string]any{"stage": "app", "phase": "submitted", "prepared_run_id": fmt.Sprint(id), "prepared_attempt": "2", "submission_id": r.recovery["submission_id"], "archive_sha256": r.recovery["archive_sha256"], "completed_sha256": ""},
+		"status-app.json": map[string]any{"id": r.recovery["submission_id"], "status": "In Progress", "error": "timeout", "execution_id": fmt.Sprint(id), "execution_attempt": "2"},
 	}
 	r.artifacts = []map[string]any{
 		{"id": 900, "name": fmt.Sprintf("Apple-notarization-b%d-r%d-a2-s03", build, id), "expired": false, "digest": r.recovery["checkpoint_digest"], "workflow_run": provenance(id, sha)},
 		{"id": 901, "name": fmt.Sprintf("Apple-receipts-b%d-r%d-a2-s03", build, id), "expired": false, "workflow_run": provenance(id, sha)},
 	}
-	r.originals = []map[string]any{{"id": 800, "name": "Agent-Job-Queue-Installer-1", "expired": false, "digest": r.recovery["build_artifact_digest"], "workflow_run": provenance(build, checkpointSHA)}}
+	r.originals = []map[string]any{{"id": 800, "name": "Agent-Queue-App-1", "expired": false, "digest": r.recovery["build_artifact_digest"], "workflow_run": provenance(build, checkpointSHA)}}
 	job := func(jobID, run int, name, conclusion, commit string, attempt int) map[string]any {
 		return map[string]any{"id": jobID, "run_id": run, "name": name, "status": "completed", "conclusion": conclusion, "head_sha": commit, "run_attempt": attempt}
 	}
@@ -110,7 +110,7 @@ func distributionRecoveryCandidate(f checkpointFixture, id, build int) *distribu
 		job(14, id, "Publish main installer", "skipped", sha, 2), job(15, id, "Verify Homebrew delivery", "skipped", sha, 2),
 	}
 	r.gates = []map[string]any{job(20, build, "ci-required", "success", checkpointSHA, 3)}
-	r.installer = []map[string]any{job(21, build, "Universal installer", "success", checkpointSHA, 1)}
+	r.app = []map[string]any{job(21, build, "Universal app", "success", checkpointSHA, 1)}
 	return r
 }
 
@@ -124,7 +124,7 @@ func (f *distributionRecoveryFixture) write(t *testing.T) {
 	f.writeJSON(t, fmt.Sprintf("run-%v.json", id), f.execution)
 	f.writeJSON(t, fmt.Sprintf("run-%v.json", build), f.source)
 	for filename, inventory := range map[string][]map[string]any{
-		fmt.Sprintf("jobs-%v.json", id): f.jobs, fmt.Sprintf("jobs-%v.json", build): f.gates, fmt.Sprintf("installer-%v.json", build): f.installer,
+		fmt.Sprintf("jobs-%v.json", id): f.jobs, fmt.Sprintf("jobs-%v.json", build): f.gates, fmt.Sprintf("app-%v.json", build): f.app,
 	} {
 		f.writeJSON(t, filename, map[string]any{"total_count": len(inventory), "jobs": inventory})
 	}
@@ -227,13 +227,13 @@ func TestDistributionRecoveryRefusesUnboundOrTerminalEvidence(t *testing.T) {
 		"bad digest", "missing digest", "expired receipts", "receipt run", "receipt sha", "receipt branch", "missing receipts", "old attempt receipts", "malformed slot", "duplicate slot",
 		"missing checkpoint", "expired checkpoint", "checkpoint digest", "checkpoint run", "checkpoint sha", "checkpoint slot", "newer checkpoint", "newer receipt missing", "newer receipt expired",
 		"missing metadata", "metadata binding", "missing stage", "stage binding", "missing status", "status id", "rejected", "invalid", "none", "pending phase", "ticket phase", "rejected log", "log mismatch", "log filename", "nonaccepted log", "rejected receipt", "other stage rejection",
-		"source fork", "source branch", "source event", "source path", "source build", "source attempt", "source sha", "source number", "source active", "source gate", "missing gate", "gate sha", "gate attempt", "installer failure",
+		"source fork", "source branch", "source event", "source path", "source build", "source attempt", "source sha", "source number", "source active", "source gate", "missing gate", "gate sha", "gate attempt", "app failure",
 		"missing original", "expired original", "original digest", "original attempt", "original sha", "original run", "cancelled", "attempt limit", "old run", "future run", "malformed date",
 		"failed validation", "other failed job", "cancelled job", "duplicate job", "wrong job sha", "wrong job attempt", "wrong job run", "old signing failure",
 	} {
 		t.Run(variant, func(t *testing.T) {
 			f := newDistributionRecoveryFixture(t)
-			stage := f.document("stage-payload.json")
+			stage := f.document("stage-app.json")
 			switch variant {
 			case "schema":
 				f.recovery["schema"] = 2
@@ -306,17 +306,17 @@ func TestDistributionRecoveryRefusesUnboundOrTerminalEvidence(t *testing.T) {
 			case "metadata binding":
 				f.document("metadata.json")["artifact_id"] = "801"
 			case "missing stage":
-				delete(f.documents, "stage-payload.json")
+				delete(f.documents, "stage-app.json")
 			case "stage binding":
 				stage["submission_id"] = "00000000-0000-0000-0000-000000000002"
 			case "missing status":
-				delete(f.documents, "status-payload.json")
+				delete(f.documents, "status-app.json")
 			case "status id":
-				f.document("status-payload.json")["id"] = "00000000-0000-0000-0000-000000000002"
+				f.document("status-app.json")["id"] = "00000000-0000-0000-0000-000000000002"
 			case "rejected":
-				f.document("status-payload.json")["status"] = "Rejected"
+				f.document("status-app.json")["status"] = "Rejected"
 			case "invalid":
-				f.document("status-payload.json")["status"] = "Invalid"
+				f.document("status-app.json")["status"] = "Invalid"
 			case "none":
 				f.recovery["reason"] = "none"
 			case "pending phase":
@@ -324,21 +324,21 @@ func TestDistributionRecoveryRefusesUnboundOrTerminalEvidence(t *testing.T) {
 			case "ticket phase":
 				f.recovery["reason"] = "ticket-connection-loss"
 			case "rejected log", "log mismatch", "log filename", "nonaccepted log":
-				f.documents["log-payload.json"] = map[string]any{"jobId": f.recovery["submission_id"], "sha256": f.recovery["archive_sha256"], "status": "Accepted"}
+				f.documents["log-app.json"] = map[string]any{"jobId": f.recovery["submission_id"], "sha256": f.recovery["archive_sha256"], "status": "Accepted"}
 				if variant == "rejected log" {
-					f.document("log-payload.json")["status"] = "Rejected"
+					f.document("log-app.json")["status"] = "Rejected"
 				}
 				if variant == "nonaccepted log" {
-					f.document("log-payload.json")["status"] = "In Progress"
+					f.document("log-app.json")["status"] = "In Progress"
 				}
 				if variant == "log mismatch" {
-					f.document("log-payload.json")["sha256"] = strings.Repeat("f", 64)
+					f.document("log-app.json")["sha256"] = strings.Repeat("f", 64)
 				}
 				if variant == "log filename" {
-					f.document("log-payload.json")["archiveFilename"] = "Other-Product.zip"
+					f.document("log-app.json")["archiveFilename"] = "Other-Product.zip"
 				}
 			case "rejected receipt":
-				f.documents["receipt-payload.json"] = map[string]any{"jobId": f.recovery["submission_id"], "sha256": f.recovery["archive_sha256"], "status": "Rejected"}
+				f.documents["receipt-app.json"] = map[string]any{"jobId": f.recovery["submission_id"], "sha256": f.recovery["archive_sha256"], "status": "Rejected"}
 			case "other stage rejection":
 				f.documents["log-dmg.json"] = map[string]any{"jobId": f.recovery["submission_id"], "sha256": f.recovery["archive_sha256"], "status": "Rejected"}
 			case "source fork":
@@ -367,8 +367,8 @@ func TestDistributionRecoveryRefusesUnboundOrTerminalEvidence(t *testing.T) {
 				f.gates[0]["head_sha"] = strings.Repeat("f", 40)
 			case "gate attempt":
 				f.gates[0]["run_attempt"] = 4
-			case "installer failure":
-				f.installer[0]["conclusion"] = "failure"
+			case "app failure":
+				f.app[0]["conclusion"] = "failure"
 			case "missing original":
 				f.originals = nil
 			case "expired original":
@@ -376,7 +376,7 @@ func TestDistributionRecoveryRefusesUnboundOrTerminalEvidence(t *testing.T) {
 			case "original digest":
 				f.originals[0]["digest"] = "sha256:" + strings.Repeat("f", 64)
 			case "original attempt":
-				f.originals[0]["name"] = "Agent-Job-Queue-Installer-2"
+				f.originals[0]["name"] = "Agent-Queue-App-2"
 			case "original sha":
 				f.originals[0]["workflow_run"].(map[string]any)["head_sha"] = strings.Repeat("f", 40)
 			case "original run":
@@ -488,9 +488,9 @@ func TestDistributionRecoveryRejectsUnsafeZIP(t *testing.T) {
 
 func (f *distributionRecoveryFixture) ticket() {
 	f.recovery["reason"], f.recovery["phase"] = "ticket-connection-loss", "accepted"
-	f.document("stage-payload.json")["phase"] = "accepted"
-	f.document("status-payload.json")["status"] = "Accepted"
-	for _, name := range []string{"receipt-payload.json", "log-payload.json"} {
+	f.document("stage-app.json")["phase"] = "accepted"
+	f.document("status-app.json")["status"] = "Accepted"
+	for _, name := range []string{"receipt-app.json", "log-app.json"} {
 		f.documents[name] = map[string]any{"jobId": f.recovery["submission_id"], "sha256": f.recovery["archive_sha256"], "status": "Accepted"}
 	}
 }
@@ -505,14 +505,14 @@ func TestDistributionRecoveryTicketAndDeliveryOnlyRetries(t *testing.T) {
 			switch variant {
 			case "ticket finished":
 				f.recovery["phase"] = "finished"
-				f.document("stage-payload.json")["phase"] = "finished"
+				f.document("stage-app.json")["phase"] = "finished"
 			case "ticket missing acceptance":
-				delete(f.documents, "receipt-payload.json")
+				delete(f.documents, "receipt-app.json")
 				want = 0
 			case "ticket legacy filename":
-				f.document("log-payload.json")["archiveFilename"] = "Agent-Job-Queue-Payload-0.1.0-universal.zip"
+				f.document("log-app.json")["archiveFilename"] = "Agent-Queue-0.1.0-universal.zip"
 			case "ticket bound filename":
-				f.document("log-payload.json")["archiveFilename"] = "Agent-Job-Queue-Payload-0.1.0-build-45-1111111-universal.zip"
+				f.document("log-app.json")["archiveFilename"] = "Agent-Queue-0.1.0-build-45-1111111-universal.zip"
 			}
 			if !strings.HasPrefix(variant, "ticket") {
 				f.recovery["reason"] = "none"
@@ -558,8 +558,8 @@ func TestDistributionRecoveryPermitsFinalBoundedAttempt(t *testing.T) {
 	f := newDistributionRecoveryFixture(t)
 	f.execution["run_attempt"] = 47
 	f.recovery["execution_attempt"] = "47"
-	f.document("stage-payload.json")["prepared_attempt"] = "47"
-	f.document("status-payload.json")["execution_attempt"] = "47"
+	f.document("stage-app.json")["prepared_attempt"] = "47"
+	f.document("status-app.json")["execution_attempt"] = "47"
 	for _, job := range f.jobs {
 		if job["run_attempt"] == 2 {
 			job["run_attempt"] = 47
@@ -696,7 +696,7 @@ case "$1" in
  tail=${1#*/runs/};id=${tail%%/*}
  case "$tail" in
  */artifacts\?*) printf '%s' "$id" > "$CHECKPOINT_TEST_ROOT/selected";cat "$CHECKPOINT_TEST_ROOT/artifacts-$id.json";;
- */attempts/*/jobs\?*) cat "$CHECKPOINT_TEST_ROOT/installer-$id.json";;
+ */attempts/*/jobs\?*) cat "$CHECKPOINT_TEST_ROOT/app-$id.json";;
  */jobs\?*) cat "$CHECKPOINT_TEST_ROOT/jobs-$id.json";;
  *) cat "$CHECKPOINT_TEST_ROOT/run-$id.json";;
  esac;;

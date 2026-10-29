@@ -1,11 +1,14 @@
 #!/bin/bash
-# Developer entry point; packaged users run the native installer instead.
+# Developer entry point; users drag the app from the disk image instead.
+# Setup runs when the app first opens.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
-"$root/scripts/build-installer.sh"
+"$root/scripts/build-app.sh"
 version=${VERSION:-$(cat "$root/VERSION")}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-ditto -x -k "${DIST_DIR:-$root/dist}/Agent-Job-Queue-Installer-$version-universal.zip" "$work"
-installer="$work/Agent Job Queue Installer.app"
-/bin/bash "$installer/Contents/Resources/payload/source/scripts/install-user.sh" --payload "$installer/Contents/Resources/payload"
+ditto -x -k "${DIST_DIR:-$root/dist}/Agent-Queue-$version-universal.zip" "$work"
+mkdir -p "$HOME/Applications"
+rm -rf "$HOME/Applications/Agent Queue.app"
+ditto "$work/Agent Queue.app" "$HOME/Applications/Agent Queue.app"
+open "$HOME/Applications/Agent Queue.app"

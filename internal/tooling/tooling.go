@@ -380,7 +380,7 @@ const caskTemplate = `cask "agent-job-queue" do
   sha256 "%s"
 
   url "https://github.com/%s/releases/download/%s/%s"
-  name "Agent Job Queue"
+  name "Agent Queue"
   desc "Shared heavy-command queue with a macOS menu-bar app"
   homepage "https://github.com/%s"
 
@@ -388,60 +388,16 @@ const caskTemplate = `cask "agent-job-queue" do
 
   # Preserve quarantine so macOS can assess the notarized release.
 
-  # Run the vendor's noninteractive installer before moving its source app.
-  # This documented artifact runs outside the flight-step hook sandbox.
-  installer script: {
-    executable: "/bin/sh",
-    args: ["-c", <<~'SCRIPT', "agent-job-queue-install", staged_path.to_s, version.csv.first, version.csv.second],
-      set -eu
-      work=$(/usr/bin/mktemp -d /private/tmp/agent-queue-install.XXXXXXXX)
-      cleanup() {
-        result=$?
-        trap - EXIT
-        /bin/rm -rf -- "$work" || exit 1
-        exit "$result"
-      }
-      trap cleanup EXIT
-      trap 'exit 1' HUP INT TERM
-      installer="$work/Agent Job Queue Installer.app"
-      /usr/bin/ditto --rsrc --extattr --qtn --acl "$1/Agent Job Queue Installer.app" "$installer"
-      payload="$installer/Contents/Resources/payload"
-      requirement='=anchor apple generic and certificate leaf[subject.OU] = "U9GXK89565" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and notarized'
-      /usr/bin/codesign --verify --strict --deep --all-architectures --check-notarization --test-requirement "$requirement and identifier \"io.went.agent-queue.installer\"" "$installer"
-      /usr/bin/codesign --verify --strict --deep --all-architectures --check-notarization --test-requirement "$requirement and identifier \"io.went.agent-queue\"" "$payload/Agent Queue.app"
-      /usr/bin/codesign --verify --strict --all-architectures --check-notarization --test-requirement "$requirement" "$payload/source/bin/agent-heavy"
-      /usr/bin/codesign --verify --strict --all-architectures --check-notarization --test-requirement "$requirement" "$payload/source/bin/agent-remote"
-      /usr/sbin/spctl --assess --type execute "$installer"
-      for bundle in "$installer" "$payload/Agent Queue.app"; do
-        [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$bundle/Contents/Info.plist")" = "$2" ] &&
-          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$bundle/Contents/Info.plist")" = "$3" ] || {
-            echo 'The copied installer differs from the requested Homebrew release.' >&2
-            exit 1
-          }
-      done
-      "$payload/source/bin/agent-heavy" install --payload "$payload" --repair-and-continue
-    SCRIPT
-    sudo: false,
-    must_succeed: true,
-  }
+  app "Agent Queue.app"
 
-  # Predecessor uninstall also runs during upgrades. Retain the independent
-  # runtime and services; their owner performs verified replacement above.
-  uninstall script: { executable: "/usr/bin/true", sudo: false, must_succeed: true }
-
-  app "Agent Job Queue Installer.app", target: "#{Dir.home}/Applications/Agent Job Queue Installer.app"
-
-  binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/links/agent-heavy"
-  binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/links/agent-remote"
+  uninstall quit: "io.went.agent-queue"
 
   caveats <<~EOS
-    Installation and upgrades run automatically, including verified setup repairs.
-    Compatible upgrades preserve ongoing jobs; older runtimes wait for the queue to drain.
-    CLI links are ready on success.
-    macOS may require background-service approval in Login Items settings.
-    Homebrew uninstall retains the independent Agent Queue app, services and private data.
-    To remove Agent Queue, use its explicit service-removal command before deleting the app.
-    Release installer and app are Developer ID signed and notarized. Quarantine is retained.
+    Open Agent Queue from Applications to finish setup; it registers its own
+    background services and adds agent-heavy and agent-remote to ~/.local/bin.
+    macOS may ask you to allow Agent Queue in Login Items settings.
+    Before removing the app, stop its services with:
+      ~/.local/bin/agent-heavy install --app-bundle "#{appdir}/Agent Queue.app" --unregister-services
   EOS
 end
 `

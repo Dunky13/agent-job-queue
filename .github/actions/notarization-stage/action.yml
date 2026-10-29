@@ -2,7 +2,7 @@ name: Durable Apple notarization stage
 description: Preserve signed bytes and upload receipts before waiting for Apple.
 inputs:
   stage:
-    description: payload, installer or dmg
+    description: app or dmg
     required: true
   prepared-slot:
     description: Ordered checkpoint slot before submission

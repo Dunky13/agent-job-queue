@@ -8,7 +8,7 @@ source "$root/scripts/distribution-common.sh"
 distribution_context
 [[ $# == 5 ]] || distribution_error 'Usage: macos-receipts.sh STATE OUTPUT STAGE CHECKPOINT_ID CHECKPOINT_DIGEST'
 state=$1 output=$2 stage=$3 checkpoint_id=$4 checkpoint_digest="sha256:${5#sha256:}"
-case "$stage" in payload|installer|dmg) ;; *) distribution_error 'Invalid receipt stage.' ;; esac
+case "$stage" in app|dmg) ;; *) distribution_error 'Invalid receipt stage.' ;; esac
 distribution_number "$checkpoint_id" || distribution_error 'A persisted checkpoint ID is required.'
 [[ $checkpoint_digest =~ ^sha256:[a-f0-9]{64}$ ]] || distribution_error 'A persisted checkpoint digest is required.'
 [[ ! -e $output && ! -L $output && -d $state && ! -L $state ]] || distribution_error 'Fresh receipt output and real state are required.'
@@ -17,7 +17,7 @@ mkdir -m 700 "$output"
 cp "$state/metadata.json" "$output/metadata.json"
 # Only explicit public files enter the receipt envelope. Private command output,
 # work directories, credentials and arbitrary state files are never copied.
-for name in payload installer dmg; do
+for name in app dmg; do
   for pair in "stages/$name.json:stage-$name.json" "receipts/$name.json:receipt-$name.json" \
     "receipts/$name.log.json:log-$name.json" "receipts/$name.status.json:status-$name.json"; do
     source_file="$state/${pair%%:*}"

@@ -9,7 +9,7 @@ The app source repository's protected main branch remains independent.
 
 The refresh workflow reads only the known public app repository. It selects the
 highest numbered published build with a strict JSON manifest, downloads the known
-installer asset, verifies its SHA256, regenerates Ruby using the trusted local
+app ZIP asset, verifies its SHA256, regenerates Ruby using the trusted local
 template, checks it through the real Homebrew DSL, and only then creates a signed
 GitHub API commit on tap. It never evaluates released Ruby. No PAT is needed.
 The GitHub Actions token is scoped to contents:write in this dedicated repository.
@@ -45,25 +45,27 @@ The refresh helper compares historical Ruby only as bounded data and never runs
 it. Local development packages can remain ad hoc signed. Offline first launch
 of the standalone Go executables has not been verified.
 
-Install and upgrade use Homebrew's documented installer script artifact, which
-runs before its app and binary artifacts and outside flight-step hook sandboxes.
-The trusted system-shell script copies the complete installer into an owned
-private temporary directory, preserving quarantine. It verifies Developer ID,
-notarization, expected bundle identifiers, Gatekeeper and the public publisher
-team U9GXK89565 before executing the private controller with
-install --payload --repair-and-continue. Publisher rotation requires a reviewed
-template update. Shared Caskroom permissions and security policy remain intact.
-The controller installs or replaces the runtime after verified repairs and queue
-drain. macOS retains control of any required background-service approval.
+The cask is a plain app cask: its only artifacts are the app and a quit-only
+uninstall. Homebrew just places Agent Queue.app; it runs no installer script,
+flight step, binary link or setup command. Opening the app from Applications
+performs setup itself (registers its bundle-owned services and writes the
+agent-heavy and agent-remote wrappers to ~/.local/bin). macOS retains control
+of any required background-service approval in Login Items settings.
 
-The real DSL fixtures cover artifact order, protected staging, cleanup, vendor
-failure propagation, quarantine retention, upgrade rollback and CLI links.
-Synthetic fixture trust adapters establish only their stated local scope;
-notarized release acceptance executes the real Apple verifiers and packaged
-controller with a parent-owned private native lifecycle adapter.
+The real DSL fixtures cover the exact artifact contract, protected staging,
+quarantine retention, upgrade rollback and uninstall without touching private
+runtime files. Synthetic fixtures use a data-only app that is never executed;
+notarized release acceptance executes the real Apple verifiers against the
+extracted release app (AGENT_QUEUE_TEST_NOTARIZED_APP) and its Gatekeeper
+assessment, and registers no Service Management jobs.
 
-Homebrew uninstall removes only its delivered installer and command links. Its
-no-op uninstall script also preserves the independent runtime during predecessor
-removal on upgrade. Runtime app, services, jobs, history and credentials remain
-retained. Full runtime removal requires the explicit ownership-checked service
-removal command before deleting the app. No destructive zap action is supplied.
+Homebrew uninstall asks a running app to quit, then removes the app. Services,
+jobs, history and credentials are removed only by the app's explicit
+ownership-checked service-removal command, which the cask caveats name and
+which must run before deleting the app. No destructive zap action is supplied.
+
+A tap that still holds metadata for a release built with the earlier installer
+wrapper is accepted as the current state, checked against its public release and
+its published cask, and replaced by the first app ZIP release. A latest public
+release that still uses the installer asset name fails visibly instead of
+publishing a cask for it.

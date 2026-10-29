@@ -266,8 +266,12 @@ enum QueueExecutableNamespace {
             guard fstat(directory, &info) == 0 else { return false }
             let inside = current == boundary || current.hasPrefix(boundary + "/")
             let sticky = !inside && info.st_uid == 0 && info.st_mode & S_ISVTX != 0
+            // Only root and administrators can write the stock /Applications,
+            // and administrators can already replace any code on this Mac.
+            let stockApplications = !inside && current == "/Applications" && info.st_uid == 0 &&
+                info.st_gid == 80 && info.st_mode & 0o002 == 0
             guard info.st_uid == getuid() || info.st_uid == 0,
-                  info.st_mode & 0o022 == 0 || sticky else { return false }
+                  info.st_mode & 0o022 == 0 || sticky || stockApplications else { return false }
         }
         let file = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
         guard file >= 0 else { return false }

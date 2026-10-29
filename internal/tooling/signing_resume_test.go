@@ -41,7 +41,7 @@ func newResumeFixture(t *testing.T, extra ...string) resumeFixture {
 	f.environment = append(f.environment, "GITHUB_SHA="+strings.Repeat("a", 40), "GITHUB_REPOSITORY=fixture/queue", "GITHUB_RUN_ID=1234", "GITHUB_RUN_NUMBER=21", "GITHUB_RUN_ATTEMPT=1", "SIGNING_TEST_ROOT="+f.root)
 	f.environment = append(f.environment, extra...)
 	fixture := resumeFixture{signingFixture: f, state: filepath.Join(f.root, "state")}
-	fixture.command(t, nil, "init", f.installer, fixture.state, "0.1.0")
+	fixture.command(t, nil, "init", f.app, fixture.state, "0.1.0")
 	return fixture
 }
 
@@ -59,40 +59,72 @@ func (f resumeFixture) step(t *testing.T, operation, stage string, extra ...stri
 	return f.command(t, extra, operation, f.state, stage, "0.1.0")
 }
 
-func TestMacOSResumeDragInstallRetainsAppPayloadAndShortcut(t *testing.T) {
+func TestMacOSResumeRetainsSelfContainedAppAndDiskImageLayout(t *testing.T) {
 	f := newResumeFixture(t)
-	f.embedAppSupport(t)
-	// Recreate the initial archive so the checkpoint owns the self-contained app.
-	if err := os.RemoveAll(f.state); err != nil {
-		t.Fatal(err)
-	}
-	f.command(t, nil, "init", f.installer, f.state, "0.1.0")
-	for _, stage := range []string{"payload", "installer", "dmg"} {
+	for _, stage := range []string{"app", "dmg"} {
 		for _, operation := range []string{"prepare", "submit", "finish"} {
 			f.step(t, operation, stage)
 		}
 	}
 	record := f.recorded(t)
-	if !strings.Contains(record, "Agent Queue.app/Contents/Resources/payload/source/bin/agent-heavy") {
-		t.Fatalf("resumed release did not sign embedded helpers: %s", record)
+	for _, name := range []string{"agent-heavy", "agent-remote"} {
+		if !strings.Contains(record, "Agent Queue.app/Contents/MacOS/"+name) {
+			t.Fatalf("resumed release omitted bundled helper %s: %s", name, record)
+		}
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n") {
-		t.Fatalf("resumed release lost the automatic installer layout: %s", record)
+	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
+		t.Fatalf("resumed release lost the drag-and-drop layout: %s", record)
 	}
 }
 
-func TestMacOSResumeRejectsDeclaredMissingPayload(t *testing.T) {
-	f := newResumeFixture(t)
-	app := filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app")
-	if err := os.WriteFile(filepath.Join(app, "Contents/Info.plist"), []byte(`{"AgentQueueEmbeddedPayload":"true"}`), 0600); err != nil {
-		t.Fatal(err)
+func TestMacOSResumeRejectsIncompleteOrInstallerEraApp(t *testing.T) {
+	for _, test := range []struct {
+		name, want string
+		change     func(*testing.T, resumeFixture)
+	}{
+		{"declared payload missing", "declares an embedded setup payload but it is missing", func(t *testing.T, f resumeFixture) {
+			if err := os.RemoveAll(filepath.Join(f.app, "Contents/Resources/payload")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"missing bundled helper", "bundled helpers are required", func(t *testing.T, f resumeFixture) {
+			if err := os.Remove(filepath.Join(f.app, "Contents/MacOS/agent-remote")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"unmanaged services", "self-contained layout", func(t *testing.T, f resumeFixture) {
+			verificationWrite(t, filepath.Join(f.app, "Contents/Info.plist"), strings.Replace(signingTestInfoPlist, "<key>AgentQueueServiceManagement</key><true/>", "", 1), 0600)
+			verificationWrite(t, filepath.Join(f.app, "Contents/Resources/payload/source/bin/agent-heavy"), "helper", 0700)
+			verificationWrite(t, filepath.Join(f.app, "Contents/Resources/payload/source/bin/agent-remote"), "helper", 0700)
+			if err := os.RemoveAll(filepath.Join(f.app, "Contents/Library")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newResumeFixture(t)
+			test.change(t, f)
+			if err := os.RemoveAll(f.state); err != nil {
+				t.Fatal(err)
+			}
+			f.reject(t, nil, test.want, "init", f.app, f.state, "0.1.0")
+			if _, err := os.Stat(filepath.Join(f.state, "stages/app.json")); !os.IsNotExist(err) {
+				t.Fatalf("rejected app created a prepared signing stage: %v", err)
+			}
+		})
 	}
-	if err := os.RemoveAll(f.state); err != nil {
-		t.Fatal(err)
-	}
-	f.reject(t, nil, "declares an embedded setup payload but it is missing", "init", f.installer, f.state, "0.1.0")
-	if _, err := os.Stat(filepath.Join(f.state, "stages/payload.json")); !os.IsNotExist(err) {
-		t.Fatalf("missing payload created a prepared signing stage: %v", err)
+}
+
+func TestMacOSResumeRefusesInstallerEraCheckpoints(t *testing.T) {
+	for _, stage := range []string{"payload", "installer"} {
+		t.Run(stage, func(t *testing.T) {
+			f := newResumeFixture(t)
+			if err := os.WriteFile(filepath.Join(f.state, "stages", stage+".json"), []byte("{}"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			f.reject(t, nil, "predates the drag-and-drop app layout", "verify-state", f.state, "0.1.0")
+			f.reject(t, nil, "predates the drag-and-drop app layout", "prepare", f.state, "app", "0.1.0")
+		})
 	}
 }
 
@@ -140,12 +172,12 @@ func newRESTResumeFixture(t *testing.T) resumeFixture {
 
 func TestMacOSResumeRESTAuthenticationPrecedesPreparation(t *testing.T) {
 	f := newRESTResumeFixture(t)
-	f.reject(t, []string{"SIGNING_TEST_FAILURE=rest-preflight"}, "operation=notary-authentication phase=failure status=33", "prepare", f.state, "payload", "0.1.0")
+	f.reject(t, []string{"SIGNING_TEST_FAILURE=rest-preflight"}, "operation=notary-authentication phase=failure status=33", "prepare", f.state, "app", "0.1.0")
 	events := f.recorded(t)
 	if !strings.Contains(events, "queue-tool|notarize|preflight") || strings.Contains(events, "codesign|--force|") || strings.Contains(events, "ditto|-x|") {
 		t.Fatalf("authentication did not stop preparation: %s", events)
 	}
-	if _, err := os.Stat(filepath.Join(f.state, "stages/payload.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(f.state, "stages/app.json")); !os.IsNotExist(err) {
 		t.Fatalf("authentication failure created a prepared stage: %v", err)
 	}
 }
@@ -163,7 +195,7 @@ func TestMacOSResumeRESTRequiresPrebuiltClient(t *testing.T) {
 			case "nonexecutable":
 				tool = filepath.Join(f.root, "synthetic-notary.p8")
 			}
-			f.reject(t, []string{"QUEUE_NOTARY_TOOL=" + tool}, "prebuilt notarization client", "prepare", f.state, "payload", "0.1.0")
+			f.reject(t, []string{"QUEUE_NOTARY_TOOL=" + tool}, "prebuilt notarization client", "prepare", f.state, "app", "0.1.0")
 			if events := f.recorded(t); strings.Contains(events, "codesign|--force|") || strings.Contains(events, "xcrun|notarytool|") || strings.Contains(events, "rest-create|") {
 				t.Fatalf("missing client reached signing or notarization: %s", events)
 			}
@@ -175,13 +207,13 @@ func TestMacOSResumeRESTPreservesSubmissionCustodyAcrossFailures(t *testing.T) {
 	for _, test := range []struct{ failure, phase string }{{"rest-preflight", "prepared"}, {"rest-before-id", "uploading"}, {"rest-after-id", "submitted"}} {
 		t.Run(test.failure, func(t *testing.T) {
 			f := newRESTResumeFixture(t)
-			f.step(t, "prepare", "payload")
-			archive := filepath.Join(f.state, "archives/payload.zip")
+			f.step(t, "prepare", "app")
+			archive := filepath.Join(f.state, "archives/app.zip")
 			original, err := os.ReadFile(archive)
 			if err != nil {
 				t.Fatal(err)
 			}
-			cmd := exec.Command("/bin/bash", f.script, "submit", f.state, "payload", "0.1.0")
+			cmd := exec.Command("/bin/bash", f.script, "submit", f.state, "app", "0.1.0")
 			cmd.Env = append(append([]string{}, f.environment...), "SIGNING_TEST_FAILURE="+test.failure)
 			output, err := cmd.Output()
 			var exitError *exec.ExitError
@@ -196,7 +228,7 @@ func TestMacOSResumeRESTPreservesSubmissionCustodyAcrossFailures(t *testing.T) {
 			} else if len(output) != 0 {
 				t.Fatalf("failure without a known ID emitted success stdout: %s", output)
 			}
-			data, err := os.ReadFile(filepath.Join(f.state, "stages/payload.json"))
+			data, err := os.ReadFile(filepath.Join(f.state, "stages/app.json"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -216,16 +248,16 @@ func TestMacOSResumeRESTPreservesSubmissionCustodyAcrossFailures(t *testing.T) {
 				}
 			case "uploading":
 				for _, attempt := range []string{"1", "2"} {
-					f.reject(t, []string{"GITHUB_RUN_ATTEMPT=" + attempt}, "unknown outcome", "submit", f.state, "payload", "0.1.0")
+					f.reject(t, []string{"GITHUB_RUN_ATTEMPT=" + attempt}, "unknown outcome", "submit", f.state, "app", "0.1.0")
 				}
-				unchanged, err := os.ReadFile(filepath.Join(f.state, "stages/payload.json"))
+				unchanged, err := os.ReadFile(filepath.Join(f.state, "stages/app.json"))
 				if err != nil || string(unchanged) != string(data) {
 					t.Fatal("unknown submission record changed on refused retries")
 				}
 			case "submitted":
-				f.step(t, "prepare", "payload", "GITHUB_RUN_ATTEMPT=2")
-				f.step(t, "submit", "payload", "GITHUB_RUN_ATTEMPT=2")
-				f.step(t, "finish", "payload", "GITHUB_RUN_ATTEMPT=2")
+				f.step(t, "prepare", "app", "GITHUB_RUN_ATTEMPT=2")
+				f.step(t, "submit", "app", "GITHUB_RUN_ATTEMPT=2")
+				f.step(t, "finish", "app", "GITHUB_RUN_ATTEMPT=2")
 				if events := f.recorded(t); strings.Count(events, "queue-tool|notarize|wait|") != 1 || strings.Count(events, "queue-tool|notarize|log|") != 1 {
 					t.Fatalf("known submission was not queried on resume: %s", events)
 				}
@@ -242,12 +274,12 @@ func TestMacOSResumeRESTPreservesSubmissionCustodyAcrossFailures(t *testing.T) {
 }
 
 func TestMacOSResumeRESTRequiresExactAcceptedLog(t *testing.T) {
-	for _, failure := range []string{"", "waitid", "loghash", "logid", "logstatus", "payload-log", "payload-rejected", "payload-timeout"} {
+	for _, failure := range []string{"", "waitid", "loghash", "logid", "logstatus", "app-log", "app-rejected", "app-timeout"} {
 		t.Run("result="+failure, func(t *testing.T) {
 			f := newRESTResumeFixture(t)
-			f.step(t, "prepare", "payload")
-			f.step(t, "submit", "payload")
-			output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "finish", f.state, "payload", "0.1.0")
+			f.step(t, "prepare", "app")
+			f.step(t, "submit", "app")
+			output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "finish", f.state, "app", "0.1.0")
 			if (failure == "") != (err == nil) {
 				t.Fatalf("unexpected REST acceptance: %v %s", err, output)
 			}
@@ -261,10 +293,10 @@ func TestMacOSResumeRESTRequiresExactAcceptedLog(t *testing.T) {
 
 func TestMacOSResumeRESTFinishesAllStagesWithBoundReceipts(t *testing.T) {
 	f := newRESTResumeFixture(t)
-	for i, stage := range []string{"payload", "installer", "dmg"} {
+	for i, stage := range []string{"app", "dmg"} {
 		output := f.step(t, "prepare", stage)
 		remaining := output
-		for _, operation := range []string{"configure-credentials", "notary-authentication", "restore-installer"} {
+		for _, operation := range []string{"configure-credentials", "notary-authentication", "restore-app"} {
 			for _, phase := range []string{"begin", "success status=0"} {
 				marker := "operation=" + operation + " phase=" + phase
 				index := strings.Index(remaining, marker)
@@ -301,11 +333,11 @@ func TestMacOSResumeRESTFinishesAllStagesWithBoundReceipts(t *testing.T) {
 	events := f.recorded(t)
 	assertNotarySubmissionNames(t, events, "0.1.0")
 	for _, event := range []string{"queue-tool|notarize|preflight", "rest-create|", "queue-tool|notarize|wait|", "queue-tool|notarize|log|", "xcrun|stapler|staple|"} {
-		if strings.Count(events, event) != 3 {
-			t.Fatalf("expected three %s events: %s", event, events)
+		if strings.Count(events, event) != 2 {
+			t.Fatalf("expected two %s events: %s", event, events)
 		}
 	}
-	if strings.Contains(events, "xcrun|notarytool|") || strings.Count(events, "codesign|--force|") != 5 || !strings.Contains(events, "spctl|--assess|") {
+	if strings.Contains(events, "xcrun|notarytool|") || strings.Count(events, "codesign|--force|") != 4 || !strings.Contains(events, "spctl|--assess|") {
 		t.Fatalf("REST completion skipped policy or repeated signing: %s", events)
 	}
 }
@@ -315,9 +347,9 @@ func TestMacOSResumeRESTTimeoutCompatibility(t *testing.T) {
 		t.Run(timeout, func(t *testing.T) {
 			f := newRESTResumeFixture(t)
 			env := "NOTARY_TIMEOUT=" + timeout
-			f.step(t, "prepare", "payload", env)
-			f.step(t, "submit", "payload", env)
-			f.step(t, "finish", "payload", env)
+			f.step(t, "prepare", "app", env)
+			f.step(t, "submit", "app", env)
+			f.step(t, "finish", "app", env)
 			expected := timeout
 			if timeout == "300" || timeout == "86400" {
 				expected += "s"
@@ -330,7 +362,7 @@ func TestMacOSResumeRESTTimeoutCompatibility(t *testing.T) {
 	for _, timeout := range []string{"86401", "1441m", "25h", strings.Repeat("9", 40)} {
 		t.Run("oversized-"+timeout, func(t *testing.T) {
 			f := newRESTResumeFixture(t)
-			f.reject(t, []string{"NOTARY_TIMEOUT=" + timeout}, "at most 24h", "prepare", f.state, "payload", "0.1.0")
+			f.reject(t, []string{"NOTARY_TIMEOUT=" + timeout}, "at most 24h", "prepare", f.state, "app", "0.1.0")
 			if events := f.recorded(t); strings.Contains(events, "queue-tool|notarize|") || strings.Contains(events, "codesign|--force|") {
 				t.Fatalf("invalid timeout reached signing or authentication: %s", events)
 			}
@@ -338,10 +370,11 @@ func TestMacOSResumeRESTTimeoutCompatibility(t *testing.T) {
 	}
 }
 
-func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T) {
-	f := newRESTResumeFixture(t)
-	f.step(t, "prepare", "payload")
-	f.step(t, "submit", "payload")
+// buildRealNotaryCLI builds the production queue-tool and writes a synthetic
+// API key, so a test can drive the real notarization client against a refused
+// local proxy instead of Apple.
+func buildRealNotaryCLI(t *testing.T, f resumeFixture) string {
+	t.Helper()
 	tool := filepath.Join(f.root, "tools", "queue-tool-real")
 	build := exec.Command("go", "build", "-p", "2", "-o", tool, "../../cmd/queue-tool")
 	build.Env = signingTestEnvironment()
@@ -359,24 +392,45 @@ func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T
 	if err := os.WriteFile(filepath.Join(f.root, "synthetic-notary.p8"), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0600); err != nil {
 		t.Fatal(err)
 	}
-	// Refuse CONNECT locally, before TLS or any provider request. Both commands
-	// must reach this proxy, proving real key/output parsing accepted the same
-	// temporary paths used by the shell, including macOS system parent aliases.
+	return tool
+}
+
+// refusingConnectProxy answers every CONNECT to Apple with 502 before TLS and
+// counts them. Other methods are ignored: local developer tooling can probe
+// any localhost listener, and the Go client only ever sends CONNECT here.
+func refusingConnectProxy(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
 	var connects atomic.Int32
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodConnect || r.Host != "appstoreconnect.apple.com:443" || r.Header.Get("Authorization") != "" {
+		if r.Method != http.MethodConnect {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.Host != "appstoreconnect.apple.com:443" || r.Header.Get("Authorization") != "" {
 			t.Errorf("unexpected proxy request: %s %s", r.Method, r.Host)
 		}
 		connects.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 	}))
-	defer proxy.Close()
+	t.Cleanup(proxy.Close)
+	return proxy, &connects
+}
+
+func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T) {
+	f := newRESTResumeFixture(t)
+	f.step(t, "prepare", "app")
+	f.step(t, "submit", "app")
+	tool := buildRealNotaryCLI(t, f)
+	// Refuse CONNECT locally, before TLS or any provider request. Both commands
+	// must reach this proxy, proving real key/output parsing accepted the same
+	// temporary paths used by the shell, including macOS system parent aliases.
+	proxy, connects := refusingConnectProxy(t)
 	output, err := f.run(t, []string{
 		"QUEUE_NOTARY_TOOL=" + tool, "NOTARY_KEY_ID=TESTKEY001",
 		"NOTARY_TIMEOUT=300",
 		"HTTPS_PROXY=" + proxy.URL, "HTTP_PROXY=" + proxy.URL, "ALL_PROXY=", "NO_PROXY=",
 		"https_proxy=" + proxy.URL, "http_proxy=" + proxy.URL, "all_proxy=", "no_proxy=",
-	}, "finish", f.state, "payload", "0.1.0")
+	}, "finish", f.state, "app", "0.1.0")
 	if err == nil || connects.Load() != 2 || strings.Count(output, "notarization: request_failed") != 2 || !strings.Contains(output, "submission 00000000-0000-0000-0000-000000000001 is preserved") {
 		t.Fatalf("real CLI did not reach both wait and log transport safely: connects=%d, %v\n%s", connects.Load(), err, output)
 	}
@@ -384,6 +438,31 @@ func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T
 		t.Fatal("real CLI failure fell back to native notarization")
 	}
 	f.command(t, nil, "verify-state", f.state, "0.1.0")
+}
+
+func TestMacOSResumeRESTActualCLISubmitAcceptsAppStageRecord(t *testing.T) {
+	f := newRESTResumeFixture(t)
+	f.step(t, "prepare", "app")
+	tool := buildRealNotaryCLI(t, f)
+	// Refuse CONNECT locally. Reaching the proxy proves the real client parsed
+	// the app record and passed every pre-provider check; it never contacts Apple.
+	proxy, connects := refusingConnectProxy(t)
+	output, err := f.run(t, []string{
+		"QUEUE_NOTARY_TOOL=" + tool, "NOTARY_KEY_ID=TESTKEY001",
+		"HTTPS_PROXY=" + proxy.URL, "HTTP_PROXY=" + proxy.URL, "ALL_PROXY=", "NO_PROXY=",
+		"https_proxy=" + proxy.URL, "http_proxy=" + proxy.URL, "all_proxy=", "no_proxy=",
+	}, "submit", f.state, "app", "0.1.0")
+	if err == nil || strings.Contains(output, "invalid_record") || connects.Load() != 1 || !strings.Contains(output, "notarization: request_failed") {
+		t.Fatalf("real CLI did not accept the app record and reach authentication: connects=%d, %v\n%s", connects.Load(), err, output)
+	}
+	// Authentication precedes the upload-intent write, so the record stays resubmittable.
+	record, readErr := os.ReadFile(filepath.Join(f.state, "stages/app.json"))
+	if readErr != nil || !strings.Contains(string(record), `"phase": "prepared"`) && !strings.Contains(string(record), `"phase":"prepared"`) {
+		t.Fatalf("failed authentication changed the app record: %v: %s", readErr, record)
+	}
+	if strings.Contains(f.recorded(t), "xcrun|notarytool|") {
+		t.Fatal("real CLI failure fell back to native notarization")
+	}
 }
 
 func TestMacOSResumeBindsLegacyStateOnlyAfterActualOriginVerification(t *testing.T) {
@@ -396,12 +475,12 @@ func TestMacOSResumeBindsLegacyStateOnlyAfterActualOriginVerification(t *testing
 	for _, variant := range []string{"verified legacy", "wrong original", "wrong source", "already bound"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newResumeFixture(t)
-			f.step(t, "prepare", "payload")
-			f.step(t, "submit", "payload")
+			f.step(t, "prepare", "app")
+			f.step(t, "submit", "app")
 			// Other resume fixtures use opaque tar bytes for the ditto seam.
 			// This boundary invokes the real ZIP verifier, so give it real ZIPs.
 			initial := checkpointZIP(t, checkpointEntry{
-				"Agent Job Queue Installer.app/Contents/MacOS/Installer", []byte("fixture executable"), 0o700,
+				"Agent Queue.app/Contents/MacOS/AgentQueue", []byte("fixture executable"), 0o700,
 			})
 			if err := os.WriteFile(filepath.Join(f.state, "initial.zip"), initial, 0600); err != nil {
 				t.Fatal(err)
@@ -409,9 +488,9 @@ func TestMacOSResumeBindsLegacyStateOnlyAfterActualOriginVerification(t *testing
 			f.mutate(t, "metadata.json", func(v map[string]any) { v["initial_sha256"] = fmt.Sprintf("%x", sha256.Sum256(initial)) })
 			metadataPath := filepath.Join(f.state, "metadata.json")
 			originalMetadata, _ := os.ReadFile(metadataPath)
-			stagePath := filepath.Join(f.state, "stages/payload.json")
+			stagePath := filepath.Join(f.state, "stages/app.json")
 			originalStage, _ := os.ReadFile(stagePath)
-			archivePath := filepath.Join(f.state, "archives/payload.zip")
+			archivePath := filepath.Join(f.state, "archives/app.zip")
 			originalArchive, _ := os.ReadFile(archivePath)
 			original := filepath.Join(f.root, "original.zip")
 			if variant == "wrong original" {
@@ -485,7 +564,7 @@ case "$operation" in
     printf 'rest-create|\n' >> "$SIGNING_TEST_EVENTS"
     [[ $failure != rest-before-id ]] || exit 34
     [[ $(shasum -a 256 "$archive" | awk '{print $1}') == "$hash" ]] || exit 97
-    case "$archive" in */Agent-Job-Queue-Payload-*-universal.zip) number=1;; */Agent-Job-Queue-Installer-*-universal.zip) number=2;; *.dmg) number=3;; *) exit 93;; esac
+    case "$archive" in */Agent-Queue-*-universal.zip) number=1;; *.dmg) number=2;; *) exit 93;; esac
     printf -v id '00000000-0000-0000-0000-%012d' "$number"
     jq --arg id "$id" '.phase="submitted" | .submission_id=$id' "$record" > "$record.new"; mv "$record.new" "$record"
     printf '%s' "$hash" > "$SIGNING_TEST_ROOT/hash.$number"
@@ -493,7 +572,7 @@ case "$operation" in
     [[ $failure != rest-after-id ]] || exit 35
     exit 0;;
   wait|log)
-    case "$id" in *001) number=1; stage=payload;; *002) number=2; stage=installer;; *003) number=3; stage=dmg;; *) exit 94;; esac
+    case "$id" in *001) number=1; stage=app;; *002) number=2; stage=dmg;; *) exit 94;; esac
     status=Accepted
     if [[ $operation == wait ]]; then
       [[ $failure != "$stage-rejected" ]] || status=Invalid
@@ -523,14 +602,14 @@ func TestMacOSResumePrepareReportsExactFailingOperation(t *testing.T) {
 		name, failure, operation, next string
 		status                         int
 	}{
-		{"configuration", "configuration", "configure-credentials", "restore-installer", 1},
-		{"credential path", "credential-path", "configure-credentials", "restore-installer", 37},
-		{"credential inside state", "credential-inside-state", "configure-credentials", "restore-installer", 1},
-		{"restore", "payload-restore", "restore-installer", "sign-agent-heavy", 31},
-		{"first helper", "payload-sign-heavy", "sign-agent-heavy", "verify-agent-heavy", 41},
-		{"second helper", "payload-sign-remote", "sign-agent-remote", "verify-agent-remote", 42},
-		{"app", "payload-sign-app", "sign-app", "verify-app", 43},
-		{"verification", "payload-verify-heavy", "verify-agent-heavy", "sign-agent-remote", 44},
+		{"configuration", "configuration", "configure-credentials", "restore-app", 1},
+		{"credential path", "credential-path", "configure-credentials", "restore-app", 37},
+		{"credential inside state", "credential-inside-state", "configure-credentials", "restore-app", 1},
+		{"restore", "app-restore", "restore-app", "sign-app-agent-heavy", 31},
+		{"first helper", "app-sign-heavy", "sign-app-agent-heavy", "verify-app-agent-heavy", 41},
+		{"second helper", "app-sign-remote", "sign-app-agent-remote", "verify-app-agent-remote", 42},
+		{"app", "app-sign-app", "sign-app", "verify-app", 43},
+		{"verification", "app-verify-heavy", "verify-app-agent-heavy", "sign-app-agent-remote", 44},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newResumeFixture(t)
@@ -559,7 +638,7 @@ exec "$SIGNING_TEST_REALPATH" "$@"
 				}
 				environment = append(environment, "APPLE_SIGNING_KEYCHAIN="+keychain)
 			}
-			output, err := f.run(t, environment, "prepare", f.state, "payload", "0.1.0")
+			output, err := f.run(t, environment, "prepare", f.state, "app", "0.1.0")
 			var exitError *exec.ExitError
 			if !errors.As(err, &exitError) || exitError.ExitCode() != test.status {
 				t.Fatalf("wanted original status %d, got %v: %s", test.status, err, output)
@@ -569,13 +648,13 @@ exec "$SIGNING_TEST_REALPATH" "$@"
 			if !strings.Contains(output, begin) || !strings.Contains(output, failed) || strings.Index(output, begin) >= strings.Index(output, failed) {
 				t.Fatalf("missing ordered safe operation evidence: %s", output)
 			}
-			if test.failure == "payload-sign-heavy" && !strings.Contains(output, "error: The specified item could not be found in the keychain.") {
+			if test.failure == "app-sign-heavy" && !strings.Contains(output, "error: The specified item could not be found in the keychain.") {
 				t.Fatalf("original tool diagnostic was lost: %s", output)
 			}
 			if strings.Contains(output, "operation="+test.operation+" phase=success") || strings.Contains(output, "operation="+test.next+" phase=begin") || strings.Contains(output, f.root) || strings.Contains(output, "Developer ID Application: Fixture") {
 				t.Fatalf("failure continued, claimed success, or exposed private arguments: %s", output)
 			}
-			for _, relative := range []string{"archives/payload.zip", "stages/payload.json", "stages/payload.json.new", "work", ".lock"} {
+			for _, relative := range []string{"archives/app.zip", "stages/app.json", "stages/app.json.new", "work", ".lock"} {
 				if _, err := os.Stat(filepath.Join(f.state, relative)); !os.IsNotExist(err) {
 					t.Fatalf("failed preparation retained %s: %v", relative, err)
 				}
@@ -590,9 +669,9 @@ exec "$SIGNING_TEST_REALPATH" "$@"
 
 func TestMacOSResumePrepareReportsSuccessAndDoesNotRepeatOnReuse(t *testing.T) {
 	f := newResumeFixture(t)
-	output := f.step(t, "prepare", "payload")
+	output := f.step(t, "prepare", "app")
 	remaining := output
-	for _, operation := range []string{"configure-credentials", "restore-installer", "sign-agent-heavy", "verify-agent-heavy", "sign-agent-remote", "verify-agent-remote", "sign-app", "verify-app"} {
+	for _, operation := range []string{"configure-credentials", "restore-app", "sign-app-agent-heavy", "verify-app-agent-heavy", "sign-app-agent-remote", "verify-app-agent-remote", "sign-app", "verify-app"} {
 		for _, phase := range []string{"begin", "success status=0"} {
 			marker := "Apple signing operation: operation=" + operation + " phase=" + phase
 			index := strings.Index(remaining, marker)
@@ -602,34 +681,34 @@ func TestMacOSResumePrepareReportsSuccessAndDoesNotRepeatOnReuse(t *testing.T) {
 			remaining = remaining[index+len(marker):]
 		}
 	}
-	if output = f.step(t, "prepare", "payload"); strings.Contains(output, "Apple signing operation:") || !strings.Contains(output, "payload already prepared") {
+	if output = f.step(t, "prepare", "app"); strings.Contains(output, "Apple signing operation:") || !strings.Contains(output, "app already prepared") {
 		t.Fatalf("reuse repeated preparation: %s", output)
 	}
 }
 
 func TestMacOSResumeRetainsExactArtifactsAndIDsAcrossAttempts(t *testing.T) {
 	f := newResumeFixture(t)
-	f.step(t, "prepare", "payload")
-	original, err := os.ReadFile(filepath.Join(f.state, "archives/payload.zip"))
+	f.step(t, "prepare", "app")
+	original, err := os.ReadFile(filepath.Join(f.state, "archives/app.zip"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.step(t, "submit", "payload")
-	f.reject(t, []string{"SIGNING_TEST_FAILURE=payload-timeout"}, "preserved", "finish", f.state, "payload", "0.1.0")
-	f.reject(t, nil, "All three stages", "export", f.state, f.destination, "0.1.0")
+	f.step(t, "submit", "app")
+	f.reject(t, []string{"SIGNING_TEST_FAILURE=app-timeout"}, "preserved", "finish", f.state, "app", "0.1.0")
+	f.reject(t, nil, "Both stages", "export", f.state, f.destination, "0.1.0")
 	if _, err := os.Stat(f.destination); !os.IsNotExist(err) {
 		t.Fatalf("pending stage created public assets: %v", err)
 	}
 	attempt := []string{"GITHUB_RUN_ATTEMPT=2"}
-	f.step(t, "prepare", "payload", attempt...)
-	f.step(t, "submit", "payload", attempt...)
-	f.step(t, "finish", "payload", attempt...)
-	for _, stage := range []string{"installer", "dmg"} {
+	f.step(t, "prepare", "app", attempt...)
+	f.step(t, "submit", "app", attempt...)
+	f.step(t, "finish", "app", attempt...)
+	for _, stage := range []string{"dmg"} {
 		for _, operation := range []string{"prepare", "submit", "finish"} {
 			f.step(t, operation, stage, attempt...)
 		}
 	}
-	for _, stage := range []string{"payload", "installer", "dmg"} {
+	for _, stage := range []string{"app", "dmg"} {
 		for _, operation := range []string{"prepare", "submit", "finish"} {
 			f.step(t, operation, stage, "GITHUB_RUN_ATTEMPT=3", "APPLE_SIGNING_IDENTITY=", "NOTARY_KEYCHAIN_PROFILE=")
 		}
@@ -637,15 +716,15 @@ func TestMacOSResumeRetainsExactArtifactsAndIDsAcrossAttempts(t *testing.T) {
 	f.command(t, []string{"GITHUB_RUN_ATTEMPT=3", "APPLE_SIGNING_IDENTITY=", "NOTARY_KEYCHAIN_PROFILE="}, "export", f.state, f.destination, "0.1.0")
 	record := f.recorded(t)
 	assertNotarySubmissionNames(t, record, "0.1.0")
-	if strings.Count(record, "xcrun|notarytool|submit|") != 3 || strings.Count(record, "codesign|--force|") != 5 {
+	if strings.Count(record, "xcrun|notarytool|submit|") != 2 || strings.Count(record, "codesign|--force|") != 4 {
 		t.Fatalf("retry signed or submitted again:\n%s", record)
 	}
-	after, err := os.ReadFile(filepath.Join(f.state, "archives/payload.zip"))
+	after, err := os.ReadFile(filepath.Join(f.state, "archives/app.zip"))
 	if err != nil || string(after) != string(original) {
 		t.Fatal("submitted archive changed while finishing later stages")
 	}
 	for _, extension := range []string{"zip", "dmg"} {
-		name := "Agent-Job-Queue-Installer-0.1.0-universal." + extension
+		name := "Agent-Queue-0.1.0-universal." + extension
 		data, err := os.ReadFile(filepath.Join(f.destination, name))
 		if err != nil {
 			t.Fatal(err)
@@ -690,22 +769,22 @@ func TestMacOSResumeRejectsBindingAndArchiveCorruption(t *testing.T) {
 	})
 	t.Run("submitted archive", func(t *testing.T) {
 		f := newResumeFixture(t)
-		f.step(t, "prepare", "payload")
-		f.step(t, "submit", "payload")
-		if err := os.WriteFile(filepath.Join(f.state, "archives/payload.zip"), []byte("corrupt"), 0600); err != nil {
+		f.step(t, "prepare", "app")
+		f.step(t, "submit", "app")
+		if err := os.WriteFile(filepath.Join(f.state, "archives/app.zip"), []byte("corrupt"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		f.reject(t, nil, "checksum mismatch", "finish", f.state, "payload", "0.1.0")
+		f.reject(t, nil, "checksum mismatch", "finish", f.state, "app", "0.1.0")
 	})
 }
 
 func TestMacOSResumeRefusesUnknownUploadAndMalformedSubmission(t *testing.T) {
-	for _, failure := range []string{"payload-upload", "payload-malformed-id"} {
+	for _, failure := range []string{"app-upload", "app-malformed-id"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newResumeFixture(t)
-			f.step(t, "prepare", "payload")
-			f.reject(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "reconciliation", "submit", f.state, "payload", "0.1.0")
-			f.reject(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "unknown outcome", "submit", f.state, "payload", "0.1.0")
+			f.step(t, "prepare", "app")
+			f.reject(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "reconciliation", "submit", f.state, "app", "0.1.0")
+			f.reject(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "unknown outcome", "submit", f.state, "app", "0.1.0")
 			if strings.Count(f.recorded(t), "xcrun|notarytool|submit|") != 1 {
 				t.Fatal("unknown upload was resubmitted")
 			}
@@ -713,25 +792,25 @@ func TestMacOSResumeRefusesUnknownUploadAndMalformedSubmission(t *testing.T) {
 	}
 	t.Run("prepared restored without identifier", func(t *testing.T) {
 		f := newResumeFixture(t)
-		f.step(t, "prepare", "payload")
-		f.reject(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "earlier attempt", "submit", f.state, "payload", "0.1.0")
+		f.step(t, "prepare", "app")
+		f.reject(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "earlier attempt", "submit", f.state, "app", "0.1.0")
 		if strings.Contains(f.recorded(t), "xcrun|notarytool|submit|") {
 			t.Fatal("restored prepared bytes were resubmitted")
 		}
 	})
 	t.Run("missing recorded identifier", func(t *testing.T) {
 		f := newResumeFixture(t)
-		f.step(t, "prepare", "payload")
-		f.step(t, "submit", "payload")
-		f.mutate(t, "stages/payload.json", func(value map[string]any) { delete(value, "submission_id") })
-		f.reject(t, nil, "submission ID is missing", "finish", f.state, "payload", "0.1.0")
+		f.step(t, "prepare", "app")
+		f.step(t, "submit", "app")
+		f.mutate(t, "stages/app.json", func(value map[string]any) { delete(value, "submission_id") })
+		f.reject(t, nil, "submission ID is missing", "finish", f.state, "app", "0.1.0")
 	})
 }
 
 func TestMacOSResumeInterruptedUploadPreservesIntentAndReleasesOwnedLock(t *testing.T) {
 	f := newResumeFixture(t)
-	f.step(t, "prepare", "payload")
-	if output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=payload-interrupted"}, "submit", f.state, "payload", "0.1.0"); err == nil {
+	f.step(t, "prepare", "app")
+	if output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=app-interrupted"}, "submit", f.state, "app", "0.1.0"); err == nil {
 		t.Fatalf("interrupted upload unexpectedly succeeded: %s", output)
 	}
 	for _, relative := range []string{".lock", "work"} {
@@ -739,19 +818,19 @@ func TestMacOSResumeInterruptedUploadPreservesIntentAndReleasesOwnedLock(t *test
 			t.Fatalf("interrupted command retained %s: %v", relative, err)
 		}
 	}
-	f.reject(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "unknown outcome", "submit", f.state, "payload", "0.1.0")
+	f.reject(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "unknown outcome", "submit", f.state, "app", "0.1.0")
 	if strings.Count(f.recorded(t), "xcrun|notarytool|submit|") != 1 {
 		t.Fatal("interrupted upload was submitted again")
 	}
 }
 
 func TestMacOSResumeRetainsSanitizedAppleWarningsAndRejectionLogs(t *testing.T) {
-	for _, failure := range []string{"warnings", "payload-rejected", "payload-timeout"} {
+	for _, failure := range []string{"warnings", "app-rejected", "app-timeout"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newResumeFixture(t)
-			f.step(t, "prepare", "payload")
-			f.step(t, "submit", "payload")
-			output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "finish", f.state, "payload", "0.1.0")
+			f.step(t, "prepare", "app")
+			f.step(t, "submit", "app")
+			output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "finish", f.state, "app", "0.1.0")
 			if failure == "warnings" {
 				if err != nil || !strings.Contains(output, "Apple reported issues") {
 					t.Fatalf("accepted warning was not surfaced: %v, %s", err, output)
@@ -759,7 +838,7 @@ func TestMacOSResumeRetainsSanitizedAppleWarningsAndRejectionLogs(t *testing.T) 
 			} else if err == nil {
 				t.Fatalf("pending or rejected submission finished: %s", output)
 			}
-			data, err := os.ReadFile(filepath.Join(f.state, "receipts/payload.log.json"))
+			data, err := os.ReadFile(filepath.Join(f.state, "receipts/app.log.json"))
 			if err != nil || !strings.Contains(string(data), "fixture diagnostic") || strings.Contains(string(data), "privateAuthentication") {
 				t.Fatalf("useful Apple diagnostic was missing or unsanitized: %v, %s", err, data)
 			}
@@ -771,12 +850,12 @@ func TestMacOSResumeRetainsSanitizedAppleWarningsAndRejectionLogs(t *testing.T) 
 }
 
 func TestMacOSResumeRequiresExactAcceptedAppleLog(t *testing.T) {
-	for _, failure := range []string{"payload-rejected", "loghash", "logid", "logstatus", "payload-log"} {
+	for _, failure := range []string{"app-rejected", "loghash", "logid", "logstatus", "app-log"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newResumeFixture(t)
-			f.step(t, "prepare", "payload")
-			f.step(t, "submit", "payload")
-			output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "finish", f.state, "payload", "0.1.0")
+			f.step(t, "prepare", "app")
+			f.step(t, "submit", "app")
+			output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "finish", f.state, "app", "0.1.0")
 			if err == nil {
 				t.Fatalf("unbound or rejected notarization was accepted: %s", output)
 			}
@@ -790,20 +869,20 @@ func TestMacOSResumeRequiresExactAcceptedAppleLog(t *testing.T) {
 func TestMacOSResumeRecoversInterruptedStaplingAndRejectsInvalidState(t *testing.T) {
 	t.Run("stapling interruption", func(t *testing.T) {
 		f := newResumeFixture(t)
-		f.step(t, "prepare", "payload")
-		f.step(t, "submit", "payload")
-		f.reject(t, []string{"SIGNING_TEST_FAILURE=payload-staple"}, "", "finish", f.state, "payload", "0.1.0")
+		f.step(t, "prepare", "app")
+		f.step(t, "submit", "app")
+		f.reject(t, []string{"SIGNING_TEST_FAILURE=app-staple"}, "", "finish", f.state, "app", "0.1.0")
 		// Dirty mutable workspace must never become the source of resumed output.
 		if _, err := os.Stat(filepath.Join(f.state, "work")); !os.IsNotExist(err) {
 			t.Fatalf("failed stage retained mutable workspace: %v", err)
 		}
-		if err := os.MkdirAll(filepath.Join(f.state, "work/payload/source/bin"), 0700); err != nil {
+		if err := os.MkdirAll(filepath.Join(f.state, "work/Agent Queue.app/Contents/MacOS"), 0700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(f.state, "work/payload/source/bin/agent-heavy"), []byte("tampered"), 0700); err != nil {
+		if err := os.WriteFile(filepath.Join(f.state, "work/Agent Queue.app/Contents/MacOS/agent-heavy"), []byte("tampered"), 0700); err != nil {
 			t.Fatal(err)
 		}
-		f.step(t, "finish", "payload", "GITHUB_RUN_ATTEMPT=2", "APPLE_SIGNING_IDENTITY=", "NOTARY_KEYCHAIN_PROFILE=")
+		f.step(t, "finish", "app", "GITHUB_RUN_ATTEMPT=2", "APPLE_SIGNING_IDENTITY=", "NOTARY_KEYCHAIN_PROFILE=")
 		if strings.Count(f.recorded(t), "xcrun|notarytool|wait|") != 1 || strings.Count(f.recorded(t), "xcrun|notarytool|submit|") != 1 {
 			t.Fatal("accepted stage was resubmitted or waited again after a stapling interruption")
 		}
@@ -820,7 +899,7 @@ func TestMacOSResumeRecoversInterruptedStaplingAndRejectsInvalidState(t *testing
 	})
 	t.Run("stage order", func(t *testing.T) {
 		f := newResumeFixture(t)
-		f.reject(t, nil, "previous stage", "prepare", f.state, "installer", "0.1.0")
+		f.reject(t, nil, "previous stage", "prepare", f.state, "dmg", "0.1.0")
 	})
 	t.Run("malformed metadata", func(t *testing.T) {
 		f := newResumeFixture(t)
@@ -831,11 +910,11 @@ func TestMacOSResumeRecoversInterruptedStaplingAndRejectsInvalidState(t *testing
 	})
 	t.Run("corrupt acceptance receipt", func(t *testing.T) {
 		f := newResumeFixture(t)
-		f.step(t, "prepare", "payload")
-		f.step(t, "submit", "payload")
-		f.step(t, "finish", "payload")
-		f.mutate(t, "receipts/payload.json", func(value map[string]any) { value["sha256"] = strings.Repeat("0", 64) })
-		f.reject(t, nil, "receipt does not match", "prepare", f.state, "installer", "0.1.0")
+		f.step(t, "prepare", "app")
+		f.step(t, "submit", "app")
+		f.step(t, "finish", "app")
+		f.mutate(t, "receipts/app.json", func(value map[string]any) { value["sha256"] = strings.Repeat("0", 64) })
+		f.reject(t, nil, "receipt does not match", "prepare", f.state, "dmg", "0.1.0")
 	})
 }
 
@@ -846,7 +925,7 @@ const resumeTestTools = `set -euo pipefail
 record_event() { printf '%s' "${0##*/}" >> "$SIGNING_TEST_EVENTS"; printf '|%s' "$@" >> "$SIGNING_TEST_EVENTS"; printf '\n' >> "$SIGNING_TEST_EVENTS"; }
 if [[ ${0##*/} == ditto ]]; then
   record_event "$@"
-  if [[ $1 == -x && ${SIGNING_TEST_FAILURE:-} == payload-restore ]]; then exit 31; fi
+  if [[ $1 == -x && ${SIGNING_TEST_FAILURE:-} == app-restore ]]; then exit 31; fi
   if [[ $1 == -x ]]; then mkdir -p "$4"; tar -xf "$3" -C "$4";
   elif [[ $1 == -c ]]; then
     shift $(($# - 2)); tar -cf "$2" -C "$(dirname "$1")" "$(basename "$1")"
@@ -855,7 +934,7 @@ if [[ ${0##*/} == ditto ]]; then
 fi
 if [[ ${0##*/} == xcrun && $1:$2 == notarytool:submit ]]; then
   record_event "$@"
-  case "$3" in */Agent-Job-Queue-Payload-*-universal.zip) number=1; stage=payload;; */Agent-Job-Queue-Installer-*-universal.zip) number=2; stage=installer;; *.dmg) number=3; stage=dmg;; *) exit 92;; esac
+  case "$3" in */Agent-Queue-*-universal.zip) number=1; stage=app;; *.dmg) number=2; stage=dmg;; *) exit 92;; esac
   [[ ${SIGNING_TEST_FAILURE:-} != "$stage-upload" ]] || exit 18
   if [[ ${SIGNING_TEST_FAILURE:-} == "$stage-interrupted" ]]; then kill -TERM "$PPID"; exit 143; fi
   shasum -a 256 "$3" | awk '{print $1}' > "$SIGNING_TEST_ROOT/hash.$number"
@@ -864,7 +943,7 @@ if [[ ${0##*/} == xcrun && $1:$2 == notarytool:submit ]]; then
 fi
 if [[ ${0##*/} == xcrun && $1:$2 == notarytool:log ]]; then
   record_event "$@"
-  case "$3" in *001) number=1; stage=payload;; *002) number=2; stage=installer;; *003) number=3; stage=dmg;; *) exit 92;; esac
+  case "$3" in *001) number=1; stage=app;; *002) number=2; stage=dmg;; *) exit 92;; esac
   [[ ${SIGNING_TEST_FAILURE:-} != "$stage-log" ]] || exit 19
   hash=$(cat "$SIGNING_TEST_ROOT/hash.$number"); id=$3; status=Accepted
   [[ ${SIGNING_TEST_FAILURE:-} != loghash ]] || hash=0000000000000000000000000000000000000000000000000000000000000000
@@ -872,7 +951,7 @@ if [[ ${0##*/} == xcrun && $1:$2 == notarytool:log ]]; then
   [[ ${SIGNING_TEST_FAILURE:-} != logstatus ]] || status=Invalid
   issues='[]'
   case "${SIGNING_TEST_FAILURE:-}" in
-    warnings|payload-rejected|payload-timeout) issues='[{"severity":"warning","code":123,"message":"fixture diagnostic","path":"payload/Agent Queue.app","privateAuthentication":"must never persist"}]' ;;
+    warnings|app-rejected|app-timeout) issues='[{"severity":"warning","code":123,"message":"fixture diagnostic","path":"Agent Queue.app","privateAuthentication":"must never persist"}]' ;;
   esac
   printf '{"jobId":"%s","sha256":"%s","status":"%s","issues":%s,"statusSummary":"fixture summary","privateAuthentication":"must never persist"}\n' "$id" "$hash" "$status" "$issues" > "${!#}"
   exit
@@ -887,19 +966,19 @@ func TestMacOSResumeReusesSignedBytesAndSubmissionAcrossDistributionRuns(t *test
 	identity := distributionResumeIdentity()
 	first := append(append([]string{}, identity...), "GITHUB_RUN_ID=5555", "GITHUB_RUN_NUMBER=100", "GITHUB_SHA="+strings.Repeat("b", 40))
 	f := newResumeFixture(t, first...)
-	f.step(t, "prepare", "payload")
-	original, err := os.ReadFile(filepath.Join(f.state, "archives/payload.zip"))
+	f.step(t, "prepare", "app")
+	original, err := os.ReadFile(filepath.Join(f.state, "archives/app.zip"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.step(t, "submit", "payload")
-	f.reject(t, []string{"SIGNING_TEST_FAILURE=payload-timeout"}, "preserved", "finish", f.state, "payload", "0.1.0")
+	f.step(t, "submit", "app")
+	f.reject(t, []string{"SIGNING_TEST_FAILURE=app-timeout"}, "preserved", "finish", f.state, "app", "0.1.0")
 	second := []string{"GITHUB_RUN_ID=6666", "GITHUB_RUN_NUMBER=101", "GITHUB_SHA=" + strings.Repeat("c", 40), "GITHUB_RUN_ATTEMPT=1"}
 	f.command(t, second, "verify-state", f.state, "0.1.0")
 	for _, operation := range []string{"prepare", "submit", "finish"} {
-		f.step(t, operation, "payload", second...)
+		f.step(t, operation, "app", second...)
 	}
-	after, err := os.ReadFile(filepath.Join(f.state, "archives/payload.zip"))
+	after, err := os.ReadFile(filepath.Join(f.state, "archives/app.zip"))
 	if err != nil || string(original) != string(after) {
 		t.Fatal("new distribution execution changed original signed bytes")
 	}
@@ -919,11 +998,11 @@ func TestMacOSResumeUnknownPreparedCustodyAcrossExecutions(t *testing.T) {
 		t.Run(fmt.Sprint("legacy=", legacy), func(t *testing.T) {
 			identity := distributionResumeIdentity()
 			f := newResumeFixture(t, identity...)
-			f.step(t, "prepare", "payload")
+			f.step(t, "prepare", "app")
 			if legacy {
-				f.mutate(t, "stages/payload.json", func(v map[string]any) { delete(v, "prepared_run_id") })
+				f.mutate(t, "stages/app.json", func(v map[string]any) { delete(v, "prepared_run_id") })
 			}
-			f.reject(t, []string{"GITHUB_RUN_ID=5555", "GITHUB_RUN_NUMBER=100", "GITHUB_SHA=" + strings.Repeat("b", 40), "GITHUB_RUN_ATTEMPT=1"}, "Upload outcome is unknown", "submit", f.state, "payload", "0.1.0")
+			f.reject(t, []string{"GITHUB_RUN_ID=5555", "GITHUB_RUN_NUMBER=100", "GITHUB_SHA=" + strings.Repeat("b", 40), "GITHUB_RUN_ATTEMPT=1"}, "Upload outcome is unknown", "submit", f.state, "app", "0.1.0")
 			if strings.Contains(f.recorded(t), "xcrun|notarytool|submit|") {
 				t.Fatal("same numeric attempt in another execution resubmitted unknown signed bytes")
 			}
@@ -951,28 +1030,5 @@ func TestMacOSResumeBindsExactOriginalArtifactAndTeam(t *testing.T) {
 				t.Fatal("mismatched state reached signing/provider")
 			}
 		})
-	}
-}
-
-func TestMacOSResumeManagedHelpersRemainInsidePayloadCheckpoint(t *testing.T) {
-	f := newResumeFixture(t)
-	f.embedManagedApp(t)
-	if err := os.RemoveAll(f.state); err != nil {
-		t.Fatal(err)
-	}
-	f.command(t, nil, "init", f.installer, f.state, "0.1.0")
-	for _, stage := range []string{"payload", "installer", "dmg"} {
-		for _, operation := range []string{"prepare", "submit", "finish"} {
-			f.step(t, operation, stage)
-		}
-	}
-	record := f.recorded(t)
-	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		if !strings.Contains(record, "Agent Queue.app/Contents/MacOS/"+name) {
-			t.Fatalf("resumed release omitted canonical helper: %s", record)
-		}
-	}
-	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n") {
-		t.Fatal("managed resume lost the automatic installer disk image layout")
 	}
 }

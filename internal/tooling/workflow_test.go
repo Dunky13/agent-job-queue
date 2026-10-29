@@ -215,7 +215,8 @@ func TestNotarizationUsesTrustedAttemptScopedArtifacts(t *testing.T) {
 			t.Fatal("reruns must preserve previous final artifacts with unique attempt-scoped names")
 		}
 	}
-	if !reflect.DeepEqual(stages, []string{"payload", "installer", "dmg"}) || !reflect.DeepEqual(slots, []string{"01", "02", "03", "04", "05", "06", "07", "08", "09"}) {
+	// Slots 04 to 06 belonged to the removed enclosing installer stage.
+	if !reflect.DeepEqual(stages, []string{"app", "dmg"}) || !reflect.DeepEqual(slots, []string{"01", "02", "03", "07", "08", "09"}) {
 		t.Fatalf("incorrect checkpoint ordering: stages=%v slots=%v", stages, slots)
 	}
 	for _, job := range []string{"notarized-tests", "publish", "homebrew-sync"} {
@@ -318,8 +319,11 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 			t.Errorf("CI still performs distribution: %s", name)
 		}
 	}
-	if _, ok := ci.Jobs["installer"]; !ok {
-		t.Fatal("CI lost installer validation")
+	if _, ok := ci.Jobs["app"]; !ok {
+		t.Fatal("CI lost app validation")
+	}
+	if _, ok := ci.Jobs["installer"]; ok {
+		t.Fatal("CI still builds the removed installer")
 	}
 	if dist.Permissions["contents"] != "read" || dist.Permissions["actions"] != "read" || dist.Concurrency.Cancel != false || !strings.Contains(dist.Concurrency.Group, "inputs.build_run_id || github.event.workflow_run.id") {
 		t.Fatal("distribution lost read-only default or source-build serialization")
@@ -344,7 +348,7 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 			t.Errorf("%s can publish before acceptance", name)
 		}
 		for _, s := range j.Steps {
-			if strings.Contains(s.Run, "build-installer") || strings.Contains(s.Run, "cat VERSION") {
+			if strings.Contains(s.Run, "build-app") || strings.Contains(s.Run, "cat VERSION") {
 				t.Errorf("%s rebuilds source or uses automation VERSION", name)
 			}
 			if strings.HasPrefix(s.Uses, "actions/checkout@") {

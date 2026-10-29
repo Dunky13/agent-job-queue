@@ -1,5 +1,5 @@
 #!/bin/bash
-# Sign and package an already built installer without running its payload.
+# Sign and package an already built app without running it.
 # Credentials stay in the Keychain or an external API key file, never the app.
 
 macos_signing_error() {
@@ -16,9 +16,8 @@ macos_notary_archive_name() {
     version="$version-build-$BUILD_RUN_NUMBER-${BUILD_SHA:0:7}"
   fi
   case "$stage" in
-    payload) printf 'Agent-Job-Queue-Payload-%s-universal.zip\n' "$version" ;;
-    installer) printf 'Agent-Job-Queue-Installer-%s-universal.zip\n' "$version" ;;
-    dmg) printf 'Agent-Job-Queue-Installer-%s-universal.dmg\n' "$version" ;;
+    app) printf 'Agent-Queue-%s-universal.zip\n' "$version" ;;
+    dmg) printf 'Agent-Queue-%s-universal.dmg\n' "$version" ;;
     *) macos_signing_error 'Unknown notarization stage.'; return 1 ;;
   esac
 }
@@ -150,24 +149,24 @@ macos_signing_canonical_path() {
 }
 
 macos_signing_validate_paths() {
-  local installer destination logs name private_path
-  installer=$(macos_signing_canonical_path "$1") || return
+  local app destination logs name private_path
+  app=$(macos_signing_canonical_path "$1") || return
   destination=$(macos_signing_canonical_path "$2") || return
   logs=$(macos_signing_canonical_path "${NOTARY_LOG_DIR:-"${2%/}.notarization"}") || return
   for name in APPLE_SIGNING_KEYCHAIN NOTARY_KEYCHAIN NOTARY_KEY_FILE; do
     [[ -n ${!name:-} ]] || continue
     private_path=$(macos_signing_canonical_path "${!name}") || return
     case "$private_path/" in
-      "$installer/"*|"$destination/"*)
-        macos_signing_error "$name must be outside the prepared installer and artifact destination."; return 1 ;;
+      "$app/"*|"$destination/"*)
+        macos_signing_error "$name must be outside the prepared app and artifact destination."; return 1 ;;
     esac
   done
   case "$destination/" in
-    "$installer/"*) macos_signing_error 'The artifact destination must be outside the prepared installer.'; return 1 ;;
+    "$app/"*) macos_signing_error 'The artifact destination must be outside the prepared app.'; return 1 ;;
   esac
   case "$logs/" in
-    "$installer/"*|"$destination/"*)
-      macos_signing_error 'NOTARY_LOG_DIR must be outside the prepared installer and artifact destination.'; return 1 ;;
+    "$app/"*|"$destination/"*)
+      macos_signing_error 'NOTARY_LOG_DIR must be outside the prepared app and artifact destination.'; return 1 ;;
   esac
   MACOS_CANONICAL_LOG_ROOT=$logs
 }
@@ -214,7 +213,7 @@ macos_verify_code() {
 macos_sign_code() {
   local path=$1 identifier=${2:-} operation=${3:-code}
   case "$operation" in
-    code|agent-heavy|agent-remote|app-agent-heavy|app-agent-remote|app|installer) ;;
+    code|app-agent-heavy|app-agent-remote|app) ;;
     *) macos_signing_error 'Unknown signing operation.'; return 1 ;;
   esac
   local arguments=(--force --sign -)
@@ -380,22 +379,19 @@ macos_assess_app() {
   spctl --assess --type execute --verbose=2 "$1"
 }
 
-macos_verify_installer_code() {
-  local installer=$1 payload="$1/Contents/Resources/payload" name
-  macos_app_payload_mode "$payload/Agent Queue.app" || return
+macos_verify_app_code() {
+  local app=$1 name
+  macos_app_payload_mode "$app" || return
+  [[ $MACOS_APP_MANAGED == 1 ]] || { macos_signing_error 'The app must own its background services.'; return 1; }
   for name in agent-heavy agent-remote; do
-    macos_verify_code "$payload/source/bin/$name" || return
-    if [[ $MACOS_APP_EMBEDDED == 1 ]]; then
-      macos_verify_code "$MACOS_APP_HELPERS/$name" || return
-    fi
+    macos_verify_code "$MACOS_APP_HELPERS/$name" || return
   done
-  macos_verify_code "$payload/Agent Queue.app" || return
-  macos_verify_code "$installer" || return
-  codesign --verify --strict --deep "$installer"
+  macos_verify_code "$app" || return
+  codesign --verify --strict --deep "$app"
 }
 
-# Old retained build artifacts lack self-contained menu apps. Keep their custom
-# installer packaging intact when newer distribution automation replays them.
+# Validate the self-contained layout: helpers in MacOS, bundle-owned agents in
+# Library/LaunchAgents and support metadata without duplicate helper binaries.
 macos_app_payload_mode() {
   local app=$1 payload="$1/Contents/Resources/payload" name marker service helper command definition
   MACOS_APP_EMBEDDED=0
@@ -466,22 +462,22 @@ macos_sign_app_helpers() {
   done
 }
 
+# Finder installs by dragging the app onto the Applications link. The app owns
+# setup on first launch; nothing on the image runs code or copies files.
 macos_disk_image_source() {
-  local installer=$1 app="$1/Contents/Resources/payload/Agent Queue.app"
-  MACOS_DISK_IMAGE_SOURCE=$installer
-  macos_app_payload_mode "$app" || return
-  # Keep every setup operation inside the signed installer. The runtime app
-  # opens only after installation and readiness succeed, and never self-installs
-  # during ordinary startup. The DMG and ZIP carry the same complete installer.
+  local app=$1 image=$2
+  [[ ! -e $image && ! -L $image ]] || { macos_signing_error 'The disk image source must be a fresh directory.'; return 1; }
+  mkdir "$image" || return
+  ditto "$app" "$image/Agent Queue.app" || return
+  ln -s /Applications "$image/Applications" || return
+  MACOS_DISK_IMAGE_SOURCE=$image
 }
 
-macos_verify_installer_distribution() {
-  local installer=$1 app="$1/Contents/Resources/payload/Agent Queue.app"
-  macos_verify_installer_code "$installer" || return
+macos_verify_app_distribution() {
+  local app=$1
+  macos_verify_app_code "$app" || return
   macos_validate_ticket "$app" || return
-  macos_validate_ticket "$installer" || return
-  macos_assess_app "$app" || return
-  macos_assess_app "$installer"
+  macos_assess_app "$app"
 }
 
 macos_verify_disk_image_code() {
@@ -499,59 +495,42 @@ macos_verify_disk_image() {
   hdiutil verify "$image"
 }
 
-macos_package_installer() (
+macos_package_app() (
   # The packaging worker owns only this temporary directory. Notary diagnostics
   # live elsewhere and survive failures, including Apple's first-time delays.
-  local installer=$1 destination=$2 version=$3 build_dmg=${BUILD_DMG:-1}
-  local payload="$1/Contents/Resources/payload" app="$1/Contents/Resources/payload/Agent Queue.app"
-  local version_pattern='^[A-Za-z0-9][A-Za-z0-9.+_-]*$' staging base name notary_archive
+  local app=$1 destination=$2 version=$3 build_dmg=${BUILD_DMG:-1}
+  local version_pattern='^[A-Za-z0-9][A-Za-z0-9.+_-]*$' staging base notary_archive
   [[ $version =~ $version_pattern && ( $build_dmg == 0 || $build_dmg == 1 ) ]] || {
     macos_signing_error 'Provide a filename-safe version and BUILD_DMG=0 or 1.'; return 1;
   }
-  [[ -d $installer && -d $app && -f $payload/source/bin/agent-heavy && -f $payload/source/bin/agent-remote ]] || {
-    macos_signing_error 'The prepared installer and its complete payload are required.'; return 1;
+  [[ -d $app && -f $app/Contents/MacOS/agent-heavy && -f $app/Contents/MacOS/agent-remote ]] || {
+    macos_signing_error 'The prepared app and its bundled helpers are required.'; return 1;
   }
   if [[ $SIGNING_MODE == developer-id ]]; then
-    macos_signing_validate_paths "$installer" "$destination" || return
+    macos_signing_validate_paths "$app" "$destination" || return
   fi
   staging=$(mktemp -d) || return
   trap 'rm -rf "$staging"' EXIT
-  base="Agent-Job-Queue-Installer-$version-universal"
+  base="Agent-Queue-$version-universal"
   if [[ $SIGNING_MODE == developer-id ]]; then
     macos_signing_prepare_logs "$destination" || return
   fi
-  for name in agent-heavy agent-remote; do
-    macos_sign_code "$payload/source/bin/$name" "io.went.agent-queue.$name" "$name" || return
-  done
   macos_sign_app_helpers "$app" || return
   macos_sign_code "$app" '' app || return
   if [[ $SIGNING_MODE == developer-id ]]; then
-    # Apple's custom installer workflow requires the installed product to be
-    # notarized first. Bare helper binaries receive tickets but cannot be stapled.
-    notary_archive="$staging/$(macos_notary_archive_name payload "$version")"
-    ditto -c -k --sequesterRsrc --keepParent "$payload" "$notary_archive" || return
-    macos_notarize payload "$notary_archive" || return
+    notary_archive="$staging/$(macos_notary_archive_name app "$version")"
+    ditto -c -k --sequesterRsrc --keepParent "$app" "$notary_archive" || return
+    macos_notarize app "$notary_archive" || return
+    rm "$notary_archive" || return
     macos_staple "$app" || return
-    macos_verify_code "$app" || return
     macos_assess_app "$app" || return
   fi
-  # The payload is sealed as installer resources. Do not staple or otherwise
-  # modify its contents after signing the parent installer.
-  macos_sign_code "$installer" '' installer || return
-  if [[ $SIGNING_MODE == developer-id ]]; then
-    notary_archive="$staging/$(macos_notary_archive_name installer "$version")"
-    ditto -c -k --sequesterRsrc --keepParent "$installer" "$notary_archive" || return
-    macos_notarize installer "$notary_archive" || return
-    rm "$notary_archive" || return
-    macos_staple "$installer" || return
-    macos_assess_app "$installer" || return
-  fi
-  macos_verify_installer_code "$installer" || return
-  ditto -c -k --sequesterRsrc --keepParent "$installer" "$staging/$base.zip" || return
+  macos_verify_app_code "$app" || return
+  ditto -c -k --sequesterRsrc --keepParent "$app" "$staging/$base.zip" || return
   if [[ $build_dmg == 1 ]]; then
-    macos_disk_image_source "$installer" "$staging/image" || return
+    macos_disk_image_source "$app" "$staging/image" || return
     sync || return
-    hdiutil create -verbose -nospotlight -fs HFS+ -volname 'Agent Job Queue' \
+    hdiutil create -verbose -nospotlight -fs HFS+ -volname 'Agent Queue' \
       -srcfolder "$MACOS_DISK_IMAGE_SOURCE" -ov -format UDZO "$staging/$base.dmg" || return
     if [[ $SIGNING_MODE == developer-id ]]; then
       local image_signing_arguments=(--force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --identifier io.went.agent-queue.disk-image)
@@ -583,20 +562,20 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   set -euo pipefail
   case "${1:-}" in
     package)
-      [[ $# == 4 ]] || { printf 'Usage: macos-signing.sh package INSTALLER_APP DESTINATION VERSION\n' >&2; exit 2; }
+      [[ $# == 4 ]] || { printf 'Usage: macos-signing.sh package APP DESTINATION VERSION\n' >&2; exit 2; }
       macos_signing_configure
-      macos_package_installer "$2" "$3" "$4"
+      macos_package_app "$2" "$3" "$4"
       ;;
-    verify-installer)
-      [[ $# == 3 ]] || { printf 'Usage: macos-signing.sh verify-installer INSTALLER_APP EXPECTED_TEAM\n' >&2; exit 2; }
+    verify-app)
+      [[ $# == 3 ]] || { printf 'Usage: macos-signing.sh verify-app APP EXPECTED_TEAM\n' >&2; exit 2; }
       macos_signing_verification_configure "$3"
-      macos_verify_installer_distribution "$2"
+      macos_verify_app_distribution "$2"
       ;;
     verify-dmg)
       [[ $# == 3 ]] || { printf 'Usage: macos-signing.sh verify-dmg DISK_IMAGE EXPECTED_TEAM\n' >&2; exit 2; }
       macos_signing_verification_configure "$3"
       macos_verify_disk_image "$2"
       ;;
-    *) printf 'Usage: macos-signing.sh {package|verify-installer|verify-dmg} ...\n' >&2; exit 2 ;;
+    *) printf 'Usage: macos-signing.sh {package|verify-app|verify-dmg} ...\n' >&2; exit 2 ;;
   esac
 fi

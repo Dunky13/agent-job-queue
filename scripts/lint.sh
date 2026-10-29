@@ -6,7 +6,7 @@ unformatted=$(gofmt -l cmd internal remote/static/embed.go packaging/homebrew/re
 [[ -z "$unformatted" ]] || { printf 'Go files need formatting:\n%s\n' "$unformatted" >&2; exit 1; }
 go vet -p 2 ./cmd/... ./internal/... ./packaging/homebrew ./remote/static
 npm run lint:web
-shellcheck bin/agent-heavy bin/agent-remote packaging/links/agent-heavy packaging/links/agent-remote .githooks/pre-push
+shellcheck bin/agent-heavy bin/agent-remote .githooks/pre-push
 while IFS= read -r -d '' path; do
   [[ -f "$path" ]] || continue
   case "$(head -n 1 "$path")" in

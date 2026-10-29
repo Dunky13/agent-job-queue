@@ -44,28 +44,28 @@ number=$(jq -r '.run_number' "$temporary/run.json")
 attempt=$(jq -r '.run_attempt' "$temporary/run.json")
 distribution_inventory "repos/$GITHUB_REPOSITORY/actions/runs/$source_id/artifacts" artifacts "$temporary/artifacts"
 jq -s -e --arg id "$source_id" --arg sha "$sha" --argjson attempt "$attempt" '
-  [.[] | select(.name|startswith("Agent-Job-Queue-Installer-"))] |
+  [.[] | select(.name|startswith("Agent-Queue-App-"))] |
   ([.[].name]|length) == ([.[].name]|unique|length) and all(.[];
-    (.name|test("^Agent-Job-Queue-Installer-[1-9][0-9]{0,14}$")) and
+    (.name|test("^Agent-Queue-App-[1-9][0-9]{0,14}$")) and
     (.name|split("-")|last|tonumber) <= $attempt and
     (.workflow_run.id|tostring) == $id and .workflow_run.head_branch == "main" and .workflow_run.head_sha == $sha)
 ' "$temporary/artifacts" >/dev/null || distribution_error 'Mixed or malformed source artifact provenance.'
-selected=$(jq -s -c '[.[] | select(.name|startswith("Agent-Job-Queue-Installer-")) |
+selected=$(jq -s -c '[.[] | select(.name|startswith("Agent-Queue-App-")) |
   . + {attempt:(.name|split("-")|last|tonumber)}] | sort_by(.attempt) | last // empty' "$temporary/artifacts")
-[[ -n $selected ]] || distribution_error 'Source installer artifact is missing.'
-[[ $(jq -r '.expired' <<< "$selected") == false ]] || distribution_error 'Newest source installer artifact expired.'
+[[ -n $selected ]] || distribution_error 'Source app artifact is missing.'
+[[ $(jq -r '.expired' <<< "$selected") == false ]] || distribution_error 'Newest source app artifact expired.'
 artifact_id=$(jq -r '.id' <<< "$selected")
 artifact_digest=$(jq -r '.digest' <<< "$selected")
 artifact_attempt=$(jq -r '.attempt' <<< "$selected")
 [[ $artifact_digest =~ ^sha256:[a-f0-9]{64}$ ]] || distribution_error 'Source artifact requires a GitHub SHA-256 digest.'
-# The retained installer must have passed in its producing attempt. Failed-job
+# The retained app must have passed in its producing attempt. Failed-job
 # retries can repair other validations without rebuilding those original bytes.
 distribution_inventory "repos/$GITHUB_REPOSITORY/actions/runs/$source_id/attempts/$artifact_attempt/jobs" jobs "$temporary/jobs"
 jq -s -e --arg id "$source_id" --arg sha "$sha" --argjson attempt "$artifact_attempt" '
   all(.[]; (.run_id|tostring) == $id and .head_sha == $sha and .run_attempt == $attempt) and
-  ([.[] | select(.name == "Universal installer")]|length) == 1 and
-  all(.[] | select(.name == "Universal installer"); .conclusion == "success")
-' "$temporary/jobs" >/dev/null || distribution_error 'Source installer attempt did not pass installer validation.'
+  ([.[] | select(.name == "Universal app")]|length) == 1 and
+  all(.[] | select(.name == "Universal app"); .conclusion == "success")
+' "$temporary/jobs" >/dev/null || distribution_error 'Source app attempt did not pass app validation.'
 # filter=latest returns each job effective for this run, including successful
 # jobs retained from earlier attempts. It does not mean the artifact's attempt.
 distribution_inventory "repos/$GITHUB_REPOSITORY/actions/runs/$source_id/jobs?filter=latest" jobs "$temporary/effective-jobs"

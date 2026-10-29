@@ -17,84 +17,39 @@ import (
 	"howett.net/plist"
 )
 
-// VerifyInstaller checks the outer control payload and the app-owned helpers.
-// Only retained legacy installers may omit the app's embedded support payload.
-func VerifyInstaller(installer string) error {
-	if installer == "" {
-		return errors.New("Installer path is required")
-	}
-	payload := filepath.Join(installer, "Contents/Resources/payload")
-	raw, err := verifySource(filepath.Join(payload, "source"))
-	if err != nil {
-		return err
-	}
-	if err = verifyNativeBundle(installer, "Installer", "io.went.agent-queue.installer", raw); err != nil {
-		return err
-	}
-	if err = verifyApp(filepath.Join(payload, "Agent Queue.app"), raw, false); err != nil {
-		return err
-	}
-	if err = verifyPayloadTree(payload, false); err != nil {
-		return err
-	}
-	if err = verifyCodeSignature(installer); err != nil {
-		return err
-	}
-	fmt.Println("Universal native and Go payload, build identities, code signatures, licenses and private-state exclusion verified.")
-	return nil
-}
-
-// VerifyApp validates a drag-to-Applications app without executing its helpers or
-// touching the installed queue. A standalone app must contain its source payload.
+// VerifyApp validates the drag-to-Applications app without executing its helpers
+// or touching the installed queue. Older installer layouts are rejected: they
+// lack the bundle-owned services and embedded support payload checked here.
 func VerifyApp(app string) error {
 	if app == "" {
 		return errors.New("App path is required")
 	}
-	if err := verifyApp(app, nil, true); err != nil {
-		return err
-	}
-	fmt.Println("Standalone universal app, embedded Go payload, build identities, code signatures, licenses and private-state exclusion verified.")
-	return nil
-}
-
-func verifyApp(app string, expected []byte, requirePayload bool) error {
-	if err := verifyPayloadTree(app, true); err != nil {
+	if err := verifyPayloadTree(app); err != nil {
 		return err
 	}
 	managed, err := managedApp(app)
 	if err != nil {
 		return err
 	}
-	payload := filepath.Join(app, "Contents/Resources/payload")
-	_, err = os.Lstat(payload)
-	switch {
-	case errors.Is(err, os.ErrNotExist) && !requirePayload && !managed:
-		// Old retained installers predate the self-contained app. A present but
-		// partial payload must never take this compatibility path.
-	case err != nil:
-		return fmt.Errorf("App embedded payload is missing: %w", err)
-	default:
-		raw, err := verifySourceLayout(filepath.Join(payload, "source"), app, managed)
-		if err != nil {
-			return err
-		}
-		if expected != nil && !bytes.Equal(expected, raw) {
-			return errors.New("Installer and embedded app source build identities differ")
-		}
-		expected = raw
+	if !managed {
+		return errors.New("App does not own its background services; installer-era layouts are not supported")
 	}
-	if err := verifyNativeBundle(app, "AgentQueue", "io.went.agent-queue", expected); err != nil {
+	raw, err := verifySourceLayout(filepath.Join(app, "Contents/Resources/payload/source"), app)
+	if err != nil {
 		return err
 	}
-	return verifyCodeSignature(app)
+	if err := verifyNativeBundle(app, "AgentQueue", "io.went.agent-queue", raw); err != nil {
+		return err
+	}
+	if err := verifyCodeSignature(app); err != nil {
+		return err
+	}
+	fmt.Println("Standalone universal app, embedded Go payload, build identities, code signatures, licenses and private-state exclusion verified.")
+	return nil
 }
 
-func verifySource(source string) ([]byte, error) {
-	return verifySourceLayout(source, "", false)
-}
-
-func verifySourceLayout(source, app string, managed bool) ([]byte, error) {
-	if err := verifyPayloadTree(source, true); err != nil {
+func verifySourceLayout(source, app string) ([]byte, error) {
+	if err := verifyPayloadTree(source); err != nil {
 		return nil, err
 	}
 	raw, err := os.ReadFile(filepath.Join(source, "build-info.json"))
@@ -106,32 +61,16 @@ func verifySourceLayout(source, app string, managed bool) ([]byte, error) {
 		return nil, err
 	}
 	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		binary := filepath.Join(source, "bin", name)
-		if managed {
-			binary = filepath.Join(app, "Contents/MacOS", name)
-		}
+		binary := filepath.Join(app, "Contents/MacOS", name)
 		if err := universalExecutable(binary); err != nil {
 			return nil, err
 		}
 		if err := verifyCodeSignature(binary); err != nil {
 			return nil, err
 		}
-		wrapperPath := filepath.Join(source, "links", name)
-		if err := requiredPayloadFile(wrapperPath, true); err != nil {
-			return nil, err
-		}
-		wrapper, err := os.ReadFile(wrapperPath)
-		if err != nil {
-			return nil, err
-		}
-		legacy := strings.Contains(string(wrapper), "/.local/share/agent-heavy/bin/"+name)
-		current := strings.Contains(string(wrapper), "/.local/bin/"+name)
-		if !current && (managed || !legacy) {
-			return nil, fmt.Errorf("Cask wrapper does not use the stable backend: %s", name)
-		}
 	}
-	for _, required := range []string{"scripts/install-user.sh", "licenses/Go-LICENSE", "LICENSE", "README.md", "THIRD-PARTY-NOTICES.md", "VERSION"} {
-		if err := requiredPayloadFile(filepath.Join(source, required), required == "scripts/install-user.sh"); err != nil {
+	for _, required := range []string{"licenses/Go-LICENSE", "LICENSE", "README.md", "THIRD-PARTY-NOTICES.md", "VERSION"} {
+		if err := requiredPayloadFile(filepath.Join(source, required), false); err != nil {
 			return nil, err
 		}
 	}
@@ -142,26 +81,24 @@ func verifySourceLayout(source, app string, managed bool) ([]byte, error) {
 	if strings.TrimSpace(string(version)) != identity.Version {
 		return nil, errors.New("Payload VERSION differs from its build identity")
 	}
-	if managed {
-		if _, err := os.Lstat(filepath.Join(source, "bin")); !errors.Is(err, os.ErrNotExist) {
-			return nil, errors.New("Managed app must not embed source/bin")
-		}
-		if err := verifyManagedAgents(app); err != nil {
-			return nil, err
-		}
-		// Reuse the installer's no-follow ownership and permission boundary.
-		// macOS temporary-directory ancestors may use their /var aliases.
-		canonical, err := filepath.EvalSymlinks(app)
-		if err != nil {
-			return nil, err
-		}
-		canonical, err = filepath.Abs(canonical)
-		if err != nil {
-			return nil, err
-		}
-		if err := appservices.ValidateBundle(canonical); err != nil {
-			return nil, err
-		}
+	if _, err := os.Lstat(filepath.Join(source, "bin")); !errors.Is(err, os.ErrNotExist) {
+		return nil, errors.New("App must not embed source/bin")
+	}
+	if err := verifyManagedAgents(app); err != nil {
+		return nil, err
+	}
+	// Reuse the runtime's no-follow ownership and permission boundary.
+	// macOS temporary-directory ancestors may use their /var aliases.
+	canonical, err := filepath.EvalSymlinks(app)
+	if err != nil {
+		return nil, err
+	}
+	canonical, err = filepath.Abs(canonical)
+	if err != nil {
+		return nil, err
+	}
+	if err := appservices.ValidateBundle(canonical); err != nil {
+		return nil, err
 	}
 	return raw, nil
 }
@@ -244,17 +181,12 @@ func verifyNativeBundle(bundle, executable, identifier string, raw []byte) error
 	if info["LSMinimumSystemVersion"] != "15.0" || info["CFBundleIdentifier"] != identifier || info["CFBundleExecutable"] != executable || info["CFBundleShortVersionString"] != identity.Version || info["CFBundleVersion"] != build {
 		return fmt.Errorf("Native bundle metadata differs from the payload: %s", executable)
 	}
-	if identifier == "io.went.agent-queue" && info["AgentQueueEmbeddedPayload"] == true {
-		if info, err := os.Lstat(filepath.Join(bundle, "Contents/Resources/payload/source")); err != nil || !info.IsDir() {
-			return errors.New("App declares an embedded setup payload but it is missing")
-		}
-	}
 	metadata, err := os.ReadFile(filepath.Join(bundle, "Contents/Resources/build-info.json"))
 	if err != nil {
 		return err
 	}
 	if !bytes.Equal(raw, metadata) {
-		return errors.New("Installer, support and app build identities differ")
+		return errors.New("Support and app build identities differ")
 	}
 	return universalExecutable(filepath.Join(bundle, "Contents/MacOS", executable))
 }
@@ -270,7 +202,7 @@ func requiredPayloadFile(path string, executable bool) error {
 	return nil
 }
 
-func verifyPayloadTree(root string, rejectApps bool) error {
+func verifyPayloadTree(root string) error {
 	info, err := os.Lstat(root)
 	if err != nil {
 		return err
@@ -286,7 +218,7 @@ func verifyPayloadTree(root string, rejectApps bool) error {
 		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() && !entry.Type().IsRegular() {
 			return fmt.Errorf("Symlink or special file in payload: %s", path)
 		}
-		if rejectApps && path != root && strings.HasSuffix(strings.ToLower(name), ".app") {
+		if path != root && strings.HasSuffix(strings.ToLower(name), ".app") {
 			return fmt.Errorf("Recursive app in payload: %s", path)
 		}
 		switch name {
@@ -295,7 +227,7 @@ func verifyPayloadTree(root string, rejectApps bool) error {
 		}
 		switch strings.ToLower(filepath.Ext(name)) {
 		case ".py", ".pyc":
-			return errors.New("Python source or bytecode shipped in Go installer")
+			return errors.New("Python source or bytecode shipped in the app")
 		case ".sqlite", ".sqlite3", ".db", ".log", ".key", ".pem", ".p12", ".pfx":
 			return fmt.Errorf("Private runtime data in payload: %s", name)
 		}

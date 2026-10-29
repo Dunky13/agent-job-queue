@@ -48,10 +48,10 @@ func buildManagedLiveFixtureCLI(t *testing.T) string {
 }
 
 func TestInstallerPackagedLiveUpgrade(t *testing.T) {
-	if runtime.GOOS != "darwin" || os.Getenv("AGENT_QUEUE_TEST_INSTALLER_PAYLOAD") == "" {
-		t.Skip("requires a built macOS installer payload")
+	if runtime.GOOS != "darwin" || os.Getenv("AGENT_QUEUE_TEST_APP_BUNDLE") == "" {
+		t.Skip("requires a built macOS app")
 	}
-	helper := filepath.Join(os.Getenv("AGENT_QUEUE_TEST_INSTALLER_PAYLOAD"), "source/bin/agent-heavy")
+	helper := filepath.Join(os.Getenv("AGENT_QUEUE_TEST_APP_BUNDLE"), "Contents/MacOS/agent-heavy")
 	for _, failure := range []string{"", "queued", "register resources"} {
 		t.Run("packaged-"+failure, func(t *testing.T) { testInstallerManagedLiveUpgrade(t, helper, failure) })
 	}

@@ -85,8 +85,7 @@ checkpoint_distribution_inventory() {
       (.started_at|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
       (.completed_at|test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
       .completed_at >= .started_at and (.steps|type) == "array" and
-      any(.steps[]; (.name == "Notarize the installed payload" or
-        .name == "Notarize the enclosing installer" or .name == "Notarize the distribution disk image") and
+      any(.steps[]; (.name == "Notarize the app" or .name == "Notarize the distribution disk image") and
         .status == "completed" and .conclusion == "success" and
         (.started_at|type) == "string" and (.completed_at|type) == "string") and
       all(.steps[]; (.number|type) == "number" and (.name|type) == "string" and
@@ -134,7 +133,7 @@ checkpoint_distribution_inventory() {
         (.number|type) == "number" and .number > 0 and .number == (.number|floor) and
         .status == "completed" and (.conclusion|type) == "string" and .conclusion != "") and
       ([.steps[].number]|length) == ([.steps[].number]|unique|length) and
-      (["Notarize the installed payload", "Notarize the enclosing installer", "Notarize the distribution disk image"] |
+      (["Notarize the app", "Notarize the distribution disk image"] |
         all(.[]; . as $name | [$job.steps[]|select(.name == $name)] |
           length == 1 and .[0].conclusion == "skipped"));
     [.[] | select(.name == "Sign and notarize main installer" and .run_attempt <= $through) |
@@ -165,8 +164,7 @@ checkpoint_distribution_inventory() {
     observed=$(jq -s -r --argjson attempt "$(jq -r '.attempt' <<< "$selected")" '
       [.[] | select(.name == "Sign and notarize main installer" and .custody_attempt == $attempt) |
         .steps[]? | select((.status == "completed" or .status == "in_progress") and .conclusion != "skipped") |
-        if .name == "Notarize the installed payload" then (if .conclusion == "success" then 3 else 1 end)
-        elif .name == "Notarize the enclosing installer" then (if .conclusion == "success" then 6 else 4 end)
+        if .name == "Notarize the app" then (if .conclusion == "success" then 3 else 1 end)
         elif .name == "Notarize the distribution disk image" then (if .conclusion == "success" then 9 else 7 end)
         else 0 end] | max // 0
     ' "$temporary/jobs-$id")

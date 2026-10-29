@@ -131,24 +131,21 @@ func newPublishFixture(t *testing.T) checkpointFixture {
 	f.writeJSON(t, "assets.json", []any{})
 	f.writeJSON(t, "refs.json", []any{})
 	for _, extension := range []string{"zip", "dmg"} {
-		name := "Agent-Job-Queue-Installer-0.1.0-universal." + extension
+		name := "Agent-Queue-0.1.0-universal." + extension
 		data := []byte("accepted " + extension + " bytes")
 		f.publishWrite(t, "dist/"+name, data)
 		f.publishWrite(t, "dist/"+name+".sha256", []byte(fmt.Sprintf("%x  %s\n", sha256.Sum256(data), name)))
 	}
-	f.writeJSON(t, "dist/agent-job-queue.json", map[string]any{"schemaVersion": 1, "repository": "owner/project", "version": "0.1.0", "commit": checkpointSHA, "build": 45, "tag": "build-45-1111111", "asset": "Agent-Job-Queue-Installer-0.1.0-universal.zip", "sha256": fmt.Sprintf("%x", sha256.Sum256([]byte("accepted zip bytes")))})
+	f.writeJSON(t, "dist/agent-job-queue.json", map[string]any{"schemaVersion": 1, "repository": "owner/project", "version": "0.1.0", "commit": checkpointSHA, "build": 45, "tag": "build-45-1111111", "asset": "Agent-Queue-0.1.0-universal.zip", "sha256": fmt.Sprintf("%x", sha256.Sum256([]byte("accepted zip bytes")))})
 	f.publishWrite(t, "dist/agent-job-queue.rb", []byte("accepted Homebrew cask\n"))
 	var stages, logs []map[string]any
-	for i, name := range []string{"payload", "installer", "dmg"} {
+	for i, name := range []string{"app", "dmg"} {
 		id := fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)
-		completed := ""
-		if i > 0 {
-			extension := "zip"
-			if name == "dmg" {
-				extension = "dmg"
-			}
-			completed = fmt.Sprintf("%x", sha256.Sum256([]byte("accepted "+extension+" bytes")))
+		extension := "zip"
+		if name == "dmg" {
+			extension = "dmg"
 		}
+		completed := fmt.Sprintf("%x", sha256.Sum256([]byte("accepted "+extension+" bytes")))
 		stages = append(stages, map[string]any{"stage": name, "phase": "finished", "submission_id": id, "archive_sha256": strings.Repeat("d", 64), "completed_sha256": completed})
 		logs = append(logs, map[string]any{"jobId": id, "sha256": strings.Repeat("d", 64), "status": "Accepted"})
 	}
@@ -245,7 +242,7 @@ func TestDistributionPublishResumesInterruptedDraft(t *testing.T) {
 			}
 			// An upload that succeeded with a lost response must be downloaded,
 			// rather than overwritten or submitted a second time.
-			if failure == "upload after" && strings.Count(calls, "POST https://uploads.github.com/repos/owner/project/releases/70/assets?name=Agent-Job-Queue-Installer-0.1.0-universal.dmg\n") != 1 {
+			if failure == "upload after" && strings.Count(calls, "POST https://uploads.github.com/repos/owner/project/releases/70/assets?name=Agent-Queue-0.1.0-universal.dmg\n") != 1 {
 				t.Fatalf("re-uploaded retained immutable bytes:\n%s", calls)
 			}
 		})
@@ -295,7 +292,7 @@ func TestDistributionPublishRejectsConflictingDraftWithoutMutation(t *testing.T)
 			case "candidate changed":
 				f.publishWrite(t, "dist/agent-job-queue.rb", []byte("new candidate"))
 			case "checksum":
-				f.publishWrite(t, "dist/Agent-Job-Queue-Installer-0.1.0-universal.zip.sha256", []byte("wrong checksum"))
+				f.publishWrite(t, "dist/Agent-Queue-0.1.0-universal.zip.sha256", []byte("wrong checksum"))
 			case "hidden asset":
 				f.publishWrite(t, "dist/.private", []byte("private"))
 			case "symlink", "missing asset":
@@ -400,7 +397,7 @@ func TestDistributionPublishRejectsUnboundAppleEvidenceBeforeProviderAccess(t *t
 				case "status":
 					logs[1].(map[string]any)["status"] = "Rejected"
 				case "completed":
-					stages[1].(map[string]any)["completed_sha256"] = strings.Repeat("e", 64)
+					stages[0].(map[string]any)["completed_sha256"] = strings.Repeat("e", 64)
 				}
 			})
 			f.canonicalPublishEvidence(t)

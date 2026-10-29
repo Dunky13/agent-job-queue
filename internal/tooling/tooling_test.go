@@ -63,7 +63,7 @@ exit "$HOOK_CHECK"
 }
 func TestHomebrewManifestAndCaskContracts(t *testing.T) {
 	root := t.TempDir()
-	archive := filepath.Join(root, "Agent-Job-Queue-Installer-0.1.0-universal.zip")
+	archive := filepath.Join(root, "Agent-Queue-0.1.0-universal.zip")
 	if err := os.WriteFile(archive, []byte("immutable archive"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -76,12 +76,12 @@ func TestHomebrewManifestAndCaskContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{manifest.SHA256, "source/links/agent-heavy", "source/links/agent-remote", `app "Agent Job Queue Installer.app", target: "#{Dir.home}/Applications/Agent Job Queue Installer.app"`, "installer script:", "--repair-and-continue", "Installation and upgrades run automatically", "CLI links are ready on success", "Homebrew uninstall retains the independent Agent Queue app", "Developer ID signed and notarized", "Quarantine is retained"} {
+	for _, expected := range []string{manifest.SHA256, "Agent-Queue-0.1.0-universal.zip\"", "\n  app \"Agent Queue.app\"\n", "\n  uninstall quit: \"io.went.agent-queue\"\n", "Open Agent Queue from Applications to finish setup", "--unregister-services", "Preserve quarantine so macOS can assess the notarized release."} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("missing %s", expected)
 		}
 	}
-	for _, obsolete := range []string{"depends_on formula:", "sudo: true", "preflight", "postflight", "/usr/bin/xattr", "com.apple.quarantine", "source/scripts/install-user.sh", "system_command", `"--app-bundle"`, "uninstall quit:", "run \"", `delete: [`, `"#{Dir.home}/Applications/Agent Queue.app",`, "payload/Agent Queue.app\", target:"} {
+	for _, obsolete := range []string{"depends_on formula:", "sudo: true", "preflight", "postflight", "/usr/bin/xattr", "com.apple.quarantine", "source/scripts/install-user.sh", "system_command", "installer script:", "uninstall script:", "binary \"", "target:", "--repair-and-continue", "Installer.app", "payload", "run \"", `delete: [`} {
 		if strings.Contains(body, obsolete) {
 			t.Errorf("obsolete dependency %s", obsolete)
 		}

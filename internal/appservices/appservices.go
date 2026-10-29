@@ -112,9 +112,21 @@ func serviceParentSafe(current, boundary string, bundle, executable bool, st *un
 	inside := current == boundary || strings.HasPrefix(current, boundary+"/")
 	owner := st.Uid == uint32(os.Getuid()) || st.Uid == 0 && (!inside || bundle)
 	// Shared Applications remains readable as package data. Executable paths
-	// cannot inherit that exception because their names must retain custody.
-	shared := !inside && st.Uid == 0 && (uint32(st.Mode)&unix.S_ISVTX != 0 || !executable && current == "/Applications" && uint32(st.Mode)&0002 == 0)
+	// inherit that exception only from the stock admin-group directory.
+	shared := !inside && st.Uid == 0 && (uint32(st.Mode)&unix.S_ISVTX != 0 ||
+		current == "/Applications" && uint32(st.Mode)&0002 == 0 && (!executable || StockApplications(st)))
 	return owner && (uint32(st.Mode)&0022 == 0 || shared)
+}
+
+// AdminGroup is the macOS admin group that owns the stock /Applications.
+const AdminGroup = 80
+
+// StockApplications reports whether st describes the stock /Applications
+// directory: owned by root and writable by no one beyond root and the admin
+// group. Administrators can already replace any code on this Mac, so Finder
+// drag-and-drop installation there retains executable custody.
+func StockApplications(st *unix.Stat_t) bool {
+	return uint32(st.Mode)&unix.S_IFMT == unix.S_IFDIR && st.Uid == 0 && st.Gid == AdminGroup && uint32(st.Mode)&0002 == 0
 }
 
 // Resolve only macOS's fixed, root-owned aliases above a private boundary.

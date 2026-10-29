@@ -17,10 +17,10 @@ func receiptFixture(t *testing.T) resumeFixture {
 	if err := os.RemoveAll(f.state); err != nil {
 		t.Fatal(err)
 	}
-	f.command(t, nil, "init", f.installer, f.state, "0.1.0")
-	f.step(t, "prepare", "payload")
-	f.step(t, "submit", "payload")
-	f.signingOutcome(t, "payload", "success", "1")
+	f.command(t, nil, "init", f.app, f.state, "0.1.0")
+	f.step(t, "prepare", "app")
+	f.step(t, "submit", "app")
+	f.signingOutcome(t, "app", "success", "1")
 	return f
 }
 
@@ -42,17 +42,17 @@ func TestAppleReceiptsRequireCurrentInvocationAndSuccessfulCleanup(t *testing.T)
 	for _, variant := range []string{"inherited attempt", "cleanup failed", "cleanup missing", "stage not entered"} {
 		t.Run(variant, func(t *testing.T) {
 			f := receiptFixture(t)
-			f.reject(t, []string{"SIGNING_TEST_FAILURE=payload-timeout"}, "", "finish", f.state, "payload", "0.1.0")
+			f.reject(t, []string{"SIGNING_TEST_FAILURE=app-timeout"}, "", "finish", f.state, "app", "0.1.0")
 			switch variant {
 			case "inherited attempt":
 				f.environment = append(f.environment, "GITHUB_RUN_ATTEMPT=2")
-				f.signingOutcome(t, "payload", "success", "2")
+				f.signingOutcome(t, "app", "success", "2")
 			case "cleanup failed":
-				f.signingOutcome(t, "payload", "failed", "1")
+				f.signingOutcome(t, "app", "failed", "1")
 			case "cleanup missing":
 				f.environment = append(f.environment, "APPLE_SIGNING_RESULT_FILE=")
 			case "stage not entered":
-				f.step(t, "begin", "payload")
+				f.step(t, "begin", "app")
 			}
 			out := filepath.Join(f.root, "public-receipts")
 			if output, err := f.receipts(t, nil, out); err != nil {
@@ -70,8 +70,8 @@ func TestAppleReceiptsRequireCurrentInvocationAndSuccessfulCleanup(t *testing.T)
 func TestAppleExportTicketFailureRetainsFinishedCandidateForContinuation(t *testing.T) {
 	t.Parallel()
 	f := receiptFixture(t)
-	f.step(t, "finish", "payload")
-	for _, stage := range []string{"installer", "dmg"} {
+	f.step(t, "finish", "app")
+	for _, stage := range []string{"dmg"} {
 		for _, op := range []string{"prepare", "submit", "finish"} {
 			f.step(t, op, stage)
 		}
@@ -105,15 +105,15 @@ func TestAppleExportTicketFailureRetainsFinishedCandidateForContinuation(t *test
 func (f resumeFixture) receipts(t *testing.T, extra []string, destination string) (string, error) {
 	t.Helper()
 	f.script, _ = filepath.Abs("../../scripts/macos-receipts.sh")
-	return f.run(t, extra, f.state, destination, "payload", "900", strings.Repeat("d", 64))
+	return f.run(t, extra, f.state, destination, "app", "900", strings.Repeat("d", 64))
 }
 
 func TestAppleReceiptsOnlyClassifyBoundPendingState(t *testing.T) {
 	t.Parallel()
-	for _, failure := range []string{"payload-timeout", "payload-rejected", "waitid", "logid", "loghash", "logstatus"} {
+	for _, failure := range []string{"app-timeout", "app-rejected", "waitid", "logid", "loghash", "logstatus"} {
 		t.Run(failure, func(t *testing.T) {
 			f := receiptFixture(t)
-			f.reject(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "", "finish", f.state, "payload", "0.1.0")
+			f.reject(t, []string{"SIGNING_TEST_FAILURE=" + failure}, "", "finish", f.state, "app", "0.1.0")
 			if err := os.WriteFile(filepath.Join(f.state, "private.p8"), []byte("never export private state"), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -135,7 +135,7 @@ func TestAppleReceiptsOnlyClassifyBoundPendingState(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := "none"
-			if failure == "payload-timeout" {
+			if failure == "app-timeout" {
 				want = "pending"
 			}
 			if record.Reason != want || record.Phase != "submitted" || record.CheckpointID != "900" || record.SubmissionID != "00000000-0000-0000-0000-000000000001" {
@@ -166,12 +166,12 @@ func TestAppleReceiptsRejectUnboundSourceAndUnsafeFiles(t *testing.T) {
 			case "different team":
 				extra = []string{"APPLE_TEAM_ID=AAAAAAAAAA"}
 			case "unsafe status":
-				if err := os.Symlink(filepath.Join(f.state, "metadata.json"), filepath.Join(f.state, "receipts/payload.status.json")); err != nil {
+				if err := os.Symlink(filepath.Join(f.state, "metadata.json"), filepath.Join(f.state, "receipts/app.status.json")); err != nil {
 					t.Fatal(err)
 				}
 			case "wrong filename":
-				f.step(t, "finish", "payload")
-				f.mutate(t, "receipts/payload.log.json", func(v map[string]any) { v["archiveFilename"] = "Other-Product.zip" })
+				f.step(t, "finish", "app")
+				f.mutate(t, "receipts/app.log.json", func(v map[string]any) { v["archiveFilename"] = "Other-Product.zip" })
 			}
 			if output, err := f.receipts(t, extra, filepath.Join(f.root, "receipts")); err == nil {
 				t.Fatalf("unbound evidence was exported: %s", output)
@@ -183,7 +183,7 @@ func TestAppleReceiptsRejectUnboundSourceAndUnsafeFiles(t *testing.T) {
 func TestAppleSubmissionNameIncludesOriginalBuild(t *testing.T) {
 	t.Parallel()
 	f := receiptFixture(t)
-	if !strings.Contains(f.recorded(t), "Agent-Job-Queue-Payload-0.1.0-build-21-aaaaaaa-universal.zip") {
+	if !strings.Contains(f.recorded(t), "Agent-Queue-0.1.0-build-21-aaaaaaa-universal.zip") {
 		t.Fatalf("submission omitted its original build identity: %s", f.recorded(t))
 	}
 }
@@ -191,8 +191,8 @@ func TestAppleSubmissionNameIncludesOriginalBuild(t *testing.T) {
 func publicationFixture(t *testing.T) resumeFixture {
 	t.Helper()
 	f := receiptFixture(t)
-	f.step(t, "finish", "payload")
-	for _, stage := range []string{"installer", "dmg"} {
+	f.step(t, "finish", "app")
+	for _, stage := range []string{"dmg"} {
 		for _, operation := range []string{"prepare", "submit", "finish"} {
 			f.step(t, operation, stage)
 		}
@@ -238,7 +238,7 @@ func TestPublicationEvidenceRetainsExactBytesAcrossWholeWorkflowRecovery(t *test
 		t.Fatal("whole-workflow recovery rewrote the immutable public evidence asset")
 	}
 	for _, suffix := range []string{"zip", "zip.sha256", "dmg", "dmg.sha256"} {
-		name := "Agent-Job-Queue-Installer-0.1.0-universal." + suffix
+		name := "Agent-Queue-0.1.0-universal." + suffix
 		left, err := os.ReadFile(filepath.Join(first, name))
 		if err != nil {
 			t.Fatal(err)

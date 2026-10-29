@@ -18,7 +18,7 @@ func TestInstallerHomebrewMovedAppAvoidsSharedStagingParents(t *testing.T) {
 			base := filepath.Dir(originalPayload)
 			brewPrefix := filepath.Join(base, prefix)
 			caskroom := filepath.Join(brewPrefix, "Caskroom")
-			stagedPayload := filepath.Join(caskroom, "agent-job-queue/0.1.0,123/Agent Job Queue Installer.app/Contents/Resources/payload")
+			stagedPayload := filepath.Join(caskroom, "agent-job-queue/0.1.0,123/payload")
 			if err := os.MkdirAll(filepath.Dir(stagedPayload), 0700); err != nil {
 				t.Fatal(err)
 			}

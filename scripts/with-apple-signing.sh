@@ -46,7 +46,7 @@ if [[ $# == 0 ]]; then
 fi
 if [[ -n ${APPLE_SIGNING_RESULT_FILE:-} ]]; then
   [[ $APPLE_SIGNING_RESULT_FILE == /* && ! -e $APPLE_SIGNING_RESULT_FILE && ! -L $APPLE_SIGNING_RESULT_FILE &&
-    -d $(dirname "$APPLE_SIGNING_RESULT_FILE") && ${APPLE_SIGNING_OPERATION:-} =~ ^(payload|installer|dmg)-finish$ ]] || {
+    -d $(dirname "$APPLE_SIGNING_RESULT_FILE") && ${APPLE_SIGNING_OPERATION:-} =~ ^(app|dmg)-finish$ ]] || {
     printf '%s\n' 'A fresh external signing outcome path and fixed operation are required.' >&2
     exit 1
   }

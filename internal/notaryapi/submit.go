@@ -65,7 +65,7 @@ func readRecord(dir *os.File, name string) (stageRecord, error) {
 	if json.Unmarshal(data, &record) != nil {
 		return record, failure("invalid_record")
 	}
-	if record.Stage != "payload" && record.Stage != "installer" && record.Stage != "dmg" {
+	if record.Stage != "app" && record.Stage != "dmg" {
 		return record, failure("invalid_record")
 	}
 	return record, nil

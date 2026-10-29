@@ -70,7 +70,7 @@ func fileDigest(filename string) (string, error) {
 }
 
 // VerifyCheckpointOrigin also binds legacy state, whose metadata predates
-// artifact IDs, to the exact original installer contents. Recompression is
+// artifact IDs, to the exact original app contents. Recompression is
 // expected; bytes and modes inside the envelope must remain identical.
 func VerifyCheckpointOrigin(original, initial string) error {
 	left, err := zip.OpenReader(original)
@@ -92,7 +92,7 @@ func VerifyCheckpointOrigin(original, initial string) error {
 		return err
 	}
 	if len(leftFiles) != len(rightFiles) {
-		return errors.New("Checkpoint initial installer differs from the original source artifact")
+		return errors.New("Checkpoint initial app differs from the original source artifact")
 	}
 	for name, source := range leftFiles {
 		retained := rightFiles[name]
@@ -165,8 +165,8 @@ func VerifyBuildArtifact(archive, digest, commit string, build int, output strin
 			return "", errors.New("Incomplete source artifact")
 		}
 	}
-	// The original installer can be large. Stage only the verified outer regular
-	// files; nested signed bundles stay inside their unchanged ZIP until ditto.
+	// The original app can be large. Stage only the verified outer regular
+	// files; the nested signed bundle stays inside its unchanged ZIP until ditto.
 	if err = os.Mkdir(output, 0700); err != nil {
 		return "", err
 	}
@@ -199,25 +199,25 @@ func VerifyBuildArtifact(archive, digest, commit string, build int, output strin
 		}
 		checksum, err := zipMetadata(files[name+".sha256"])
 		if err != nil || string(checksum) != hash+"  "+name+"\n" || (name == manifest.Asset && hash != manifest.SHA256) {
-			return "", errors.New("Original installer checksum mismatch")
+			return "", errors.New("Original app checksum mismatch")
 		}
 	}
-	installer, err := zip.OpenReader(filepath.Join(output, manifest.Asset))
+	appArchive, err := zip.OpenReader(filepath.Join(output, manifest.Asset))
 	if err != nil {
 		return "", err
 	}
-	defer installer.Close()
-	entries, err := checkedZIP(installer.File)
+	defer appArchive.Close()
+	entries, err := checkedZIP(appArchive.File)
 	if err != nil {
 		return "", err
 	}
-	base := "Agent Job Queue Installer.app/"
+	base := "Agent Queue.app/"
 	for name := range entries {
 		if name != strings.TrimSuffix(base, "/") && !strings.HasPrefix(name, base) && name != "__MACOSX" && !strings.HasPrefix(name, "__MACOSX/") {
-			return "", errors.New("Unexpected installer archive root")
+			return "", errors.New("Unexpected app archive root")
 		}
 	}
-	for _, name := range []string{"Contents/Resources/build-info.json", "Contents/Resources/payload/source/build-info.json", "Contents/Resources/payload/Agent Queue.app/Contents/Resources/build-info.json"} {
+	for _, name := range []string{"Contents/Resources/build-info.json", "Contents/Resources/payload/source/build-info.json"} {
 		data, err := zipMetadata(entries[base+name])
 		if err != nil {
 			return "", err

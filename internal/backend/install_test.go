@@ -2099,12 +2099,8 @@ func TestInstallerRetirementRefusesSymlinkParentsAndWritableSource(t *testing.T)
 	}
 }
 
-// The release smoke script supplies its extracted payload. This test exercises
-// the actual universal binaries and native app distributed to users.
-func TestInstallerPackagedPayload(t *testing.T) {
-	installTestPackaged(t, false)
-}
-
+// The release smoke script supplies the built app. This test exercises the
+// actual universal binaries and native app distributed to users.
 func TestInstallerPackagedAppBundle(t *testing.T) {
 	installTestPackaged(t, true)
 }

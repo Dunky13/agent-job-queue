@@ -444,7 +444,7 @@ func TestDistributionCheckpointRejectsUnknownSigningHistory(t *testing.T) {
 }
 
 func TestDistributionCheckpointRecoversBeforeNotarizationStages(t *testing.T) {
-	for _, failedStep := range []string{"Set up Go", "Download original installer"} {
+	for _, failedStep := range []string{"Set up Go", "Download original app"} {
 		for _, execution := range []string{"fresh execution", "same execution retry"} {
 			t.Run(failedStep+"/"+execution, func(t *testing.T) {
 				f := newDistributionCheckpointFixture(t)
@@ -485,7 +485,7 @@ func distributionFailedSetupJob(t *testing.T, f checkpointFixture, failedStep st
 		job["started_at"] = "2026-10-22T13:25:36Z"
 		job["completed_at"] = "2026-10-22T13:26:00Z"
 		steps := []any{map[string]any{"number": 1, "name": failedStep, "status": "completed", "conclusion": "failure"}}
-		for i, name := range []string{"Notarize the installed payload", "Notarize the enclosing installer", "Notarize the distribution disk image"} {
+		for i, name := range []string{"Notarize the app", "Notarize the distribution disk image"} {
 			steps = append(steps, map[string]any{"number": i + 2, "name": name, "status": "completed", "conclusion": "skipped"})
 		}
 		job["steps"] = steps
@@ -504,9 +504,9 @@ func TestDistributionCheckpointRejectsUnprovenSkippedStages(t *testing.T) {
 				case "missing stages":
 					delete(job, "steps")
 				case "missing stage":
-					job["steps"] = steps[:3]
+					job["steps"] = steps[:2]
 				case "duplicate stage":
-					job["steps"] = append(steps, map[string]any{"number": 5, "name": "Notarize the installed payload", "status": "completed", "conclusion": "skipped"})
+					job["steps"] = append(steps, map[string]any{"number": 4, "name": "Notarize the app", "status": "completed", "conclusion": "skipped"})
 				case "entered stage":
 					steps[1].(map[string]any)["conclusion"] = "failure"
 				case "incomplete stage":
@@ -544,7 +544,7 @@ func TestDistributionCheckpointSetupFailurePreservesSigningObligations(t *testin
 				setup["run_attempt"] = 2
 				jobs := []any{map[string]any{"id": 22, "run_id": 222, "head_sha": strings.Repeat("d", 40), "status": "completed", "conclusion": "success", "name": "Sign and notarize main installer", "run_attempt": 1, "steps": []any{map[string]any{"name": "Notarize the distribution disk image", "status": "completed", "conclusion": "success"}}}, setup}
 				if laterSigner {
-					jobs = append(jobs, map[string]any{"id": 24, "run_id": 222, "head_sha": strings.Repeat("d", 40), "status": "completed", "conclusion": "failure", "name": "Sign and notarize main installer", "run_attempt": 3, "steps": []any{map[string]any{"name": "Notarize the installed payload", "status": "completed", "conclusion": "failure"}}})
+					jobs = append(jobs, map[string]any{"id": 24, "run_id": 222, "head_sha": strings.Repeat("d", 40), "status": "completed", "conclusion": "failure", "name": "Sign and notarize main installer", "run_attempt": 3, "steps": []any{map[string]any{"name": "Notarize the app", "status": "completed", "conclusion": "failure"}}})
 				}
 				v["jobs"] = jobs
 				v["total_count"] = len(jobs)

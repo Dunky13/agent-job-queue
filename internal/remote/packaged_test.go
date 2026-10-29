@@ -19,17 +19,17 @@ import (
 	"time"
 )
 
-// The release smoke script supplies an extracted, signed payload. Execute that
-// actual universal binary rather than the test executable's embedded gateway.
+// The release smoke script supplies an extracted, signed app. Execute its
+// bundled universal binary rather than the test executable's embedded gateway.
 func TestRemotePackagedGateway(t *testing.T) {
-	payload := os.Getenv("AGENT_QUEUE_TEST_INSTALLER_PAYLOAD")
-	if payload == "" {
-		t.Skip("release payload not supplied")
+	app := os.Getenv("AGENT_QUEUE_TEST_APP_BUNDLE")
+	if app == "" {
+		t.Skip("release app not supplied")
 	}
-	if !filepath.IsAbs(payload) {
-		t.Fatal("release payload must be absolute")
+	if !filepath.IsAbs(app) {
+		t.Fatal("release app must be absolute")
 	}
-	executable := filepath.Join(payload, "source/bin/agent-remote")
+	executable := filepath.Join(app, "Contents/MacOS/agent-remote")
 	info, err := os.Stat(executable)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
 		t.Fatal("packaged remote executable is unavailable", err)

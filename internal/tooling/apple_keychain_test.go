@@ -360,7 +360,7 @@ func TestAppleSigningReportsOutcomeOnlyAfterCredentialCleanup(t *testing.T) {
 		t.Run(cleanup, func(t *testing.T) {
 			root, env := appleSigningFixture(t)
 			path := filepath.Join(root, "outcome.json")
-			env = append(env, "APPLE_SIGNING_RESULT_FILE="+path, "APPLE_SIGNING_OPERATION=payload-finish", "GITHUB_RUN_ID=1234", "GITHUB_RUN_ATTEMPT=2")
+			env = append(env, "APPLE_SIGNING_RESULT_FILE="+path, "APPLE_SIGNING_OPERATION=app-finish", "GITHUB_RUN_ID=1234", "GITHUB_RUN_ATTEMPT=2")
 			if cleanup == "failed" {
 				env = append(env, "KEYCHAIN_TEST_FAIL=delete-keychain")
 			}
@@ -382,7 +382,7 @@ func TestAppleSigningReportsOutcomeOnlyAfterCredentialCleanup(t *testing.T) {
 				Attempt            string `json:"execution_attempt"`
 				CommandStatus      int    `json:"command_status"`
 			}
-			if err := json.Unmarshal(body, &outcome); err != nil || outcome.Cleanup != cleanup || outcome.Operation != "payload-finish" || outcome.Run != "1234" || outcome.Attempt != "2" || outcome.CommandStatus != 23 {
+			if err := json.Unmarshal(body, &outcome); err != nil || outcome.Cleanup != cleanup || outcome.Operation != "app-finish" || outcome.Run != "1234" || outcome.Attempt != "2" || outcome.CommandStatus != 23 {
 				t.Fatalf("incorrect cleanup outcome: %s (%v)", body, err)
 			}
 			assertAppleSigningRemoved(t, root)

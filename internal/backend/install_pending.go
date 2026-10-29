@@ -24,6 +24,23 @@ func (err *installPendingError) Error() string {
 	return fmt.Sprintf("Another candidate installation is pending: build %s, version %s, commit %s. Finish that exact build before replacing it. If its app is no longer available, retrieve that build from the release history. Preserve the pending installation records and any retained application backup.", build, err.identity.Version, commit)
 }
 
+// App-bundle setup never publishes a copy, so once Finder has replaced the
+// pending build's app its marker only records an interrupted, repeatable setup.
+// A strictly newer tracked bundle may then take over, unless an installer-made
+// backup or publication receipt still needs the exact pending build.
+func (install *installer) managedPendingSuperseded(identity, pending BuildInfo) (bool, error) {
+	if !install.appBundle || install.prepareReplacement || install.unregisterServices || install.pendingIdentity != nil ||
+		identity.Build == nil || pending.Build == nil || *identity.Build <= *pending.Build {
+		return false, nil
+	}
+	for _, retained := range []string{install.managedPreviousPath(), install.managedReceiptPath()} {
+		if exists, err := updateExists(retained); err != nil || exists {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
 // Recovery completes the exact retained app using the current controller. It
 // never clears or replaces an unfinished identity to let a different build in.
 func (install *installer) pendingInstallation(ctx context.Context) (*installer, error) {

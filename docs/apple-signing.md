@@ -6,8 +6,8 @@ It does not certify an artifact while Apple is still processing it.
 
 ## Signing policy
 
-Use Developer ID Application for both app bundles, both Go executables, and the
-DMG. Sign universal executables after combining their architecture slices. Each
+Use Developer ID Application for the app bundle, its two bundled Go executables
+(`agent-heavy` and `agent-remote` in `Contents/MacOS`), and the DMG. Sign universal executables after combining their architecture slices. Each
 executable receives Hardened Runtime, a secure timestamp, and a stable code
 identifier. Verify both architecture slices against Apple's certificate chain
 and the configured team. Sign components explicitly from the inside out; use
@@ -29,20 +29,22 @@ require Developer ID signing, runtime protection and secure timestamps.
 
 ## Packaging order
 
-This is a custom installer that copies another app and standalone helpers.
-Apple explicitly requires payload notarization before assembling such an
-installer. Our additional DMG distribution also receives its own ticket:
+The release is one self-contained `Agent Queue.app`. No installer or payload is
+assembled around it, so the app itself is the notarized unit and the DMG is an
+additional container that receives its own ticket. Notarization has two stages,
+`app` then `dmg`:
 
-1. Sign the two Go helpers in both the outer controller payload and the menu app's `Contents/MacOS`, then sign the menu app. Submit the complete payload ZIP. Managed service definitions remain in the app's `Contents/Library/LaunchAgents` and use `BundleProgram`.
-2. Require acceptance, fetch the log, then staple and validate the menu app.
-3. Sign the outer installer, submit its ZIP, require acceptance, and staple it.
-4. Recreate the distribution ZIP with the stapled installer inside it.
-5. Package the stapled owning app and Applications shortcut in the managed DMG, sign the DMG, notarize it, and staple it. The ZIP retains the explicit installer. Historical images retain their original layout and verification path.
-6. Generate final checksums and Homebrew metadata after all byte changes.
+1. Sign the two Go helpers in the app's `Contents/MacOS`, then sign the app. Managed service definitions remain in the app's `Contents/Library/LaunchAgents` and use `BundleProgram`. Submit the app as a ZIP (`ditto -c -k --sequesterRsrc --keepParent`).
+2. Require acceptance, fetch the log, then staple and validate the app.
+3. Recreate the distribution ZIP from the stapled app. It contains only `Agent Queue.app` at its top level.
+4. Package the stapled app and an `Applications` symlink in the DMG, sign the DMG, notarize it, and staple it.
+5. Generate final checksums and Homebrew metadata after all byte changes.
 
-Hosted Apple submissions use `Agent-Job-Queue-Payload-VERSION-build-N-SHA-universal.zip`,
-`Agent-Job-Queue-Installer-VERSION-build-N-SHA-universal.zip`, and
-`Agent-Job-Queue-Installer-VERSION-build-N-SHA-universal.dmg`. `N` is the original
+Final release assets are `Agent-Queue-VERSION-universal.zip` and
+`Agent-Queue-VERSION-universal.dmg`, each with a `.sha256` file, plus
+`agent-job-queue.json`, `agent-job-queue.rb` and `apple-notarization.json`.
+Hosted Apple submissions are named `Agent-Queue-VERSION-build-N-SHA-universal.zip`
+(app stage) and `Agent-Queue-VERSION-build-N-SHA-universal.dmg` (dmg stage). `N` is the original
 CI build number and `SHA` is its seven-character source prefix. Local packaging
 keeps version-only names. Product, version, build and stage are visible before upload. Resumable checkpoints retain their
 existing internal filenames; submission copies preserve the exact archive bytes
@@ -56,13 +58,12 @@ first launch of the complete installed product remains a separate test.
 These requirements come from Apple's
 [custom notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
-The menu app carries support metadata and documents without duplicate helper binaries. Explicit setup can use its canonical bundled helpers; ordinary first launch only checks installation and approval state. The copied app offers a confirmed setup action. Helpers are signed before sealing the app, and in-place setup never modifies the installed bundle. Managed ZIPs deliver the explicit installer; DMGs deliver the owning app and Applications shortcut, preserving signatures, tickets and quarantine. Homebrew delivers the explicit installer and command links; runtime installation occurs explicitly outside its hook sandbox.
+The app carries support metadata and documents without duplicate helper binaries; its only executables are the helpers in `Contents/MacOS`. Opening the app from `/Applications` or `~/Applications` runs setup (`agent-heavy install --app-bundle`) from inside the bundle. Setup registers the bundle-owned services, writes the CLI wrappers to `~/.local/bin` and never modifies the installed bundle or copies executables out of it. Helpers are signed before sealing the app. The ZIP and the DMG deliver the same stapled app, preserving signatures, tickets and quarantine. Homebrew delivers the app through a plain `app` cask; nothing runs at install time and the first launch completes setup.
 
-The payload app is stapled before signing its parent because it lives under
-the installer's sealed resources. Production installation copies the app with
-`ditto --rsrc --extattr --qtn --acl`; verification checks the copied app's
-signature, ticket and quarantine. Never change signed resource files afterward.
-Apple's [packaging guide](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)
+The app is stapled only after its notarization is accepted, and no signed
+resource file changes afterward. Verification copies the app with
+`ditto --rsrc --extattr --qtn --acl` and checks the copy's signature, ticket and
+quarantine. Apple's [packaging guide](https://developer.apple.com/documentation/xcode/packaging-mac-software-for-distribution)
 describes container signing, stapling and distribution testing.
 
 ## Credentials and CI
@@ -77,13 +78,13 @@ the following secrets there, with no repository-scoped Apple secret copies:
 Its non-secret variables are `APPLE_SIGNING_IDENTITY`, `APPLE_TEAM_ID`,
 `APPLE_NOTARY_KEY_ID`, and `APPLE_NOTARY_ISSUER_ID`. Optional
 `APPLE_NOTARY_TIMEOUT` defaults to `5m` per submission. The signing job has a
-45-minute outer budget for three submissions, checkpoint transfers and packaging. This is a bounded
+45-minute outer budget for two submissions, checkpoint transfers and packaging. This is a bounded
 wait, not a claim about Apple's turnaround time.
 
 PRs build and test ad hoc development artifacts without Apple credentials.
 After required main validation passes, a separate distribution workflow imports the
 identity into a disposable private Keychain and signs the already-built
-installer. It does not recompile code with the signing key loaded. The wrapper
+app. It does not recompile code with the signing key loaded. The wrapper
 removes temporary credentials on success, failure and cancellation. Publication
 consumes only the finalized notarized artifact. Missing credentials, rejection,
 stapling or policy failures stop publication with no ad hoc fallback. Distribution
@@ -103,7 +104,7 @@ subsequent signature and Apple-chain verification remain required.
 
 Signing and verification operations emit fixed begin/success/failure markers
 with the original tool exit status. Preparation also marks credential
-configuration and installer restoration, so a failure can be attributed to
+configuration and app restoration, so a failure can be attributed to
 one operation without tracing command arguments. The markers do not include
 paths, credential selectors or command arguments. Inventory `ready` means
 one valid matching identity was enumerated; it does not establish successful
@@ -130,10 +131,10 @@ The probe is separate from Developer ID acceptance
 and never executes its signed target.
 
 Before publication, separate fresh Apple Silicon and Intel jobs verify final
-checksums, signatures, tickets and app-copy policy, exercise the hardened queue
+checksums, signatures, tickets and app-copy policy (a quarantine-preserving copy of the extracted app), exercise the hardened queue
 and HTTPS gateway, and exercise actual Homebrew delivery with quarantine kept.
-The runtime test then invokes the signed explicit installer outside Homebrew's
-restricted hook sandbox. It owns private daemon processes and user directories,
+The runtime test then runs setup from inside the extracted, signed app. It owns
+private daemon processes and user directories,
 substitutes native lifecycle and launchctl readback, and bounds descendants
 before cleanup. These checks do not qualify real Service Management registration,
 approval, subsequent login or reboot; those need an isolated login-session test.
@@ -197,21 +198,21 @@ the accepted receipt and immutable submitted archive remain recoverable through
 the existing checkpoints. The 45-minute signing job budget still applies.
 
 Build CI and distribution run independently. `ci.yml` validates and retains the
-universal installer. `distribution.yml` automatically follows a successful
+universal app (artifact `Agent-Queue-App-N`). `distribution.yml` automatically follows a successful
 same-repository main-push CI run. It can also be dispatched manually from `main`
 with the original `build_run_id`, so a merged automation repair can process the
-retained installer without recompiling it.
+retained app without recompiling it.
 
 The build run ID, artifact-producing attempt, build number, source commit,
 artifact ID, artifact digest and embedded version identify the original build.
-The workflow checks API provenance, the successful artifact-producing installer
+The workflow checks API provenance, the successful artifact-producing build
 job and the effective successful required validation gate for the same run and
 source commit, the outer GitHub artifact digest, ZIP/DMG checksums and the
-embedded build identities before credentials are used. The installer may come
+embedded build identities before credentials are used. The app may come
 from an earlier attempt when a failed-job retry passed the remaining checks. It reads the version from the original
 artifact, even when current main has a different `VERSION`.
 
-Manual recovery also supports a completed legacy CI run whose installer and
+Manual recovery also supports a completed legacy CI run whose app and
 required validation passed before its old distribution jobs failed. It does not
 make a failed application build eligible. Automatic distribution requires the
 whole triggering CI run to have succeeded.
@@ -222,15 +223,15 @@ application source requires a new CI build; changing distribution automation can
 reuse the existing artifact.
 
 The protected signing job uses `scripts/macos-resume.sh`; local one-shot
-`macos-signing.sh package` remains available. Each payload, installer and DMG
+`macos-signing.sh package` remains available. Each app and DMG
 stage persists an immutable checkpoint before uploading, immediately after
 recording its submission ID, and after every attempted preparation, including
-failures before submission and failed waits. The last snapshot retains the
+failures before submission and failed waits. Checkpoint slots are ordered: `s00` is the initial state, `01` to `03` are the app stage (prepared, submitted, finished), `07` to `09` are the dmg stage, and `s10` is the final candidate (`04` to `06` are unused). The last snapshot retains the
 latest available state even when preparation never reaches its first upload.
 Missing required checkpoints still stop recovery; this does not authorize an
 older state after an uncertain attempt. An
 initial `s00` checkpoint precedes credential setup and signing. Checkpoints
-contain the original prepared installer, exact signed upload archives, their
+contain the original prepared app, exact signed upload archives, their
 SHA-256 values, stage records and public Apple receipts. ZIP wrapping preserves
 executable modes and macOS resource forks.
 
@@ -272,20 +273,20 @@ an older run's attempt `1`.
 
 Checkpoint obligations follow actual signing jobs across attempts. A retry of
 acceptance or publication can retain an earlier successful signing checkpoint;
-a complete job history proving all three signing stages were skipped does not
+a complete job history proving both signing stages were skipped does not
 require a new one, including setup failures before the initial checkpoint.
 Missing state after signing could have begun still stops recovery.
 
 Recovery continues accepted stages and existing submission IDs without signing
 or uploading them again. Accepted Apple logs must match the submission ID and
-exact archive hash. Only three completed stages can export release assets.
+exact archive hash. Only the two completed stages (app and dmg) can export release assets. The final distribution artifact is `Agent-Queue-Notarized-App-N`; the workflow extracts its ZIP into `prepared-app/` and checks it with `queue-tool verify-app --app`. Installer-era checkpoints and builds (payload or installer stages, or a non-self-contained app layout) are refused by this automation and cannot be resumed or published.
 Fresh Apple Silicon and Intel acceptance jobs still precede publication and
 Homebrew delivery. Final artifacts use execution-specific names; downstream
 jobs consume the successful signing job's exact artifact.
 
 Checkpoints and original CI artifacts are retained for 90 days. Independent small
 receipt/diagnostic artifacts are also retained for 90 days. Successful releases
-include permanent `apple-notarization.json` evidence binding all three Accepted
+include permanent `apple-notarization.json` evidence binding both Accepted
 logs, submitted hashes, source metadata and final hashes. Missing or
 expired latest state, invalid provenance, corruption, a changed source artifact
 or signing team, rejection and an uncertain upload stop recovery. There is no
@@ -365,7 +366,7 @@ exact-build gate using the existing narrowly scoped App token and trusted tap.
 Ad hoc development remains the default:
 
 ```sh
-agent-heavy run --label "Agent Queue installer" -- scripts/build-installer.sh
+agent-heavy run --label "Agent Queue app" -- scripts/build-app.sh
 ```
 
 For Developer ID packaging, provide your installed identity, expected team,
@@ -376,7 +377,7 @@ SIGNING_MODE=developer-id \
 APPLE_SIGNING_IDENTITY='Developer ID Application: YOUR NAME (YOURTEAMID)' \
 APPLE_TEAM_ID=YOURTEAMID \
 NOTARY_KEYCHAIN_PROFILE=YOUR_PROFILE \
-agent-heavy run --label "Agent Queue notarized installer" -- scripts/build-installer.sh
+agent-heavy run --label "Agent Queue notarized app" -- scripts/build-app.sh
 ```
 
 The team placeholder must be replaced by the actual ten-character team ID.
@@ -387,10 +388,10 @@ Alternatively use `NOTARY_KEY_FILE`, `NOTARY_KEY_ID`, and, for a team API key,
 never committed private material. `NOTARY_LOG_DIR` must be outside `DIST_DIR`.
 Configuration is checked before compiling.
 
-To sign an already validated extracted installer without rebuilding it:
+To sign an already validated extracted app without rebuilding it:
 
 ```sh
-scripts/macos-signing.sh package 'prepared-installer/Agent Job Queue Installer.app' dist "$(cat VERSION)"
+scripts/macos-signing.sh package 'prepared-app/Agent Queue.app' dist "$(cat VERSION)"
 ```
 
 Supply the same Developer ID environment for that command. Inspect a retained
@@ -399,26 +400,27 @@ Do not submit the same pending build repeatedly to try to accelerate processing.
 
 ## Distribution and acceptance
 
-The native installer directly executes the signed Go controller. New Homebrew
-casks deliver that explicit installer without executing setup in a hook. The
-user opens it and chooses Install. The cask preserves quarantine. Historical ad hoc casks remain
-unchanged until the next numbered release; the trusted tap helper validates
-their original cask as bounded data. Merge the companion trusted tap update
-before the source release, as documented in [Homebrew delivery](homebrew-delivery.md).
+The notarized app runs setup itself on first launch and executes its signed Go
+helpers from inside the bundle. New Homebrew casks deliver only the app, with no
+installer script or setup hook; the user opens it to finish setup. The cask
+preserves quarantine. Historical ad hoc casks remain unchanged until the next numbered release; the trusted tap
+helper validates their original cask as bounded data. Merge the companion trusted
+tap update before the source release, as documented in [Homebrew delivery](homebrew-delivery.md).
 
-Acceptance requires all four executable signatures, Apple acceptance and logs,
-valid stapled tickets, final ZIP extraction and mounted-DMG checks, successful
-`syspolicy_check distribution` for both app bundles, and actual packaged queue
-and HTTPS execution. Automated tests also exercise rejection, malformed
-responses, missing or conflicting configuration, wrong teams, cleanup and
-quarantine preservation.
+Acceptance requires valid signatures on the app, both bundled helpers and the DMG, Apple
+acceptance and logs for both stages, valid stapled tickets on the app and DMG,
+final ZIP extraction and mounted-DMG checks (exactly `Agent Queue.app` and an
+`Applications` link), successful `syspolicy_check distribution` for the app,
+and actual packaged queue and HTTPS execution. Automated tests also exercise
+rejection, malformed responses, missing or conflicting configuration, wrong
+teams, cleanup and quarantine preservation.
 
 Use `codesign --verify --check-notarization` with an explicit `notarized`
 requirement for the standalone Go executables. An app-oriented `spctl` check
 does not establish the correct behavior for every non-app code type. The
-quarantined Homebrew test verifies both helpers' notarization before exercising
-the actual signed installer entry outside Homebrew's hook sandbox. Native
-service operations remain simulated there; signing and packaged job execution
+quarantined Homebrew test delivers the extracted release app through the real
+cask DSL and verifies the app's and both helpers' notarization. It registers no
+Service Management jobs; signing and packaged job execution
 cannot certify live Service Management or endpoint-security acceptance. Apple documents these distinct checks in
 [Testing a Notarised Product](https://developer.apple.com/forums/thread/130560).
 
