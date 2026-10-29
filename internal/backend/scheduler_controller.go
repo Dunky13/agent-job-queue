@@ -2,11 +2,13 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -123,6 +125,7 @@ type schedulerCandidate struct {
 	id              int
 	token           string
 	task, resources Object
+	lease           bool
 }
 type schedulerAudit struct {
 	token, mode string
@@ -146,6 +149,12 @@ func (c *Controller) Tick() (Object, error) {
 	}
 	jobs := Object{}
 	active := []Object{}
+	// activeLanes parallels active so the limit counts only lanes sharing it.
+	activeLanes := []string{}
+	addActive := func(entry Object, lane string) {
+		active = append(active, entry)
+		activeLanes = append(activeLanes, lane)
+	}
 	candidates := []schedulerCandidate{}
 	audits := []schedulerAudit{}
 	sampledActive := map[string]bool{}
@@ -170,7 +179,7 @@ func (c *Controller) Tick() (Object, error) {
 		if e != nil {
 			return nil, e
 		}
-		if state == "Done" {
+		if state == "Done" && !taskIsLease(task) {
 			id, e := schedulerTaskID(key)
 			if e != nil {
 				return nil, e
@@ -198,12 +207,17 @@ func (c *Controller) Tick() (Object, error) {
 		if e != nil {
 			return nil, e
 		}
+		// Leases have no worker to sample and no workload to learn; their lane
+		// reservations are accounted for with the current snapshot below.
+		if taskIsLease(task) {
+			continue
+		}
 		if state == "Done" && !terminalTokens[value] && c.runs[value] == nil {
 			continue
 		}
 		if value == "" {
 			if (state == "Running" || state == "Paused") && (task["group"] == nil || task["group"] == "default") {
-				active = append(active, unknownReservation())
+				addActive(unknownReservation(), taskLane(task))
 			}
 			continue
 		}
@@ -217,7 +231,7 @@ func (c *Controller) Tick() (Object, error) {
 		}
 		if workload == nil {
 			if state == "Running" || state == "Paused" {
-				active = append(active, unknownReservation())
+				addActive(unknownReservation(), taskLane(task))
 			}
 			continue
 		}
@@ -253,11 +267,11 @@ func (c *Controller) Tick() (Object, error) {
 				if e != nil {
 					return nil, e
 				}
-				active = append(active, resources)
+				addActive(resources, taskLane(task))
 				sampledActive[value] = true
 			}
 		} else if state == "Running" || state == "Paused" {
-			candidates = append(candidates, schedulerCandidate{id, value, task, resources})
+			candidates = append(candidates, schedulerCandidate{id: id, token: value, task: task, resources: resources})
 		}
 		if state == "Done" && receipt != nil {
 			if c.runs[value] != nil {
@@ -303,7 +317,7 @@ func (c *Controller) Tick() (Object, error) {
 			}
 			c.finalized[value] = true
 		} else if state == "Queued" || state == "Stashed" {
-			candidates = append(candidates, schedulerCandidate{id, value, task, resources})
+			candidates = append(candidates, schedulerCandidate{id: id, token: value, task: task, resources: resources})
 		}
 		requests = append(requests, profileRequest{workload, safe})
 		collected = append(collected, struct {
@@ -407,7 +421,8 @@ func (c *Controller) Tick() (Object, error) {
 					return nil, e
 				}
 				if !sampledActive[text(member["token"])] {
-					active = append(active, unknownReservation())
+					id, _ := integer(member["task_id"])
+					addActive(unknownReservation(), taskLane(obj(tasks[strconv.Itoa(id)])))
 				}
 			}
 		}
@@ -436,36 +451,124 @@ func (c *Controller) Tick() (Object, error) {
 			if len(prediction) == 0 {
 				prediction = Object{"memoryBytes": GiB, "cpuCores": 2.0}
 			}
-			active = append(active, Object{"prediction": prediction, "observed": Object{}})
+			addActive(Object{"prediction": prediction, "observed": Object{}}, taskLane(task))
 		}
+	}
+	heldSharing, held, e := heldLeases(current)
+	if e != nil {
+		return nil, e
+	}
+	occupied := heldSharing
+	for _, lane := range activeLanes {
+		if snapshotSharesLimit(current, lane) {
+			occupied++
+		}
+	}
+	// The daemon's lane counts include started work; a grant still counts
+	// against its lane until the daemon has started it.
+	pendingByLane := map[string]int{}
+	for _, raw := range grants {
+		id, _ := integer(obj(raw)["task_id"])
+		task := obj(currentTasks[fmt.Sprint(id)])
+		if state, _, e := taskState(task); e == nil && (state == "Queued" || state == "Stashed") {
+			pendingByLane[taskLane(task)]++
+		}
+	}
+	for key, raw := range currentTasks {
+		task := obj(raw)
+		if state, _, e := taskState(task); e != nil {
+			return nil, e
+		} else if taskIsLease(task) && state == "Queued" {
+			id, e := schedulerTaskID(key)
+			if e != nil {
+				return nil, e
+			}
+			candidates = append(candidates, schedulerCandidate{id: id, task: task, lease: true})
+		}
+	}
+	lanePriority := func(task Object) int {
+		priority, _ := integer(snapshotLane(current, taskLane(task))["priority"])
+		return priority
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		a, b := candidates[i], candidates[j]
+		if lanePriority(a.task) != lanePriority(b.task) {
+			return lanePriority(a.task) > lanePriority(b.task)
+		}
 		if metric(a.task["priority"]) != metric(b.task["priority"]) {
 			return metric(a.task["priority"]) > metric(b.task["priority"])
 		}
 		return a.id < b.id
 	})
+	// A lane at its own concurrency cannot start anything, so it never holds
+	// back other lanes. Limit-sharing work keeps today's head-of-line fairness
+	// among itself; a lane outside the limit only queues behind its own work.
+	laneFull := func(task Object) bool {
+		name := taskLane(task)
+		lane := snapshotLane(current, name)
+		if name == defaultLaneName || lane == nil {
+			return false
+		}
+		concurrency, _ := integer(lane["concurrency"])
+		running, _ := integer(lane["running"])
+		holding, _ := integer(lane["held"])
+		return running+holding+pendingByLane[name] >= concurrency
+	}
+	head := func(index int) int {
+		sharing := snapshotSharesLimit(current, taskLane(candidates[index].task))
+		for i := range candidates[:index] {
+			if laneFull(candidates[i].task) {
+				continue
+			}
+			if sharing && snapshotSharesLimit(current, taskLane(candidates[i].task)) || !sharing && taskLane(candidates[i].task) == taskLane(candidates[index].task) {
+				return i
+			}
+		}
+		return index
+	}
+	leaseDecisions := Object{}
 	selected := -1
 	for index, entry := range candidates {
-		allowed, why := ResourceDecision(host, obj(entry.resources["prediction"]), active, limit)
-		if !hostFresh {
-			allowed, why = false, "Waiting for a fresh host resource sample"
+		lane := taskLane(entry.task)
+		laneOccupied := -1
+		if snapshotSharesLimit(current, lane) {
+			laneOccupied = occupied
 		}
-		if time.Now().Before(c.recoveryUntil) {
-			allowed, why = false, "Waiting for a stable recovery interval"
+		var allowed bool
+		var why string
+		if entry.lease {
+			memory, cpu := laneReservation(current, lane)
+			allowed, why = leaseDecision(host, memory, cpu, active, held)
+			if laneOccupied >= limit {
+				allowed, why = false, "Waiting for the parallel job limit"
+			}
+			if memory+cpu > 0 && !hostFresh {
+				allowed, why = false, "Waiting for a fresh host resource sample"
+			}
+			if memory+cpu > 0 && time.Now().Before(c.recoveryUntil) {
+				allowed, why = false, "Waiting for a stable recovery interval"
+			}
+		} else {
+			allowed, why = resourceDecision(host, obj(entry.resources["prediction"]), active, laneOccupied, limit, held)
+			if !hostFresh {
+				allowed, why = false, "Waiting for a fresh host resource sample"
+			}
+			if time.Now().Before(c.recoveryUntil) {
+				allowed, why = false, "Waiting for a stable recovery interval"
+			}
 		}
 		if group["status"] != "Running" {
 			allowed, why = false, "Queue is paused"
 		}
-		if slotExists && manifest == nil {
+		if slotExists && manifest == nil && !entry.lease {
 			allowed, why = false, "Waiting for the external shared validation owner"
 		}
-		if index > 0 && metric(candidates[0].task["priority"]) > metric(entry.task["priority"]) {
+		first := head(index)
+		if index > first && (lanePriority(candidates[first].task) > lanePriority(entry.task) || lanePriority(candidates[first].task) == lanePriority(entry.task) && metric(candidates[first].task["priority"]) > metric(entry.task["priority"])) {
 			allowed, why = false, "Waiting behind a higher-priority job"
 		}
-		if index > 0 {
-			created, ok := resourceTimestamp(candidates[0].task["created_at"])
+		if index > first {
+			created, ok := resourceTimestamp(candidates[first].task["created_at"])
 			age := resourceStarvationSeconds
 			if ok {
 				age = resourceNow() - created
@@ -474,19 +577,26 @@ func (c *Controller) Tick() (Object, error) {
 				allowed, why = false, "Reserving the next opportunity for an older job"
 			}
 		}
-		if grants[entry.token] != nil {
+		if laneFull(entry.task) {
+			allowed, why = false, "Waiting for lane capacity"
+		}
+		if !entry.lease && grants[entry.token] != nil {
 			allowed, why = false, "Admission is starting"
 		}
 		state, _, e := taskState(obj(currentTasks[fmt.Sprint(entry.id)]))
 		if e != nil {
 			return nil, e
 		}
-		if !containsString([]string{"Queued", "Stashed", "Running"}, state) {
+		if !containsString([]string{"Queued", "Stashed", "Running"}, state) || entry.lease && state != "Queued" {
 			allowed, why = false, "Job changed while resources were sampled"
 		}
-		entry.resources["decision"] = Object{"allowed": allowed, "reason": why}
-		if configuration["mode"] == "shadow" || configuration["mode"] == "adaptive" {
-			audits = append(audits, schedulerAudit{entry.token, text(configuration["mode"]), obj(entry.resources["prediction"]), allowed, why})
+		if entry.lease {
+			leaseDecisions[strconv.Itoa(entry.id)] = Object{"decision": Object{"allowed": allowed, "reason": why}}
+		} else {
+			entry.resources["decision"] = Object{"allowed": allowed, "reason": why}
+			if configuration["mode"] == "shadow" || configuration["mode"] == "adaptive" {
+				audits = append(audits, schedulerAudit{entry.token, text(configuration["mode"]), obj(entry.resources["prediction"]), allowed, why})
+			}
 		}
 		if selected < 0 && allowed {
 			selected = index
@@ -518,10 +628,11 @@ func (c *Controller) Tick() (Object, error) {
 		reason = "Collecting a complete resource interval"
 	}
 	value := c.status(configuration, host, jobs, learningRevision, available, admissionReady, reason)
+	value["leases"] = leaseDecisions
 	if e = WritePrivate(filepath.Join(g.State, "resource-status.json"), value); e != nil {
 		return nil, e
 	}
-	if configuration["mode"] == "adaptive" && selected >= 0 && available {
+	if configuration["mode"] == "adaptive" && selected >= 0 && available && !candidates[selected].lease {
 		entry := candidates[selected]
 		grants[entry.token] = Object{"task_id": entry.id, "manual": false, "expires": resourceNow() + resourceGrantSeconds, "prediction": entry.resources["prediction"]}
 	}
@@ -549,7 +660,8 @@ func (c *Controller) Tick() (Object, error) {
 				return nil, e
 			}
 			if state == "Queued" || state == "Stashed" {
-				if _, e = g.QueueControl("start", Object{"id": entry.id}); e != nil {
+				// The daemon recounts the lane; a stale view is refused, not fatal.
+				if _, e = g.QueueControl("start", Object{"id": entry.id}); e != nil && !errors.Is(e, errQueueLaneFull) {
 					return nil, e
 				}
 			}

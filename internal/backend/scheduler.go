@@ -222,10 +222,21 @@ func SchedulingLedger(g *Gate, configuration Object) (Object, error) {
 	return value, nil
 }
 func ResourceDecision(host, prediction Object, active []Object, limit int) (bool, string) {
+	return resourceDecision(host, prediction, active, len(active), limit, leaseReservations{})
+}
+
+// leaseReservations totals the declared reservations of held leases. Leases
+// have no measured workers, so these stand in for their resource use.
+type leaseReservations struct{ memoryBytes, cpuCores float64 }
+
+// resourceDecision is ResourceDecision with lane accounting: occupied counts
+// only work that shares the global limit (negative when the candidate's lane
+// does not share it), and held lease reservations reduce headroom.
+func resourceDecision(host, prediction Object, active []Object, occupied, limit int, held leaseReservations) (bool, string) {
 	if !validHost(host) || !validPrediction(prediction) {
 		return false, "Waiting for valid resource observations and predictions"
 	}
-	if len(active) >= limit {
+	if occupied >= 0 && occupied >= limit {
 		return false, "Waiting for the parallel job limit"
 	}
 	if !boolean(host["complete"]) {
@@ -269,7 +280,7 @@ func ResourceDecision(host, prediction Object, active []Object, limit int) (bool
 		memoryGrowth += max(0.0, metric(pred["memoryBytes"])-metric(observed["memoryBytes"]))
 		cpuGrowth += max(0.0, min(cpuBudget, metric(pred["cpuCores"]))-metric(observed["cpuCores"]))
 	}
-	if metric(prediction["memoryBytes"])+reserve+memoryGrowth > metric(host["availableMemoryBytes"]) {
+	if metric(prediction["memoryBytes"])+reserve+memoryGrowth+held.memoryBytes > metric(host["availableMemoryBytes"]) {
 		return false, "Waiting for predicted peak memory headroom"
 	}
 	if len(active) == 0 && metric(host["cpuBusyCores"]) > metric(host["cpuCores"])*.6 {
@@ -278,10 +289,103 @@ func ResourceDecision(host, prediction Object, active []Object, limit int) (bool
 	if metric(prediction["cpuCores"]) > cpuBudget {
 		return false, "Predicted CPU demand exceeds this machine's budget; reduce workers or inspect Start now"
 	}
-	if metric(host["cpuBusyCores"])+cpuGrowth+metric(prediction["cpuCores"]) > cpuBudget {
+	if metric(host["cpuBusyCores"])+cpuGrowth+held.cpuCores+metric(prediction["cpuCores"]) > cpuBudget {
 		return false, "Waiting for predicted CPU headroom"
 	}
 	return true, "Predicted resource demand fits the current headroom"
+}
+
+// leaseDecision admits a lease when its lane reservation fits the headroom.
+// A lease is never an unfamiliar workload, and a zero reservation always fits.
+func leaseDecision(host Object, memoryBytes, cpuCores float64, active []Object, held leaseReservations) (bool, string) {
+	if memoryBytes == 0 && cpuCores == 0 {
+		return true, "Lane has capacity"
+	}
+	if !validHost(host) {
+		return false, "Waiting for valid resource observations"
+	}
+	if !boolean(host["complete"]) {
+		return false, "Collecting a complete resource interval"
+	}
+	if host["memoryPressure"] != "normal" {
+		return false, "Waiting for memory pressure to recover"
+	}
+	if metric(host["swapOutBytesPerSecond"]) > 1024*1024 {
+		return false, "Waiting for active swapping to settle"
+	}
+	reserve := max(float64(GiB), math.Trunc(metric(host["totalMemoryBytes"])*.15))
+	cpuBudget := max(1.0, metric(host["cpuCores"])*.8)
+	if memoryBytes > metric(host["totalMemoryBytes"])-reserve || cpuCores > cpuBudget {
+		return false, "Lane reservation exceeds this machine's budget"
+	}
+	memoryGrowth, cpuGrowth := 0.0, 0.0
+	for _, job := range active {
+		pred, observed := obj(job["prediction"]), obj(job["observed"])
+		if !validPrediction(pred) || !schedulingNumber(observed["memoryBytes"], false) || !schedulingNumber(observed["cpuCores"], false) {
+			return false, "Waiting for valid active resource reservations"
+		}
+		memoryGrowth += max(0.0, metric(pred["memoryBytes"])-metric(observed["memoryBytes"]))
+		cpuGrowth += max(0.0, min(cpuBudget, metric(pred["cpuCores"]))-metric(observed["cpuCores"]))
+	}
+	if memoryBytes+reserve+memoryGrowth+held.memoryBytes > metric(host["availableMemoryBytes"]) {
+		return false, "Waiting for memory headroom for the lane reservation"
+	}
+	if metric(host["cpuBusyCores"])+cpuGrowth+held.cpuCores+cpuCores > cpuBudget {
+		return false, "Waiting for CPU headroom for the lane reservation"
+	}
+	return true, "Lane reservation fits the current headroom"
+}
+
+// snapshotLane reads the lane registry the daemon publishes in its snapshot.
+// An older daemon publishes none; callers then treat work as default-lane.
+func snapshotLane(snapshot Object, name string) Object {
+	return obj(obj(snapshot["lanes"])[name])
+}
+
+// snapshotSharesLimit is fail-closed: an unknown lane counts against the
+// global limit.
+func snapshotSharesLimit(snapshot Object, name string) bool {
+	lane := snapshotLane(snapshot, name)
+	return lane == nil || lane["sharesLimit"] != false
+}
+
+func laneReservation(snapshot Object, name string) (float64, float64) {
+	reservation := obj(snapshotLane(snapshot, name)["reservation"])
+	memory, _ := integer(reservation["memoryMiB"])
+	cpu, _ := integer(reservation["cpuPercent"])
+	return float64(memory) * 1024 * 1024, float64(cpu) / 100
+}
+
+// heldLeases returns how many held leases share the global limit and the total
+// reservation of all held leases, which applies whether or not they share it.
+func heldLeases(snapshot Object) (int, leaseReservations, error) {
+	sharing := 0
+	held := leaseReservations{}
+	for _, raw := range obj(snapshot["tasks"]) {
+		task := obj(raw)
+		if !taskIsLease(task) {
+			continue
+		}
+		state, _, err := TaskStatus(task)
+		if err != nil {
+			return 0, held, err
+		}
+		if state != "Running" {
+			continue
+		}
+		lane := taskLane(task)
+		if snapshotSharesLimit(snapshot, lane) {
+			sharing++
+		}
+		memory, cpu := laneReservation(snapshot, lane)
+		held.memoryBytes += memory
+		held.cpuCores += cpu
+	}
+	return sharing, held, nil
+}
+
+func snapshotTaskByID(snapshot Object, id int) Object {
+	return obj(obj(snapshot["tasks"])[strconv.Itoa(id)])
 }
 
 func schedulingGroup(snapshot Object) (Object, int, error) {
@@ -293,6 +397,12 @@ func schedulingGroup(snapshot Object) (Object, int, error) {
 	return group, limit, nil
 }
 func SchedulingPermit(g *Gate, marker Object, memberCount int) (bool, error) {
+	return schedulingPermit(g, marker, func(Object) int { return memberCount })
+}
+
+// schedulingPermit lets the worker recheck its admission. sharingMembers counts
+// slot members whose lanes share the global limit in the given snapshot.
+func schedulingPermit(g *Gate, marker Object, sharingMembers func(Object) int) (bool, error) {
 	configuration, e := SchedulingSettings(g)
 	if e != nil {
 		return false, e
@@ -324,7 +434,16 @@ func SchedulingPermit(g *Gate, marker Object, memberCount int) (bool, error) {
 			if e != nil {
 				return false, e
 			}
-			if !boolean(state["available"]) || !boolean(state["admissionReady"]) || memberCount >= limit || group["status"] != "Running" {
+			sharing := snapshotSharesLimit(queue, taskLane(snapshotTaskByID(queue, markerID)))
+			heldSharing, held, e := heldLeases(queue)
+			if e != nil {
+				return false, e
+			}
+			occupied := -1
+			if sharing {
+				occupied = sharingMembers(queue) + heldSharing
+			}
+			if !boolean(state["available"]) || !boolean(state["admissionReady"]) || sharing && occupied >= limit || group["status"] != "Running" {
 				return false, nil
 			}
 			for _, raw := range obj(queue["tasks"]) {
@@ -333,7 +452,7 @@ func SchedulingPermit(g *Gate, marker Object, memberCount int) (bool, error) {
 				if e != nil {
 					return false, e
 				}
-				if (status == "Running" || status == "Paused") && CommandToken(task) == "" && (task["group"] == nil || task["group"] == "default") {
+				if (status == "Running" || status == "Paused") && CommandToken(task) == "" && !taskIsLease(task) && (task["group"] == nil || task["group"] == "default") {
 					return false, nil
 				}
 			}
@@ -357,7 +476,7 @@ func SchedulingPermit(g *Gate, marker Object, memberCount int) (bool, error) {
 			} else if !os.IsNotExist(e) {
 				return false, e
 			}
-			allowed, _ := ResourceDecision(obj(state["host"]), obj(grant["prediction"]), active, limit)
+			allowed, _ := resourceDecision(obj(state["host"]), obj(grant["prediction"]), active, occupied, limit, held)
 			now := resourceNow()
 			return allowed && now <= metric(grant["expires"]) && now-metric(state["sampledAt"]) >= 0 && now-metric(state["sampledAt"]) <= resourceFreshSeconds && now-metric(obj(state["host"])["sampledAt"]) >= 0 && now-metric(obj(state["host"])["sampledAt"]) <= resourceFreshSeconds, nil
 		}
@@ -368,7 +487,15 @@ func SchedulingPermit(g *Gate, marker Object, memberCount int) (bool, error) {
 			return false, e
 		}
 		_, limit, e := schedulingGroup(snapshot)
-		return memberCount < limit, e
+		if e != nil {
+			return false, e
+		}
+		// The daemon already enforced this lane's concurrency when it
+		// dispatched the attempt; only limit-sharing lanes recheck the limit.
+		if !snapshotSharesLimit(snapshot, taskLane(snapshotTaskByID(snapshot, markerID))) {
+			return true, nil
+		}
+		return sharingMembers(snapshot) < limit, nil
 	}
 	return false, nil
 }
@@ -488,6 +615,31 @@ func ManualGrant(g *Gate, id int, value string) error {
 		return e
 	}
 	obj(admissions["grants"])[value] = Object{"task_id": id, "manual": true, "expires": resourceNow() + 30, "prediction": Object{}}
+	return WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions)
+}
+
+// revokeManualGrant withdraws a Start now grant the daemon refused, so it
+// cannot admit the job later outside its lane's order.
+func revokeManualGrant(g *Gate, id int, value string) error {
+	unlock, e := LockPrivate(g, "")
+	if e != nil {
+		return e
+	}
+	defer unlock()
+	configuration, e := SchedulingSettings(g)
+	if e != nil {
+		return e
+	}
+	admissions, e := SchedulingLedger(g, configuration)
+	if e != nil {
+		return e
+	}
+	grants := obj(admissions["grants"])
+	grant := obj(grants[value])
+	if grantID, ok := integer(grant["task_id"]); !ok || grantID != id || !boolean(grant["manual"]) {
+		return nil
+	}
+	delete(grants, value)
 	return WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions)
 }
 func schedulerTaskID(key string) (int, error) {

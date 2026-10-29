@@ -297,6 +297,14 @@ func RejectPipedInput() error {
 	return nil
 }
 func Run(g *Gate, argv []string, label string) (code int, err error) {
+	return RunInLane(g, argv, label, "")
+}
+
+// RunInLane is Run in a plugin lane. Without a lane it is exactly Run.
+func RunInLane(g *Gate, argv []string, label, lane string) (code int, err error) {
+	if lane == defaultLaneName {
+		lane = ""
+	}
 	if os.Getenv("AGENT_HEAVY_ACTIVE") != "" {
 		return 125, errors.New("Nested agent-heavy would deadlock; wrap the outer command once")
 	}
@@ -328,6 +336,18 @@ func Run(g *Gate, argv []string, label string) (code int, err error) {
 	}
 	if group["status"] != "Running" {
 		return 125, errors.New("Dedicated default queue must be Running; no command was submitted")
+	}
+	if lane != "" {
+		// An older daemon ignores unknown submission fields; refuse before it
+		// could run the command in the default lane.
+		if obj(snapshot["lanes"]) == nil {
+			fmt.Fprintln(os.Stderr, "agent-heavy:", errLanesUnsupported)
+			return laneExitUsage, nil
+		}
+		if definition := snapshotLane(snapshot, lane); definition == nil || definition["removed"] == true {
+			fmt.Fprintln(os.Stderr, "agent-heavy:", unknownLaneError(snapshot, lane))
+			return laneExitUsage, nil
+		}
 	}
 	jobToken := token()
 	path, _ := g.PayloadPath(jobToken)
@@ -383,16 +403,26 @@ func Run(g *Gate, argv []string, label string) (code int, err error) {
 		return 125, err
 	}
 	submitted = true
-	added, err := g.QueueControl("submit", Object{"token": jobToken})
+	// Lane submissions use their own operation, which an older daemon rejects
+	// outright instead of queueing the command in the default lane.
+	operation, request := "submit", Object{"token": jobToken}
+	if lane != "" {
+		operation, request = "submit-lane", Object{"token": jobToken, "lane": lane}
+	}
+	added, err := g.QueueControl(operation, request)
 	// A lost response does not establish whether submission committed. Reconcile
 	// using the same immutable token; the daemon returns the original identity.
-	for retry := 0; err != nil && !errors.Is(err, errQueueHandoverBusy) && retry < 2; retry++ {
-		added, err = g.QueueControl("submit", Object{"token": jobToken})
+	for retry := 0; err != nil && !errors.Is(err, errQueueHandoverBusy) && !errors.Is(err, errQueueUnknownLane) && retry < 2; retry++ {
+		added, err = g.QueueControl(operation, request)
 	}
 	if err != nil {
 		unlock()
-		if errors.Is(err, errQueueHandoverBusy) {
+		if errors.Is(err, errQueueHandoverBusy) || errors.Is(err, errQueueUnknownLane) {
 			submitted = false
+		}
+		if errors.Is(err, errQueueUnknownLane) {
+			fmt.Fprintln(os.Stderr, "agent-heavy:", unknownLaneError(snapshot, lane))
+			return laneExitUsage, nil
 		}
 		return 125, err
 	}

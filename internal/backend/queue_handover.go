@@ -367,6 +367,11 @@ func queueHandoverAttempts(store *queueStore) ([]queueHandoverAttempt, error) {
 		return nil, err
 	}
 	for _, job := range jobs {
+		// Handover protocol 1 targets cannot schedule lanes or own leases, so
+		// unfinished lane work takes the drained path instead of a live swap.
+		if job.phase != "done" && (taskIsLease(job.task) || taskLane(job.task) != defaultLaneName) {
+			return nil, errors.New("Lane work or a lease is unfinished; live upgrade waits until it finishes or is released")
+		}
 		protocol, ok := integer(job.task["handoverProtocol"])
 		if job.phase == "done" && (!ok || protocol != queueHandoverProtocol) {
 			continue
