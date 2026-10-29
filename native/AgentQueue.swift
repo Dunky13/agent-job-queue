@@ -1942,7 +1942,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if let bootstrap, bootstrap.phase != .complete, bootstrap.phase != .idle { showSetupWindow() }
+        guard let bootstrap, bootstrap.phase != .complete, bootstrap.phase != .idle else { return true }
+        showSetupWindow()
         return false
     }
 

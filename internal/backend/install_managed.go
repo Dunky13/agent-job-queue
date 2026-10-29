@@ -386,7 +386,9 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 			if exists, err := updateExists(p.previous.App); err != nil {
 				return nil, err
 			} else if !exists {
-				return nil, fmt.Errorf("Agent Queue was installed at %s and its background services are still registered there. Stop them with: agent-heavy install --app-bundle %s --unregister-services, then open Agent Queue again", p.previous.App, installQuote(p.previous.App))
+				// The recorded app is gone, so its own helpers cannot unregister.
+				domain := install.domain()
+				return nil, fmt.Errorf("Agent Queue was installed at %s and its background services are still loaded from there. Stop them with: launchctl bootout %s/io.went.agent-heavy; launchctl bootout %s/io.went.agent-resources; launchctl bootout %s/io.went.agent-remote. Then open Agent Queue again", p.previous.App, domain, domain, domain)
 			}
 			return nil, fmt.Errorf("Agent Queue is already installed at %s; that location changed. Quit Agent Queue and drag this copy over that one, or move that copy to the Trash, then open Agent Queue again", p.previous.App)
 		}

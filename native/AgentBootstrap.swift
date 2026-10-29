@@ -911,7 +911,11 @@ final class QueueBootstrapModel: ObservableObject {
             } catch {
                 guard !(error is CancellationError), attempt == current,
                       QueueSetupProgress.parse(error.localizedDescription).requiresServiceApproval else { throw error }
-                let requests = try environment.serviceStatusRequests()
+                // The app's login item can need approval as well as its agents.
+                var requests = try environment.serviceStatusRequests()
+                if let launcher = requests.first?.executable {
+                    requests.append(QueueBootstrapRequest(executable: launcher, arguments: ["--service-management", "status", "login"]))
+                }
                 var statuses: [String] = []
                 for status in requests { statuses.append(try await serviceStatus(status)) }
                 // Without a pending approval another attempt would fail the same way.
