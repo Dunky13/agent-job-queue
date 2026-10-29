@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,8 +10,9 @@ import (
 )
 
 // laneControllerFixture is an adaptive controller over a fake daemon snapshot
-// that publishes the given lanes. Its sampler already has a complete interval.
-func laneControllerFixture(t *testing.T, lanes Object) (*Gate, Object, *Controller) {
+// that publishes the given lanes. A primed sampler already has a complete
+// interval; an unprimed one has taken no host sample yet.
+func laneControllerFixture(t *testing.T, lanes Object, primed bool) (*Gate, Object, *Controller) {
 	t.Helper()
 	g, snapshot := schedulerFixtureGate(t)
 	snapshot["lanes"] = lanes
@@ -18,9 +20,11 @@ func laneControllerFixture(t *testing.T, lanes Object) (*Gate, Object, *Controll
 	s.wallClock = resourceNow
 	epoch := time.Now()
 	s.clock = func() float64 { return time.Since(epoch).Seconds() }
-	mustHost(t, s)
-	*now += 2
-	b.raw["cpuTicks"] = []any{110, 100, 290, 100}
+	if primed {
+		mustHost(t, s)
+		*now += 2
+		b.raw["cpuTicks"] = []any{110, 100, 290, 100}
+	}
 	controller, e := NewController(g, s, nil)
 	if e != nil {
 		t.Fatal(e)
@@ -49,7 +53,7 @@ func schedulerCalls(t *testing.T, g *Gate) string {
 // slot, the controller must grant it again rather than wait for lane capacity
 // it already holds.
 func TestControllerRegrantsStartedLaneCommandAfterGrantDrop(t *testing.T) {
-	g, snapshot, controller := laneControllerFixture(t, Object{"qa": fixtureLane("qa", 1, 1, 0, true, 0)})
+	g, snapshot, controller := laneControllerFixture(t, Object{"qa": fixtureLane("qa", 1, 1, 0, true, 0)}, true)
 	value := strings.Repeat("1", 32)
 	if e := WritePrivate(filepath.Join(g.State, "workloads", value+".json"), fixtureIdentity()); e != nil {
 		t.Fatal(e)
@@ -73,5 +77,90 @@ func TestControllerRegrantsStartedLaneCommandAfterGrantDrop(t *testing.T) {
 	}
 	if calls := schedulerCalls(t, g); strings.Contains(calls, "start") {
 		t.Fatalf("a running command was started again: %s", calls)
+	}
+}
+
+func fixtureLeaseTask(lane string) Object {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return Object{"kind": "lease", "lane": lane, "label": "session", "priority": 0, "created_at": now, "status": Object{"Queued": Object{}}, "lease": Object{"state": "queued", "queuedAt": now, "ttlSeconds": 0, "meta": Object{}}}
+}
+
+// leaseLanesSnapshot queues a zero-reservation lease (1), a reserved lease (2)
+// and an ordinary command (3) in an adaptive queue.
+func leaseLanesSnapshot(t *testing.T, g *Gate, snapshot Object) string {
+	t.Helper()
+	value := strings.Repeat("3", 32)
+	if e := WritePrivate(filepath.Join(g.State, "workloads", value+".json"), fixtureIdentity()); e != nil {
+		t.Fatal(e)
+	}
+	tasks := obj(snapshot["tasks"])
+	tasks["1"] = fixtureLeaseTask("mutex")
+	tasks["2"] = fixtureLeaseTask("heavy")
+	tasks["3"] = Object{"command": "agent-heavy execute " + value, "status": Object{"Queued": Object{}}, "created_at": time.Now().UTC().Format(time.RFC3339Nano), "priority": 0}
+	writeSchedulerSnapshot(t, g, snapshot)
+	return value
+}
+
+func leaseLanes() Object {
+	return Object{"mutex": fixtureLane("mutex", 1, 0, 0, false, 0), "heavy": fixtureLane("heavy", 1, 0, 0, true, 2048)}
+}
+
+func requireOnlyLeaseStarted(t *testing.T, g *Gate, leases Object, reserved string) {
+	t.Helper()
+	if decision := obj(obj(leases["1"])["decision"]); !boolean(decision["allowed"]) {
+		t.Fatalf("zero-reservation lease waited for resource samples: %v", leases)
+	}
+	if decision := obj(obj(leases["2"])["decision"]); boolean(decision["allowed"]) || decision["reason"] != reserved {
+		t.Fatalf("reserved lease was admitted without a fresh sample: %v", leases)
+	}
+	calls := schedulerCalls(t, g)
+	if !strings.Contains(calls, "start 1\n") || strings.Contains(calls, "start 2\n") || strings.Contains(calls, "start 3\n") {
+		t.Fatalf("only the zero-reservation lease may start: %q", calls)
+	}
+}
+
+// Before the controller has a complete interval, a zero-reservation lease is
+// admitted and started; reserved leases and commands keep waiting.
+func TestControllerStartsUnreservedLeaseBeforeHostInterval(t *testing.T) {
+	g, snapshot, controller := laneControllerFixture(t, leaseLanes(), false)
+	value := leaseLanesSnapshot(t, g, snapshot)
+	state, e := controller.Tick()
+	if e != nil {
+		t.Fatal(e)
+	}
+	if boolean(state["available"]) {
+		t.Fatal("the first host sample reported a complete interval")
+	}
+	requireOnlyLeaseStarted(t, g, obj(state["leases"]), "Collecting a complete resource interval")
+	if decision := obj(obj(obj(state["jobs"])[value])["decision"]); boolean(decision["allowed"]) {
+		t.Fatalf("a command was admitted without a complete interval: %v", decision)
+	}
+}
+
+// A failed host sample still admits a zero-reservation lease. The tick still
+// fails, so the published status keeps admissions held, and it reports the
+// lease decisions without granting any command.
+func TestControllerAdmitsUnreservedLeaseWhenHostSampleFails(t *testing.T) {
+	g, snapshot := schedulerFixtureGate(t)
+	snapshot["lanes"] = leaseLanes()
+	value := leaseLanesSnapshot(t, g, snapshot)
+	s := NewResourceSampler(".", &failingResourceBackend{})
+	if e := serveScheduler(g, s, true); e == nil {
+		t.Fatal("a failed host sample returned success")
+	}
+	status, e := ReadPrivate(filepath.Join(g.State, "resource-status.json"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if boolean(status["available"]) || status["host"] != nil {
+		t.Fatalf("failed sample published usable telemetry: %v", status)
+	}
+	requireOnlyLeaseStarted(t, g, obj(status["leases"]), "Waiting for a fresh host resource sample")
+	admissions, e := ReadPrivate(filepath.Join(g.State, "resource-admissions.json"))
+	if e != nil && !os.IsNotExist(e) {
+		t.Fatal(e)
+	}
+	if grant := obj(admissions["grants"])[value]; grant != nil {
+		t.Fatalf("a command was granted without host telemetry: %v", fmt.Sprint(grant))
 	}
 }

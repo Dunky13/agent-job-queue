@@ -138,11 +138,16 @@ func taskState(task Object) (string, Object, error) { return TaskStatus(task) }
 func (c *Controller) Tick() (Object, error) {
 	g := c.gate
 	host, e := c.sampler.Host()
-	if e != nil {
-		return nil, e
+	if e == nil && !validHost(host) {
+		e = fmt.Errorf("Invalid host resource observations")
 	}
-	if !validHost(host) {
-		return nil, fmt.Errorf("Invalid host resource observations")
+	if e != nil {
+		// A zero-reservation lease never waits for resource samples.
+		leases, leaseError := c.admitLeasesWithoutHost()
+		if leaseError != nil {
+			return nil, errors.Join(e, leaseError)
+		}
+		return Object{"leases": leases}, e
 	}
 	if host["memoryPressure"] != "normal" || metric(host["swapOutBytesPerSecond"]) > 1024*1024 {
 		c.recoveryUntil = time.Now().Add(time.Duration(resourceRecoverySeconds * float64(time.Second)))
@@ -167,8 +172,7 @@ func (c *Controller) Tick() (Object, error) {
 	if e != nil {
 		return nil, e
 	}
-	_, limit, e := schedulingGroup(snapshot)
-	if e != nil {
+	if _, _, e = schedulingGroup(snapshot); e != nil {
 		return nil, e
 	}
 	tasks := obj(snapshot["tasks"])
@@ -395,41 +399,226 @@ func (c *Controller) Tick() (Object, error) {
 	if e != nil {
 		return nil, e
 	}
-	group, limit, e := schedulingGroup(current)
-	if e != nil {
-		return nil, e
-	}
 	hostAge := resourceNow() - metric(host["sampledAt"])
 	hostFresh := hostAge >= 0 && hostAge <= resourceFreshSeconds
 	admissionReady := hostFresh && boolean(host["complete"]) && host["memoryPressure"] == "normal" && metric(host["swapOutBytesPerSecond"]) <= 1024*1024 && !time.Now().Before(c.recoveryUntil)
+	pass := &admissionPass{current: current, tasks: tasks, host: host, hostFresh: hostFresh, admissionReady: admissionReady, active: active, activeLanes: activeLanes, measured: sampledActive, candidates: candidates, grants: obj(admissions["grants"])}
+	if e = c.admit(pass); e != nil {
+		return nil, e
+	}
+	candidates, selected, leaseDecisions := pass.candidates, pass.selected, pass.leases
+	grants, currentTasks := pass.grants, obj(current["tasks"])
+	if configuration["mode"] == "shadow" || configuration["mode"] == "adaptive" {
+		for _, entry := range candidates {
+			if !entry.lease {
+				decision := obj(entry.resources["decision"])
+				audits = append(audits, schedulerAudit{entry.token, text(configuration["mode"]), obj(entry.resources["prediction"]), boolean(decision["allowed"]), text(decision["reason"])})
+			}
+		}
+	}
+	// Serialize snapshot validation with the durable grant write. This read lock
+	// is released before queue RPC so a slow daemon cannot block history writers.
+	valid, releaseProfiles, e := collection.Validate()
+	if e != nil {
+		return nil, e
+	}
+	defer releaseProfiles()
+	if !valid {
+		releaseProfiles()
+		if e = retainActiveGrants(g, admissions); e != nil {
+			return nil, e
+		}
+		if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
+			return nil, e
+		}
+		value := c.status(configuration, host, Object{}, learningRevision, false, false, "Learning changed during collection; waiting for fresh predictions")
+		if e = WritePrivate(filepath.Join(g.State, "resource-status.json"), value); e != nil {
+			return nil, e
+		}
+		return value, nil
+	}
+	available := boolean(host["complete"]) && resourceNow()-metric(host["sampledAt"]) >= 0 && resourceNow()-metric(host["sampledAt"]) <= resourceFreshSeconds
+	if !available {
+		reason = "Collecting a complete resource interval"
+	}
+	value := c.status(configuration, host, jobs, learningRevision, available, admissionReady, reason)
+	value["leases"] = leaseDecisions
+	if e = WritePrivate(filepath.Join(g.State, "resource-status.json"), value); e != nil {
+		return nil, e
+	}
+	if configuration["mode"] == "adaptive" && selected >= 0 && available && !candidates[selected].lease {
+		entry := candidates[selected]
+		grants[entry.token] = Object{"task_id": entry.id, "manual": false, "expires": resourceNow() + resourceGrantSeconds, "prediction": entry.resources["prediction"]}
+	}
+	if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
+		return nil, e
+	}
+	releaseProfiles()
+	if configuration["mode"] == "adaptive" {
+		for id, raw := range currentTasks {
+			task := obj(raw)
+			state, _, e := taskState(task)
+			if e != nil {
+				return nil, e
+			}
+			if CommandToken(task) != "" && state == "Queued" {
+				if _, e = g.QueueControl("hold", Object{"id": mustSchedulerID(id)}); e != nil {
+					return nil, e
+				}
+			}
+		}
+		// Admitted leases already met their own sample requirements: a reserved
+		// lease needs a fresh sample and a zero-reservation lease needs none.
+		if selected >= 0 && (available || candidates[selected].lease) {
+			entry := candidates[selected]
+			state, _, e := taskState(obj(currentTasks[fmt.Sprint(entry.id)]))
+			if e != nil {
+				return nil, e
+			}
+			if state == "Queued" || state == "Stashed" {
+				// The daemon recounts the lane; a stale view is refused, not fatal.
+				if _, e = g.QueueControl("start", Object{"id": entry.id}); e != nil && !errors.Is(e, errQueueLaneFull) {
+					return nil, e
+				}
+			}
+		}
+	}
+	unlockLease()
+	locked = false
+	unlockScheduling()
+	schedulingLocked = false
+	for _, audit := range audits {
+		if e = c.store.RecordDecision(audit.token, audit.mode, audit.prediction, audit.allowed, audit.reason, metric(host["sampledAt"])); e != nil {
+			return nil, e
+		}
+	}
+	retained := map[string]bool{}
+	for _, raw := range tasks {
+		task := obj(raw)
+		state, _, e := taskState(task)
+		if e != nil {
+			return nil, e
+		}
+		if state != "Done" {
+			retained[CommandToken(task)] = true
+		}
+	}
+	receipts, e := filepath.Glob(filepath.Join(g.Receipts, "*.json"))
+	if e != nil {
+		return nil, e
+	}
+	for _, path := range receipts {
+		receipt, e := ReadPrivate(path)
+		if e != nil {
+			return nil, e
+		}
+		retained[text(receipt["token"])] = true
+	}
+	for value := range c.runs {
+		if !retained[value] && !terminalTokens[value] {
+			delete(c.runs, value)
+		}
+	}
+	for value, pgid := range c.groups {
+		if !retained[value] {
+			c.sampler.ForgetGroup(pgid)
+			delete(c.groups, value)
+		}
+	}
+	for value := range c.finalized {
+		if !terminalTokens[value] {
+			delete(c.finalized, value)
+		}
+	}
+	for _, directory := range []string{"resource-runs", "workloads"} {
+		paths, e := filepath.Glob(filepath.Join(g.State, directory, "*.json"))
+		if e != nil {
+			return nil, e
+		}
+		type dated struct {
+			path     string
+			modified time.Time
+		}
+		files := []dated{}
+		for _, path := range paths {
+			info, e := os.Stat(path)
+			if e != nil {
+				return nil, e
+			}
+			files = append(files, dated{path, info.ModTime()})
+		}
+		sort.Slice(files, func(i, j int) bool { return files[i].modified.Before(files[j].modified) })
+		for _, file := range files[:max(0, len(files)-1000)] {
+			value := filepath.Base(file.path)
+			value = value[:len(value)-5]
+			if !retained[value] && !terminalTokens[value] {
+				if e = os.Remove(file.path); e != nil {
+					return nil, e
+				}
+			}
+		}
+	}
+	return value, nil
+}
+
+// admissionPass is one admission decision over a daemon snapshot taken under
+// the scheduling locks. active holds work already using capacity, activeLanes
+// parallels it, and measured names the tokens whose workers are in active.
+type admissionPass struct {
+	current, tasks, host      Object
+	hostFresh, admissionReady bool
+	active                    []Object
+	activeLanes               []string
+	measured                  map[string]bool
+	candidates                []schedulerCandidate
+	grants                    Object
+	selected                  int
+	leases                    Object
+}
+
+// admit orders the candidates, adds queued leases, and records a decision for
+// each. It selects the first admitted candidate, or -1. Grants it no longer
+// counts are removed from pass.grants; persisting them is the caller's choice.
+func (c *Controller) admit(pass *admissionPass) error {
+	g, current, host, hostFresh := c.gate, pass.current, pass.host, pass.hostFresh
+	group, limit, e := schedulingGroup(current)
+	if e != nil {
+		return e
+	}
+	active, activeLanes, candidates := pass.active, pass.activeLanes, pass.candidates
+	addActive := func(entry Object, lane string) {
+		active = append(active, entry)
+		activeLanes = append(activeLanes, lane)
+	}
+	admissionReady := pass.admissionReady
 	slotExists := false
 	var manifest Object
 	if _, e = os.Stat(g.Slot); e == nil {
 		slotExists = true
 		manifest, e = SharedManifest(g)
 		if e != nil {
-			return nil, e
+			return e
 		}
 		if manifest != nil {
 			members, e := os.ReadDir(filepath.Join(g.Slot, "agent-heavy-jobs"))
 			if e != nil {
-				return nil, e
+				return e
 			}
 			for _, path := range members {
 				member, e := ReadPrivate(filepath.Join(g.Slot, "agent-heavy-jobs", path.Name()))
 				if e != nil {
-					return nil, e
+					return e
 				}
-				if !sampledActive[text(member["token"])] {
+				if !pass.measured[text(member["token"])] {
 					id, _ := integer(member["task_id"])
-					addActive(unknownReservation(), taskLane(obj(tasks[strconv.Itoa(id)])))
+					addActive(unknownReservation(), taskLane(obj(pass.tasks[strconv.Itoa(id)])))
 				}
 			}
 		}
 	} else if !os.IsNotExist(e) {
-		return nil, e
+		return e
 	}
-	grants := obj(admissions["grants"])
+	grants := pass.grants
 	currentTasks := obj(current["tasks"])
 	for value, raw := range grants {
 		grant := obj(raw)
@@ -437,12 +626,12 @@ func (c *Controller) Tick() (Object, error) {
 		task := obj(currentTasks[fmt.Sprint(id)])
 		receipt, e := g.Receipt(id)
 		if e != nil {
-			return nil, e
+			return e
 		}
 		pending := receipt == nil || receipt["pgid"] == nil
 		state, _, e := taskState(task)
 		if e != nil {
-			return nil, e
+			return e
 		}
 		if state == "Missing" || state == "Done" || (pending && (metric(grant["expires"]) < resourceNow() || (!boolean(grant["manual"]) && !admissionReady))) {
 			delete(grants, value)
@@ -456,7 +645,7 @@ func (c *Controller) Tick() (Object, error) {
 	}
 	heldSharing, held, e := heldLeases(current)
 	if e != nil {
-		return nil, e
+		return e
 	}
 	occupied := heldSharing
 	for _, lane := range activeLanes {
@@ -477,11 +666,11 @@ func (c *Controller) Tick() (Object, error) {
 	for key, raw := range currentTasks {
 		task := obj(raw)
 		if state, _, e := taskState(task); e != nil {
-			return nil, e
+			return e
 		} else if taskIsLease(task) && state == "Queued" {
 			id, e := schedulerTaskID(key)
 			if e != nil {
-				return nil, e
+				return e
 			}
 			candidates = append(candidates, schedulerCandidate{id: id, task: task, lease: true})
 		}
@@ -590,7 +779,7 @@ func (c *Controller) Tick() (Object, error) {
 		}
 		state, _, e := taskState(obj(currentTasks[fmt.Sprint(entry.id)]))
 		if e != nil {
-			return nil, e
+			return e
 		}
 		if !containsString([]string{"Queued", "Stashed", "Running"}, state) || entry.lease && state != "Queued" {
 			allowed, why = false, "Job changed while resources were sampled"
@@ -599,155 +788,96 @@ func (c *Controller) Tick() (Object, error) {
 			leaseDecisions[strconv.Itoa(entry.id)] = Object{"decision": Object{"allowed": allowed, "reason": why}}
 		} else {
 			entry.resources["decision"] = Object{"allowed": allowed, "reason": why}
-			if configuration["mode"] == "shadow" || configuration["mode"] == "adaptive" {
-				audits = append(audits, schedulerAudit{entry.token, text(configuration["mode"]), obj(entry.resources["prediction"]), allowed, why})
-			}
 		}
 		if selected < 0 && allowed {
 			selected = index
 		}
 	}
-	// Serialize snapshot validation with the durable grant write. This read lock
-	// is released before queue RPC so a slow daemon cannot block history writers.
-	valid, releaseProfiles, e := collection.Validate()
+	pass.candidates, pass.selected, pass.leases = candidates, selected, leaseDecisions
+	return nil
+}
+
+// admitLeasesWithoutHost runs when the host sample failed. Commands and
+// reserved leases keep waiting for a fresh sample; a zero-reservation lease is
+// admitted by the same lane, limit and ordering rules from the daemon snapshot.
+// Running work counts at the unknown reservation, and the admission ledger is
+// read but never rewritten.
+func (c *Controller) admitLeasesWithoutHost() (Object, error) {
+	g := c.gate
+	if configuration, e := SchedulingSettings(g); e != nil || configuration["mode"] != "adaptive" {
+		return nil, e
+	}
+	unlockScheduling, e := LockPrivate(g, "scheduling.lock")
 	if e != nil {
 		return nil, e
 	}
-	defer releaseProfiles()
-	if !valid {
-		releaseProfiles()
-		if e = retainActiveGrants(g, admissions); e != nil {
-			return nil, e
-		}
-		if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
-			return nil, e
-		}
-		value := c.status(configuration, host, Object{}, learningRevision, false, false, "Learning changed during collection; waiting for fresh predictions")
-		if e = WritePrivate(filepath.Join(g.State, "resource-status.json"), value); e != nil {
-			return nil, e
-		}
-		return value, nil
-	}
-	available := boolean(host["complete"]) && resourceNow()-metric(host["sampledAt"]) >= 0 && resourceNow()-metric(host["sampledAt"]) <= resourceFreshSeconds
-	if !available {
-		reason = "Collecting a complete resource interval"
-	}
-	value := c.status(configuration, host, jobs, learningRevision, available, admissionReady, reason)
-	value["leases"] = leaseDecisions
-	if e = WritePrivate(filepath.Join(g.State, "resource-status.json"), value); e != nil {
+	defer unlockScheduling()
+	unlockLease, e := LockPrivate(g, "")
+	if e != nil {
 		return nil, e
 	}
-	if configuration["mode"] == "adaptive" && selected >= 0 && available && !candidates[selected].lease {
-		entry := candidates[selected]
-		grants[entry.token] = Object{"task_id": entry.id, "manual": false, "expires": resourceNow() + resourceGrantSeconds, "prediction": entry.resources["prediction"]}
-	}
-	if e = WritePrivate(filepath.Join(g.State, "resource-admissions.json"), admissions); e != nil {
+	defer unlockLease()
+	configuration, e := SchedulingSettings(g)
+	if e != nil || configuration["mode"] != "adaptive" {
 		return nil, e
 	}
-	releaseProfiles()
-	if configuration["mode"] == "adaptive" {
-		for id, raw := range currentTasks {
-			task := obj(raw)
-			state, _, e := taskState(task)
-			if e != nil {
-				return nil, e
-			}
-			if CommandToken(task) != "" && state == "Queued" {
-				if _, e = g.QueueControl("hold", Object{"id": mustSchedulerID(id)}); e != nil {
-					return nil, e
-				}
-			}
-		}
-		if selected >= 0 && available {
-			entry := candidates[selected]
-			state, _, e := taskState(obj(currentTasks[fmt.Sprint(entry.id)]))
-			if e != nil {
-				return nil, e
-			}
-			if state == "Queued" || state == "Stashed" {
-				// The daemon recounts the lane; a stale view is refused, not fatal.
-				if _, e = g.QueueControl("start", Object{"id": entry.id}); e != nil && !errors.Is(e, errQueueLaneFull) {
-					return nil, e
-				}
-			}
-		}
+	admissions, e := SchedulingLedger(g, configuration)
+	if e != nil {
+		return nil, e
 	}
-	unlockLease()
-	locked = false
-	unlockScheduling()
-	schedulingLocked = false
-	for _, audit := range audits {
-		if e = c.store.RecordDecision(audit.token, audit.mode, audit.prediction, audit.allowed, audit.reason, metric(host["sampledAt"])); e != nil {
-			return nil, e
-		}
+	current, e := g.Snapshot()
+	if e != nil {
+		return nil, e
 	}
-	retained := map[string]bool{}
-	for _, raw := range tasks {
+	pass := &admissionPass{current: current, tasks: obj(current["tasks"]), measured: map[string]bool{}, grants: obj(admissions["grants"])}
+	for key, raw := range pass.tasks {
 		task := obj(raw)
 		state, _, e := taskState(task)
 		if e != nil {
 			return nil, e
 		}
-		if state != "Done" {
-			retained[CommandToken(task)] = true
+		if taskIsLease(task) || !containsString([]string{"Queued", "Stashed", "Running", "Paused"}, state) {
+			continue
 		}
+		started := state == "Running" || state == "Paused"
+		value := CommandToken(task)
+		if value == "" {
+			if started && (task["group"] == nil || task["group"] == "default") {
+				pass.active = append(pass.active, unknownReservation())
+				pass.activeLanes = append(pass.activeLanes, taskLane(task))
+			}
+			continue
+		}
+		id, e := schedulerTaskID(key)
+		if e != nil {
+			return nil, e
+		}
+		receipt, e := g.Receipt(id)
+		if e != nil {
+			return nil, e
+		}
+		if receipt != nil && receipt["pgid"] != nil {
+			pass.active = append(pass.active, unknownReservation())
+			pass.activeLanes = append(pass.activeLanes, taskLane(task))
+			pass.measured[value] = true
+			continue
+		}
+		pass.candidates = append(pass.candidates, schedulerCandidate{id: id, token: value, task: task, resources: Object{"prediction": Object{}, "observed": nil, "decision": nil}})
 	}
-	receipts, e := filepath.Glob(filepath.Join(g.Receipts, "*.json"))
-	if e != nil {
+	if e = c.admit(pass); e != nil {
 		return nil, e
 	}
-	for _, path := range receipts {
-		receipt, e := ReadPrivate(path)
-		if e != nil {
+	if pass.selected >= 0 && pass.candidates[pass.selected].lease {
+		entry := pass.candidates[pass.selected]
+		if state, _, e := taskState(snapshotTaskByID(current, entry.id)); e != nil {
 			return nil, e
-		}
-		retained[text(receipt["token"])] = true
-	}
-	for value := range c.runs {
-		if !retained[value] && !terminalTokens[value] {
-			delete(c.runs, value)
-		}
-	}
-	for value, pgid := range c.groups {
-		if !retained[value] {
-			c.sampler.ForgetGroup(pgid)
-			delete(c.groups, value)
-		}
-	}
-	for value := range c.finalized {
-		if !terminalTokens[value] {
-			delete(c.finalized, value)
-		}
-	}
-	for _, directory := range []string{"resource-runs", "workloads"} {
-		paths, e := filepath.Glob(filepath.Join(g.State, directory, "*.json"))
-		if e != nil {
-			return nil, e
-		}
-		type dated struct {
-			path     string
-			modified time.Time
-		}
-		files := []dated{}
-		for _, path := range paths {
-			info, e := os.Stat(path)
-			if e != nil {
+		} else if state == "Queued" {
+			if _, e = g.QueueControl("start", Object{"id": entry.id}); e != nil && !errors.Is(e, errQueueLaneFull) {
 				return nil, e
 			}
-			files = append(files, dated{path, info.ModTime()})
-		}
-		sort.Slice(files, func(i, j int) bool { return files[i].modified.Before(files[j].modified) })
-		for _, file := range files[:max(0, len(files)-1000)] {
-			value := filepath.Base(file.path)
-			value = value[:len(value)-5]
-			if !retained[value] && !terminalTokens[value] {
-				if e = os.Remove(file.path); e != nil {
-					return nil, e
-				}
-			}
 		}
 	}
-	return value, nil
+	return pass.leases, nil
 }
 func unknownReservation() Object {
 	return Object{"prediction": Object{"memoryBytes": GiB, "cpuCores": 2.0}, "observed": Object{}}
@@ -817,6 +947,9 @@ func serveScheduler(g *Gate, sampler *ResourceSampler, once bool) error {
 				return configError
 			}
 			value := Object{"mode": configuration["mode"], "generation": configuration["generation"], "boot": controller.boot, "sampledAt": resourceNow(), "updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "available": false, "reason": "Resource collection failed; admissions held", "host": nil, "jobs": Object{}}
+			if leases := obj(state["leases"]); leases != nil {
+				value["leases"] = leases
+			}
 			if writeError := WritePrivate(filepath.Join(g.State, "resource-status.json"), value); writeError != nil {
 				return writeError
 			}

@@ -85,7 +85,7 @@ The default lane with no plugins loaded must behave byte-for-byte as before: sam
 - The daemon recounts a lane from its durable state immediately before every start or grant, whichever path asked (dispatch, **Start now**, the resource controller or `lane acquire`). A full lane refuses the transition.
 - A lane's occupancy includes jobs that have finished but whose process group is still being cleaned up, as the default lane's count always has.
 - A lane at its concurrency never holds back other lanes. In adaptive mode, lanes that share the limit keep the existing head-of-line fairness among themselves; a lane with `sharesLimit: false` only waits behind work in its own lane.
-- In adaptive mode the resource controller admits leases as it admits jobs, one admission per pass. A lease with a zero reservation does not wait for resource samples. Lease decisions appear as the lease's `phase` in status.
+- In adaptive mode the resource controller admits leases as it admits jobs, one admission per pass. A lease with a zero reservation does not wait for resource samples, and is still admitted while host sampling fails. Lease decisions appear as the lease's `phase` in status.
 - The default lane has no plugin and never starts hooks. Leases always belong to a plugin lane.
 
 ## Leases (Contract)
