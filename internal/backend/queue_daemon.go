@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -96,8 +97,17 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 		return nil, errors.New("Unsupported queue protocol")
 	}
 	if response.Error != "" {
-		if response.ErrorCode == "handover-busy" {
+		switch response.ErrorCode {
+		case "handover-busy":
 			return nil, errQueueHandoverBusy
+		case "lane-full":
+			return nil, queueCodedError(errQueueLaneFull, response.Error)
+		case "lane-unknown":
+			return nil, queueCodedError(errQueueUnknownLane, response.Error)
+		case "lease-gone":
+			return nil, queueCodedError(errQueueLeaseGone, response.Error)
+		case "lease-owner":
+			return nil, queueCodedError(errQueueLeaseOwner, response.Error)
 		}
 		return nil, errors.New(response.Error)
 	}
@@ -117,6 +127,44 @@ type queueDaemon struct {
 	cleanup      sync.WaitGroup
 	handover     *queueHandoverReceipt
 	handoverStop chan struct{}
+	plugins      pluginRegistry
+	retired      map[string]queueLane
+	hooks        *hookRunner
+	ownerAlive   map[int]bool
+	finished     map[int]bool
+	boot         string
+	now          func() time.Time
+}
+
+// queueCodedError keeps the daemon's message while restoring the sentinel the
+// caller branches on; the transport only carries strings.
+func queueCodedError(sentinel error, message string) error {
+	if detail, ok := strings.CutPrefix(message, sentinel.Error()); ok {
+		return fmt.Errorf("%w%s", sentinel, detail)
+	}
+	return fmt.Errorf("%w: %s", sentinel, message)
+}
+
+func queueErrorCode(err error) string {
+	switch {
+	case errors.Is(err, errQueueHandoverBusy):
+		return "handover-busy"
+	case errors.Is(err, errQueueLaneFull):
+		return "lane-full"
+	case errors.Is(err, errQueueUnknownLane):
+		return "lane-unknown"
+	case errors.Is(err, errQueueLeaseGone):
+		return "lease-gone"
+	case errors.Is(err, errQueueLeaseOwner):
+		return "lease-owner"
+	}
+	return ""
+}
+
+func newQueueDaemon(g *Gate, store *queueStore) *queueDaemon {
+	d := &queueDaemon{g: g, store: store, children: map[int]*exec.Cmd{}, errors: map[int]string{}, cleaning: map[int]bool{}, handoverStop: make(chan struct{}, 1), retired: map[string]queueLane{}, hooks: newHookRunner(g), ownerAlive: map[int]bool{}, finished: map[int]bool{}}
+	d.plugins = loadPluginRegistry(g)
+	return d
 }
 
 func ServeQueue(g *Gate) error {
@@ -182,7 +230,8 @@ func ServeQueue(g *Gate) error {
 		return e
 	}
 	defer os.Remove(path)
-	d := &queueDaemon{g: g, store: store, children: map[int]*exec.Cmd{}, errors: map[int]string{}, cleaning: map[int]bool{}, handoverStop: make(chan struct{}, 1)}
+	d := newQueueDaemon(g, store)
+	defer d.hooks.wait()
 	if e = d.recover(); e != nil {
 		return e
 	}
@@ -227,12 +276,28 @@ func ServeQueue(g *Gate) error {
 				response := queueResponse{Version: 1, Result: result}
 				if e != nil {
 					response.Error = e.Error()
-					if errors.Is(e, errQueueHandoverBusy) {
-						response.ErrorCode = "handover-busy"
-					}
+					response.ErrorCode = queueErrorCode(e)
 				}
 				json.NewEncoder(conn).Encode(response)
 			}()
+		}
+	}()
+	servers.Add(1)
+	go func() {
+		defer servers.Done()
+		owners := time.NewTicker(leaseOwnerCheckInterval)
+		defer owners.Stop()
+		reported := time.Time{}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-owners.C:
+				if e := d.checkLeaseOwners(); e != nil && time.Since(reported) > time.Minute {
+					fmt.Fprintln(os.Stderr, "agent-heavy daemon:", e)
+					reported = time.Now()
+				}
+			}
 		}
 	}()
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -257,7 +322,8 @@ func ServeQueue(g *Gate) error {
 			jobs, e := store.unfinishedJobs()
 			active := false
 			for _, j := range jobs {
-				active = active || j.phase == "starting" || j.phase == "running" || j.phase == "outcome"
+				// A held lease has no process that a restart could orphan.
+				active = active || !taskIsLease(j.task) && (j.phase == "starting" || j.phase == "running" || j.phase == "outcome")
 			}
 			if e == nil && !active {
 				_, e = store.db.Exec("UPDATE queue_settings SET dirty=0 WHERE id=1")
@@ -306,8 +372,8 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	if op == "handover-status" || op == "prepare-handover" || op == "commit-handover" || op == "cancel-handover" {
 		return d.handoverControl(op, p)
 	}
-	if d.handover != nil && op != "snapshot" {
-		if op == "submit" {
+	if d.handover != nil && op != "snapshot" && op != "lease-status" {
+		if op == "submit" || op == "submit-lane" || op == "lease-acquire" {
 			value := text(p["token"])
 			if !validToken(value) {
 				return nil, errors.New("Invalid submission token")
@@ -315,6 +381,9 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 			var id int
 			err := d.store.db.QueryRow("SELECT id FROM queue_jobs WHERE token=?", value).Scan(&id)
 			if err == nil {
+				if op == "lease-acquire" {
+					return d.leaseView(id)
+				}
 				return Object{"id": id}, nil
 			}
 			if !errors.Is(err, sql.ErrNoRows) {
@@ -323,11 +392,34 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		}
 		return nil, errQueueHandoverBusy
 	}
-	if op == "snapshot" {
-		return d.store.snapshot()
-	}
-	if op == "submit" {
+	switch op {
+	case "snapshot":
+		return d.snapshot()
+	case "submit":
 		return d.submit(p)
+	case "submit-lane":
+		lane := text(p["lane"])
+		if _, ok := d.plugins.lanes[lane]; !ok {
+			return nil, fmt.Errorf("%w %q", errQueueUnknownLane, lane)
+		}
+		return d.submitLane(p, lane)
+	case "lease-acquire":
+		return d.acquireLease(p)
+	case "lease-renew":
+		return d.renewLease(p)
+	case "lease-release":
+		return d.releaseLease(p)
+	case "lease-status":
+		id, ok := integer(p["id"])
+		if !ok || id < 0 {
+			return nil, errors.New("Invalid lease ID")
+		}
+		return d.leaseView(id)
+	case "plugins-reload":
+		if err := d.reloadPlugins(); err != nil {
+			return nil, err
+		}
+		return d.snapshot()
 	}
 	if op == "limit" {
 		limit, ok := integer(p["limit"])
@@ -373,12 +465,17 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		if name != "Queued" && name != "Stashed" {
 			return nil, errors.New("Only queued jobs can be started")
 		}
-		if e = d.launch(j); e != nil {
+		if taskIsLease(j.task) {
+			e = d.grantLease(j)
+		} else {
+			e = d.launch(j)
+		}
+		if e != nil {
 			return nil, e
 		}
-		return d.store.snapshot()
+		return d.snapshot()
 	case "hold", "enqueue":
-		if name == "Queued" || name == "Stashed" {
+		if (name == "Queued" || name == "Stashed") && !taskIsLease(j.task) {
 			state := "Queued"
 			if op == "hold" {
 				state = "Stashed"
@@ -402,7 +499,8 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 				if e != nil {
 					return nil, e
 				}
-				if state == "Queued" || state == "Stashed" {
+				// Reordering stays within the item's own lane.
+				if (state == "Queued" || state == "Stashed") && taskLane(candidate.task) == taskLane(j.task) {
 					v, _ := integer(candidate.task["priority"])
 					values = append(values, v)
 				}
@@ -425,7 +523,24 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		if e == nil {
 			return Object{"priority": priority}, nil
 		}
-	case "cancel":
+	case "cancel", "kill":
+		if taskIsLease(j.task) {
+			// Cancelling a queued lease drops it; cancelling a held lease
+			// releases it. There is no process to signal.
+			if name != "Done" {
+				e = d.endLease(j, "cancelled")
+			}
+			break
+		}
+		if op == "kill" {
+			if name != "Done" {
+				j.task["cancelled"] = true
+				if e = d.store.saveTask(j); e == nil {
+					e = d.signal(j, syscall.SIGKILL)
+				}
+			}
+			break
+		}
 		if name == "Done" {
 			return j.task, nil
 		}
@@ -441,14 +556,10 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 				e = d.signal(j, syscall.SIGCONT)
 			}
 		}
-	case "kill":
-		if name != "Done" {
-			j.task["cancelled"] = true
-			if e = d.store.saveTask(j); e == nil {
-				e = d.signal(j, syscall.SIGKILL)
-			}
-		}
 	case "pause-job", "resume-job":
+		if taskIsLease(j.task) {
+			return nil, errors.New("A lease has no process to pause or resume")
+		}
 		if name != "Running" && name != "Paused" {
 			return nil, errors.New("Only active jobs can be paused or resumed")
 		}
@@ -468,9 +579,12 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	if e != nil {
 		return nil, e
 	}
-	return d.store.snapshot()
+	return d.snapshot()
 }
 func (d *queueDaemon) submit(p Object) (Object, error) {
+	return d.submitLane(p, defaultLaneName)
+}
+func (d *queueDaemon) submitLane(p Object, lane string) (Object, error) {
 	value := text(p["token"])
 	if !validToken(value) {
 		return nil, errors.New("Invalid submission token")
@@ -534,6 +648,9 @@ func (d *queueDaemon) submit(p Object) (Object, error) {
 		return nil, errors.New("Queue job ID space exhausted")
 	}
 	task := Object{"token": value, "path": payload["cwd"], "label": payload["label"], "priority": 0, "group": "default", "created_at": queueNow(), "status": Object{state: Object{}}, "logPath": filepath.Join(d.g.State, "logs", strconv.Itoa(next)+".log")}
+	if lane != defaultLaneName {
+		task["lane"] = lane
+	}
 	if supported && protocol == queueHandoverProtocol {
 		task["handoverProtocol"] = queueHandoverProtocol
 		task["handoverCaller"] = caller
@@ -564,11 +681,18 @@ func (d *queueDaemon) submit(p Object) (Object, error) {
 	if e = tx.Commit(); e != nil {
 		return nil, e
 	}
+	if lane != defaultLaneName {
+		d.emitTask("job.queued", next, task, nil)
+		return Object{"id": next, "lane": lane}, nil
+	}
 	return Object{"id": next}, nil
 }
 func (d *queueDaemon) launch(j queueJob) error {
 	if d.handover != nil {
 		return errors.New("Queue dispatch is frozen for live handover")
+	}
+	if e := d.laneRoom(taskLane(j.task)); e != nil {
+		return e
 	}
 	j.attempt = token()
 	j.task["status"] = Object{"Running": Object{"start": queueNow()}}
@@ -613,6 +737,7 @@ func (d *queueDaemon) launch(j queueJob) error {
 		return d.finish(j, 125)
 	}
 	d.children[j.id] = cmd
+	d.emitTask("job.started", j.id, j.task, nil)
 	go func() {
 		e := cmd.Wait()
 		d.mu.Lock()
@@ -682,15 +807,41 @@ func (d *queueDaemon) tick() error {
 	if e != nil {
 		return e
 	}
-	active := 0
+	usage := map[string]*laneCount{}
+	occupy := func(j queueJob) {
+		lane := taskLane(j.task)
+		if usage[lane] == nil {
+			usage[lane] = &laneCount{}
+		}
+		if taskIsLease(j.task) {
+			usage[lane].held++
+		} else {
+			usage[lane].running++
+		}
+	}
 	waiting := []queueJob{}
+	now := d.clock()
 	for _, j := range jobs {
+		if taskIsLease(j.task) {
+			if leaseExpired(j.task, now) {
+				if e = d.endLease(j, "ttl"); e != nil && !errors.Is(e, errQueueChanged) {
+					return e
+				}
+				continue
+			}
+			if j.phase == "running" {
+				occupy(j)
+			} else if name, _, e := TaskStatus(j.task); e == nil && name == "Queued" {
+				waiting = append(waiting, j)
+			}
+			continue
+		}
 		switch j.phase {
 		case "starting":
-			active++
+			occupy(j)
 		case "running":
 			if d.children[j.id] != nil {
-				active++
+				occupy(j)
 				continue
 			}
 			owned, e := VerifyGroupIdentity(j.worker)
@@ -698,7 +849,7 @@ func (d *queueDaemon) tick() error {
 				return e
 			}
 			if owned {
-				active++
+				occupy(j)
 				continue
 			}
 			code := 125
@@ -709,7 +860,18 @@ func (d *queueDaemon) tick() error {
 				return e
 			}
 		case "outcome":
-			active++
+			occupy(j)
+			if !d.finished[j.id] {
+				if d.finished == nil {
+					d.finished = map[int]bool{}
+				}
+				d.finished[j.id] = true
+				extra := Object{}
+				if j.outcome.Valid {
+					extra["exitStatus"] = j.outcome.Int64
+				}
+				d.emitTask("job.finished", j.id, j.task, extra)
+			}
 			if !d.cleaning[j.id] {
 				d.cleaning[j.id] = true
 				d.cleanup.Add(1)
@@ -728,6 +890,7 @@ func (d *queueDaemon) tick() error {
 						d.errors[job.id] = cleanupError.Error()
 					} else {
 						delete(d.errors, job.id)
+						delete(d.finished, job.id)
 					}
 				}(j)
 			}
@@ -749,7 +912,29 @@ func (d *queueDaemon) tick() error {
 		return nil
 	}
 	limit, _ := integer(settings["parallel_tasks"])
-	if settings["status"] != "Running" || active >= limit {
+	if settings["status"] != "Running" {
+		return nil
+	}
+	count := func(name string) *laneCount {
+		if usage[name] == nil {
+			usage[name] = &laneCount{}
+		}
+		return usage[name]
+	}
+	sharing := 0
+	for name, c := range usage {
+		if lane, _ := d.lane(name, limit); lane.SharesLimit {
+			sharing += c.occupied()
+		}
+	}
+	// With only the default lane this is exactly the former "active >= limit"
+	// early return: every candidate shares the global limit.
+	startable := false
+	for _, j := range waiting {
+		lane, _ := d.lane(taskLane(j.task), limit)
+		startable = startable || laneAdmissible(lane, count(lane.Name), sharing, limit)
+	}
+	if !startable {
 		return nil
 	}
 	configuration, e := SchedulingSettings(d.g)
@@ -760,6 +945,11 @@ func (d *queueDaemon) tick() error {
 		return nil
 	}
 	sort.Slice(waiting, func(i, j int) bool {
+		laneA, _ := d.lane(taskLane(waiting[i].task), limit)
+		laneB, _ := d.lane(taskLane(waiting[j].task), limit)
+		if laneA.Priority != laneB.Priority {
+			return laneA.Priority > laneB.Priority
+		}
 		a, _ := integer(waiting[i].task["priority"])
 		b, _ := integer(waiting[j].task["priority"])
 		if a != b {
@@ -768,13 +958,25 @@ func (d *queueDaemon) tick() error {
 		return waiting[i].id < waiting[j].id
 	})
 	for _, j := range waiting {
-		if active >= limit {
-			break
+		lane, _ := d.lane(taskLane(j.task), limit)
+		if !laneAdmissible(lane, count(lane.Name), sharing, limit) {
+			continue
 		}
-		if e = d.launch(j); e != nil {
+		if taskIsLease(j.task) {
+			e = d.grantLease(j)
+		} else {
+			e = d.launch(j)
+		}
+		if errors.Is(e, errQueueLaneFull) || errors.Is(e, errQueueChanged) {
+			continue
+		}
+		if e != nil {
 			return e
 		}
-		active++
+		occupy(j)
+		if lane.SharesLimit {
+			sharing++
+		}
 	}
 	return nil
 }

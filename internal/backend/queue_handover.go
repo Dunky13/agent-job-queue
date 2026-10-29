@@ -367,6 +367,11 @@ func queueHandoverAttempts(store *queueStore) ([]queueHandoverAttempt, error) {
 		return nil, err
 	}
 	for _, job := range jobs {
+		// Handover protocol 1 targets cannot schedule lanes or own leases, so
+		// unfinished lane work takes the drained path instead of a live swap.
+		if job.phase != "done" && (taskIsLease(job.task) || taskLane(job.task) != defaultLaneName) {
+			return nil, errors.New("Lane work or a lease is unfinished; live upgrade waits until it finishes or is released")
+		}
 		protocol, ok := integer(job.task["handoverProtocol"])
 		if job.phase == "done" && (!ok || protocol != queueHandoverProtocol) {
 			continue
@@ -852,6 +857,10 @@ func queueHandoverWorkerWait(g *Gate, id int, value, attempt string) (bool, erro
 }
 
 func queueHandoverRetainedTask(g *Gate, id int, expectedToken, workerAttempt string) (Object, bool, error) {
+	return queueHandoverRetainedTaskWithProbe(g, id, expectedToken, workerAttempt, queueHandoverDaemonAlive)
+}
+
+func queueHandoverRetainedTaskWithProbe(g *Gate, id int, expectedToken, workerAttempt string, daemonAlive func(queueHandoverDaemon) (bool, error)) (Object, bool, error) {
 	if !validToken(expectedToken) {
 		return nil, false, nil
 	}
@@ -869,16 +878,37 @@ func queueHandoverRetainedTask(g *Gate, id int, expectedToken, workerAttempt str
 		return nil, false, err
 	}
 	if receipt.Phase == "committed" {
-		alive, err := queueHandoverDaemonAlive(receipt.Daemon)
-		if err != nil || !alive {
+		alive, err := daemonAlive(receipt.Daemon)
+		if err != nil {
+			return nil, false, err
+		}
+		if !alive {
+			// The old daemon publishes released custody before exiting.
+			// Re-read after observing its exit: the earlier committed view
+			// may already have advanced, including adoption by a successor.
+			current, err := readQueueHandoverReceipt(g)
 			if err != nil {
 				return nil, false, err
 			}
-			return nil, false, errors.New("Queue daemon crashed before releasing handover custody")
+			if current.Phase != "released" && current.Phase != "consumed" {
+				return nil, false, errors.New("Queue daemon crashed before releasing handover custody")
+			}
+			expected := *receipt
+			expected.Phase = current.Phase
+			if current.Phase == "consumed" {
+				expected.Consumer = current.Consumer
+			}
+			if !jsonEqual(&expected, current) {
+				return nil, false, errors.New("Queue handover custody changed while observing daemon exit")
+			}
+			if err := validateQueueHandoverDatabase(g, current); err != nil {
+				return nil, false, err
+			}
+			receipt = current
 		}
 	}
 	if receipt.Phase == "consumed" {
-		alive, err := queueHandoverDaemonAlive(*receipt.Consumer)
+		alive, err := daemonAlive(*receipt.Consumer)
 		if err != nil || !alive {
 			if err != nil {
 				return nil, false, err

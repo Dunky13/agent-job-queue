@@ -25,7 +25,9 @@
       "logPath": "",
       "canReorder": true,
       "canCancel": true,
-      "phase": "Queued"
+      "phase": "Queued",
+      "lane": "default",
+      "kind": "command"
     },
     {
       "id": 2,
@@ -44,7 +46,23 @@
       "logPath": "",
       "canReorder": false,
       "canCancel": true,
-      "phase": "Running"
+      "phase": "Running",
+      "lane": "default",
+      "kind": "command"
     }
-  ]
+  ],
+  "lanes": [
+    {
+      "name": "default",
+      "label": "Default",
+      "plugin": null,
+      "concurrency": 1,
+      "priority": 0,
+      "sharesLimit": true,
+      "running": 1,
+      "held": 0,
+      "waiting": 1
+    }
+  ],
+  "plugins": []
 }

@@ -267,7 +267,8 @@ func LeaseCapacity(g *Gate) (int, error) {
 			return 0, err
 		}
 		group := text(task["group"])
-		if (group == "" || group == "default") && (name == "Running" || name == "Paused") {
+		// A held lease is Running but never claims a slot member.
+		if (group == "" || group == "default") && (name == "Running" || name == "Paused") && !taskIsLease(task) {
 			admitted++
 		}
 	}
@@ -280,7 +281,7 @@ func AcquireLease(g *Gate, marker Object, capacity int) (bool, error) {
 	}
 	defer unlock()
 	var manifest Object
-	count := 0
+	members := []int{}
 	if _, err = os.Lstat(g.Slot); err == nil {
 		manifest, err = SharedManifest(g)
 		if err != nil {
@@ -293,11 +294,27 @@ func AcquireLease(g *Gate, marker Object, capacity int) (bool, error) {
 		if e != nil {
 			return false, e
 		}
-		count = len(entries)
+		for _, entry := range entries {
+			// SharedManifest validated every member name as ID-token.json.
+			prefix, _, _ := strings.Cut(entry.Name(), "-")
+			id, e := strconv.Atoi(prefix)
+			if e != nil {
+				return false, errors.New("Invalid shared lease member; retaining the validation slot")
+			}
+			members = append(members, id)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
-	permitted, err := SchedulingPermit(g, marker, count)
+	permitted, err := schedulingPermit(g, marker, func(snapshot Object) int {
+		sharing := 0
+		for _, id := range members {
+			if snapshotSharesLimit(snapshot, taskLane(snapshotTaskByID(snapshot, id))) {
+				sharing++
+			}
+		}
+		return sharing
+	})
 	if err != nil || !permitted {
 		return false, err
 	}

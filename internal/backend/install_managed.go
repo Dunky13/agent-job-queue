@@ -638,10 +638,18 @@ func (install *installer) managedLoaded(raw []byte, label, app string) error {
 // Newer launchd prints a bundle-relative "program identifier" for Service
 // Management agents instead of an absolute program. A running instance
 // establishes custody only through its kernel-recorded executable. Without a
-// process (for example a replaced bundle awaiting re-registration) nothing can
-// be stopped in error, so this app's bundle and helper identity suffice.
+// process, the registration must name this app's absolute program or bundled
+// definition. Bundle identifiers alone cannot distinguish two installed copies.
 func managedLoadedBundleProgram(raw []byte, executable, helper, command string) bool {
 	identifiers, bundles, pids, blocks := 0, 0, 0, 0
+	programs, paths := 0, 0
+	label := "io.went.agent-heavy"
+	if command == "scheduler" {
+		label = "io.went.agent-resources"
+	} else if command == "serve" {
+		label = "io.went.agent-remote"
+	}
+	definition := filepath.Join(filepath.Dir(filepath.Dir(executable)), "Library/LaunchAgents", label+".plist")
 	identified, bundled, running := false, false, false
 	pid := 0
 	arguments := []string{}
@@ -657,6 +665,16 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 			continue
 		}
 		switch {
+		case strings.HasPrefix(trimmed, "program = "):
+			programs++
+			if trimmed != "program = "+executable {
+				return false
+			}
+		case strings.HasPrefix(trimmed, "path = "):
+			paths++
+			if trimmed != "path = "+definition {
+				return false
+			}
 		case trimmed == "arguments = {":
 			blocks++
 			inArguments = true
@@ -680,12 +698,12 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 			}
 		}
 	}
-	if identifiers != 1 || bundles != 1 || pids > 1 || blocks != 1 || inArguments || !identified || !bundled ||
+	if identifiers != 1 || bundles != 1 || pids > 1 || programs > 1 || paths > 1 || blocks != 1 || inArguments || !identified || !bundled ||
 		!slices.Equal(arguments, []string{helper, command}) {
 		return false
 	}
 	if pids == 0 {
-		return !running
+		return !running && (programs == 1 || paths == 1)
 	}
 	if pid <= 1 {
 		return false

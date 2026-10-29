@@ -315,12 +315,17 @@ func StatusData(g *Gate) (Object, error) {
 		return ai > bi
 	})
 	entries = append(entries, doneEntries[:min(30, len(doneEntries))]...)
+	lanes := obj(snapshot["lanes"])
 	for _, entry := range entries {
 		id, _ := integer(entry["id"])
 		task := obj(entry["task"])
 		name, details, err := TaskStatus(task)
 		if err != nil {
 			return nil, err
+		}
+		if taskIsLease(task) {
+			jobs = append(jobs, leaseStatusJob(id, task, details, scheduling))
+			continue
 		}
 		state := strings.ToLower(name)
 		receipt, err := g.Receipt(id)
@@ -372,21 +377,30 @@ func StatusData(g *Gate) (Object, error) {
 		if resources != nil {
 			job["resources"] = resources
 		}
+		job["lane"] = taskLane(task)
+		job["kind"] = "command"
 		jobs = append(jobs, job)
 	}
 	active, waiting, done := []Object{}, []Object{}, []Object{}
 	for _, job := range jobs {
 		switch job["state"] {
-		case "running", "paused":
+		case "running", "paused", "held":
 			active = append(active, job)
-		case "done":
+		case "done", "released", "expired", "dropped":
 			done = append(done, job)
 		default:
 			waiting = append(waiting, job)
 		}
 	}
+	lanePriority := func(job Object) int {
+		priority, _ := integer(obj(lanes[text(job["lane"])])["priority"])
+		return priority
+	}
 	sort.Slice(active, func(i, j int) bool { a, _ := integer(active[i]["id"]); b, _ := integer(active[j]["id"]); return a < b })
 	sort.Slice(waiting, func(i, j int) bool {
+		if a, b := lanePriority(waiting[i]), lanePriority(waiting[j]); a != b {
+			return a > b
+		}
 		a, _ := integer(waiting[i]["priority"])
 		b, _ := integer(waiting[j]["priority"])
 		if a != b {
@@ -397,10 +411,15 @@ func StatusData(g *Gate) (Object, error) {
 		return a < b
 	})
 	position := 0
+	lanePositions := map[string]int{}
 	for _, job := range waiting {
 		if job["state"] == "queued" {
 			position++
 			job["queuePosition"] = position
+			lanePositions[text(job["lane"])]++
+			if job["kind"] == "lease" {
+				job["position"] = lanePositions[text(job["lane"])]
+			}
 		}
 	}
 	sort.Slice(done, func(i, j int) bool {
@@ -422,7 +441,67 @@ func StatusData(g *Gate) (Object, error) {
 	if status == "" {
 		status = "unknown"
 	}
-	return Object{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": Object{"status": status, "limit": group["parallel_tasks"], "running": len(active), "waiting": len(waiting), "legacyOccupied": LegacyOccupied(g)}, "jobs": all, "scheduler": scheduler}, nil
+	return Object{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": Object{"status": status, "limit": group["parallel_tasks"], "running": len(active), "waiting": len(waiting), "legacyOccupied": LegacyOccupied(g)}, "jobs": all, "scheduler": scheduler, "lanes": statusLanes(snapshot, active, waiting), "plugins": statusPlugins(snapshot)}, nil
+}
+
+// statusLanes lists every lane in priority order. A daemon that predates lanes
+// publishes none; its queue is reported as the default lane alone.
+func statusLanes(snapshot Object, active, waiting []Object) []Object {
+	published := obj(snapshot["lanes"])
+	if published == nil {
+		limit := obj(obj(snapshot["groups"])["default"])["parallel_tasks"]
+		published = Object{defaultLaneName: Object{"name": defaultLaneName, "label": "Default", "plugin": nil, "concurrency": limit, "priority": 0, "sharesLimit": true, "running": len(active), "held": 0, "waiting": len(waiting)}}
+	}
+	lanes := []Object{}
+	for _, lane := range sortedLanes(published) {
+		value := Object{}
+		for _, key := range []string{"name", "label", "plugin", "concurrency", "priority", "sharesLimit", "running", "held", "waiting"} {
+			value[key] = lane[key]
+		}
+		if lane["removed"] == true {
+			value["removed"] = true
+		}
+		lanes = append(lanes, value)
+	}
+	return lanes
+}
+
+func statusPlugins(snapshot Object) []Object {
+	plugins := []Object{}
+	for _, raw := range list(snapshot["plugins"]) {
+		if plugin := obj(raw); plugin != nil {
+			plugins = append(plugins, plugin)
+		}
+	}
+	return plugins
+}
+
+// leaseStatusJob keeps every field existing status consumers require, with
+// empty project and log values: a lease has neither a command nor output.
+func leaseStatusJob(id int, task, details, scheduling Object) Object {
+	fields := leaseFields(id, task, nil)
+	state := text(fields["state"])
+	phase := map[string]string{"queued": "Waiting for lane capacity", "held": "Held", "released": "Released", "expired": "Expired", "dropped": "Dropped"}[state]
+	if state == "queued" && scheduling["mode"] == "adaptive" {
+		if reason := text(obj(obj(obj(scheduling["leases"])[strconv.Itoa(id)])["decision"])["reason"]); reason != "" {
+			phase = reason
+		}
+	}
+	if reason := text(fields["reason"]); reason != "" && state != "queued" && state != "held" {
+		phase += " (" + strings.ReplaceAll(reason, "-", " ") + ")"
+	}
+	title := text(task["label"])
+	if strings.TrimSpace(title) == "" {
+		title = "Lease"
+	}
+	priority, _ := integer(task["priority"])
+	job := Object{"id": id, "title": DisplayText(title, 120), "project": "", "branch": "", "directory": "", "executable": "", "priority": priority, "queuePosition": nil, "submittedAt": task["created_at"], "startedAt": details["start"], "finishedAt": details["end"], "exitCode": nil, "logPath": "", "canReorder": state == "queued", "canStart": state == "queued", "canCancel": state == "queued" || state == "held", "phase": phase, "kind": "lease"}
+	for key, value := range fields {
+		if key != "id" {
+			job[key] = value
+		}
+	}
+	return job
 }
 func ValidateLimit(value int) error {
 	if value < 1 || value > MaxParallel {
@@ -484,22 +563,39 @@ func StartJob(g *Gate, id int) error {
 		return err
 	}
 	defer unlock()
-	task, err := g.Task(id)
+	snapshot, err := g.Snapshot()
 	if err != nil {
 		return err
 	}
+	task := snapshotTaskByID(snapshot, id)
 	name, _, err := TaskStatus(task)
 	if err != nil {
 		return err
 	}
 	value := CommandToken(task)
-	if (name != "Queued" && name != "Stashed") || value == "" {
+	lease := taskIsLease(task)
+	if (name != "Queued" && name != "Stashed") || value == "" && !lease {
 		return fmt.Errorf("Only a queued agent-heavy job can be started; inspect job %d", id)
 	}
-	if err = ManualGrant(g, id, value); err != nil {
-		return err
+	// Start now overrides the global limit and resource admission, never a
+	// lane's own concurrency. The daemon recounts; this check explains early.
+	if lane := snapshotLane(snapshot, taskLane(task)); taskLane(task) != defaultLaneName && lane != nil {
+		concurrency, _ := integer(lane["concurrency"])
+		running, _ := integer(lane["running"])
+		held, _ := integer(lane["held"])
+		if running+held >= concurrency {
+			return fmt.Errorf("%w (%s: %d of %d in use); Start now cannot exceed a lane's concurrency", errQueueLaneFull, taskLane(task), running+held, concurrency)
+		}
+	}
+	if !lease {
+		if err = ManualGrant(g, id, value); err != nil {
+			return err
+		}
 	}
 	if _, err = g.QueueControl("start", Object{"id": id}); err != nil {
+		if errors.Is(err, errQueueLaneFull) && !lease {
+			_ = revokeManualGrant(g, id, value)
+		}
 		return err
 	}
 	task, err = g.Task(id)

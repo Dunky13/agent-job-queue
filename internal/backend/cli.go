@@ -11,8 +11,10 @@ import (
 )
 
 const usage = `Usage: agent-heavy <command>
-  run [--label NAME] -- COMMAND [ARGUMENTS...]
+  run [--label NAME] [--lane LANE] -- COMMAND [ARGUMENTS...]
   status [--json]
+  lane list|acquire|wait|status|renew|release [--json]
+  plugins list|validate|reload [--json]
   pause|resume
   daemon
   cancel|logs|start|next|last JOB_ID
@@ -64,7 +66,7 @@ func Main(args []string) int {
 	case "install":
 		return InstallMain(args[1:])
 	}
-	if args[0] == "--" || args[0] == "--label" {
+	if args[0] == "--" || args[0] == "--label" || args[0] == "--lane" {
 		args = append([]string{"run"}, args...)
 	}
 	g, err := NewGate()
@@ -89,9 +91,9 @@ func commandHelp(args []string) bool {
 			switch {
 			case args[i] == "--":
 				return false
-			case args[i] == "--label":
+			case args[i] == "--label" || args[i] == "--lane":
 				i++
-			case strings.HasPrefix(args[i], "--label="):
+			case strings.HasPrefix(args[i], "--label=") || strings.HasPrefix(args[i], "--lane="):
 			case args[i] == "--help" || args[i] == "-h":
 				return true
 			default:
@@ -101,7 +103,7 @@ func commandHelp(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "daemon", "pause", "resume", "execute-attempt", "status", "cancel", "logs", "cleanup", "execute", "next", "last", "priority", "limit", "start", "scheduling", "scheduler", "profiles", "agents", "version", "updates":
+	case "daemon", "pause", "resume", "execute-attempt", "status", "cancel", "logs", "cleanup", "execute", "next", "last", "priority", "limit", "start", "scheduling", "scheduler", "profiles", "agents", "version", "updates", "lane", "plugins":
 		for _, arg := range args[1:] {
 			if arg == "--help" || arg == "-h" {
 				return true
@@ -118,14 +120,35 @@ func argumentInt(value string) (int, error) {
 	return id, nil
 }
 func runArguments(rest []string) ([]string, string, error) {
-	label := ""
+	argv, label, _, err := runLaneArguments(rest, false)
+	return argv, label, err
+}
+
+// runLaneArguments also accepts --lane when lanes is true. Without it, a
+// leading --lane stays part of the command as it always has.
+func runLaneArguments(rest []string, lanes bool) ([]string, string, string, error) {
+	label, lane := "", ""
 	for len(rest) > 0 {
 		if rest[0] == "--" {
-			return rest[1:], label, nil
+			return rest[1:], label, lane, nil
+		}
+		if lanes && (rest[0] == "--lane" || strings.HasPrefix(rest[0], "--lane=")) {
+			if rest[0] == "--lane" {
+				if len(rest) < 2 {
+					return nil, "", "", errors.New("--lane requires a value")
+				}
+				lane, rest = rest[1], rest[2:]
+			} else {
+				lane, rest = strings.TrimPrefix(rest[0], "--lane="), rest[1:]
+			}
+			if lane != defaultLaneName && !pluginNamePattern.MatchString(lane) {
+				return nil, "", "", errors.New("Lane names match ^[a-z][a-z0-9-]{0,31}$")
+			}
+			continue
 		}
 		if rest[0] == "--label" {
 			if len(rest) < 2 {
-				return nil, "", errors.New("--label requires a value")
+				return nil, "", "", errors.New("--label requires a value")
 			}
 			label = rest[1]
 			rest = rest[2:]
@@ -133,24 +156,32 @@ func runArguments(rest []string) ([]string, string, error) {
 			label = strings.TrimPrefix(rest[0], "--label=")
 			rest = rest[1:]
 		} else {
-			return rest, label, nil
+			return rest, label, lane, nil
 		}
 		if strings.TrimSpace(label) == "" {
-			return nil, "", errors.New("Label must be 1 to 120 printable characters")
+			return nil, "", "", errors.New("Label must be 1 to 120 printable characters")
 		}
 	}
-	return rest, label, nil
+	return rest, label, lane, nil
 }
 func dispatch(g *Gate, args []string) (int, error) {
 	command := args[0]
 	rest := args[1:]
 	switch command {
 	case "run":
-		argv, label, err := runArguments(rest)
+		argv, label, lane, err := runLaneArguments(rest, true)
 		if err != nil {
+			if lane != "" || containsString(rest, "--lane") {
+				fmt.Fprintln(os.Stderr, "agent-heavy:", err)
+				return laneExitUsage, nil
+			}
 			return 125, err
 		}
-		return Run(g, argv, label)
+		return RunInLane(g, argv, label, lane)
+	case "lane":
+		return LaneMain(g, rest, os.Stdout, os.Stderr), nil
+	case "plugins":
+		return PluginsMain(g, rest, os.Stdout, os.Stderr), nil
 	case "status":
 		if len(rest) > 1 || (len(rest) == 1 && rest[0] != "--json") {
 			return 125, errors.New("Usage: agent-heavy status [--json]")
@@ -178,6 +209,13 @@ func dispatch(g *Gate, args []string) (int, error) {
 			}
 			if job["exitCode"] != nil {
 				suffix += fmt.Sprintf("; exit=%v", job["exitCode"])
+			}
+			if job["kind"] == "lease" {
+				fmt.Printf("  lease %v: %s | %s | lane %s%s\n", job["id"], text(job["phase"]), text(job["title"]), text(job["lane"]), suffix)
+				continue
+			}
+			if lane := text(job["lane"]); lane != "" && lane != defaultLaneName {
+				suffix += "; lane " + lane
 			}
 			fmt.Printf("  job %v: %s | %s | %s%s\n", job["id"], text(job["phase"]), text(job["title"]), context, suffix)
 		}
