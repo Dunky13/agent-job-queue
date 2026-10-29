@@ -258,9 +258,11 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 	if err != nil {
 		// A registered daemon that launchd cannot spawn, such as a replaced
 		// bundle awaiting re-registration, answers nothing and holds no
-		// lifetime lock. Its stopped store is then authoritative.
+		// lifetime lock. Its stopped store is then authoritative for planning.
+		// The owned resource controller may still run; quiescence stops it and
+		// repeats the complete offline drain before any mutation.
 		if busy, lockErr := installInspectLock(install.state, "queue-daemon.lock"); lockErr == nil && !busy && exists {
-			return install.managedOfflineDrain(ctx)
+			return install.managedOfflineDrainHolding(ctx, "queue-daemon.lock")
 		}
 		return fmt.Errorf("Cannot verify the installed queue is drained; no service was changed: %w", err)
 	}
@@ -296,7 +298,12 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 // Inspect a stopped queue using private copies. SQLite may create sidecars even
 // in read-only mode, so never open the user's live database during preflight.
 func (install *installer) managedOfflineDrain(ctx context.Context) error {
-	for _, name := range []string{"queue-daemon.lock", "resource-controller.lock"} {
+	return install.managedOfflineDrainHolding(ctx, "queue-daemon.lock", "resource-controller.lock")
+}
+
+// Each named lifetime lock must be free; its owner could still change the store.
+func (install *installer) managedOfflineDrainHolding(ctx context.Context, locks ...string) error {
+	for _, name := range locks {
 		busy, err := installInspectLock(install.state, name)
 		if err != nil {
 			return err
@@ -1631,7 +1638,7 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		}
 	}
 	// Service Management can take well over 30 seconds to apply a fresh
-	// registration, notably after Finder replaced a registered bundle.
+	// registration.
 	ready := false
 	for attempt := 0; attempt < 120; attempt++ {
 		output, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-heavy"), "status", "--json")

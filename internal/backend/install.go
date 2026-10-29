@@ -699,7 +699,13 @@ func (install *installer) validatePayload() error {
 			}
 		}
 		if install.managed && marker == filepath.Join(install.root, "install-in-progress.json") && !identity.Equal(installed) {
-			return &installPendingError{identity: installed}
+			superseded, err := install.managedPendingSuperseded(identity, installed)
+			if err != nil {
+				return err
+			}
+			if !superseded {
+				return &installPendingError{identity: installed}
+			}
 		}
 	}
 	return nil

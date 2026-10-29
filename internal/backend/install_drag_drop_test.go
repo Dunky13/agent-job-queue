@@ -125,3 +125,52 @@ func TestManagedLoadedBundleProgramRequiresThisHelper(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedAppBundleNewerBuildSupersedesInterruptedSetup(t *testing.T) {
+	m := managedTestFixture(t)
+	if err := m.run(t); err != nil {
+		t.Fatal(err)
+	}
+	i := m.installer
+	marker := filepath.Join(i.root, "install-in-progress.json")
+	// Finder replaced the app while setup for build 124 was interrupted.
+	if err := installAtomic(marker, mustMetadataJSON(t, metadataTestInfo(t, "124")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	drop := func(build string) {
+		t.Helper()
+		managedCandidate(t, m, build)
+		if err := os.RemoveAll(i.app); err != nil {
+			t.Fatal(err)
+		}
+		if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
+			t.Fatal(err)
+		}
+	}
+	payload := i.payload
+	drop("123")
+	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
+	before, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.run(t); err == nil {
+		t.Fatal("an older bundle superseded a newer interrupted setup")
+	}
+	if after, err := os.ReadFile(marker); err != nil || string(after) != string(before) {
+		t.Fatal("refusal changed the interrupted setup marker", err)
+	}
+	i.appBundle, i.payload = false, payload
+	drop("125")
+	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
+	if err := m.run(t); err != nil {
+		t.Fatal("a newer dropped bundle could not supersede interrupted setup", err)
+	}
+	completed, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
+	if err != nil || completed.Build == nil || *completed.Build != 125 {
+		t.Fatal("newer bundle did not complete setup", completed, err)
+	}
+	if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("completed setup retained the interrupted marker", err)
+	}
+}
