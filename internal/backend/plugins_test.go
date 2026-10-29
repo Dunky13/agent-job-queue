@@ -67,20 +67,20 @@ func TestPluginRegistryRejectsEveryEntryBeyondLimit(t *testing.T) {
 
 func TestPluginManifestLoadsDefaultsAndHooks(t *testing.T) {
 	g := testGate(t)
-	pluginFixture(t, g, "teifi-qa", `{
+	pluginFixture(t, g, "qa-plugin", `{
   "schemaVersion": 1,
-  "name": "teifi-qa",
+  "name": "qa-plugin",
   "description": "One QA session at a time",
   "lanes": [{"name": "qa", "label": "QA", "concurrency": 1, "priority": 50, "sharesLimit": false, "reservation": {"memoryMiB": 4096, "cpuPercent": 100}, "lease": {"ttlSeconds": 600}}, {"name": "qa-light", "concurrency": 2}],
   "hooks": {"lease.granted": ["hooks/granted"]}
 }`, map[string]string{"hooks/granted": "#!/bin/sh\n"})
 	registry := loadPluginRegistry(g)
-	plugin := pluginByName(registry, "teifi-qa")
+	plugin := pluginByName(registry, "qa-plugin")
 	if !plugin.Loaded || plugin.Error != "" || plugin.Warning != "" || len(plugin.Hooks["lease.granted"]) != 1 {
 		t.Fatalf("plugin did not load: %+v", plugin)
 	}
 	qa := registry.lanes["qa"]
-	if qa.Label != "QA" || qa.Concurrency != 1 || qa.Priority != 50 || qa.SharesLimit || qa.MemoryMiB != 4096 || qa.CPUPercent != 100 || qa.TTLSeconds != 600 || qa.Plugin != "teifi-qa" {
+	if qa.Label != "QA" || qa.Concurrency != 1 || qa.Priority != 50 || qa.SharesLimit || qa.MemoryMiB != 4096 || qa.CPUPercent != 100 || qa.TTLSeconds != 600 || qa.Plugin != "qa-plugin" {
 		t.Fatalf("lane fields: %+v", qa)
 	}
 	light := registry.lanes["qa-light"]
