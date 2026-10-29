@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 	"golang.org/x/sys/unix"
 )
 
@@ -63,7 +64,7 @@ func (install *installer) managedPublicationParent(require bool) (*os.File, erro
 }
 
 func managedSystemPublicationParentInfo(info *unix.Stat_t) error {
-	if uint32(info.Mode)&unix.S_IFMT != unix.S_IFDIR || info.Uid != 0 || uint32(info.Mode)&0022 != 0 {
+	if uint32(info.Mode)&unix.S_IFMT != unix.S_IFDIR || info.Uid != 0 || uint32(info.Mode)&0022 != 0 && !appservices.StockApplications(info) {
 		return errors.New("Managed application publication requires a protected root-owned Applications directory without group/world write permission; use your per-user Applications directory with the explicit installer, or an approved protected location for shared deployments")
 	}
 	return nil

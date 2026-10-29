@@ -149,6 +149,11 @@ func (install *installer) managedReadReceipt() (*managedPublicationReceipt, []by
 	if err := json.Unmarshal(raw, &receipt); err != nil {
 		return nil, nil, err
 	}
+	if superseded, err := install.managedReceiptSuperseded(&receipt); err != nil {
+		return nil, nil, err
+	} else if superseded {
+		return nil, nil, nil
+	}
 	if receipt.SchemaVersion != 1 || receipt.App != install.app || receipt.Candidate.Inode == 0 || receipt.Candidate.Digest == [32]byte{} || receipt.Backup != nil && (receipt.Backup.Inode == 0 || receipt.Backup.Digest == [32]byte{}) {
 		return nil, nil, errors.New("Retained publication receipt belongs to another application; evidence preserved")
 	}
@@ -157,6 +162,47 @@ func (install *installer) managedReadReceipt() (*managedPublicationReceipt, []by
 		return nil, nil, errors.New("Retained publication receipt differs from the pending installation; evidence preserved")
 	}
 	return &receipt, raw, nil
+}
+
+// A receipt guards an installer-made copy until its pending setup completes.
+// When setup adopts a bundle the user placed with Finder, a candidate-only
+// receipt without pending setup or a retained backup guards nothing.
+func (install *installer) managedReceiptSuperseded(receipt *managedPublicationReceipt) (bool, error) {
+	if !install.appBundle || install.prepareReplacement || install.unregisterServices || receipt.SchemaVersion != 1 || receipt.Backup != nil {
+		return false, nil
+	}
+	if pending, err := updateExists(filepath.Join(install.root, "install-in-progress.json")); err != nil || pending {
+		return false, err
+	}
+	for _, app := range []string{install.app, receipt.App} {
+		if !filepath.IsAbs(app) || filepath.Clean(app) != app {
+			return false, nil
+		}
+		if retained, err := updateExists(filepath.Join(filepath.Dir(app), ".Agent Queue.previous.app")); err != nil || retained {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+// Retire a superseded receipt under the installation lock so final cleanup
+// never compares the adopted bundle against an unrelated historical candidate.
+func (install *installer) managedRetireSupersededReceipt() error {
+	raw, err := appservices.ReadFile(install.home, install.managedReceiptPath(), 16384, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var receipt managedPublicationReceipt
+	if err := json.Unmarshal(raw, &receipt); err != nil {
+		return err
+	}
+	if superseded, err := install.managedReceiptSuperseded(&receipt); err != nil || !superseded {
+		return err
+	}
+	return install.managedRemoveFile(install.managedReceiptPath(), raw)
 }
 
 // This read-only check precedes all quiescence, including identical reinstall.

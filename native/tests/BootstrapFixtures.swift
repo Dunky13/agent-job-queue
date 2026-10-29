@@ -16,7 +16,7 @@ struct BootstrapFixture: Sendable {
         let appParent = location == "home" ? home.appendingPathComponent("Applications") : directory.appendingPathComponent(location)
         let app = appParent.appendingPathComponent("Agent Queue.app")
         environment = QueueBootstrapEnvironment(app: app, resources: app.appendingPathComponent("Contents/Resources"),
-            home: home, arguments: setupMode ? ["--setup"] : [], systemApplications: applications)
+            home: home, systemApplications: applications, setupAllowed: setupMode)
         identity = try JSONEncoder().encode(BootstrapFixtureIdentity(version: "1.2.3", commit: tracked ? String(repeating: "a", count: 40) : nil,
             build: tracked ? 42 : nil))
         let binaries = managed ? app.appendingPathComponent("Contents/MacOS") : environment.source.appendingPathComponent("bin")

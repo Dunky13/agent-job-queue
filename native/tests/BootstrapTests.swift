@@ -52,8 +52,8 @@ struct BootstrapTests {
             await model.start()?.value
             let calls = await executor.calls
             try check(model.phase == .setupRequired && completions == 0 && calls == 0 && !model.allowsInstallation &&
-                model.message.contains("installer must finish"),
-                "Runtime \(scenario) remains read-only and directs incomplete installation to the installer")
+                model.message.contains("Setup must finish"),
+                "Runtime \(scenario) remains read-only when setup is disabled")
             try check(model.start(disablePhoneAccess: true) == nil && model.waitAndContinue() == nil &&
                 model.repairAndContinue(confirmed: true) == nil,
                 "Runtime \(scenario) cannot acquire mutation authority through recovery actions")

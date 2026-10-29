@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Dunky13/agent-job-queue/internal/appservices"
@@ -249,7 +251,15 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 	if !p.loaded["io.went.agent-heavy"] && !exists {
 		return nil
 	}
-	if !p.loaded["io.went.agent-heavy"] {
+	running := p.loaded["io.went.agent-heavy"]
+	if running {
+		// A registered daemon that launchd cannot spawn, such as a replaced
+		// bundle awaiting re-registration, holds no lifetime lock.
+		if running, err = installInspectLock(install.state, "queue-daemon.lock"); err != nil {
+			return err
+		}
+	}
+	if !running {
 		return install.managedOfflineDrain(ctx)
 	}
 	snapshot, err := install.managedSnapshot(ctx)
@@ -357,6 +367,13 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	p.previous, err = appservices.Load(install.home)
 	if err != nil {
 		return nil, err
+	}
+	if stale, err := install.managedStaleInstallation(ctx, p.previous); err != nil {
+		return nil, err
+	} else if stale {
+		// The managed runtime was installed before, so legacy migrations stay
+		// complete. Setup adopts this bundle and rewrites the location record.
+		p.previous = &appservices.Installation{SchemaVersion: 1, App: install.app, ServiceManagement: true}
 	}
 	if p.previous != nil {
 		if p.previous.App != install.app {
@@ -564,6 +581,27 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	return p, nil
 }
 
+// Finder deletion or a move between Applications folders can leave the
+// location record naming a missing app. Once no service runs from that app and
+// no retained backup sits beside it, the record owns nothing.
+func (install *installer) managedStaleInstallation(ctx context.Context, previous *appservices.Installation) (bool, error) {
+	if !install.appBundle || install.prepareReplacement || install.unregisterServices || previous == nil || previous.App == install.app {
+		return false, nil
+	}
+	if exists, err := updateExists(previous.App); err != nil || exists {
+		return false, err
+	}
+	if retained, err := updateExists(filepath.Join(filepath.Dir(previous.App), ".Agent Queue.previous.app")); err != nil || retained {
+		return false, err
+	}
+	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-remote"} {
+		if _, loaded, err := install.inspectService(ctx, label); err != nil || loaded {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
 func (install *installer) managedLoaded(raw []byte, label, app string) error {
 	helper, command := "agent-heavy", "daemon"
 	if label == "io.went.agent-resources" {
@@ -578,7 +616,67 @@ func (install *installer) managedLoaded(raw []byte, label, app string) error {
 			return nil
 		}
 	}
+	if managedLoadedBundleProgram(raw, executable, helper, command) {
+		return nil
+	}
 	return errors.New("Loaded service differs from the canonical managed helper; no process was stopped")
+}
+
+// Newer launchd prints a bundle-relative "program identifier" for Service
+// Management agents instead of an absolute program. A running instance
+// establishes custody only through its kernel-recorded executable. Without a
+// process (for example a replaced bundle awaiting re-registration) nothing can
+// be stopped in error, so this app's bundle and helper identity suffice.
+func managedLoadedBundleProgram(raw []byte, executable, helper, command string) bool {
+	identifiers, bundles, pids, blocks := 0, 0, 0, 0
+	identified, bundled := false, false
+	pid := 0
+	arguments := []string{}
+	inArguments := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if inArguments {
+			if trimmed == "}" {
+				inArguments = false
+			} else {
+				arguments = append(arguments, trimmed)
+			}
+			continue
+		}
+		switch {
+		case trimmed == "arguments = {":
+			blocks++
+			inArguments = true
+		case strings.HasPrefix(trimmed, "program identifier = "):
+			identifiers++
+			value := strings.TrimPrefix(trimmed, "program identifier = ")
+			if mode := strings.LastIndex(value, " (mode: "); mode >= 0 {
+				value = value[:mode]
+			}
+			identified = value == "Contents/MacOS/"+helper
+		case strings.HasPrefix(trimmed, "parent bundle identifier = "):
+			bundles++
+			bundled = trimmed == "parent bundle identifier = io.went.agent-queue"
+		case strings.HasPrefix(line, "\tpid = "):
+			pids++
+			value, err := strconv.Atoi(strings.TrimPrefix(line, "\tpid = "))
+			if err == nil {
+				pid = value
+			}
+		}
+	}
+	if identifiers != 1 || bundles != 1 || pids > 1 || blocks != 1 || inArguments || !identified || !bundled ||
+		!slices.Equal(arguments, []string{helper, command}) {
+		return false
+	}
+	if pids == 0 {
+		return true
+	}
+	if pid <= 1 {
+		return false
+	}
+	path, err := installProcessExecutable(pid)
+	return err == nil && path == executable
 }
 
 func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan) error {
@@ -969,13 +1067,25 @@ func (install *installer) managedSupport() error {
 }
 
 func (install *installer) managedWrapper(name string) []byte {
-	return []byte("#!/bin/sh\nexec " + installQuote(filepath.Join(install.app, "Contents/MacOS", name)) + " \"$@\"\n")
+	return managedWrapperFor(install.app, name)
+}
+
+func managedWrapperFor(app, name string) []byte {
+	return []byte("#!/bin/sh\nexec " + installQuote(filepath.Join(app, "Contents/MacOS", name)) + " \"$@\"\n")
 }
 
 // Exact generated content is required in addition to no-follow ownership
 // checks. A private custom script is not permission to overwrite or delete it.
 func (install *installer) managedWrappers() (map[string][]byte, error) {
 	wrappers := map[string][]byte{}
+	// A wrapper generated for the recorded location is also owned, so a Finder
+	// move between Applications folders can rewrite it for the adopted bundle.
+	recorded := map[string][]byte{}
+	if previous, err := appservices.Load(install.home); err == nil && previous != nil && install.appBundle {
+		for _, name := range []string{"agent-heavy", "agent-remote"} {
+			recorded[name] = managedWrapperFor(previous.App, name)
+		}
+	}
 	for _, name := range []string{"agent-heavy", "agent-remote"} {
 		filename := filepath.Join(install.home, ".local/bin", name)
 		raw, err := appservices.ReadFile(install.home, filename, 16384, false)
@@ -992,7 +1102,7 @@ func (install *installer) managedWrappers() (map[string][]byte, error) {
 		}
 		// Exact wrappers shipped before the Go migration (452f076's parent).
 		python := []byte("#!/bin/sh\nset -eu\nroot=\"${HOME:?}/.local/share/agent-heavy\"\nexec \"$root/.venv/bin/python\" \"$root/" + pythonModule + "\" \"$@\"\n")
-		if !bytes.Equal(raw, install.managedWrapper(name)) && !bytes.Equal(raw, legacy) && !bytes.Equal(raw, python) {
+		if !bytes.Equal(raw, install.managedWrapper(name)) && !bytes.Equal(raw, legacy) && !bytes.Equal(raw, python) && !bytes.Equal(raw, recorded[name]) {
 			return nil, fmt.Errorf("CLI wrapper %s is customized; no service was stopped", name)
 		}
 		wrappers[filename] = raw
@@ -1439,6 +1549,9 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := install.managedRetireSupersededReceipt(); err != nil {
+		return err
+	}
 	if install.automaticSetup {
 		if err := install.managedBackupLegacyDefinitions(p); err != nil {
 			return err
@@ -1519,8 +1632,10 @@ func (install *installer) executeManaged(ctx context.Context) error {
 			return err
 		}
 	}
+	// Service Management can take well over 30 seconds to apply a fresh
+	// registration, notably after Finder replaced a registered bundle.
 	ready := false
-	for attempt := 0; attempt < 30; attempt++ {
+	for attempt := 0; attempt < 120; attempt++ {
 		output, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-heavy"), "status", "--json")
 		if err == nil {
 			if err := managedReadiness(output); err != nil {
