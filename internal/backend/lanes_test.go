@@ -74,7 +74,8 @@ func (f *daemonFixture) lane(args ...string) (int, Object) {
 // laneQuiet is safe to call from goroutines other than the test's own.
 func (f *daemonFixture) laneQuiet(args ...string) (int, Object, error) {
 	var stdout, stderr bytes.Buffer
-	code := LaneMain(f.gate, append(args, "--json"), &stdout, &stderr)
+	gate := *f.gate
+	code := LaneMain(&gate, append(args, "--json"), &stdout, &stderr)
 	var result Object
 	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
 		return code, nil, fmt.Errorf("lane %v: %d %q %q", args, code, stdout.String(), stderr.String())
@@ -98,6 +99,8 @@ func (f *daemonFixture) watchLane(name string) func() {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	var violation atomic.Value
+	// A Gate is not safe for concurrent use; the watcher polls with its own.
+	gate := *f.gate
 	go func() {
 		defer close(done)
 		for {
@@ -106,7 +109,7 @@ func (f *daemonFixture) watchLane(name string) func() {
 				return
 			case <-time.After(20 * time.Millisecond):
 			}
-			snapshot, err := f.gate.Snapshot()
+			snapshot, err := gate.Snapshot()
 			if err != nil {
 				continue
 			}
