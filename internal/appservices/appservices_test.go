@@ -36,6 +36,30 @@ func TestExecutableNamespaceDoesNotInheritSharedReadException(t *testing.T) {
 	}
 }
 
+func TestStockApplicationsHoldsDragAndDropExecutables(t *testing.T) {
+	boundary := "/Applications/Agent Queue.app"
+	for _, test := range []struct {
+		mode uint32
+		uid  uint32
+		gid  uint32
+		want bool
+	}{
+		{0775, 0, AdminGroup, true},
+		{0755, 0, AdminGroup, true},
+		{0777, 0, AdminGroup, false},
+		{0775, 0, 20, false},
+		{0775, 501, AdminGroup, false},
+	} {
+		st := unix.Stat_t{Mode: uint16(unix.S_IFDIR | test.mode), Uid: test.uid, Gid: test.gid}
+		if got := serviceParentSafe("/Applications", boundary, true, true, &st); got != test.want {
+			t.Fatalf("mode %o uid %d gid %d: executable custody %v, want %v", test.mode, test.uid, test.gid, got, test.want)
+		}
+		if serviceParentSafe("/Library", boundary, true, true, &st) != (test.mode&0022 == 0 && test.uid == 0) {
+			t.Fatal("the stock Applications exception applied to another directory", test)
+		}
+	}
+}
+
 func TestDecodeStatusRejectsAmbiguousNativeResponses(t *testing.T) {
 	for _, raw := range []string{
 		`{"schemaVersion":1,"service":"queue","status":"enabled"}`,

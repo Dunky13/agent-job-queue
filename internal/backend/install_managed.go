@@ -251,19 +251,17 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 	if !p.loaded["io.went.agent-heavy"] && !exists {
 		return nil
 	}
-	running := p.loaded["io.went.agent-heavy"]
-	if running {
-		// A registered daemon that launchd cannot spawn, such as a replaced
-		// bundle awaiting re-registration, holds no lifetime lock.
-		if running, err = installInspectLock(install.state, "queue-daemon.lock"); err != nil {
-			return err
-		}
-	}
-	if !running {
+	if !p.loaded["io.went.agent-heavy"] {
 		return install.managedOfflineDrain(ctx)
 	}
 	snapshot, err := install.managedSnapshot(ctx)
 	if err != nil {
+		// A registered daemon that launchd cannot spawn, such as a replaced
+		// bundle awaiting re-registration, answers nothing and holds no
+		// lifetime lock. Its stopped store is then authoritative.
+		if busy, lockErr := installInspectLock(install.state, "queue-daemon.lock"); lockErr == nil && !busy && exists {
+			return install.managedOfflineDrain(ctx)
+		}
 		return fmt.Errorf("Cannot verify the installed queue is drained; no service was changed: %w", err)
 	}
 	tasks := obj(snapshot["tasks"])
