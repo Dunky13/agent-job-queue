@@ -96,10 +96,10 @@ test("accepts lane, lease and plugin fields and keeps older status valid", () =>
     position: null, queuedAt: "2026-10-29T10:00:00Z", grantedAt: "2026-10-29T10:00:01Z", renewedAt: null,
     expiresAt: null, reason: null };
   const lanes = [
-    { name: "qa", label: "QA", plugin: "teifi-qa", concurrency: 1, priority: 50, sharesLimit: false, running: 0, held: 1, waiting: 0 },
+    { name: "qa", label: "QA", plugin: "qa-plugin", concurrency: 1, priority: 50, sharesLimit: false, running: 0, held: 1, waiting: 0 },
     { name: "default", label: "Default", plugin: null, concurrency: 1, priority: 0, sharesLimit: true, running: 0, held: 0, waiting: 1 },
   ];
-  const plugins = [{ name: "teifi-qa", loaded: true, error: null, warning: null, lanes: ["qa"] },
+  const plugins = [{ name: "qa-plugin", loaded: true, error: null, warning: null, lanes: ["qa"] },
     { name: "broken", loaded: false, error: "Invalid plugin.json: unknown field \"concurency\"", lanes: [] }];
   const value = { ...snapshot, jobs: [{ ...job, lane: "default", kind: "command" }, lease], lanes, plugins };
   assert.deepEqual(snapshotSchema.parse(value), value);

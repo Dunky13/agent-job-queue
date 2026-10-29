@@ -133,7 +133,7 @@ func (f *daemonFixture) watchLane(name string) func() {
 
 func TestRealDaemonLaneConcurrencyUnderConcurrentAcquireRunAndStartNow(t *testing.T) {
 	f := daemonAcceptance(t)
-	f.writePlugin("teifi-qa", `{"schemaVersion":1,"name":"teifi-qa","lanes":[{"name":"qa","label":"QA","concurrency":1,"priority":50,"sharesLimit":false}]}`)
+	f.writePlugin("qa-plugin", `{"schemaVersion":1,"name":"qa-plugin","lanes":[{"name":"qa","label":"QA","concurrency":1,"priority":50,"sharesLimit":false}]}`)
 	f.reloadPlugins()
 	stopWatching := f.watchLane("qa")
 	exclusive := filepath.Join(f.root, "qa-exclusive")
@@ -292,7 +292,7 @@ func TestRealDaemonBrokenPluginsLeaveDefaultLaneWorking(t *testing.T) {
 
 func TestRealDaemonLeaseCLIWaitsOwnersAndStatus(t *testing.T) {
 	f := daemonAcceptance(t)
-	f.writePlugin("teifi-qa", `{"schemaVersion":1,"name":"teifi-qa","lanes":[{"name":"qa","label":"QA","concurrency":1,"priority":50,"sharesLimit":false,"reservation":{"memoryMiB":4096,"cpuPercent":100}}]}`)
+	f.writePlugin("qa-plugin", `{"schemaVersion":1,"name":"qa-plugin","lanes":[{"name":"qa","label":"QA","concurrency":1,"priority":50,"sharesLimit":false,"reservation":{"memoryMiB":4096,"cpuPercent":100}}]}`)
 	f.reloadPlugins()
 	owners := []*exec.Cmd{}
 	for range 2 {
@@ -340,7 +340,7 @@ func TestRealDaemonLeaseCLIWaitsOwnersAndStatus(t *testing.T) {
 		t.Fatalf("queue summary: %v", queue)
 	}
 	qa := status["lanes"].([]Object)[0]
-	if qa["name"] != "qa" || mustInteger(qa["held"]) != 1 || mustInteger(qa["waiting"]) != 2 || qa["plugin"] != "teifi-qa" || qa["sharesLimit"] != false {
+	if qa["name"] != "qa" || mustInteger(qa["held"]) != 1 || mustInteger(qa["waiting"]) != 2 || qa["plugin"] != "qa-plugin" || qa["sharesLimit"] != false {
 		t.Fatalf("lane summary: %v", qa)
 	}
 	if code, refused := f.lane("release", secondID); code != laneExitRefused || !strings.Contains(text(refused["error"]), "--force") {

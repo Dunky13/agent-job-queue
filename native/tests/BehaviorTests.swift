@@ -190,15 +190,15 @@ func checkLaneStatusDecoding(_ check: (Bool, String) throws -> Void) throws {
        "logPath":"","canReorder":false,"canStart":false,"canCancel":true,"phase":"Held","lane":"qa","kind":"lease","label":"QA session",
        "meta":{"ticket":"WM-123"},"ownerPid":4242,"ownerAlive":true,"position":null,"queuedAt":"2026-10-29T09:59:00Z",
        "grantedAt":"2026-10-29T09:59:01Z","renewedAt":null,"expiresAt":null,"reason":null}],
-     "lanes":[{"name":"qa","label":"QA","plugin":"teifi-qa","concurrency":1,"priority":50,"sharesLimit":false,"running":0,"held":1,"waiting":0},
+     "lanes":[{"name":"qa","label":"QA","plugin":"qa-plugin","concurrency":1,"priority":50,"sharesLimit":false,"running":0,"held":1,"waiting":0},
        {"name":"default","label":"Default","plugin":null,"concurrency":1,"priority":0,"sharesLimit":true,"running":0,"held":0,"waiting":0}],
-     "plugins":[{"name":"teifi-qa","loaded":true,"error":null,"warning":null,"lanes":["qa"]}]}
+     "plugins":[{"name":"qa-plugin","loaded":true,"error":null,"warning":null,"lanes":["qa"]}]}
     """.utf8)
     let snapshot = try JSONDecoder().decode(QueueSnapshot.self, from: current)
     let lease = snapshot.jobs[0]
     try check(lease.isLease && lease.lane == "qa" && lease.meta?["ticket"] == "WM-123" && lease.ownerPid == 4242 && lease.ownerAlive == true,
               "Lease status fields decode")
-    try check(snapshot.lanes?.map(\.name) == ["qa", "default"] && snapshot.lanes?.first?.plugin == "teifi-qa" && snapshot.lanes?.last?.plugin == nil,
+    try check(snapshot.lanes?.map(\.name) == ["qa", "default"] && snapshot.lanes?.first?.plugin == "qa-plugin" && snapshot.lanes?.last?.plugin == nil,
               "Lanes decode in priority order")
     try check(snapshot.plugins?.first?.loaded == true && snapshot.plugins?.first?.lanes == ["qa"], "Plugins decode")
     var older = snapshot

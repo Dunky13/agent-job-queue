@@ -2,7 +2,7 @@
 
 Status: v1. Sections marked **Contract** are binding for the daemon, CLI, app, dashboard and any plugin. The queue daemon and CLI implement them; the notes after each Contract section describe details of that implementation. App and dashboard lane views follow separately.
 
-Plugins tweak the queue without running code inside it. A plugin is a declarative manifest that adds **lanes** (named queues with their own concurrency and priority) and optional **hooks** (separate, time-limited processes the daemon starts when queue events happen). The motivating plugin is a Teifi QA lane: QA must run one session at a time, while builds and tests keep using the ordinary queue.
+Plugins tweak the queue without running code inside it. A plugin is a declarative manifest that adds **lanes** (named queues with their own concurrency and priority) and optional **hooks** (separate, time-limited processes the daemon starts when queue events happen). For example, a QA lane can run one session at a time, while builds and tests keep using the ordinary queue.
 
 ## Concepts
 
@@ -21,7 +21,7 @@ Safety requirements, enforced on every load, with the repository's existing fail
 ```json
 {
   "schemaVersion": 1,
-  "name": "teifi-qa",
+  "name": "qa-plugin",
   "description": "One QA session at a time on the emulator and dev app",
   "lanes": [
     {
