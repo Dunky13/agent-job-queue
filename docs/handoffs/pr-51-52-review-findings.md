@@ -2,9 +2,10 @@
 
 ## Scope and source identities
 
-Review the drag-and-drop app and plugin lanes changes, reproduce actionable
-findings, and fix them locally. No merge, release, Apple submission, deployment,
-or operation on the installed queue is included.
+The initial scope was to review the drag-and-drop app and plugin lanes changes,
+reproduce actionable findings, and fix them locally. The later authorization to
+commit, push and merge on green is recorded below. Release, Apple submission,
+deployment and operations on the installed queue remain outside this task.
 
 - [PR 51](https://github.com/Dunky13/agent-job-queue/pull/51) is merged as
   `7d79088ec28d024922d1a2b7674d965bde324139`. Its reviewed base is
@@ -75,13 +76,58 @@ not run for this scope.
 
 Independent final Standards and Spec reviews found no remaining actionable
 findings in the follow-up backend patch. Both were source reviews without
-additional test runs. The reviewed backend patch SHA-256 is
+additional test runs. The original fixes were committed as
+`088ce3b2947a252b328a45adf273d658b7aa83c3`. Their reviewed backend patch SHA-256 is
 `503316f5ec8f31b1263431a15f78f143c4d8a761599c14b04076eec388ebe2b0`, computed with
-`git diff --binary -- internal/backend | shasum -a 256` against the PR 52 head.
+`git diff --binary 839c788 088ce3b -- internal/backend | shasum -a 256`.
 This statement covers the fixes; it is not an exhaustive clean certification of
 both original PRs. Optional cross-provider review was not requested.
 
-Jev merge readiness is not asserted for this follow-up: no follow-up PR exists.
+Jev merge readiness and hosted checks are separate from the source reviews.
+
+## Packaged live-upgrade CI repair
+
+When merge-on-green was requested, PR 52's Universal app check was failing in
+[run 40899979250](https://github.com/Dunky13/agent-job-queue/actions/runs/40899979250/job/123539286250).
+`TestInstallerPackagedLiveUpgrade/packaged-` lost its original caller with exit
+125 and `Queue daemon crashed before releasing handover custody`.
+
+A deterministic regression reproduced that exact error when a caller read a
+`committed` receipt immediately before the old daemon published `released`
+custody and exited. The subsequent process probe saw a dead daemon, while the
+caller still used its stale receipt. The same race can span successor adoption.
+
+After a confirmed daemon exit, the follower now re-reads the private receipt.
+It accepts only the same immutable custody advanced to `released` or `consumed`,
+revalidates database identity, and checks a consumed successor's liveness.
+Unreleased crashes, changed tokens, targets, issuers, attempts or databases,
+missing receipts, dead successors and process-probe errors remain failures.
+It does not resubmit work or change timeouts.
+
+The new eleven-case regression failed for the two valid transitions before the
+fix and passed with race detection afterward in 2.663 seconds. Independent
+Standards and Spec reviews found no actionable issue in the repair. The
+reviewed two-file repair patch SHA-256 against `088ce3b` is
+`e30b79ebaaab6fb39bdf3c557e64cd663a703bd966ed7121c358d14ceb9caf03`.
+
+The broader repair validation passed in 171.846 seconds:
+
+```sh
+go test -p 2 -parallel 2 -race ./internal/backend \
+  -run 'Test(Queue.*Handover|RealDaemon.*Handover|InstallerManagedLiveUpgradeRetainsRunningAttempts)' \
+  -timeout 12m -count=1
+```
+
+This covers the real-daemon handover and six managed live-upgrade scenarios in
+addition to the deterministic transition and refusal cases.
+
+The production CLI was also built with `go build -p 2 -trimpath
+-ldflags='-s -w'` into a private helper fixture. Running
+`TestInstallerPackagedLiveUpgrade` with that helper and `-count=3` passed all
+nine scenario executions in 59.281 seconds. This uses the same test as the
+failed Universal app job, with a freshly built production helper; it is not a
+full universal app, native Service Management, signing or Apple acceptance
+claim. The disposable helper fixture was removed after verification.
 
 Task-owned test processes completed. Go build scratch and private fixture
 resources were reclaimed by their command and test cleanup paths. The retained
@@ -91,11 +137,12 @@ runtime resource was created.
 
 ## Delivery and remaining gates
 
-After local validation, the user authorized a signed, DCO-certified commit and
-push of the task branch. A follow-up PR and merge are outside that delivery
-request. This handoff makes no hosted CI result or merge-readiness claim for
-these fixes. The original PR 52 remained independently open when rechecked
-before committing.
+The user authorized commit and push, then extended that authorization to a PR
+and merge when all required checks are green. The follow-up targets main and
+includes the plugin feature from the still-open PR 52 as well as the review
+fixes and packaged live-upgrade repair. After this combined change merges, PR
+52 can be closed as superseded. Every hosted check must cover the final head;
+the inherited failing run is diagnostic evidence, not a passing gate.
 
 No rendered UI or release packaging code changed. Native UI screenshots, signed
 artifact builds, live Service Management acceptance, Intel runtime checks,
@@ -103,8 +150,7 @@ Apple notarization, Gatekeeper distribution checks and publication were not run
 for this local backend follow-up. Existing release evidence is not evidence for
 these changed bytes.
 
-When preparing delivery, retain the dependency on PR 52: either land the fixes on
-top of that feature, or separate the PR 51 custody correction from the
-plugin-dependent fixes. Any commit must retain configured signing and use the
-author-matching DCO sign-off. Merge and release remain separate authorization
-boundaries.
+Any commit must retain configured signing and use the author-matching DCO
+sign-off. Use the guarded maintainer squash path, verify the actual merge
+identity, signature and tree, and check the exact post-merge main run. Release,
+Apple submission, publication and deployment remain outside this authorization.

@@ -471,6 +471,86 @@ func releasedQueueFixture(t *testing.T) (*Gate, *queueStore, *queueHandoverRecei
 	return g, store, receipt
 }
 
+func TestQueueHandoverFollowerObservesReleaseBeforeDaemonExit(t *testing.T) {
+	for _, variant := range []string{"released", "consumed", "unchanged", "token", "target", "daemon", "attempt", "database", "missing", "consumer-dead", "probe-error"} {
+		t.Run(variant, func(t *testing.T) {
+			g, store, receipt := releasedQueueFixture(t)
+			caller, err := queueHandoverIdentity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			job := edgeInsertJob(t, store, "queued")
+			job.task["status"] = Object{"Queued": Object{}}
+			job.task["handoverProtocol"], job.task["handoverCaller"] = 1, caller
+			data, err := queueJSON(job.task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.db.Exec("UPDATE queue_jobs SET task=?,attempt='' WHERE id=?", data, job.id); err != nil {
+				t.Fatal(err)
+			}
+			receipt.Phase = "committed"
+			receipt.ExpiresAt = time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
+			receipt.Attempts = []queueHandoverAttempt{{ID: job.id, Token: job.token, Phase: "queued", Caller: &caller}}
+			if err := writeQueueHandoverReceipt(g, receipt); err != nil {
+				t.Fatal(err)
+			}
+			probes := 0
+			probeError := errors.New("process listing unavailable")
+			probe := func(identity queueHandoverDaemon) (bool, error) {
+				probes++
+				if probes > 1 {
+					return queueHandoverDaemonAlive(identity)
+				}
+				// The follower already read committed custody. The daemon
+				// releases it and exits before its liveness result arrives.
+				current := *receipt
+				current.Phase = "released"
+				switch variant {
+				case "consumed":
+					current.Phase, current.Consumer = "consumed", &caller
+				case "unchanged", "probe-error":
+					current.Phase = "committed"
+				case "token":
+					current.Token = token()
+				case "target":
+					current.TargetSHA256 = strings.Repeat("0", 64)
+				case "daemon":
+					current.Daemon.Birth = "changed daemon identity"
+				case "attempt":
+					current.Attempts = []queueHandoverAttempt{}
+				case "database":
+					current.DatabaseInode++
+				case "consumer-dead":
+					current.Phase, current.Consumer = "consumed", &receipt.Daemon
+				}
+				if variant == "missing" {
+					if err := os.Remove(queueHandoverPath(g)); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := writeQueueHandoverReceipt(g, &current); err != nil {
+					t.Fatal(err)
+				}
+				if variant == "probe-error" {
+					return false, probeError
+				}
+				return false, nil
+			}
+			_, allowed, err := queueHandoverRetainedTaskWithProbe(g, job.id, job.token, "", probe)
+			if variant == "released" || variant == "consumed" {
+				if err != nil || !allowed {
+					t.Fatalf("normal daemon exit lost authenticated handover: allowed=%v, error=%v", allowed, err)
+				}
+			} else if err == nil || allowed {
+				t.Fatalf("unsafe handover accepted: allowed=%v, error=%v", allowed, err)
+			}
+			if variant == "probe-error" && !errors.Is(err, probeError) {
+				t.Fatalf("process identity error was lost: %v", err)
+			}
+		})
+	}
+}
+
 func TestQueueReleasedHandoverRejectsChangedCustodyWithoutMigration(t *testing.T) {
 	for _, variant := range []string{"token", "target", "boot", "schema", "database", "live-issuer", "queue-state"} {
 		t.Run(variant, func(t *testing.T) {
