@@ -37,11 +37,11 @@ jq -e --arg repository "$GITHUB_REPOSITORY" --arg sha "$BUILD_SHA" --arg tag "$B
   .schemaVersion == 1 and .repository == $repository and .commit == $sha and .tag == $tag and
   (.build|type) == "number" and (.build|tostring) == $build and (.version|type) == "string" and
   (.version|test("^[0-9]+\\.[0-9]+\\.[0-9]+([+-][A-Za-z0-9.+-]+)?$")) and
-  .asset == ("Agent-Job-Queue-Installer-" + .version + "-universal.zip") and
+  .asset == ("Agent-Queue-" + .version + "-universal.zip") and
   (.sha256|test("^[a-f0-9]{64}$"))
 ' "$manifest" >/dev/null || fail 'Candidate manifest does not match the release source.'
 version=$(jq -r '.version' "$manifest")
-base="Agent-Job-Queue-Installer-$version-universal"
+base="Agent-Queue-$version-universal"
 names=("$base.dmg" "$base.dmg.sha256" "$base.zip" "$base.zip.sha256" agent-job-queue.json agent-job-queue.rb apple-notarization.json)
 entries=("$candidate"/*)
 [[ ${#entries[@]} == "${#names[@]}" ]] || fail 'Unexpected candidate asset inventory.'
@@ -68,19 +68,19 @@ jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$BUILD_SHA" --arg version "$ver
   (.metadata.team | test("^[A-Z0-9]{10}$")) and
   (.metadata.schema == 1 or (.metadata.schema == 2 and .metadata.build_attempt == $attempt and
     .metadata.artifact_id == $artifact and .metadata.artifact_digest == $digest)) and
-  ([.stages[].stage] == ["payload", "installer", "dmg"]) and (.logs | length) == 3 and
-  all(range(0;3); . as $i |
+  ([.stages[].stage] == ["app", "dmg"]) and (.logs | length) == 2 and
+  all(range(0;2); . as $i |
     $evidence.stages[$i].phase == "finished" and $evidence.logs[$i].status == "Accepted" and
     ($evidence.stages[$i].submission_id | test("^[A-Fa-f0-9]{8}(-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}$")) and
     ($evidence.stages[$i].archive_sha256 | test("^[a-f0-9]{64}$")) and
     $evidence.logs[$i].jobId == $evidence.stages[$i].submission_id and
     $evidence.logs[$i].sha256 == $evidence.stages[$i].archive_sha256) and
-  .stages[1].completed_sha256 == $zip and .stages[2].completed_sha256 == $dmg
+  .stages[0].completed_sha256 == $zip and .stages[1].completed_sha256 == $dmg
 ' "$candidate/apple-notarization.json" >/dev/null || fail 'Public Apple evidence does not bind Accepted stages to this source and final candidate.'
 {
   printf '%s\n\n%s\n\n' \
-    "Automated installer from validated main commit ${BUILD_SHA}. Includes Apple Silicon and Intel executables plus checksum-pinned Homebrew metadata." \
-    'Signed with Apple Developer ID and notarized by Apple. The installer, installed menu app and DMG carry stapled tickets. Homebrew preserves quarantine. Standalone CLI first launch can require access to Apple notarization services.'
+    "Automated app from validated main commit ${BUILD_SHA}. Includes Apple Silicon and Intel executables plus checksum-pinned Homebrew metadata." \
+    'Signed with Apple Developer ID and notarized by Apple. The menu app and DMG carry stapled tickets; drag Agent Queue to Applications and open it to finish setup. Homebrew preserves quarantine. Standalone CLI first launch can require access to Apple notarization services.'
   printf 'Immutable candidate SHA-256 inventory:\n'
   cat "$temporary/checksums"
 } > "$temporary/notes"

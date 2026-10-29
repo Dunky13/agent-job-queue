@@ -224,8 +224,8 @@ func TestMacOSCheckpointInitialStateCanPrepareFirstSubmissionAfterRestore(t *tes
 		t.Fatalf("restore before any signing or upload: %v: %s", err, output)
 	}
 	resume.command(t, []string{"GITHUB_RUN_ATTEMPT=2"}, "verify-state", resume.state, "0.1.0")
-	resume.step(t, "prepare", "payload", "GITHUB_RUN_ATTEMPT=2")
-	resume.step(t, "submit", "payload", "GITHUB_RUN_ATTEMPT=2")
+	resume.step(t, "prepare", "app", "GITHUB_RUN_ATTEMPT=2")
+	resume.step(t, "submit", "app", "GITHUB_RUN_ATTEMPT=2")
 	if strings.Count(resume.recorded(t), "xcrun|notarytool|submit|") != 1 {
 		t.Fatal("initial checkpoint recovery must make exactly its first submission")
 	}

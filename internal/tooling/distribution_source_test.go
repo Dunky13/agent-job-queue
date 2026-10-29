@@ -33,12 +33,12 @@ printf '0.1.0\n'
 	run := map[string]any{"id": 123, "run_number": 45, "run_attempt": 3, "path": ".github/workflows/ci.yml", "event": "push", "head_branch": "main", "head_sha": checkpointSHA, "status": "completed", "conclusion": "success", "repository": map[string]any{"full_name": "owner/project"}, "head_repository": map[string]any{"full_name": "owner/project"}}
 	f.writeJSON(t, "run.json", run)
 	f.writeJSON(t, "event.json", map[string]any{"action": "completed", "workflow_run": run, "repository": map[string]any{"full_name": "owner/project"}})
-	f.inventory(t, map[string]any{"id": 800, "name": "Agent-Job-Queue-Installer-1", "expired": false, "digest": "sha256:" + strings.Repeat("c", 64), "workflow_run": map[string]any{"id": 123, "head_branch": "main", "head_sha": checkpointSHA}})
+	f.inventory(t, map[string]any{"id": 800, "name": "Agent-Queue-App-1", "expired": false, "digest": "sha256:" + strings.Repeat("c", 64), "workflow_run": map[string]any{"id": 123, "head_branch": "main", "head_sha": checkpointSHA}})
 	f.writeJSON(t, "effective-jobs.json", map[string]any{"total_count": 1, "jobs": []map[string]any{
 		{"id": 3, "run_id": 123, "name": "ci-required", "head_sha": checkpointSHA, "run_attempt": 3, "status": "completed", "conclusion": "success"}}})
-	// A partial rerun can retain the successful installer artifact from attempt 1.
+	// A partial rerun can retain the successful app artifact from attempt 1.
 	f.writeJSON(t, "jobs.json", map[string]any{"total_count": 2, "jobs": []map[string]any{
-		{"id": 1, "run_id": 123, "name": "Universal installer", "head_sha": checkpointSHA, "run_attempt": 1, "conclusion": "success"},
+		{"id": 1, "run_id": 123, "name": "Universal app", "head_sha": checkpointSHA, "run_attempt": 1, "conclusion": "success"},
 		{"id": 2, "run_id": 123, "name": "ci-required", "head_sha": checkpointSHA, "run_attempt": 1, "conclusion": "success"}}})
 	return f
 }
@@ -87,7 +87,7 @@ func TestDistributionSelectsOriginalArtifactAcrossCIPartialReruns(t *testing.T) 
 }
 
 func TestDistributionRejectsAutomaticAndManualUntrustedSources(t *testing.T) {
-	for _, variant := range []string{"manual feature", "manual nonnumeric", "manual leading zero", "automatic failure", "automatic fork", "automatic PR", "automatic branch", "automatic path", "automatic changed attempt", "source repository", "source SHA", "source path", "source event", "source unfinished", "source run", "source number", "missing artifact", "expired artifact", "wrong artifact SHA", "wrong artifact run", "malformed artifact name", "missing digest", "failed gate", "wrong gate SHA", "wrong gate attempt", "wrong gate run", "unfinished gate", "unvalidated installer"} {
+	for _, variant := range []string{"manual feature", "manual nonnumeric", "manual leading zero", "automatic failure", "automatic fork", "automatic PR", "automatic branch", "automatic path", "automatic changed attempt", "source repository", "source SHA", "source path", "source event", "source unfinished", "source run", "source number", "missing artifact", "expired artifact", "wrong artifact SHA", "wrong artifact run", "malformed artifact name", "missing digest", "failed gate", "wrong gate SHA", "wrong gate attempt", "wrong gate run", "unfinished gate", "unvalidated app"} {
 		t.Run(variant, func(t *testing.T) {
 			event := "workflow_dispatch"
 			if strings.HasPrefix(variant, "automatic") {
@@ -152,14 +152,14 @@ func TestDistributionRejectsAutomaticAndManualUntrustedSources(t *testing.T) {
 					case "wrong artifact run":
 						a["workflow_run"].(map[string]any)["id"] = 456
 					case "malformed artifact name":
-						a["name"] = "Agent-Job-Queue-Installer-01"
+						a["name"] = "Agent-Queue-App-01"
 					case "missing digest":
 						delete(a, "digest")
 					}
 				})
 			default:
 				file := "effective-jobs.json"
-				if variant == "unvalidated installer" {
+				if variant == "unvalidated app" {
 					file = "jobs.json"
 				}
 				f.changeJSON(t, file, func(v map[string]any) {
@@ -176,7 +176,7 @@ func TestDistributionRejectsAutomaticAndManualUntrustedSources(t *testing.T) {
 						j["run_id"] = 456
 					case "unfinished gate":
 						j["status"] = "in_progress"
-					case "unvalidated installer":
+					case "unvalidated app":
 						jobs[0].(map[string]any)["conclusion"] = "failure"
 					}
 				})
@@ -228,7 +228,7 @@ func TestDistributionSourcePaginatesArtifactInventory(t *testing.T) {
 	}
 }
 
-func TestDistributionSourceSeparatesInstallerAttemptFromEffectiveGate(t *testing.T) {
+func TestDistributionSourceSeparatesAppAttemptFromEffectiveGate(t *testing.T) {
 	for _, event := range []string{"workflow_run", "workflow_dispatch"} {
 		t.Run(event, func(t *testing.T) {
 			f := newDistributionSourceFixture(t, event)
@@ -255,7 +255,7 @@ func TestDistributionSourceSeparatesInstallerAttemptFromEffectiveGate(t *testing
 			}
 			result, _ := os.ReadFile(filepath.Join(f.root, "output"))
 			if !strings.Contains(string(result), "run_attempt=1\n") {
-				t.Fatalf("lost original installer attempt: %s", result)
+				t.Fatalf("lost original app attempt: %s", result)
 			}
 			calls, _ := os.ReadFile(filepath.Join(f.root, "calls"))
 			if !strings.Contains(string(calls), "/jobs?filter=latest") {

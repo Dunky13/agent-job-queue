@@ -29,11 +29,11 @@ fi
 }
 
 func TestMacOSResumeRetriesStaplingWithoutResubmitting(t *testing.T) {
-	for _, stage := range []string{"payload", "installer", "dmg"} {
+	for _, stage := range []string{"app", "dmg"} {
 		for _, outcome := range []string{"late-recovers", "persistent", "invalid", "invalid-after-loss"} {
 			t.Run(stage+"/"+outcome, func(t *testing.T) {
 				f := newResumeFixture(t)
-				for _, current := range []string{"payload", "installer", "dmg"} {
+				for _, current := range []string{"app", "dmg"} {
 					f.step(t, "prepare", current)
 					f.step(t, "submit", current)
 					if current == stage {
@@ -107,7 +107,7 @@ func TestMacOSResumeRetriesStaplingWithoutResubmitting(t *testing.T) {
 
 func TestMacOSResumeRetriesTicketValidationDuringDMGPreparation(t *testing.T) {
 	f := newResumeFixture(t)
-	for _, stage := range []string{"payload", "installer"} {
+	for _, stage := range []string{"app"} {
 		for _, operation := range []string{"prepare", "submit", "finish"} {
 			f.step(t, operation, stage)
 		}
@@ -116,14 +116,14 @@ func TestMacOSResumeRetriesTicketValidationDuringDMGPreparation(t *testing.T) {
 	f.injectTicketFailures(t, "validate", "late-recovers")
 	f.step(t, "prepare", "dmg")
 	record := strings.TrimPrefix(f.recorded(t), before)
-	if strings.Count(record, "ticket-validation|") != 7 || strings.Count(record, "sleep|") != 5 ||
+	if strings.Count(record, "ticket-validation|") != 6 || strings.Count(record, "sleep|") != 5 ||
 		!strings.Contains(record, "hdiutil|create|") || strings.Contains(record, "notarytool|") {
 		t.Fatalf("DMG preparation did not recover without submitting: %s", record)
 	}
 }
 
 func TestMacOSTicketValidationRetriesOnlyCloudKitConnectionLoss(t *testing.T) {
-	for _, kind := range []string{"installer", "dmg"} {
+	for _, kind := range []string{"app", "dmg"} {
 		for _, test := range []struct {
 			name                  string
 			status, calls, sleeps int
@@ -163,7 +163,7 @@ func TestMacOSTicketValidationRetriesOnlyCloudKitConnectionLoss(t *testing.T) {
 				tools := filepath.Join(f.root, "tools")
 				testTool(t, tools, "xcrun", ticketValidationTestTool)
 				testTool(t, tools, "sleep", `printf 'sleep|%s\n' "$1" >> "$SIGNING_TEST_EVENTS"`)
-				path := f.installer
+				path := f.app
 				if kind == "dmg" {
 					path = filepath.Join(f.root, "fixture.dmg")
 					if err := os.WriteFile(path, []byte("signed fixture"), 0600); err != nil {
@@ -186,11 +186,7 @@ func TestMacOSTicketValidationRetriesOnlyCloudKitConnectionLoss(t *testing.T) {
 					t.Fatalf("status=%d, want %d: %s", status, test.status, output)
 				}
 				record := f.recorded(t)
-				calls := test.calls
-				if kind == "installer" && status == 0 {
-					calls++ // The enclosing installer also has its own ticket.
-				}
-				if strings.Count(record, "ticket-validation|") != calls || strings.Count(record, "sleep|") != test.sleeps {
+				if strings.Count(record, "ticket-validation|") != test.calls || strings.Count(record, "sleep|") != test.sleeps {
 					t.Fatalf("unexpected validation attempts/backoff: %s", record)
 				}
 				for attempt, delay := 0, 5; attempt < test.sleeps; attempt, delay = attempt+1, delay*2 {

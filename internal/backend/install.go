@@ -51,7 +51,7 @@ var errInstallCustomCallback = errors.New("Custom cleanup callback cannot be ret
 type installDrainPendingError struct{ tasks Object }
 
 func (err *installDrainPendingError) Error() string {
-	return "Queue migration requires a drained queue. Finish or cancel all queued, stashed, running, and paused jobs, then retry the installer"
+	return "Queue migration requires a drained queue. Finish or cancel all queued, stashed, running, and paused jobs, then open Agent Queue again"
 }
 
 type installApprovalError struct{ service string }
@@ -305,7 +305,7 @@ func (install *installer) validateServices() error {
 		if raw, present := value["Program"]; present {
 			program, valid := raw.(string)
 			if !valid || len(args) == 0 || program != args[0] {
-				return errors.New("Existing launch agent Program differs from its expected executable; preserve its behavior before retrying the installer")
+				return errors.New("Existing launch agent Program differs from its expected executable; preserve its behavior before opening Agent Queue again")
 			}
 		}
 		valid := false
@@ -315,7 +315,7 @@ func (install *installer) validateServices() error {
 			valid = (len(args) == 2 && args[0] == filepath.Join(install.root, "bin/agent-heavy") && args[1] == "scheduler") || (len(args) == 3 && args[0] == filepath.Join(install.root, ".venv/bin/python") && args[1] == filepath.Join(install.root, "agent_heavy.py") && args[2] == "scheduler")
 		}
 		if !valid {
-			return errors.New("Existing launch agent is customized; preserve its behavior before retrying the installer")
+			return errors.New("Existing launch agent is customized; preserve its behavior before opening Agent Queue again")
 		}
 		environment := Object{}
 		if raw, present := value["EnvironmentVariables"]; present {
@@ -328,7 +328,7 @@ func (install *installer) validateServices() error {
 			if raw, present := environment[key]; present {
 				actual, valid := raw.(string)
 				if !valid || actual != expected {
-					return fmt.Errorf("Existing launch agent %s differs from the installation target; preserve its configuration before retrying the installer", key)
+					return fmt.Errorf("Existing launch agent %s differs from the installation target; preserve its configuration before opening Agent Queue again", key)
 				}
 			}
 		}
@@ -341,7 +341,7 @@ func (install *installer) validateServices() error {
 			slot = actual
 		}
 		if serviceSlot != "" && serviceSlot != slot {
-			return errors.New("Existing queue and resource controller use different legacy slots; reconcile their configuration before retrying the installer")
+			return errors.New("Existing queue and resource controller use different legacy slots; reconcile their configuration before opening Agent Queue again")
 		}
 		serviceSlot = slot
 	}
@@ -1270,7 +1270,7 @@ func (install *installer) pythonMigration(ctx context.Context, node *yaml.Node) 
 		return false, nil
 	}
 	if node != nil && !install.standardCleanupCallback(callback) {
-		return false, errors.New("Existing queue callback is customized. Preserve its behavior and replace its Python invocation before retrying the installer")
+		return false, errors.New("Existing queue callback is customized. Preserve its behavior and replace its Python invocation before opening Agent Queue again")
 	}
 	// A retry may find the new daemon already published and Python files still
 	// awaiting retirement. Its active jobs are no longer part of legacy drain.
@@ -1996,7 +1996,7 @@ func (install *installer) execute(ctx context.Context) error {
 	}
 	remoteControl, err := installLock(remoteState, "control.lock")
 	if err != nil {
-		return fmt.Errorf("A remote settings operation is running; finish it before retrying the installer: %w", err)
+		return fmt.Errorf("A remote settings operation is running; finish it before opening Agent Queue again: %w", err)
 	}
 	defer remoteControl.Close()
 	// Serialize the last legacy/remote snapshot with publication of the stable
@@ -2005,12 +2005,12 @@ func (install *installer) execute(ctx context.Context) error {
 	if currentMigration, err := install.pythonMigration(ctx, node); err != nil {
 		return err
 	} else if currentMigration != migration {
-		return errors.New("Installed queue migration state changed; retry the installer")
+		return errors.New("Installed queue migration state changed; open Agent Queue again")
 	}
 	if currentMigration, err := install.queueMigration(ctx, node); err != nil {
 		return err
 	} else if currentMigration != queueMigration {
-		return errors.New("Installed queue migration state changed; retry the installer")
+		return errors.New("Installed queue migration state changed; open Agent Queue again")
 	}
 	remoteWasEnabled, err := install.remoteEnabled()
 	if err != nil {

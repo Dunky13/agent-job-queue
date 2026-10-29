@@ -59,7 +59,7 @@ func (f *fakeGitHub) Request(_ context.Context, endpoint string, options Request
 	return json.Marshal(value)
 }
 func fixtureManifest(build int, commit string) backend.Manifest {
-	return backend.Manifest{BuildInfo: backend.BuildInfo{SchemaVersion: 1, Repository: backend.ReleaseRepository, Version: "0.1.0", Commit: &commit, Build: &build}, Tag: fmt.Sprintf("build-%d-%.7s", build, commit), Asset: "Agent-Job-Queue-Installer-0.1.0-universal.zip", SHA256: strings.TrimPrefix(digest([]byte("fixture archive")), "sha256:")}
+	return backend.Manifest{BuildInfo: backend.BuildInfo{SchemaVersion: 1, Repository: backend.ReleaseRepository, Version: "0.1.0", Commit: &commit, Build: &build}, Tag: fmt.Sprintf("build-%d-%.7s", build, commit), Asset: "Agent-Queue-0.1.0-universal.zip", SHA256: strings.TrimPrefix(digest([]byte("fixture archive")), "sha256:")}
 }
 func jsonBody(value any) []byte {
 	data, err := json.Marshal(value)

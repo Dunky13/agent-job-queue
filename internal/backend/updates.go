@@ -31,7 +31,7 @@ import (
 )
 
 const updateAPI = "https://api.github.com/repos/" + ReleaseRepository + "/releases?per_page=100"
-const updateInstaller = "Agent Job Queue Installer.app"
+const updateApp = "Agent Queue.app"
 const updateMaxArchive = 128 * 1024 * 1024
 const updateMaxExpanded = 512 * 1024 * 1024
 const updateMaxPages = 10
@@ -68,7 +68,7 @@ func updateCompleted(root string) error {
 	if _, err := ValidateBuildInfo(data); err != nil {
 		return err
 	}
-	return errors.New("Installation is incomplete. Finish or retry the installer before checking versions or updates")
+	return errors.New("Installation is incomplete. Open Agent Queue from Applications to finish setup before checking versions or updates")
 }
 
 func updatePlist(path string) (map[string]any, error) {
@@ -475,23 +475,23 @@ func updateLock(state string) (*os.File, error) {
 func updateInspectArchive(filename string) error {
 	archive, err := zip.OpenReader(filename)
 	if err != nil {
-		return errors.New("Installer archive is invalid")
+		return errors.New("Update archive is invalid")
 	}
 	defer archive.Close()
 	if len(archive.File) == 0 || len(archive.File) > 5000 {
-		return errors.New("Installer archive exceeds its extraction limits")
+		return errors.New("Update archive exceeds its extraction limits")
 	}
 	names := make(map[string]bool)
 	var expanded uint64
 	fold := cases.Fold()
 	for _, item := range archive.File {
 		if item.UncompressedSize64 > updateMaxExpanded || expanded > updateMaxExpanded-item.UncompressedSize64 {
-			return errors.New("Installer archive exceeds its extraction limits")
+			return errors.New("Update archive exceeds its extraction limits")
 		}
 		expanded += item.UncompressedSize64
 		name := item.Name
 		parts := strings.Split(strings.TrimSuffix(name, "/"), "/")
-		unsafe := name == "" || strings.HasPrefix(name, "/") || strings.ContainsAny(name, "\\:\x00") || len(parts) == 0 || (parts[0] != updateInstaller && parts[0] != "__MACOSX") || (!item.Mode().IsRegular() && !item.Mode().IsDir()) || item.Flags&1 != 0
+		unsafe := name == "" || strings.HasPrefix(name, "/") || strings.ContainsAny(name, "\\:\x00") || len(parts) == 0 || (parts[0] != updateApp && parts[0] != "__MACOSX") || (!item.Mode().IsRegular() && !item.Mode().IsDir()) || item.Flags&1 != 0
 		for _, part := range parts {
 			if part == ".." || part == "." || part == "" {
 				unsafe = true
@@ -499,7 +499,7 @@ func updateInspectArchive(filename string) error {
 		}
 		canonical := fold.String(norm.NFC.String(path.Clean(name)))
 		if unsafe || names[canonical] {
-			return errors.New("Installer archive contains unsafe paths or entries")
+			return errors.New("Update archive contains unsafe paths or entries")
 		}
 		names[canonical] = true
 	}
@@ -515,15 +515,16 @@ func updateCommand(ctx context.Context, args []string) error {
 	command := exec.CommandContext(bounded, args[0], args[1:]...)
 	if err := command.Run(); err != nil {
 		if bounded.Err() != nil {
-			return errors.New("Installer verification timed out. Try again")
+			return errors.New("Update verification or copying timed out. Try again")
 		}
-		return errors.New("Installer verification or opening failed. Download the installer from the release page")
+		return errors.New("Update verification or copying failed. Download the app from the release page")
 	}
 	return nil
 }
 
 type UpdateClient struct {
 	Root, App, State string
+	Downloads        string
 	download         func(context.Context, string, int64, string) ([]byte, error)
 	command          func(context.Context, []string) error
 	pages            int
@@ -534,7 +535,7 @@ func NewUpdateClient(root, app, state string) *UpdateClient {
 		state = filepath.Join(integrationHome(), ".local/state/agent-heavy")
 	}
 	httpClient := updateHTTPClient()
-	return &UpdateClient{Root: root, App: app, State: state, download: func(ctx context.Context, url string, limit int64, dest string) ([]byte, error) {
+	return &UpdateClient{Root: root, App: app, State: state, Downloads: filepath.Join(integrationHome(), "Downloads"), download: func(ctx context.Context, url string, limit int64, dest string) ([]byte, error) {
 		return updateDownload(ctx, httpClient, url, limit, dest)
 	}, command: updateCommand, pages: updateMaxPages}
 }
@@ -666,7 +667,7 @@ func (client *UpdateClient) check(ctx context.Context) (Object, *updateSelection
 			}
 		}
 	}
-	return Object{"installed": installed, "latest": latest, "comparison": comparison, "canInstall": comparison == "available" || comparison == "untracked", "message": message}, selected, nil
+	return Object{"installed": installed, "latest": latest, "comparison": comparison, "canDownload": comparison == "available" || comparison == "untracked", "message": message}, selected, nil
 }
 
 func (client *UpdateClient) Check() (Object, error) {
@@ -677,38 +678,59 @@ func (client *UpdateClient) Check() (Object, error) {
 }
 
 func (client *UpdateClient) verifyPackage(ctx context.Context, directory string, manifest Manifest) (string, error) {
-	installer := filepath.Join(directory, updateInstaller)
-	payload := filepath.Join(installer, "Contents/Resources/payload")
-	app := filepath.Join(payload, "Agent Queue.app")
-	for _, filename := range []string{filepath.Join(app, "Contents/Resources/build-info.json"), filepath.Join(payload, "source/build-info.json")} {
+	app := filepath.Join(directory, updateApp)
+	for _, filename := range []string{filepath.Join(app, "Contents/Resources/build-info.json"), filepath.Join(app, "Contents/Resources/payload/source/build-info.json")} {
 		raw, err := updateReadOwned(filename, 16384)
 		if err != nil {
-			return "", errors.New("Installer lacks matching build metadata. Use the release page for this older build")
+			return "", errors.New("Update lacks matching build metadata. Use the release page for this older build")
 		}
 		info, err := ValidateBuildInfo(raw)
 		if err != nil {
-			return "", errors.New("Installer lacks matching build metadata. Use the release page for this older build")
+			return "", errors.New("Update lacks matching build metadata. Use the release page for this older build")
 		}
 		if !info.Equal(manifest.BuildInfo) {
-			return "", errors.New("Installer build identity does not match the published release")
+			return "", errors.New("Update build identity does not match the published release")
 		}
 	}
-	for _, bundle := range []struct{ path, id string }{{installer, "io.went.agent-queue.installer"}, {app, "io.went.agent-queue"}} {
-		info, err := updatePlist(filepath.Join(bundle.path, "Contents/Info.plist"))
-		if err != nil {
-			return "", err
-		}
-		if info["CFBundleIdentifier"] != bundle.id || info["CFBundleShortVersionString"] != manifest.Version || info["CFBundleVersion"] != strconv.Itoa(*manifest.Build) {
-			return "", errors.New("Installer bundle version does not match the published release")
-		}
-		if err := client.command(ctx, []string{"/usr/bin/codesign", "--verify", "--strict", "--deep", bundle.path}); err != nil {
-			return "", err
-		}
+	info, err := updatePlist(filepath.Join(app, "Contents/Info.plist"))
+	if err != nil {
+		return "", err
 	}
-	return installer, nil
+	if info["CFBundleIdentifier"] != "io.went.agent-queue" || info["CFBundleShortVersionString"] != manifest.Version || info["CFBundleVersion"] != strconv.Itoa(*manifest.Build) {
+		return "", errors.New("Update bundle version does not match the published release")
+	}
+	if err := client.command(ctx, []string{"/usr/bin/codesign", "--verify", "--strict", "--deep", app}); err != nil {
+		return "", err
+	}
+	return app, nil
 }
 
-func (client *UpdateClient) OpenInstaller(build int) (Object, error) {
+// updateDestination claims a fresh folder in Downloads with an exclusive mkdir,
+// so an earlier download or any other user file is never overwritten.
+func (client *UpdateClient) updateDestination(manifest Manifest) (string, error) {
+	info, err := os.Stat(client.Downloads)
+	if err != nil || !info.IsDir() {
+		return "", errors.New("The Downloads folder is not available. Create it and try again")
+	}
+	base := fmt.Sprintf("Agent Queue %s (build %d)", manifest.Version, *manifest.Build)
+	for suffix := 1; suffix <= 100; suffix++ {
+		name := base
+		if suffix > 1 {
+			name = fmt.Sprintf("%s %d", base, suffix)
+		}
+		directory := filepath.Join(client.Downloads, name)
+		err := os.Mkdir(directory, 0755)
+		if err == nil {
+			return directory, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return "", err
+		}
+	}
+	return "", errors.New("Too many earlier downloads of this update exist in Downloads. Remove some and try again")
+}
+
+func (client *UpdateClient) DownloadUpdate(build int) (Object, error) {
 	if build < 1 || build > MaxReleaseBuild {
 		return nil, errors.New("Select a valid published build before downloading")
 	}
@@ -723,7 +745,7 @@ func (client *UpdateClient) OpenInstaller(build int) (Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	if status["canInstall"] != true || selected == nil || *selected.manifest.Build != build {
+	if status["canDownload"] != true || selected == nil || *selected.manifest.Build != build {
 		return nil, errors.New("Update availability changed. Check for updates again before downloading")
 	}
 	manifest, release := selected.manifest, selected.release
@@ -735,7 +757,8 @@ func (client *UpdateClient) OpenInstaller(build int) (Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	prepared := 0
+	// Staging is only an intermediate step now. Earlier versions kept opened
+	// installers in ready-* directories; nothing needs them anymore.
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, "preparing-") && !strings.HasPrefix(name, "ready-") {
@@ -745,41 +768,15 @@ func (client *UpdateClient) OpenInstaller(build int) (Object, error) {
 		if err := updatePrivateDirectory(stage); err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(name, "preparing-") {
-			if err := os.RemoveAll(stage); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		raw, err := updateReadOwned(filepath.Join(stage, "release.json"), 16384)
-		if err != nil {
+		if err := os.RemoveAll(stage); err != nil {
 			return nil, err
 		}
-		prior, err := ValidateManifest(raw)
-		if err != nil {
-			return nil, err
-		}
-		installed := status["installed"].(Object)
-		if installed["build"] != nil && *prior.Build <= installed["build"].(int) {
-			if err := os.RemoveAll(stage); err != nil {
-				return nil, err
-			}
-		} else {
-			prepared++
-		}
-	}
-	if prepared >= 3 {
-		return nil, errors.New("Finish a previously opened installer before preparing another update")
 	}
 	temporary, err := os.MkdirTemp(updates, "preparing-")
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		if temporary != "" {
-			_ = os.RemoveAll(temporary)
-		}
-	}()
+	defer func() { _ = os.RemoveAll(temporary) }()
 	archive := filepath.Join(temporary, manifest.Asset)
 	asset, err := updateAsset(release, manifest.Asset)
 	if err != nil {
@@ -803,7 +800,7 @@ func (client *UpdateClient) OpenInstaller(build int) (Object, error) {
 	}
 	digest := hex.EncodeToString(hasher.Sum(nil))
 	if digest != manifest.SHA256 || (asset["digest"] != nil && asset["digest"] != "sha256:"+digest) {
-		return nil, errors.New("Installer checksum does not match the published release")
+		return nil, errors.New("Update checksum does not match the published release")
 	}
 	if err := updateInspectArchive(archive); err != nil {
 		return nil, err
@@ -815,21 +812,10 @@ func (client *UpdateClient) OpenInstaller(build int) (Object, error) {
 	if err := client.command(ctx, []string{"/usr/bin/ditto", "-x", "-k", archive, expanded}); err != nil {
 		return nil, err
 	}
-	if _, err := client.verifyPackage(ctx, expanded, manifest); err != nil {
-		return nil, err
-	}
-	raw, err := json.Marshal(manifest)
+	verified, err := client.verifyPackage(ctx, expanded, manifest)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(temporary, "release.json"), raw, 0600); err != nil {
-		return nil, err
-	}
-	ready := filepath.Join(updates, "ready-"+strings.TrimPrefix(filepath.Base(temporary), "preparing-"))
-	if err := os.Rename(temporary, ready); err != nil {
-		return nil, err
-	}
-	temporary = ready
 	installed, err := updateInstalled(client.Root, client.App)
 	if err != nil {
 		return nil, err
@@ -837,16 +823,35 @@ func (client *UpdateClient) OpenInstaller(build int) (Object, error) {
 	if !reflect.DeepEqual(installed, status["installed"]) {
 		return nil, errors.New("Installed version changed while downloading. Check for updates again")
 	}
-	if err := client.command(ctx, []string{"/usr/bin/open", "-n", filepath.Join(ready, "expanded", updateInstaller)}); err != nil {
+	directory, err := client.updateDestination(manifest)
+	if err != nil {
 		return nil, err
 	}
-	temporary = ""
-	return Object{"installerOpened": true, "build": build, "message": "Installer opened. Setup starts automatically and waits for active jobs before updating background services"}, nil
+	delivered := filepath.Join(directory, updateApp)
+	copied := false
+	defer func() {
+		// The folder was created by this call, so removing it cannot touch user files.
+		if !copied {
+			_ = os.RemoveAll(directory)
+		}
+	}()
+	if err := client.command(ctx, []string{"/usr/bin/ditto", verified, delivered}); err != nil {
+		return nil, err
+	}
+	if _, err := client.verifyPackage(ctx, directory, manifest); err != nil {
+		return nil, err
+	}
+	copied = true
+	message := "Quit Agent Queue, then drag the new copy into Applications and choose Replace. Opening it finishes the update automatically."
+	if err := client.command(ctx, []string{"/usr/bin/open", "-R", delivered}); err != nil {
+		message = fmt.Sprintf("Could not show the new copy in Finder. It is at %s. %s", delivered, message)
+	}
+	return Object{"downloaded": true, "build": build, "app": delivered, "message": message}, nil
 }
 
 func UpdatesMain(args []string) int {
 	argumentError := func() int {
-		fmt.Fprintln(os.Stderr, "agent-heavy: use version [--json], updates check [--json], or updates install --build NUMBER [--json]")
+		fmt.Fprintln(os.Stderr, "agent-heavy: use version [--json], updates check [--json], or updates download --build NUMBER [--json]")
 		return 2
 	}
 	if len(args) == 0 {
@@ -856,7 +861,7 @@ func UpdatesMain(args []string) int {
 	index := 1
 	operation := ""
 	if action == "updates" {
-		if len(args) < 2 || (args[1] != "check" && args[1] != "install") {
+		if len(args) < 2 || (args[1] != "check" && args[1] != "download") {
 			return argumentError()
 		}
 		operation = args[1]
@@ -888,7 +893,7 @@ func UpdatesMain(args []string) int {
 			return argumentError()
 		}
 	}
-	if action == "updates" && ((operation == "install") != hasBuild) {
+	if action == "updates" && ((operation == "download") != hasBuild) {
 		return argumentError()
 	}
 	var result Object
@@ -904,7 +909,7 @@ func UpdatesMain(args []string) int {
 		if operation == "check" {
 			result, err = client.Check()
 		} else {
-			result, err = client.OpenInstaller(build)
+			result, err = client.DownloadUpdate(build)
 		}
 		if err == nil {
 			display = result["message"].(string)

@@ -152,8 +152,8 @@ jobs:
       - run: npm run test:web
       - run: npm run test:browser
 
-  installer:
-    name: Universal installer
+  app:
+    name: Universal app
     runs-on: macos-15
     timeout-minutes: 20
     env:
@@ -170,10 +170,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Build macOS 15+ universal installer app
+      - name: Build macOS 15+ universal drag-and-drop app
         run: |
           scripts/apple-toolchain.sh "$RUNNER_TEMP/build-toolchain.json"
-          scripts/build-installer.sh
+          scripts/build-app.sh
       - name: Retain credential-free build toolchain identity
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -184,34 +184,34 @@ jobs:
       - name: Generate immutable release manifest and Homebrew cask
         run: |
           go run -p 2 ./cmd/queue-tool render-cask \
-            --archive "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip" \
+            --archive "dist/Agent-Queue-$(cat VERSION)-universal.zip" \
             --version "$(cat VERSION)" --tag "build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" \
             --commit "$GITHUB_SHA" --build "$GITHUB_RUN_NUMBER" --output dist
       - name: Record Homebrew version used for packaging validation
         run: brew --version
-      - name: Verify Homebrew manifest and actual automated installer artifact
+      - name: Verify Homebrew manifest and the actual app artifact
         env:
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_DEVELOPER: '1'
         run: go test -p 2 ./internal/tooling -run TestHomebrew -v
-      - name: Verify payload and first install / upgrade behavior
-        run: scripts/test-installer.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip"
-      - name: Verify signed installer on the mounted disk image
-        run: bash scripts/test-dmg.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.dmg"
-      - name: Upload installer and checksums
+      - name: Verify the packaged app, queue and HTTPS runtime
+        run: scripts/test-installer.sh "dist/Agent-Queue-$(cat VERSION)-universal.zip"
+      - name: Verify the app on the mounted disk image
+        run: bash scripts/test-dmg.sh "dist/Agent-Queue-$(cat VERSION)-universal.dmg"
+      - name: Upload app and checksums
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: Agent-Job-Queue-Installer-${{ github.run_attempt }}
+          name: Agent-Queue-App-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
           retention-days: 90
-      - name: Record validated installer artifact
+      - name: Record validated app artifact
         id: artifact-name
-        run: printf 'name=Agent-Job-Queue-Installer-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+        run: printf 'name=Agent-Queue-App-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
   ci-required:
     name: ci-required
-    needs: [commit-policy, lint, vulnerability-check, macos-tests, tooling-tests, native-tests, web-tests, installer]
+    needs: [commit-policy, lint, vulnerability-check, macos-tests, tooling-tests, native-tests, web-tests, app]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

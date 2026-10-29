@@ -26,7 +26,7 @@ func fixtureManifest(build int) manifest {
 	commit := strings.Repeat(strconv.Itoa(build), 40)
 	body := []byte(fmt.Sprintf("archive-%d", build))
 	sum := sha256.Sum256(body)
-	return manifest{1, repository, "0.1.0", commit, build, fmt.Sprintf("build-%d-%.7s", build, commit), "Agent-Job-Queue-Installer-0.1.0-universal.zip", hex.EncodeToString(sum[:])}
+	return manifest{1, repository, "0.1.0", commit, build, fmt.Sprintf("build-%d-%.7s", build, commit), "Agent-Queue-0.1.0-universal.zip", hex.EncodeToString(sum[:])}
 }
 func jsonBytes(value any) []byte {
 	data, err := json.Marshal(value)
@@ -315,16 +315,15 @@ func TestRenderedCaskRetainsQuarantine(t *testing.T) {
 			t.Fatalf("rendered cask contains quarantine bypass: %s", unsafe)
 		}
 	}
-	if !strings.Contains(cask, `app "Agent Job Queue Installer.app", target: "#{Dir.home}/Applications/Agent Job Queue Installer.app"`) || !strings.Contains(cask, "installer script:") || !strings.Contains(cask, "--repair-and-continue") || !strings.Contains(cask, "CLI links are ready on success") || !strings.Contains(cask, "Homebrew uninstall retains the independent Agent Queue app") {
-		t.Fatal("rendered cask must install automatically and retain the independently installed runtime")
-	}
-	for _, forbidden := range []string{"preflight", "postflight", "sudo: true", "uninstall quit:", "system_command", "run \"", `"--app-bundle"`, "payload/Agent Queue.app\", target:"} {
-		if strings.Contains(cask, forbidden) {
-			t.Fatal("rendered delivery cask contains executable setup or runtime app ownership", forbidden)
+	for _, expected := range []string{"Agent-Queue-0.1.0-universal.zip\"", "\n  app \"Agent Queue.app\"\n", "\n  uninstall quit: \"io.went.agent-queue\"\n", "Open Agent Queue from Applications to finish setup", "--unregister-services", "Preserve quarantine so macOS can assess the notarized release."} {
+		if !strings.Contains(cask, expected) {
+			t.Fatalf("rendered cask is missing %q", expected)
 		}
 	}
-	if !strings.Contains(cask, "Developer ID signed and notarized") || !strings.Contains(cask, "Quarantine is retained") {
-		t.Fatal("rendered cask is missing notarized release provenance")
+	for _, forbidden := range []string{"installer script:", "uninstall script:", "binary \"", "target:", "--repair-and-continue", "postflight", "sudo: true", "system_command", "run \"", "Installer.app"} {
+		if strings.Contains(cask, forbidden) {
+			t.Fatalf("rendered cask contains setup execution or installer ownership: %s", forbidden)
+		}
 	}
 }
 
@@ -393,7 +392,58 @@ func TestRefreshHistoricalRubyIsComparedAsDataAndNeverExecuted(t *testing.T) {
 			if scenario == "archive-first" {
 				for _, download := range x.downloads {
 					if download[1] == "agent-job-queue.rb" {
-						t.Fatal("historical cask read before installer verification")
+						t.Fatal("historical cask read before archive verification")
+					}
+				}
+			}
+		})
+	}
+}
+
+// Taps published before the drag-and-drop app hold installer-wrapper metadata.
+// Only that predecessor state may use the old asset name; it is verified but
+// never rendered, and the first app release replaces it.
+func TestRefreshMigratesLegacyInstallerTapState(t *testing.T) {
+	legacyName := "Agent-Job-Queue-Installer-0.1.0-universal.zip"
+	legacify := func(x *refreshFixture, build int, name string) manifest {
+		data := fixtureManifest(build)
+		data.Asset = name
+		x.data[data.Tag] = data
+		asObject(x.source[data.Tag]["assets"].([]any)[1])["name"] = name
+		return data
+	}
+	for _, scenario := range []string{"upgrade", "same-build", "latest-release", "unknown-asset"} {
+		t.Run(scenario, func(t *testing.T) {
+			x := newRefreshFixture(t)
+			legacyBuild, name := 1, legacyName
+			switch scenario {
+			case "same-build":
+				legacyBuild = 2
+			case "unknown-asset":
+				name = "Agent-Job-Queue-0.1.0-universal.zip"
+			}
+			current := legacify(x, legacyBuild, name)
+			historical := []byte("# Legacy installer cask, comparison only\nraise 'must never execute'\n")
+			x.setHistorical(current.Tag, historical)
+			x.installCurrent(current, historical)
+			if scenario == "latest-release" {
+				legacify(x, 2, legacyName)
+			}
+			err := x.f.refresh(true, "", "")
+			if (err != nil) != (scenario != "upgrade") {
+				t.Fatalf("%s: %v", scenario, err)
+			}
+			want := 0
+			if scenario == "upgrade" {
+				want = 1
+			}
+			if len(x.publications) != want || (want == 1 && x.publications[0].Asset != "Agent-Queue-0.1.0-universal.zip") {
+				t.Fatalf("unexpected publications %v", x.publications)
+			}
+			if scenario == "upgrade" {
+				for _, call := range x.brewCalls {
+					if strings.Contains(call[len(call)-1], fixtureManifest(1).Tag) {
+						t.Fatal("legacy installer release was rendered into a cask")
 					}
 				}
 			}

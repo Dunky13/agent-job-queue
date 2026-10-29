@@ -15,13 +15,13 @@ import (
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("Expected check-source, check-commits, render-cask, verify-release, verify-installer, verify-app, or notarize")
+		return errors.New("Expected check-source, check-commits, render-cask, verify-release, verify-app, or notarize")
 	}
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
 	case "verify-checkpoint-origin":
-		original := flags.String("original", "", "verified original installer ZIP")
-		initial := flags.String("initial", "", "checkpoint initial installer ZIP")
+		original := flags.String("original", "", "verified original app ZIP")
+		initial := flags.String("initial", "", "checkpoint initial app ZIP")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -52,17 +52,11 @@ func run(args []string) error {
 		}
 		return tooling.ShiftFixture(*input, *output)
 	case "verify-app":
-		app := flags.String("app", "", "standalone app with embedded source payload")
+		app := flags.String("app", "", "extracted Agent Queue.app")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
 		return tooling.VerifyApp(*app)
-	case "verify-installer":
-		installer := flags.String("installer", "", "extracted installer app")
-		if err := flags.Parse(args[1:]); err != nil {
-			return err
-		}
-		return tooling.VerifyInstaller(*installer)
 	case "licenses":
 		output := flags.String("output", "", "license output directory")
 		if err := flags.Parse(args[1:]); err != nil {
@@ -88,7 +82,7 @@ func run(args []string) error {
 		}
 		return tooling.CheckCommits(*base, *head, *local, *repo)
 	case "render-cask":
-		archive := flags.String("archive", "", "installer ZIP")
+		archive := flags.String("archive", "", "app ZIP")
 		version := flags.String("version", "", "version")
 		tag := flags.String("tag", "", "immutable tag")
 		commit := flags.String("commit", "", "commit")

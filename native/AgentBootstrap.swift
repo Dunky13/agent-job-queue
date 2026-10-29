@@ -147,7 +147,7 @@ struct QueueBootstrapEnvironment: Sendable {
                       service.label == label, service.bundleProgram == "Contents/MacOS/\(helper)",
                       service.program == nil,
                       service.arguments == [helper, command] else {
-                    throw ClientError.message("A bundled background service definition is missing or invalid. Download a complete installer.")
+                    throw ClientError.message("A bundled background service definition is missing or invalid. Download Agent Queue again.")
                 }
             }
             return .ready
@@ -189,7 +189,7 @@ struct QueueBootstrapEnvironment: Sendable {
         guard packaging.serviceManagement == true else { return [] }
         let executable = app.appendingPathComponent("Contents/MacOS/AgentQueue")
         guard try QueueBootstrapFiles.safeExecutable(executable, scope: scope) else {
-            throw ClientError.message("The app launcher is missing or unsafe. Download a complete installer.")
+            throw ClientError.message("The app launcher is missing or unsafe. Download Agent Queue again.")
         }
         return ["queue", "resources"].map {
             QueueBootstrapRequest(executable: executable, arguments: ["--service-management", "status", $0])
@@ -1035,7 +1035,7 @@ struct QueueBootstrapView: View {
                         Button("Check again") { model.start() }
                             .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                     } else if !model.allowsInstallation {
-                        Button("Download installer") { model.downloadRelease() }
+                        Button("Download Agent Queue") { model.downloadRelease() }
                         Button("Check again") { model.start() }
                             .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                     } else if model.canRepairAndContinue {

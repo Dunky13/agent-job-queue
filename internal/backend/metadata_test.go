@@ -111,7 +111,7 @@ func mustMetadataJSON(t *testing.T, value any) []byte {
 }
 
 func TestMetadataManifestPinsSourceAndArtifact(t *testing.T) {
-	manifest := Manifest{BuildInfo: metadataTestInfo(t, "123"), Tag: "build-123-abcdef0", Asset: "Agent-Job-Queue-Installer-0.1.0-universal.zip", SHA256: strings.Repeat("1", 64)}
+	manifest := Manifest{BuildInfo: metadataTestInfo(t, "123"), Tag: "build-123-abcdef0", Asset: "Agent-Queue-0.1.0-universal.zip", SHA256: strings.Repeat("1", 64)}
 	validated, err := ValidateManifest(mustMetadataJSON(t, manifest))
 	if err != nil || validated.Tag != manifest.Tag {
 		t.Fatalf("valid manifest: %+v %v", validated, err)
@@ -119,7 +119,7 @@ func TestMetadataManifestPinsSourceAndArtifact(t *testing.T) {
 	for _, change := range []struct {
 		field string
 		value any
-	}{{"build", nil}, {"sha256", strings.Repeat("0", 63)}, {"tag", "build-124-abcdef0"}, {"asset", "../installer.zip"}, {"unexpected", "value"}} {
+	}{{"build", nil}, {"sha256", strings.Repeat("0", 63)}, {"tag", "build-124-abcdef0"}, {"asset", "../installer.zip"}, {"asset", "Agent-Job-Queue-Installer-0.1.0-universal.zip"}, {"asset", "Agent-Queue-0.1.1-universal.zip"}, {"unexpected", "value"}} {
 		var value map[string]any
 		_ = json.Unmarshal(mustMetadataJSON(t, manifest), &value)
 		value[change.field] = change.value

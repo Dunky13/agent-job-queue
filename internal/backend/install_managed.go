@@ -375,7 +375,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	}
 	if p.previous != nil {
 		if p.previous.App != install.app {
-			return nil, errors.New("Managed app location changed; restore its recorded Applications location before retrying")
+			return nil, fmt.Errorf("Agent Queue is already installed at %s; that location changed. Quit Agent Queue and drag this copy over that one, or move that copy to the Trash, then open Agent Queue again", p.previous.App)
 		}
 		if err := appservices.ValidateApp(install.home, p.previous.App); err != nil {
 			return nil, err

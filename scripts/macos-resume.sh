@@ -90,7 +90,11 @@ verify_state() {
     [[ -d $state/$directory && ! -L $state/$directory ]] || fail 'An expected state directory is missing or is a symlink.'
   done
   check_file "$state/initial.zip" "$(json_field "$metadata" initial_sha256)"
-  for stage in payload installer dmg; do
+  # Checkpoints from the installer-era layout cannot be continued: they would
+  # restart as an app stage over a different initial archive.
+  [[ ! -e $state/stages/payload.json && ! -e $state/stages/installer.json ]] ||
+    fail 'State predates the drag-and-drop app layout and cannot be resumed.'
+  for stage in app dmg; do
     record="$state/stages/$stage.json"
     if [[ ! -e $record ]]; then
       [[ ! -e $state/archives/$stage.zip && ! -e $state/archives/$stage.dmg &&
@@ -129,9 +133,8 @@ verify_state() {
 verify_publication() {
   [[ -f $state/publication.json && ! -L $state/publication.json ]] || fail 'Retained publication evidence is unsafe.'
   jq -s -e --slurpfile metadata "$state/metadata.json" \
-    --slurpfile payload "$state/stages/payload.json" --slurpfile installer "$state/stages/installer.json" \
-    --slurpfile dmg "$state/stages/dmg.json" --slurpfile payload_log "$state/receipts/payload.log.json" \
-    --slurpfile installer_log "$state/receipts/installer.log.json" --slurpfile dmg_log "$state/receipts/dmg.log.json" '
+    --slurpfile app "$state/stages/app.json" --slurpfile dmg "$state/stages/dmg.json" \
+    --slurpfile app_log "$state/receipts/app.log.json" --slurpfile dmg_log "$state/receipts/dmg.log.json" '
     def toolchain_valid:
       keys == ["automation_sha","go","host_architecture","macos_sdk","notarytool","os",
         "runner_image","runner_image_version","schema","source_sha","swift","xcode","xcode_build"] and
@@ -141,15 +144,15 @@ verify_publication() {
     def evidence_valid:
       keys == ["automation_sha","execution_attempt","execution_id","logs","metadata","schema","stages","toolchain"] and
     .schema == 1 and .metadata == $metadata[0] and
-    .stages == [$payload[0],$installer[0],$dmg[0]] and
+    .stages == [$app[0],$dmg[0]] and
     all(.stages[]; .phase == "finished") and
-    .logs == [$payload_log[0],$installer_log[0],$dmg_log[0]] and
+    .logs == [$app_log[0],$dmg_log[0]] and
     (.execution_id | type == "string" and test("^[1-9][0-9]*$")) and
     (.execution_attempt | type == "string" and test("^[1-9][0-9]*$")) and
     (.automation_sha | type == "string" and test("^[a-f0-9]{40}$")) and
     (.toolchain | toolchain_valid) and .toolchain.source_sha == .metadata.source_sha and
     .toolchain.automation_sha == .automation_sha;
-    ([$metadata,$payload,$installer,$dmg,$payload_log,$installer_log,$dmg_log] |
+    ([$metadata,$app,$dmg,$app_log,$dmg_log] |
       all(.[]; length == 1 and (.[0] | type == "object"))) and
     length == 1 and all(.[]; type == "object" and evidence_valid)
   ' "$state/publication.json" >/dev/null || fail 'Retained publication evidence does not match this exact completed candidate.'
@@ -163,7 +166,7 @@ publication_evidence() {
   [[ -n ${BUILD_RUN_ID:-} && $(json_field "$state/metadata.json" schema) == 2 ]] ||
     fail 'Publication evidence requires an artifact-bound CI candidate.'
   local stage
-  for stage in payload installer dmg; do
+  for stage in app dmg; do
     [[ -f $state/stages/$stage.json && $(json_field "$state/stages/$stage.json" phase) == finished ]] ||
       fail 'All stages must finish before retaining publication evidence.'
   done
@@ -172,13 +175,12 @@ publication_evidence() {
     jq -s -e 'length == 1 and (.[0] | type == "object")' "$APPLE_TOOLCHAIN_RECEIPT" >/dev/null ||
       fail 'The finalization toolchain receipt must be one JSON object.'
     jq -S -n --slurpfile metadata "$state/metadata.json" \
-      --slurpfile payload "$state/stages/payload.json" --slurpfile installer "$state/stages/installer.json" \
-      --slurpfile dmg "$state/stages/dmg.json" --slurpfile payload_log "$state/receipts/payload.log.json" \
-      --slurpfile installer_log "$state/receipts/installer.log.json" --slurpfile dmg_log "$state/receipts/dmg.log.json" \
+      --slurpfile app "$state/stages/app.json" --slurpfile dmg "$state/stages/dmg.json" \
+      --slurpfile app_log "$state/receipts/app.log.json" --slurpfile dmg_log "$state/receipts/dmg.log.json" \
       --slurpfile toolchain "$APPLE_TOOLCHAIN_RECEIPT" --arg execution "$GITHUB_RUN_ID" \
       --arg attempt "$GITHUB_RUN_ATTEMPT" --arg automation "$GITHUB_SHA" '
-      {schema:1,metadata:$metadata[0],stages:[$payload[0],$installer[0],$dmg[0]],
-       logs:[$payload_log[0],$installer_log[0],$dmg_log[0]],toolchain:$toolchain[0],
+      {schema:1,metadata:$metadata[0],stages:[$app[0],$dmg[0]],
+       logs:[$app_log[0],$dmg_log[0]],toolchain:$toolchain[0],
        execution_id:$execution,execution_attempt:$attempt,automation_sha:$automation}
     ' > "$state/publication.json.new"
     mv "$state/publication.json.new" "$state/publication.json"
@@ -223,55 +225,44 @@ configure_credentials() {
 }
 
 require_stage() {
-  case "$stage" in payload|installer|dmg) ;; *) fail 'Stage must be payload, installer or dmg.' ;; esac
+  case "$stage" in app|dmg) ;; *) fail 'Stage must be app or dmg.' ;; esac
   record="$state/stages/$stage.json"
   if [[ $stage == dmg ]]; then submitted_archive="$state/archives/dmg.dmg"; else submitted_archive="$state/archives/$stage.zip"; fi
 }
 
-restore_installer() {
+restore_app() {
   rm -rf "$state/work" || return
   mkdir "$state/work" || return
   ditto -x -k "$state/initial.zip" "$state/work" || return
-  installer="$state/work/Agent Job Queue Installer.app"
-  payload="$installer/Contents/Resources/payload"
-  app="$payload/Agent Queue.app"
+  app="$state/work/Agent Queue.app"
+  [[ -f $app/Contents/MacOS/agent-heavy ]] || { macos_signing_error 'The initial archive is not a self-contained Agent Queue app.'; return 1; }
 }
 
 prepare_stage() {
-  local previous name image_signing_arguments
+  local image_signing_arguments
   [[ ! -f $record ]] || { printf '%s already prepared.\n' "$stage"; return; }
-  case "$stage" in payload) ;; installer) previous=payload ;; dmg) previous=installer ;; esac
-  if [[ $stage != payload ]]; then
-    [[ -f $state/stages/$previous.json && $(json_field "$state/stages/$previous.json" phase) == finished ]] ||
+  if [[ $stage == dmg ]]; then
+    [[ -f $state/stages/app.json && $(json_field "$state/stages/app.json" phase) == finished ]] ||
       fail 'The previous stage must be accepted and finished before preparing this stage.'
   fi
   macos_signing_operation configure-credentials configure_credentials
   if [[ $MACOS_NOTARY_REST == 1 ]]; then
     macos_signing_operation notary-authentication "$QUEUE_NOTARY_TOOL" notarize preflight
   fi
-  macos_signing_operation restore-installer restore_installer
+  macos_signing_operation restore-app restore_app
   case "$stage" in
-    payload)
-      for name in agent-heavy agent-remote; do
-        macos_sign_code "$payload/source/bin/$name" "io.went.agent-queue.$name" "$name"
-      done
+    app)
       macos_sign_app_helpers "$app"
       macos_sign_code "$app" '' app
-      archive "$payload" "$submitted_archive"
-      ;;
-    installer)
-      rm -rf "$payload"
-      ditto -x -k "$state/completed/payload.zip" "$installer/Contents/Resources"
-      macos_sign_code "$installer" '' installer
-      archive "$installer" "$submitted_archive"
+      archive "$app" "$submitted_archive"
       ;;
     dmg)
-      rm -rf "$state/work/Agent Job Queue Installer.app"
-      ditto -x -k "$state/completed/installer.zip" "$state/work"
-      macos_verify_installer_distribution "$installer"
-      macos_disk_image_source "$installer" "$state/work/image"
+      rm -rf "$app"
+      ditto -x -k "$state/completed/app.zip" "$state/work"
+      macos_verify_app_distribution "$app"
+      macos_disk_image_source "$app" "$state/work/image"
       sync
-      hdiutil create -verbose -nospotlight -fs HFS+ -volname 'Agent Job Queue' \
+      hdiutil create -verbose -nospotlight -fs HFS+ -volname 'Agent Queue' \
         -srcfolder "$MACOS_DISK_IMAGE_SOURCE" -ov -format UDZO "$submitted_archive"
       image_signing_arguments=(--force --sign "$APPLE_SIGNING_IDENTITY" --timestamp --identifier io.went.agent-queue.disk-image)
       [[ -z ${APPLE_SIGNING_KEYCHAIN:-} ]] || image_signing_arguments+=(--keychain "$APPLE_SIGNING_KEYCHAIN")
@@ -434,19 +425,11 @@ finish_stage() {
     mv "$state/work/image.dmg" "$completed"
   else
     ditto -x -k "$submitted_archive" "$state/work"
-    completed="$state/completed/$stage.zip"
-    if [[ $stage == payload ]]; then
-      app="$state/work/payload/Agent Queue.app"
-      macos_staple "$app"
-      macos_verify_code "$app"
-      macos_assess_app "$app"
-      archive "$state/work/payload" "$completed"
-    else
-      installer="$state/work/Agent Job Queue Installer.app"
-      macos_staple "$installer"
-      macos_verify_installer_distribution "$installer"
-      archive "$installer" "$completed"
-    fi
+    completed="$state/completed/app.zip"
+    app="$state/work/Agent Queue.app"
+    macos_staple "$app"
+    macos_verify_app_distribution "$app"
+    archive "$app" "$completed"
   fi
   jq --arg hash "$(sha256 "$completed")" '.phase="finished" | .completed_sha256=$hash' "$record" > "$record.new"
   mv "$record.new" "$record"
@@ -455,12 +438,12 @@ finish_stage() {
 }
 
 export_assets() {
-  local stage destination=$1 base="Agent-Job-Queue-Installer-$resume_version-universal"
+  local stage destination=$1 base="Agent-Queue-$resume_version-universal"
   rm -f "$state/receipts/dmg.retry"
   MACOS_TICKET_RECOVERY_FILE="$state/receipts/dmg.retry"
-  for stage in payload installer dmg; do
+  for stage in app dmg; do
     [[ -f $state/stages/$stage.json && $(json_field "$state/stages/$stage.json" phase) == finished ]] ||
-      fail 'All three stages must be Accepted and finished before publishing.'
+      fail 'Both stages must be Accepted and finished before publishing.'
   done
   destination=$(macos_signing_canonical_path "$destination")
   case "$destination/" in "$state/"*) fail 'Public assets must be outside private working state.' ;; esac
@@ -469,10 +452,10 @@ export_assets() {
   # Reverify tickets and signatures on the final immutable assets before export.
   rm -rf "$state/work"
   mkdir "$state/work"
-  ditto -x -k "$state/completed/installer.zip" "$state/work"
-  macos_verify_installer_distribution "$state/work/Agent Job Queue Installer.app"
+  ditto -x -k "$state/completed/app.zip" "$state/work"
+  macos_verify_app_distribution "$state/work/Agent Queue.app"
   macos_verify_disk_image "$state/completed/dmg.dmg"
-  cp "$state/completed/installer.zip" "$destination/$base.zip"
+  cp "$state/completed/app.zip" "$destination/$base.zip"
   cp "$state/completed/dmg.dmg" "$destination/$base.dmg"
   (cd "$destination" && shasum -a 256 "$base.zip" > "$base.zip.sha256" && shasum -a 256 "$base.dmg" > "$base.dmg.sha256")
   rm -rf "$state/work"
@@ -496,8 +479,8 @@ command=${1:-}
 # Explicit version arguments ensure restored metadata cannot choose a release.
 case "$command" in
   init)
-    [[ $# == 4 ]] || fail 'Usage: macos-resume.sh init INSTALLER STATE VERSION'
-    initial_installer=$2 state=$3 resume_version=$4
+    [[ $# == 4 ]] || fail 'Usage: macos-resume.sh init APP STATE VERSION'
+    initial_app=$2 state=$3 resume_version=$4
     ;;
   verify-state|evidence)
     [[ $# == 3 ]] || fail "Usage: macos-resume.sh $command STATE VERSION"
@@ -520,18 +503,20 @@ esac
 identity
 state=$(macos_signing_canonical_path "$state")
 if [[ $command == init ]]; then
-  [[ ! -e $state && -d $initial_installer ]] || fail 'Init requires a complete installer and a fresh state directory.'
-  initial_installer=$(macos_signing_canonical_path "$initial_installer")
-  case "$state/" in "$initial_installer/"*) fail 'State must be outside the initial installer.' ;; esac
+  [[ ! -e $state && -d $initial_app ]] || fail 'Init requires a complete app and a fresh state directory.'
+  initial_app=$(macos_signing_canonical_path "$initial_app")
+  case "$state/" in "$initial_app/"*) fail 'State must be outside the initial app.' ;; esac
   mkdir "$state"
   lock_state
   mkdir "$state/archives" "$state/completed" "$state/stages" "$state/receipts" "$state/work"
-  ditto "$initial_installer" "$state/work/Agent Job Queue Installer.app"
-  for path in 'Agent Queue.app/Contents/MacOS/AgentQueue' source/bin/agent-heavy source/bin/agent-remote; do
-    [[ -f "$state/work/Agent Job Queue Installer.app/Contents/Resources/payload/$path" ]] || fail 'The complete installer payload is required.'
+  ditto "$initial_app" "$state/work/Agent Queue.app"
+  for path in AgentQueue agent-heavy agent-remote; do
+    [[ -f "$state/work/Agent Queue.app/Contents/MacOS/$path" ]] || fail 'The complete app and its bundled helpers are required.'
   done
-  macos_app_payload_mode "$state/work/Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app"
-  archive "$state/work/Agent Job Queue Installer.app" "$state/initial.zip"
+  macos_app_payload_mode "$state/work/Agent Queue.app"
+  [[ $MACOS_APP_MANAGED == 1 && $MACOS_APP_EMBEDDED == 1 ]] ||
+    fail 'The app must be the self-contained layout; installer-era builds are not supported.'
+  archive "$state/work/Agent Queue.app" "$state/initial.zip"
   jq -n --arg version "$resume_version" --arg team "$APPLE_TEAM_ID" --arg sha "$source_sha" \
     --arg repository "$GITHUB_REPOSITORY" --arg run "$source_run" --arg number "$source_number" \
     --arg attempt "${BUILD_RUN_ATTEMPT:-}" --arg artifact "${BUILD_ARTIFACT_ID:-}" --arg digest "${BUILD_ARTIFACT_DIGEST:-}" \

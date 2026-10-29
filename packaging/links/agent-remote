@@ -1,8 +1,0 @@
-#!/bin/sh
-set -eu
-entry="${HOME:?}/.local/bin/agent-remote"
-if [ ! -x "$entry" ]; then
-  echo 'Agent Queue installation is incomplete. Reopen Agent Job Queue Installer to resume automatic setup.' >&2
-  exit 125
-fi
-exec "$entry" "$@"

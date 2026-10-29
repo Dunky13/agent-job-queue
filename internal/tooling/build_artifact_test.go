@@ -22,13 +22,12 @@ func buildArtifactFixture(t *testing.T, change func(map[string][]byte)) (string,
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := "Agent Job Queue Installer.app/"
+	base := "Agent Queue.app/"
 	contents := map[string][]byte{
-		base + "Contents/Resources/build-info.json":                                            metadata,
-		base + "Contents/Resources/payload/source/build-info.json":                             metadata,
-		base + "Contents/Resources/payload/Agent Queue.app/Contents/Resources/build-info.json": metadata,
-		base + "Contents/Resources/payload/source/VERSION":                                     []byte("0.1.0\n"),
-		base + "Contents/MacOS/Installer":                                                      []byte("original executable bytes"),
+		base + "Contents/Resources/build-info.json":                metadata,
+		base + "Contents/Resources/payload/source/build-info.json": metadata,
+		base + "Contents/Resources/payload/source/VERSION":         []byte("0.1.0\n"),
+		base + "Contents/MacOS/AgentQueue":                         []byte("original executable bytes"),
 	}
 	if change != nil {
 		change(contents)
@@ -38,7 +37,7 @@ func buildArtifactFixture(t *testing.T, change func(map[string][]byte)) (string,
 		entries = append(entries, checkpointEntry{name, data, 0755})
 	}
 	inner := checkpointZIP(t, entries...)
-	asset := "Agent-Job-Queue-Installer-0.1.0-universal.zip"
+	asset := "Agent-Queue-0.1.0-universal.zip"
 	image := strings.TrimSuffix(asset, ".zip") + ".dmg"
 	manifest := backend.Manifest{BuildInfo: info, Tag: "build-21-aaaaaaa", Asset: asset, SHA256: fmt.Sprintf("%x", sha256.Sum256(inner))}
 	data, err := json.Marshal(manifest)
@@ -64,7 +63,7 @@ func TestBuildArtifactVerifiesOriginalBytesAndEmbeddedIdentity(t *testing.T) {
 	if err != nil || version != "0.1.0" {
 		t.Fatalf("verify original: version=%s err=%v", version, err)
 	}
-	if _, err := os.Stat(filepath.Join(output, "Agent-Job-Queue-Installer-0.1.0-universal.zip")); err != nil {
+	if _, err := os.Stat(filepath.Join(output, "Agent-Queue-0.1.0-universal.zip")); err != nil {
 		t.Fatal(err)
 	}
 	// An automation checkout's VERSION is deliberately not consulted.
@@ -74,10 +73,10 @@ func TestBuildArtifactVerifiesOriginalBytesAndEmbeddedIdentity(t *testing.T) {
 }
 
 func TestBuildArtifactRejectsUntrustedIdentityAndArchivePaths(t *testing.T) {
-	for _, variant := range []string{"digest", "commit", "build", "embedded repository", "embedded SHA", "embedded build", "embedded version", "source version", "traversal", "newline", "shadowed directory"} {
+	for _, variant := range []string{"digest", "commit", "build", "embedded repository", "embedded SHA", "embedded build", "embedded version", "source version", "traversal", "newline", "shadowed directory", "installer layout"} {
 		t.Run(variant, func(t *testing.T) {
 			archive, digest, commit, output := buildArtifactFixture(t, func(contents map[string][]byte) {
-				name := "Agent Job Queue Installer.app/Contents/Resources/payload/source/build-info.json"
+				name := "Agent Queue.app/Contents/Resources/payload/source/build-info.json"
 				if strings.HasPrefix(variant, "embedded ") {
 					var info map[string]any
 					if err := json.Unmarshal(contents[name], &info); err != nil {
@@ -101,13 +100,15 @@ func TestBuildArtifactRejectsUntrustedIdentityAndArchivePaths(t *testing.T) {
 				}
 				switch variant {
 				case "source version":
-					contents["Agent Job Queue Installer.app/Contents/Resources/payload/source/VERSION"] = []byte("9.9.9\n")
+					contents["Agent Queue.app/Contents/Resources/payload/source/VERSION"] = []byte("9.9.9\n")
 				case "traversal":
 					contents["../escaped"] = []byte("bad")
 				case "newline":
-					contents["Agent Job Queue Installer.app/a\nb"] = []byte("bad")
+					contents["Agent Queue.app/a\nb"] = []byte("bad")
 				case "shadowed directory":
-					contents["Agent Job Queue Installer.app/Contents"] = []byte("bad")
+					contents["Agent Queue.app/Contents"] = []byte("bad")
+				case "installer layout":
+					contents["Agent Job Queue Installer.app/Contents/Resources/build-info.json"] = contents["Agent Queue.app/Contents/Resources/build-info.json"]
 				}
 			})
 			switch variant {
@@ -133,7 +134,7 @@ func TestBuildArtifactRejectsUntrustedIdentityAndArchivePaths(t *testing.T) {
 func TestCheckpointOriginRequiresExactBytesModesAndResourceMetadata(t *testing.T) {
 	for _, variant := range []string{"same", "bytes", "mode", "xattr", "missing", "link"} {
 		t.Run(variant, func(t *testing.T) {
-			entries := []checkpointEntry{{"Agent Job Queue Installer.app/", nil, os.ModeDir | 0755}, {"Agent Job Queue Installer.app/executable", []byte("original"), 0755}, {"__MACOSX/._Agent Job Queue Installer.app", []byte("opaque resource metadata"), 0600}}
+			entries := []checkpointEntry{{"Agent Queue.app/", nil, os.ModeDir | 0755}, {"Agent Queue.app/executable", []byte("original"), 0755}, {"__MACOSX/._Agent Queue.app", []byte("opaque resource metadata"), 0600}}
 			original := checkpointZIP(t, entries...)
 			switch variant {
 			case "bytes":
@@ -170,11 +171,11 @@ func TestCheckpointOriginNativeDittoRoundTrip(t *testing.T) {
 	for _, mask := range []string{"022", "077"} {
 		t.Run(mask, func(t *testing.T) {
 			root := t.TempDir()
-			app := filepath.Join(root, "Agent Job Queue Installer.app")
+			app := filepath.Join(root, "Agent Queue.app")
 			if err := os.MkdirAll(filepath.Join(app, "Contents/MacOS"), 0755); err != nil {
 				t.Fatal(err)
 			}
-			executable := filepath.Join(app, "Contents/MacOS/Installer")
+			executable := filepath.Join(app, "Contents/MacOS/AgentQueue")
 			if err := os.WriteFile(executable, []byte("inert original bytes\n"), 0755); err != nil {
 				t.Fatal(err)
 			}
@@ -190,8 +191,8 @@ func TestCheckpointOriginNativeDittoRoundTrip(t *testing.T) {
  ditto -c -k --sequesterRsrc --keepParent "$2" "$3"
  mkdir "$4/extracted" "$4/work"
  ditto -x -k "$3" "$4/extracted"
- ditto "$4/extracted/Agent Job Queue Installer.app" "$4/work/Agent Job Queue Installer.app"
- ditto -c -k --sequesterRsrc --keepParent "$4/work/Agent Job Queue Installer.app" "$5"`, "origin-fixture", mask, app, original, root, initial)
+ ditto "$4/extracted/Agent Queue.app" "$4/work/Agent Queue.app"
+ ditto -c -k --sequesterRsrc --keepParent "$4/work/Agent Queue.app" "$5"`, "origin-fixture", mask, app, original, root, initial)
 			if out, err := command.CombinedOutput(); err != nil {
 				t.Fatalf("ditto roundtrip: %v: %s", err, out)
 			}

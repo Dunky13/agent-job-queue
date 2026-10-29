@@ -37,7 +37,7 @@ recovery_archive() {
   [[ $(LC_ALL=C sort "$temporary/names" | uniq -d | wc -l | tr -d ' ') == 0 ]] || distribution_error 'Duplicate receipt ZIP entry.'
   while IFS= read -r entry; do
     case "$entry" in recovery.json|metadata.json|toolchain.json) ;;
-      stage-payload.json|stage-installer.json|stage-dmg.json|receipt-payload.json|receipt-installer.json|receipt-dmg.json|log-payload.json|log-installer.json|log-dmg.json|status-payload.json|status-installer.json|status-dmg.json) ;;
+      stage-app.json|stage-dmg.json|receipt-app.json|receipt-dmg.json|log-app.json|log-dmg.json|status-app.json|status-dmg.json) ;;
       *) distribution_error 'Unsafe or unexpected receipt ZIP entry.' ;; esac
   done < "$temporary/names"
   # Info-ZIP lists mode, version, host, expanded size, flags, compressed size,
@@ -149,7 +149,7 @@ recovery_candidate() (
     ([.build_run_number,.build_attempt,.build_artifact_id,.checkpoint_id]|all(.[]; number)) and
     (.build_artifact_digest|digest) and (.checkpoint_digest|digest) and
     (.team|test("^[A-Z0-9]{10}$")) and (.version|test("^[A-Za-z0-9][A-Za-z0-9.+_-]*$")) and
-    (.stage == "payload" or .stage == "installer" or .stage == "dmg") and
+    (.stage == "app" or .stage == "dmg") and
     (.phase == "submitted" or .phase == "accepted" or .phase == "finished" or .phase == "prepared" or .phase == "uploading") and
     ($mode != "signing" or .reason != "none") and
     (.reason == "none" or (.reason == "pending" and .phase == "submitted") or
@@ -179,7 +179,7 @@ recovery_candidate() (
   # Cross-check every retained diagnostic, not just the advertised reason.
   jq -e '
     def archive_names($stage; $r):
-      (if $stage == "payload" then "Agent-Job-Queue-Payload-" else "Agent-Job-Queue-Installer-" end) as $prefix |
+      "Agent-Queue-" as $prefix |
       (if $stage == "dmg" then "-universal.dmg" else "-universal.zip" end) as $suffix |
       [$prefix + $r.version + $suffix,
        $prefix + $r.version + "-build-" + $r.build_run_number + "-" + $r.source_sha[0:7] + $suffix];
@@ -190,7 +190,7 @@ recovery_candidate() (
     $m.version == $r.version and $m.team == $r.team and ($m.initial_sha256|type == "string" and test("^[a-f0-9]{64}$")) and
     ($e["stage-" + $r.stage + ".json"] | .stage == $r.stage and .phase == $r.phase and
       .submission_id == $r.submission_id and .archive_sha256 == $r.archive_sha256) and
-    all(["payload","installer","dmg"][]; . as $stage | $e["stage-" + $stage + ".json"] as $s |
+    all(["app","dmg"][]; . as $stage | $e["stage-" + $stage + ".json"] as $s |
       all(["log-","receipt-","status-"][]; . as $kind | $e[$kind + $stage + ".json"] as $d |
         $d == null or ($s != null and
           (if $kind == "status-" then $d.id == $s.submission_id and
@@ -211,7 +211,7 @@ recovery_candidate() (
   distribution_inventory "repos/$GITHUB_REPOSITORY/actions/runs/$build/artifacts" artifacts "$temporary/source-artifacts"
   jq -s -e --slurpfile recovery "$temporary/recovery.json" '
     $recovery[0] as $r | [.[]|select((.id|tostring) == $r.build_artifact_id)] | length == 1 and
-    all(.[]; .name == ("Agent-Job-Queue-Installer-" + $r.build_attempt) and .expired == false and
+    all(.[]; .name == ("Agent-Queue-App-" + $r.build_attempt) and .expired == false and
       .digest == $r.build_artifact_digest and (.workflow_run.id|tostring) == $r.build_run_id and
       .workflow_run.head_branch == "main" and .workflow_run.head_sha == $r.source_sha)' "$temporary/source-artifacts" >/dev/null ||
     distribution_error 'Original build artifact missing, expired or mismatched.'
@@ -227,9 +227,9 @@ recovery_candidate() (
   jq -s -e --slurpfile recovery "$temporary/recovery.json" '
     $recovery[0] as $r | all(.[]; (.run_id|tostring) == $r.build_run_id and .head_sha == $r.source_sha and
       (.run_attempt|tostring) == $r.build_attempt) and
-    ([.[]|select(.name == "Universal installer")]|length) == 1 and
-    all(.[]|select(.name == "Universal installer"); .status == "completed" and .conclusion == "success")' "$temporary/build-jobs" >/dev/null ||
-    distribution_error 'Original installer attempt did not succeed.'
+    ([.[]|select(.name == "Universal app")]|length) == 1 and
+    all(.[]|select(.name == "Universal app"); .status == "completed" and .conclusion == "success")' "$temporary/build-jobs" >/dev/null ||
+    distribution_error 'Original app attempt did not succeed.'
 
   # Re-observe the group immediately before mutation; a new active or successful
   # execution, or a changed attempt, invalidates the decision.

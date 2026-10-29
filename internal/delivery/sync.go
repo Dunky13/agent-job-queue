@@ -292,7 +292,7 @@ func verifyRelease(ctx context.Context, data backend.Manifest, github GitHub) er
 		}
 	}
 	if selected[data.Asset]["digest"] != "sha256:"+data.SHA256 {
-		return errors.New("Published installer asset checksum conflicts with its release manifest")
+		return errors.New("Published app archive checksum conflicts with its release manifest")
 	}
 	manifest := selected["agent-job-queue.json"]
 	size, _ := positive(manifest["size"])

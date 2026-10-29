@@ -25,12 +25,12 @@ import (
 )
 
 type updateFixture struct {
-	root, app, state string
-	manifest         Manifest
-	release          Object
-	archive          []byte
-	commands         [][]string
-	client           *UpdateClient
+	root, app, state, downloads string
+	manifest                    Manifest
+	release                     Object
+	archive                     []byte
+	commands                    [][]string
+	client                      *UpdateClient
 }
 
 func updateTestFixture(t *testing.T) *updateFixture {
@@ -39,8 +39,11 @@ func updateTestFixture(t *testing.T) *updateFixture {
 	info := metadataTestInfo(t, "20")
 	commit := strings.Repeat("a", 40)
 	info.Commit = &commit
-	f := &updateFixture{root: filepath.Join(directory, "installed"), app: filepath.Join(directory, "Agent Queue.app"), state: filepath.Join(directory, "state"), manifest: Manifest{BuildInfo: info, Tag: "build-20-aaaaaaa", Asset: "Agent-Job-Queue-Installer-0.1.0-universal.zip"}}
+	f := &updateFixture{root: filepath.Join(directory, "installed"), app: filepath.Join(directory, "Agent Queue.app"), state: filepath.Join(directory, "state"), downloads: filepath.Join(directory, "Downloads"), manifest: Manifest{BuildInfo: info, Tag: "build-20-aaaaaaa", Asset: "Agent-Queue-0.1.0-universal.zip"}}
 	if err := os.Mkdir(f.root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(f.downloads, 0700); err != nil {
 		t.Fatal(err)
 	}
 	f.archive = f.makeArchive(t, false)
@@ -50,8 +53,12 @@ func updateTestFixture(t *testing.T) *updateFixture {
 	f.refreshAssets(t)
 	f.client = NewUpdateClient(f.root, f.app, f.state)
 	f.client.download = f.download(t)
+	f.client.Downloads = f.downloads
 	f.client.command = func(ctx context.Context, args []string) error {
 		f.commands = append(f.commands, append([]string{}, args...))
+		if args[0] == "/usr/bin/ditto" && args[1] != "-x" {
+			return updateTestCopy(args[1], args[2])
+		}
 		if args[0] == "/usr/bin/ditto" {
 			archive, err := zip.OpenReader(args[len(args)-2])
 			if err != nil {
@@ -86,6 +93,27 @@ func updateTestFixture(t *testing.T) *updateFixture {
 		return nil
 	}
 	return f
+}
+
+func updateTestCopy(source, destination string) error {
+	return filepath.WalkDir(source, func(filename string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(source, filename)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		if entry.IsDir() {
+			return os.MkdirAll(target, 0700)
+		}
+		data, err := os.ReadFile(filename)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0600)
+	})
 }
 
 func updateTestBundle(t *testing.T, directory, identifier string, info BuildInfo, format int) {
@@ -163,16 +191,14 @@ func (f *updateFixture) download(t *testing.T) func(context.Context, string, int
 func (f *updateFixture) makeArchive(t *testing.T, mismatch bool) []byte {
 	t.Helper()
 	directory := t.TempDir()
-	installer := filepath.Join(directory, updateInstaller)
-	updateTestBundle(t, installer, "io.went.agent-queue.installer", f.manifest.BuildInfo, plist.BinaryFormat)
-	payload := filepath.Join(installer, "Contents/Resources/payload")
-	updateTestBundle(t, filepath.Join(payload, "Agent Queue.app"), "io.went.agent-queue", f.manifest.BuildInfo, plist.XMLFormat)
+	app := filepath.Join(directory, updateApp)
+	updateTestBundle(t, app, "io.went.agent-queue", f.manifest.BuildInfo, plist.BinaryFormat)
 	info := f.manifest.BuildInfo
 	if mismatch {
 		build := 19
 		info.Build = &build
 	}
-	integrationTestWrite(t, filepath.Join(payload, "source/build-info.json"), mustMetadataJSON(t, info))
+	integrationTestWrite(t, filepath.Join(app, "Contents/Resources/payload/source/build-info.json"), mustMetadataJSON(t, info))
 	var buffer bytes.Buffer
 	archive := zip.NewWriter(&buffer)
 	err := filepath.WalkDir(directory, func(filename string, entry os.DirEntry, err error) error {
@@ -418,7 +444,7 @@ func TestUpdatesComparisonUsesImmutableBuilds(t *testing.T) {
 	}{{10, strings.Repeat("b", 40), "available", true}, {20, strings.Repeat("a", 40), "current", false}, {21, strings.Repeat("c", 40), "newer", false}, {0, "", "untracked", true}} {
 		f.install(t, test.build, test.commit)
 		result, err := f.client.Check()
-		if err != nil || result["comparison"] != test.comparison || result["canInstall"] != test.install {
+		if err != nil || result["comparison"] != test.comparison || result["canDownload"] != test.install {
 			t.Fatalf("comparison %+v: %v %v", test, result, err)
 		}
 	}
@@ -502,44 +528,84 @@ func TestUpdatesReleasePaginationAndTrust(t *testing.T) {
 	}
 }
 
-func TestUpdatesInstallerHandoffAndBoundedStorage(t *testing.T) {
+func TestUpdatesDownloadDeliversVerifiedAppAndNeverOverwrites(t *testing.T) {
 	f := updateTestFixture(t)
 	f.install(t, 10, strings.Repeat("b", 40))
-	for index := 0; index < 3; index++ {
-		result, err := f.client.OpenInstaller(20)
-		if err != nil || result["installerOpened"] != true {
-			t.Fatalf("prepare %v %v", result, err)
-		}
+	// An earlier folder with the expected name holds user data that must survive.
+	occupied := filepath.Join(f.downloads, "Agent Queue 0.1.0 (build 20)")
+	integrationTestWrite(t, filepath.Join(occupied, "keep"), []byte("user file"))
+	result, err := f.client.DownloadUpdate(20)
+	delivered := filepath.Join(f.downloads, "Agent Queue 0.1.0 (build 20) 2", "Agent Queue.app")
+	if err != nil || result["downloaded"] != true || result["build"] != 20 || result["app"] != delivered || !strings.Contains(result["message"].(string), "drag the new copy into Applications") {
+		t.Fatalf("download %v %v", result, err)
 	}
-	if _, err := f.client.OpenInstaller(20); err == nil || !strings.Contains(err.Error(), "previously opened") {
-		t.Fatalf("unbounded storage: %v", err)
+	if string(integrationTestRead(t, filepath.Join(occupied, "keep"))) != "user file" {
+		t.Fatal("existing download folder was changed")
+	}
+	if _, err := os.Stat(filepath.Join(occupied, "Agent Queue.app")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("download wrote into an existing folder")
 	}
 	var commands []string
-	for _, args := range f.commands[:4] {
+	for _, args := range f.commands {
 		commands = append(commands, args[0])
 	}
-	if strings.Join(commands, ",") != "/usr/bin/ditto,/usr/bin/codesign,/usr/bin/codesign,/usr/bin/open" || f.commands[3][1] != "-n" {
-		t.Fatalf("unsafe handoff: %v", f.commands)
+	if strings.Join(commands, ",") != "/usr/bin/ditto,/usr/bin/codesign,/usr/bin/ditto,/usr/bin/codesign,/usr/bin/open" || !strings.HasPrefix(f.commands[2][1], filepath.Join(f.state, "updates")) || f.commands[2][2] != delivered || f.commands[4][1] != "-R" || f.commands[4][2] != delivered {
+		t.Fatalf("unsafe delivery: %v", f.commands)
+	}
+	if _, err := f.client.verifyPackage(context.Background(), filepath.Dir(delivered), f.manifest); err != nil {
+		t.Fatalf("delivered app is not the verified build: %v", err)
 	}
 	installed, err := updateInstalled(f.root, f.app)
 	if err != nil || installed["build"] != 10 {
-		t.Fatal("handoff installed without confirmation")
+		t.Fatal("download changed the installed app")
 	}
-	ready, _ := filepath.Glob(filepath.Join(f.state, "updates/ready-*"))
-	if len(ready) != 3 {
-		t.Fatalf("prepared count %d", len(ready))
-	}
-	// Completed older preparations are removed only after that build is installed.
-	f.install(t, 21, strings.Repeat("c", 40))
-	for _, directory := range ready {
-		if _, err := os.Stat(filepath.Join(directory, "release.json")); err != nil {
+	// Each further download claims its own folder, and private staging is always emptied.
+	for _, suffix := range []string{"3", "4"} {
+		if _, err := f.client.DownloadUpdate(20); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(f.downloads, "Agent Queue 0.1.0 (build 20) "+suffix, "Agent Queue.app")); err != nil {
 			t.Fatal(err)
 		}
 	}
+	entries, err := os.ReadDir(filepath.Join(f.state, "updates"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("staging retained: %v %v", entries, err)
+	}
 }
 
-func TestUpdatesFailuresNeverOpenOrLeakPreparation(t *testing.T) {
-	for _, kind := range []string{"stale", "current", "newer", "checksum", "identity", "signature", "changed-install", "open-failure"} {
+func TestUpdatesDownloadClearsStaleStagingAndSurvivesRevealFailure(t *testing.T) {
+	f := updateTestFixture(t)
+	f.install(t, 10, strings.Repeat("b", 40))
+	for _, name := range []string{"preparing-old", "ready-old"} {
+		if err := os.MkdirAll(filepath.Join(f.state, "updates", name), 0700); err != nil {
+			t.Fatal(err)
+		}
+		integrationTestWrite(t, filepath.Join(f.state, "updates", name, "release.json"), []byte("{}"))
+	}
+	command := f.client.command
+	f.client.command = func(ctx context.Context, args []string) error {
+		if args[0] == "/usr/bin/open" {
+			return errors.New("Finder unavailable")
+		}
+		return command(ctx, args)
+	}
+	result, err := f.client.DownloadUpdate(20)
+	app := filepath.Join(f.downloads, "Agent Queue 0.1.0 (build 20)", "Agent Queue.app")
+	if err != nil || result["downloaded"] != true || !strings.Contains(result["message"].(string), app) {
+		t.Fatalf("reveal failure %v %v", result, err)
+	}
+	if _, err := os.Stat(app); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(filepath.Join(f.state, "updates"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("stale staging retained: %v %v", entries, err)
+	}
+}
+
+func TestUpdatesFailuresNeverDeliverOrLeakPreparation(t *testing.T) {
+	for _, kind := range []string{"stale", "current", "newer", "checksum", "identity", "signature", "copied-signature", "changed-install", "copy-failure", "missing-downloads"} {
 		t.Run(kind, func(t *testing.T) {
 			f := updateTestFixture(t)
 			f.install(t, 10, strings.Repeat("b", 40))
@@ -558,14 +624,22 @@ func TestUpdatesFailuresNeverOpenOrLeakPreparation(t *testing.T) {
 				sum := sha256.Sum256(f.archive)
 				f.manifest.SHA256 = hex.EncodeToString(sum[:])
 				f.refreshAssets(t)
+			case "missing-downloads":
+				if err := os.Remove(f.downloads); err != nil {
+					t.Fatal(err)
+				}
 			}
 			command := f.client.command
+			signatures := 0
 			f.client.command = func(ctx context.Context, args []string) error {
-				if kind == "signature" && args[0] == "/usr/bin/codesign" {
-					return errors.New("Invalid signature")
+				if args[0] == "/usr/bin/codesign" {
+					signatures++
+					if kind == "signature" || (kind == "copied-signature" && signatures == 2) {
+						return errors.New("Invalid signature")
+					}
 				}
-				if kind == "open-failure" && args[0] == "/usr/bin/open" {
-					return errors.New("Open failed")
+				if kind == "copy-failure" && args[0] == "/usr/bin/ditto" && args[1] != "-x" {
+					return errors.New("Copy failed")
 				}
 				if err := command(ctx, args); err != nil {
 					return err
@@ -575,12 +649,18 @@ func TestUpdatesFailuresNeverOpenOrLeakPreparation(t *testing.T) {
 				}
 				return nil
 			}
-			if _, err := f.client.OpenInstaller(requested); err == nil {
-				t.Fatal("unsafe installer opened")
+			if _, err := f.client.DownloadUpdate(requested); err == nil {
+				t.Fatal("unsafe update delivered")
 			}
 			for _, args := range f.commands {
 				if args[0] == "/usr/bin/open" {
-					t.Fatal("failure opened installer")
+					t.Fatal("failure revealed an update")
+				}
+			}
+			if kind != "missing-downloads" {
+				delivered, err := os.ReadDir(f.downloads)
+				if err != nil || len(delivered) != 0 {
+					t.Fatalf("download leaked: %v %v", delivered, err)
 				}
 			}
 			entries, err := os.ReadDir(filepath.Join(f.state, "updates"))
@@ -599,10 +679,10 @@ func TestUpdatesArchiveRejectsUnsafeEntries(t *testing.T) {
 		names []string
 		mode  os.FileMode
 	}{
-		{[]string{"../outside"}, 0600}, {[]string{"/absolute"}, 0600}, {[]string{updateInstaller + "/link"}, os.ModeSymlink | 0600}, {[]string{updateInstaller + "/pipe"}, os.ModeNamedPipe | 0600},
-		{[]string{updateInstaller + "/../outside"}, 0600}, {[]string{updateInstaller + "/./file"}, 0600}, {[]string{updateInstaller + "/FILE", updateInstaller + "/file"}, 0600},
-		{[]string{updateInstaller + "/caf\u00e9", updateInstaller + "/cafe\u0301"}, 0600}, {[]string{updateInstaller + "/STRASSE", updateInstaller + "/Stra\u00dfe"}, 0600},
-		{[]string{updateInstaller + "/evil\x00ignored"}, 0600}, {[]string{updateInstaller + "/a:b"}, 0600}, {[]string{updateInstaller + "/a\\b"}, 0600},
+		{[]string{"../outside"}, 0600}, {[]string{"/absolute"}, 0600}, {[]string{"Agent Job Queue Installer.app/file"}, 0600}, {[]string{"Agent Queue.app/file", "Other.app/file"}, 0600}, {[]string{updateApp + "/link"}, os.ModeSymlink | 0600}, {[]string{updateApp + "/pipe"}, os.ModeNamedPipe | 0600},
+		{[]string{updateApp + "/../outside"}, 0600}, {[]string{updateApp + "/./file"}, 0600}, {[]string{updateApp + "/FILE", updateApp + "/file"}, 0600},
+		{[]string{updateApp + "/caf\u00e9", updateApp + "/cafe\u0301"}, 0600}, {[]string{updateApp + "/STRASSE", updateApp + "/Stra\u00dfe"}, 0600},
+		{[]string{updateApp + "/evil\x00ignored"}, 0600}, {[]string{updateApp + "/a:b"}, 0600}, {[]string{updateApp + "/a\\b"}, 0600},
 	} {
 		t.Run(fmt.Sprint(test.names), func(t *testing.T) {
 			filename := filepath.Join(t.TempDir(), "bad.zip")
@@ -638,7 +718,7 @@ func TestUpdatesLockRefusesConcurrentAndUnsafeFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lock.Close()
-	if _, err := f.client.OpenInstaller(20); err == nil || !strings.Contains(err.Error(), "Another update") {
+	if _, err := f.client.DownloadUpdate(20); err == nil || !strings.Contains(err.Error(), "Another update") {
 		t.Fatalf("concurrent update %v", err)
 	}
 	lock.Close()
@@ -722,5 +802,13 @@ func TestUpdatesAbsoluteDeadlineInterruptsHeadersAndTricklingBody(t *testing.T) 
 				t.Fatal("deadline did not bound trickling I/O")
 			}
 		})
+	}
+}
+
+func TestUpdatesCLIUsesDownloadAction(t *testing.T) {
+	for _, args := range [][]string{{"updates", "install", "--build", "20"}, {"updates", "download"}, {"updates", "check", "--build", "20"}, {"updates", "download", "--build", "x"}} {
+		if code := UpdatesMain(args); code != 2 {
+			t.Errorf("%v returned %d", args, code)
+		}
 	}
 }

@@ -1,8 +1,6 @@
 package tooling
 
 import (
-	"context"
-	"encoding/json"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -42,7 +40,7 @@ func TestManagedCaskTemplateParity(t *testing.T) {
 	}
 }
 
-func TestHomebrewInstallerPreservesQuarantineWithPrivateVendorAdapter(t *testing.T) {
+func TestHomebrewAppCaskPreservesQuarantineWithFixtureApp(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("Homebrew quarantine delivery requires macOS")
 	}
@@ -50,89 +48,22 @@ func TestHomebrewInstallerPreservesQuarantineWithPrivateVendorAdapter(t *testing
 	if err != nil {
 		t.Skip("Homebrew is unavailable")
 	}
-	for _, historical := range []bool{false, true} {
-		t.Run(strconv.FormatBool(historical), func(t *testing.T) {
-			root, home, environment, owner := notarizedCaskFixture(t, "AAAAAAAAAA")
-			protocolPath := filepath.Join(root, "fixture-environment.json")
-			body, err := os.ReadFile(protocolPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var protocol map[string]string
-			if err := json.Unmarshal(body, &protocol); err != nil {
-				t.Fatal(err)
-			}
-			delete(protocol, "AGENT_QUEUE_INSTALL_TEST_TEAM")
-			body, err = json.Marshal(protocol)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(protocolPath, body, 0600); err != nil {
-				t.Fatal(err)
-			}
-			installer := filepath.Join(root, "Agent Job Queue Installer.app")
-			payload := filepath.Join(installer, "Contents/Resources/payload")
-			for _, bundle := range []string{installer, filepath.Join(payload, "Agent Queue.app")} {
-				verificationWrite(t, filepath.Join(bundle, "Contents/Info.plist"), `<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>0.1.0</string><key>CFBundleVersion</key><string>123</string></dict></plist>`, 0600)
-			}
-			paths := []string{filepath.Join(installer, "Contents/MacOS/Installer"), filepath.Join(payload, "source/bin/agent-heavy"), filepath.Join(payload, "source/bin/agent-remote"), filepath.Join(payload, "Agent Queue.app/Contents/MacOS/AgentQueue")}
-			helperDir := "Agent Queue.app/Contents/MacOS"
-			if historical {
-				helperDir = "Agent Queue.app/Contents/Resources/payload/source/bin"
-			}
-			for _, name := range []string{"agent-heavy", "agent-remote"} {
-				paths = append(paths, filepath.Join(payload, helperDir, name), filepath.Join(payload, "source/links", name))
-			}
-			for _, path := range paths {
-				verificationWrite(t, path, "#!/bin/sh\ntouch \"$HOME/forbidden-execution\"\nexit 95\n", 0700)
-			}
-			verificationWrite(t, filepath.Join(payload, "source/bin/agent-heavy"), "#!/bin/sh\n[ \"$1\" = install ] && [ \"$2\" = --payload ] && [ \"$4\" = --repair-and-continue ] || exit 94\ncase \"$3\" in /private/tmp/agent-queue-install.*/*) ;; *) exit 93;; esac\nprintf '%s\\n' \"$3\" > \"$HOME/vendor-payload\"\n", 0700)
-			runtime := filepath.Join(home, "Applications/Agent Queue.app/Contents/MacOS/AgentQueue")
-			verificationWrite(t, runtime, "live runtime sentinel", 0700)
-			before, err := os.Stat(runtime)
-			if err != nil {
-				t.Fatal(err)
-			}
-			cask := notarizedFixtureCask(t, root, "0.1.0")
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			command, err := owner.start(ctx, environment, nil, brew, "ruby", "--", "../../packaging/homebrew/test-cask.rb", cask, root, "--quarantined")
-			if err != nil {
-				t.Fatal(err)
-			}
-			output, err := command.wait()
-			if err != nil {
-				t.Fatalf("quarantined installer delivery failed: %v: %s", err, output)
-			}
-			var result struct {
-				Installed bool           `json:"fixture_app_installed"`
-				Executed  bool           `json:"fixture_installer_executed"`
-				Attrs     map[string]int `json:"fixture_attributes"`
-			}
-			lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-			if err := json.Unmarshal([]byte(lines[len(lines)-1]), &result); err != nil || !result.Installed || !result.Executed || len(result.Attrs) != 5 || result.Attrs["entries"] == 0 {
-				t.Fatalf("invalid delivery evidence: %v: %s", err, output)
-			}
-			for _, count := range result.Attrs {
-				if count != result.Attrs["entries"] {
-					t.Fatal("delivery lost quarantine or unrelated xattrs", result.Attrs)
-				}
-			}
-			after, err := os.Stat(runtime)
-			if err != nil || !os.SameFile(before, after) {
-				t.Fatal("delivery replaced the live runtime", err)
-			}
-			if _, err := os.Stat(filepath.Join(home, "forbidden-execution")); !os.IsNotExist(err) {
-				t.Fatal("installation executed an unrelated helper", err)
-			}
-			privatePayload, err := os.ReadFile(filepath.Join(home, "vendor-payload"))
-			if err != nil || !strings.HasPrefix(string(privatePayload), "/private/tmp/agent-queue-install.") {
-				t.Fatalf("vendor controller did not use protected staging: %v", err)
-			}
-			if _, err := os.Stat(strings.TrimSpace(string(privatePayload))); !os.IsNotExist(err) {
-				t.Fatal("successful vendor installation left private staging", err)
-			}
-		})
+	fixture, home, environment := caskFixture(t)
+	writeFixtureApp(t, filepath.Join(fixture, "Agent Queue.app"), 123)
+	cask := fixtureCask(t, fixture, "0.1.0", 123)
+	output, err := runBrewRuby(t, 30*time.Second, environment, brew, "--", "../../packaging/homebrew/test-cask.rb", cask, fixture, "--quarantined")
+	if err != nil {
+		t.Fatalf("quarantined app delivery failed: %v: %s", err, output)
+	}
+	assertFixtureDelivery(t, output)
+	if _, err := os.Stat(filepath.Join(home, "Applications/Agent Queue.app/Contents/MacOS/agent-heavy")); err != nil {
+		t.Fatalf("Homebrew did not place the complete app: %v", err)
+	}
+	// Placing the app must neither run it nor perform its first-launch setup.
+	for _, name := range []string{"forbidden-execution", ".local", "Library/LaunchAgents"} {
+		if _, err := os.Stat(filepath.Join(home, name)); !os.IsNotExist(err) {
+			t.Fatalf("installation executed or set up the app: %s (%v)", name, err)
+		}
 	}
 }
 
@@ -144,26 +75,25 @@ func TestManagedCaskLoaderRejectsHookDrift(t *testing.T) {
 	if err != nil {
 		t.Skip("Homebrew is unavailable")
 	}
-	root, home, environment, owner := notarizedCaskFixture(t, "AAAAAAAAAA")
-	valid := notarizedFixtureCask(t, root, "0.1.0")
+	root, home, environment := caskFixture(t)
+	valid := fixtureCask(t, root, "0.1.0", 123)
 	body, err := os.ReadFile(valid)
 	if err != nil {
 		t.Fatal(err)
 	}
+	const script = `{ executable: "/bin/sh", args: ["-c", "true"], sudo: false, must_succeed: true }`
 	paths := []string{valid}
 	for _, mutation := range []struct{ name, before, after string }{
-		{"runtime-app", `app "Agent Job Queue Installer.app",`, `app "Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app",`},
-		{"runtime-target", `Applications/Agent Job Queue Installer.app`, `Applications/Agent Queue.app`},
+		{"installer-script", "  caveats <<~EOS", "  installer script: " + script + "\n  caveats <<~EOS"},
+		{"uninstall-script", `uninstall quit: "io.went.agent-queue"`, "uninstall script: " + script},
+		{"uninstall-extra", `uninstall quit: "io.went.agent-queue"`, `uninstall quit: "io.went.agent-queue", delete: "/tmp/unexpected"`},
+		{"uninstall-bundle", `quit: "io.went.agent-queue"`, `quit: "io.went.other"`},
 		{"preflight", "  caveats <<~EOS", "  preflight_steps do\n    run \"/bin/true\"\n  end\n  caveats <<~EOS"},
 		{"postflight", "  caveats <<~EOS", "  postflight_steps do\n    run \"/bin/true\"\n  end\n  caveats <<~EOS"},
-		{"uninstall", `uninstall script: { executable: "/usr/bin/true", sudo: false, must_succeed: true }`, `uninstall quit: "io.went.agent-queue"`},
-		{"installer-command", `executable: "/bin/sh"`, `executable: "/bin/bash"`},
-		{"installer-flags", `--repair-and-continue`, `--unregister-services`},
-		{"publisher", `U9GXK89565`, `AAAAAAAAAA`},
-		{"sudo", `sudo: false`, `sudo: true`},
 		{"removal", "  caveats <<~EOS", "  uninstall_preflight_steps do\n    run \"/bin/true\"\n  end\n  caveats <<~EOS"},
-		{"binary", "source/links/agent-heavy", "source/bin/agent-heavy"},
-		{"binary-target", `source/links/agent-heavy"`, `source/links/agent-heavy", target: "unexpected"`},
+		{"binary", "  caveats <<~EOS", "  binary \"Agent Queue.app/Contents/MacOS/agent-heavy\"\n  caveats <<~EOS"},
+		{"app-target", `app "Agent Queue.app"`, `app "Agent Queue.app", target: "#{Dir.home}/Applications/Agent Queue.app"`},
+		{"installer-app", `app "Agent Queue.app"`, `app "Agent Job Queue Installer.app"`},
 		{"extra-app", "  caveats <<~EOS", "  app \"Other.app\"\n  caveats <<~EOS"},
 	} {
 		changed := strings.Replace(string(body), mutation.before, mutation.after, 1)
@@ -171,11 +101,16 @@ func TestManagedCaskLoaderRejectsHookDrift(t *testing.T) {
 			t.Fatalf("mutation %s no longer targets the current cask", mutation.name)
 		}
 		path := filepath.Join(root, mutation.name, "agent-job-queue.rb")
-		verificationWrite(t, path, changed, 0600)
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(changed), 0600); err != nil {
+			t.Fatal(err)
+		}
 		paths = append(paths, path)
 	}
-	script := filepath.Join(root, "verify-contract.rb")
-	verificationWrite(t, script, `require File.expand_path("../../packaging/homebrew/test-cask.rb")
+	driver := filepath.Join(root, "verify-contract.rb")
+	if err := os.WriteFile(driver, []byte(`require File.expand_path("../../packaging/homebrew/test-cask.rb")
 ARGV.each_with_index do |path, index|
   rejected = false
   begin
@@ -187,18 +122,14 @@ ARGV.each_with_index do |path, index|
   raise "Wrong contract verdict for #{path}" unless rejected == (index > 0)
 end
 puts "exact delivery contracts verified"
-`, 0600)
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
 	// Keep the literal HOME in the same path shape used by release acceptance.
 	if !strings.Contains(home, "User With Spaces") {
 		t.Fatal("missing spaced HOME")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	command, err := owner.start(ctx, environment, nil, brew, append([]string{"ruby", "--", script}, paths...)...)
-	if err != nil {
-		t.Fatal(err)
-	}
-	output, err := command.wait()
+	output, err := runBrewRuby(t, 30*time.Second, environment, brew, append([]string{"--", driver}, paths...)...)
 	if err != nil || !strings.Contains(string(output), "exact delivery contracts verified") {
 		t.Fatalf("cask contract drift check failed: %v: %s", err, output)
 	}

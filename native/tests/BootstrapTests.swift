@@ -426,14 +426,14 @@ struct BootstrapTests {
         model.onSetupRequired = { shown += 1 }
         let first = model.start()
         try await waitUntil { await executor.isHeld }
-        try check(model.phase == .installing && model.isRunning && completions == 0 && shown == 1,
-            "Installing gates normal startup and termination while presenting setup progress")
+        try check(model.phase == .installing && model.isRunning && completions == 0 && shown == 0,
+            "Installing gates normal startup and termination without presenting a setup window")
         try check(model.start() == nil, "Repeated startup cannot launch a second installer")
         first?.cancel()
         await executor.release()
         await first?.value
-        try check(model.phase == .failed && !model.isRunning && completions == 0 && model.output.contains("Fixture service"),
-            "Failure retains a readable error, permits quit and leaves normal startup gated")
+        try check(model.phase == .failed && !model.isRunning && completions == 0 && model.output.contains("Fixture service") && shown == 1,
+            "Failure presents a readable error, permits quit and leaves normal startup gated")
         try check(!model.canDisablePhoneAccess && model.start(disablePhoneAccess: true) == nil,
             "Unrelated setup failures cannot authorize disabling phone access")
         let retry = model.start()

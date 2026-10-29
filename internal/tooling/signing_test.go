@@ -25,7 +25,7 @@ func signingTestEnvironment(extra ...string) []string {
 }
 
 func TestMacOSSigningRejectsIncompleteConfigurationBeforeBuild(t *testing.T) {
-	script, err := filepath.Abs("../../scripts/build-installer.sh")
+	script, err := filepath.Abs("../../scripts/build-app.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,8 +73,29 @@ func TestMacOSSigningRejectsIncompleteConfigurationBeforeBuild(t *testing.T) {
 }
 
 type signingFixture struct {
-	script, root, installer, destination, events string
-	environment                                  []string
+	script, root, app, destination, events string
+	environment                            []string
+}
+
+const signingTestInfoPlist = `<?xml version="1.0"?><plist version="1.0"><dict><key>AgentQueueEmbeddedPayload</key><true/><key>AgentQueueServiceManagement</key><true/></dict></plist>`
+
+// signingTestApp writes the self-contained layout build-app.sh produces:
+// helpers beside the executable, bundle-owned agents and a support payload.
+func signingTestApp(t *testing.T, app string) {
+	t.Helper()
+	for _, path := range []string{"Contents/MacOS/AgentQueue", "Contents/MacOS/agent-heavy", "Contents/MacOS/agent-remote"} {
+		verificationWrite(t, filepath.Join(app, filepath.FromSlash(path)), "fixture executable", 0700)
+	}
+	verificationWrite(t, filepath.Join(app, "Contents/Info.plist"), signingTestInfoPlist, 0600)
+	verificationWrite(t, filepath.Join(app, "Contents/Resources/payload/source/build-info.json"), "{}", 0600)
+	for _, name := range []string{"heavy", "resources", "remote"} {
+		filename := "io.went.agent-" + name + ".plist"
+		raw, err := os.ReadFile(filepath.Join("../../native/LaunchAgents", filename))
+		if err != nil {
+			t.Fatal(err)
+		}
+		verificationWrite(t, filepath.Join(app, "Contents/Library/LaunchAgents", filename), string(raw), 0600)
+	}
 }
 
 func newSigningFixture(t *testing.T) signingFixture {
@@ -84,16 +105,8 @@ func newSigningFixture(t *testing.T) signingFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	installer := filepath.Join(root, "prepared Installer.app")
-	for _, path := range []string{"Contents/MacOS/Installer", "Contents/Resources/payload/Agent Queue.app/Contents/MacOS/AgentQueue", "Contents/Resources/payload/source/bin/agent-heavy", "Contents/Resources/payload/source/bin/agent-remote"} {
-		full := filepath.Join(installer, filepath.FromSlash(path))
-		if err := os.MkdirAll(filepath.Dir(full), 0700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(full, []byte("fixture executable"), 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
+	app := filepath.Join(root, "prepared Agent Queue.app")
+	signingTestApp(t, app)
 	bin := filepath.Join(root, "tools")
 	if err := os.Mkdir(bin, 0700); err != nil {
 		t.Fatal(err)
@@ -107,7 +120,7 @@ func newSigningFixture(t *testing.T) signingFixture {
 	}
 	events := filepath.Join(root, "events")
 	return signingFixture{
-		script: script, root: root, installer: installer, destination: filepath.Join(root, "public assets"), events: events,
+		script: script, root: root, app: app, destination: filepath.Join(root, "public assets"), events: events,
 		environment: signingTestEnvironment("PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "TMPDIR="+tmp,
 			"SIGNING_TEST_EVENTS="+events, "SIGNING_TEST_FAILURE=", "SIGNING_TEST_TEAM="+signingTestTeam),
 	}
@@ -146,63 +159,56 @@ func assertNotarySubmissionNames(t *testing.T, events, version string) {
 		}
 	}
 	want := []string{
-		"Agent-Job-Queue-Payload-" + version + "-universal.zip",
-		"Agent-Job-Queue-Installer-" + version + "-universal.zip",
-		"Agent-Job-Queue-Installer-" + version + "-universal.dmg",
+		"Agent-Queue-" + version + "-universal.zip",
+		"Agent-Queue-" + version + "-universal.dmg",
 	}
 	if strings.Join(names, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("unexpected Apple submission names: %v, want %v", names, want)
 	}
 }
 
-func (f signingFixture) embedAppSupport(t *testing.T) string {
-	t.Helper()
-	source := filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app/Contents/Resources/payload/source")
-	if err := os.MkdirAll(filepath.Join(source, "bin"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		if err := os.WriteFile(filepath.Join(source, "bin", name), []byte("embedded fixture helper"), 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(source, "build-info.json"), []byte("{}"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	return source
-}
-
-func TestMacOSSigningDragInstallSignsEmbeddedHelpersBeforeApp(t *testing.T) {
+func TestMacOSSigningSignsBundledHelpersBeforeApp(t *testing.T) {
 	f := newSigningFixture(t)
-	source := f.embedAppSupport(t)
-	if output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3"); err != nil {
-		t.Fatalf("drag packaging failed: %v: %s", err, output)
+	if output, err := f.run(t, signingProductionEnvironment(), "package", f.app, f.destination, "1.2.3"); err != nil {
+		t.Fatalf("app packaging failed: %v: %s", err, output)
 	}
 	record := f.recorded(t)
-	app := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(source))))
-	seal := strings.Index(record, "|"+app+"\n")
+	seal := strings.Index(record, "codesign|--force|--sign|Developer ID Application: Fixture ("+signingTestTeam+")|--timestamp|--options|runtime|"+f.app+"\n")
 	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		sign := strings.Index(record, "|"+filepath.Join(source, "bin", name)+"\n")
-		if sign < 0 || seal < sign || !strings.Contains(record, "|--identifier|io.went.agent-queue."+name+"|") {
-			t.Fatalf("embedded helper was not signed before sealing the app: %s", record)
+		path := filepath.Join(f.app, "Contents/MacOS", name)
+		sign := strings.Index(record, "|--identifier|io.went.agent-queue."+name+"|"+path+"\n")
+		if sign < 0 || seal < sign {
+			t.Fatalf("bundled helper was not signed before sealing the app: %s", record)
+		}
+		for _, arch := range []string{"arm64", "x86_64"} {
+			if !strings.Contains(record, "codesign|--display|--verbose=4|--architecture|"+arch+"|"+path+"\n") {
+				t.Fatalf("bundled helper signature was not inspected for %s: %s", arch, path)
+			}
 		}
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n") {
-		t.Fatalf("disk image did not contain the complete automatic installer: %s", record)
+	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
+		t.Fatalf("disk image did not contain the app and the Applications link: %s", record)
 	}
+	assertNotarySubmissionNames(t, record, "1.2.3")
 }
 
-func TestMacOSSigningRejectsPartialEmbeddedSetupWithoutPublishing(t *testing.T) {
-	f := newSigningFixture(t)
-	source := f.embedAppSupport(t)
-	if err := os.Remove(filepath.Join(source, "bin/agent-remote")); err != nil {
-		t.Fatal(err)
-	}
-	if output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3"); err == nil || !strings.Contains(output, "setup helper is missing") {
-		t.Fatalf("partial embedded setup was packaged: %v: %s", err, output)
-	}
-	if entries, err := os.ReadDir(f.destination); !os.IsNotExist(err) && (err != nil || len(entries) != 0) {
-		t.Fatalf("failed drag package published artifacts: %v: %v", entries, err)
+func TestMacOSSigningRejectsPartialAppWithoutPublishing(t *testing.T) {
+	for _, test := range []struct{ missing, message string }{
+		{"Contents/MacOS/agent-remote", "bundled helpers are required"},
+		{"Contents/Resources/payload/source/build-info.json", "setup payload is incomplete"},
+	} {
+		t.Run(test.missing, func(t *testing.T) {
+			f := newSigningFixture(t)
+			if err := os.Remove(filepath.Join(f.app, test.missing)); err != nil {
+				t.Fatal(err)
+			}
+			if output, err := f.run(t, signingProductionEnvironment(), "package", f.app, f.destination, "1.2.3"); err == nil || !strings.Contains(output, test.message) {
+				t.Fatalf("partial app was packaged: %v: %s", err, output)
+			}
+			if entries, err := os.ReadDir(f.destination); !os.IsNotExist(err) && (err != nil || len(entries) != 0) {
+				t.Fatalf("failed packaging published artifacts: %v: %v", entries, err)
+			}
+		})
 	}
 }
 
@@ -210,21 +216,18 @@ func TestMacOSSigningRejectsDeclaredMissingAndLinkedPayload(t *testing.T) {
 	for _, linked := range []bool{false, true} {
 		t.Run(fmt.Sprint("linked=", linked), func(t *testing.T) {
 			f := newSigningFixture(t)
-			app := filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app")
-			if err := os.WriteFile(filepath.Join(app, "Contents/Info.plist"), []byte(`{"AgentQueueEmbeddedPayload":"true"}`), 0600); err != nil {
+			payload := filepath.Join(f.app, "Contents/Resources/payload")
+			if err := os.RemoveAll(payload); err != nil {
 				t.Fatal(err)
 			}
 			if linked {
-				if err := os.MkdirAll(filepath.Join(app, "Contents/Resources"), 0700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink("missing", filepath.Join(app, "Contents/Resources/payload")); err != nil {
+				if err := os.Symlink("missing", payload); err != nil {
 					t.Fatal(err)
 				}
 			}
-			output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3")
+			output, err := f.run(t, signingProductionEnvironment(), "package", f.app, f.destination, "1.2.3")
 			if err == nil || !strings.Contains(output, "menu app") || strings.Contains(f.recorded(t), "notarytool|submit") {
-				t.Fatalf("missing or linked setup fell back to legacy: %v: %s", err, output)
+				t.Fatalf("missing or linked setup payload was accepted: %v: %s", err, output)
 			}
 		})
 	}
@@ -237,21 +240,20 @@ func TestMacOSSigningPackagesInsideOutAndHashesStapledBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	environment := append(signingProductionEnvironment(), "APPLE_SIGNING_KEYCHAIN="+keychain, "NOTARY_TIMEOUT=7m")
-	if output, err := f.run(t, environment, "package", f.installer, f.destination, "1.2.3"); err != nil {
+	if output, err := f.run(t, environment, "package", f.app, f.destination, "1.2.3"); err != nil {
 		t.Fatalf("packaging failed: %v: %s", err, output)
 	}
 	record := f.recorded(t)
 	assertNotarySubmissionNames(t, record, "1.2.3")
 	ordered := []string{
+		"codesign|--force|--sign|Developer ID Application: Fixture (" + signingTestTeam + ")|--timestamp|--options|runtime|--keychain|" + keychain + "|" + f.app + "\n",
 		"xcrun|notarytool|submit|", "xcrun|notarytool|wait|00000000-0000-0000-0000-000000000001",
-		"xcrun|notarytool|log|00000000-0000-0000-0000-000000000001", "xcrun|stapler|staple|" + filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app"),
-		"syspolicy_check|distribution|" + filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app"),
-		"codesign|--force|--sign|Developer ID Application: Fixture (" + signingTestTeam + ")|--timestamp|--options|runtime|--keychain|" + keychain + "|" + f.installer + "\n",
-		"xcrun|notarytool|submit|", "xcrun|notarytool|wait|00000000-0000-0000-0000-000000000002",
-		"xcrun|stapler|staple|" + f.installer + "\n", "hdiutil|create|", "xcrun|notarytool|submit|",
-		"xcrun|notarytool|wait|00000000-0000-0000-0000-000000000003", "xcrun|stapler|staple|",
-		"spctl|--assess|--type|open|--context|context:primary-signature", "shasum|-a|256|Agent-Job-Queue-Installer-1.2.3-universal.zip",
-		"shasum|-a|256|Agent-Job-Queue-Installer-1.2.3-universal.dmg",
+		"xcrun|notarytool|log|00000000-0000-0000-0000-000000000001", "xcrun|stapler|staple|" + f.app + "\n",
+		"syspolicy_check|distribution|" + f.app + "|--verbose\n",
+		"hdiutil|create|", "xcrun|notarytool|submit|",
+		"xcrun|notarytool|wait|00000000-0000-0000-0000-000000000002", "xcrun|stapler|staple|",
+		"spctl|--assess|--type|open|--context|context:primary-signature", "shasum|-a|256|Agent-Queue-1.2.3-universal.zip",
+		"shasum|-a|256|Agent-Queue-1.2.3-universal.dmg",
 	}
 	remaining := record
 	for _, expected := range ordered {
@@ -269,7 +271,7 @@ func TestMacOSSigningPackagesInsideOutAndHashesStapledBytes(t *testing.T) {
 			t.Fatalf("signing must select the private Keychain without deep signing: %s", line)
 		}
 	}
-	for _, path := range []string{f.installer, filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app"), filepath.Join(f.installer, "Contents/Resources/payload/source/bin/agent-heavy"), filepath.Join(f.installer, "Contents/Resources/payload/source/bin/agent-remote")} {
+	for _, path := range []string{f.app, filepath.Join(f.app, "Contents/MacOS/agent-heavy"), filepath.Join(f.app, "Contents/MacOS/agent-remote")} {
 		for _, arch := range []string{"arm64", "x86_64"} {
 			if !strings.Contains(record, "codesign|--display|--verbose=4|--architecture|"+arch+"|"+path+"\n") {
 				t.Fatalf("signature metadata was not inspected for %s: %s", arch, path)
@@ -281,7 +283,7 @@ func TestMacOSSigningPackagesInsideOutAndHashesStapledBytes(t *testing.T) {
 		t.Fatalf("expected only final ZIP, DMG, and their checksums: %v: %v", entries, err)
 	}
 	for _, extension := range []string{"zip", "dmg"} {
-		name := "Agent-Job-Queue-Installer-1.2.3-universal." + extension
+		name := "Agent-Queue-1.2.3-universal." + extension
 		data, err := os.ReadFile(filepath.Join(f.destination, name))
 		if err != nil {
 			t.Fatal(err)
@@ -295,10 +297,10 @@ func TestMacOSSigningPackagesInsideOutAndHashesStapledBytes(t *testing.T) {
 		}
 	}
 	logs, err := filepath.Glob(f.destination + ".notarization/notarization.*/*.log.json")
-	if err != nil || len(logs) != 3 {
+	if err != nil || len(logs) != 2 {
 		t.Fatalf("all submission logs must survive outside public artifacts: %v: %v", logs, err)
 	}
-	image := filepath.Join(f.destination, "Agent-Job-Queue-Installer-1.2.3-universal.dmg")
+	image := filepath.Join(f.destination, "Agent-Queue-1.2.3-universal.dmg")
 	if output, err := f.run(t, nil, "verify-dmg", image, signingTestTeam); err != nil {
 		t.Fatalf("credential-free disk image verification failed: %v: %s", err, output)
 	}
@@ -309,7 +311,7 @@ func TestMacOSSigningPackagesInsideOutAndHashesStapledBytes(t *testing.T) {
 
 func TestMacOSSigningAdhocDoesNotUseProductionTools(t *testing.T) {
 	f := newSigningFixture(t)
-	if output, err := f.run(t, nil, "package", f.installer, f.destination, "1.2.3"); err != nil {
+	if output, err := f.run(t, nil, "package", f.app, f.destination, "1.2.3"); err != nil {
 		t.Fatalf("ad hoc packaging failed: %v: %s", err, output)
 	}
 	record := f.recorded(t)
@@ -318,31 +320,31 @@ func TestMacOSSigningAdhocDoesNotUseProductionTools(t *testing.T) {
 			t.Fatalf("ad hoc build used %s:\n%s", forbidden, record)
 		}
 	}
-	if count := strings.Count(record, "codesign|--force|--sign|-|"); count != 4 {
-		t.Fatalf("expected four explicit ad hoc signatures, got %d:\n%s", count, record)
+	if count := strings.Count(record, "codesign|--force|--sign|-|"); count != 3 {
+		t.Fatalf("expected three explicit ad hoc signatures, got %d:\n%s", count, record)
 	}
 	if _, err := os.Stat(f.destination + ".notarization"); !os.IsNotExist(err) {
 		t.Fatalf("ad hoc build created a notarization directory: %v", err)
 	}
 }
 
-func TestMacOSSigningRejectsPrivatePathsInsideInstallerOrArtifacts(t *testing.T) {
+func TestMacOSSigningRejectsPrivatePathsInsideAppOrArtifacts(t *testing.T) {
 	for _, test := range []struct {
 		name, variable, location string
 		alias, logDirectory      bool
 	}{
-		{"signing Keychain in payload", "APPLE_SIGNING_KEYCHAIN", "payload", false, false},
+		{"signing Keychain in app", "APPLE_SIGNING_KEYCHAIN", "app", false, false},
 		{"notary Keychain in artifacts", "NOTARY_KEYCHAIN", "artifacts", false, false},
-		{"API key in payload", "NOTARY_KEY_FILE", "payload", false, false},
+		{"API key in app", "NOTARY_KEY_FILE", "app", false, false},
 		{"API key alias into artifacts", "NOTARY_KEY_FILE", "artifacts", true, false},
-		{"signing Keychain alias into payload", "APPLE_SIGNING_KEYCHAIN", "payload", true, false},
-		{"missing log directory in payload", "NOTARY_LOG_DIR", "payload", false, true},
+		{"signing Keychain alias into app", "APPLE_SIGNING_KEYCHAIN", "app", true, false},
+		{"missing log directory in app", "NOTARY_LOG_DIR", "app", false, true},
 		{"missing log directory in artifacts", "NOTARY_LOG_DIR", "artifacts", false, true},
-		{"log parent alias into payload", "NOTARY_LOG_DIR", "payload", true, true},
+		{"log parent alias into app", "NOTARY_LOG_DIR", "app", true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			f := newSigningFixture(t)
-			parent := filepath.Join(f.installer, "Contents/Resources/payload")
+			parent := filepath.Join(f.app, "Contents/Resources")
 			if test.location == "artifacts" {
 				parent = f.destination
 				if err := os.Mkdir(parent, 0700); err != nil {
@@ -376,7 +378,7 @@ func TestMacOSSigningRejectsPrivatePathsInsideInstallerOrArtifacts(t *testing.T)
 			if test.variable == "NOTARY_KEY_FILE" {
 				environment = append(environment, "NOTARY_KEYCHAIN_PROFILE=", "NOTARY_KEY_ID=EXAMPLE1234")
 			}
-			output, err := f.run(t, environment, "package", f.installer, f.destination, "1.2.3")
+			output, err := f.run(t, environment, "package", f.app, f.destination, "1.2.3")
 			if err == nil || !strings.Contains(output, "must be outside") {
 				t.Fatalf("private path was not rejected: %v: %s", err, output)
 			}
@@ -393,11 +395,11 @@ func TestMacOSSigningRejectsPrivatePathsInsideInstallerOrArtifacts(t *testing.T)
 }
 
 func TestMacOSSigningFailurePublishesNothingAndRetainsSubmissionEvidence(t *testing.T) {
-	for _, failure := range []string{"payload-rejected", "installer-rejected", "dmg-rejected", "payload-timeout", "payload-malformed-status", "payload-malformed-id", "payload-upload", "payload-log", "payload-staple", "payload-validate", "helper-signature", "intel-team", "missing-runtime", "missing-timestamp", "syspolicy", "gatekeeper", "dmg-signature"} {
+	for _, failure := range []string{"app-rejected", "dmg-rejected", "app-timeout", "app-malformed-status", "app-malformed-id", "app-upload", "app-log", "app-staple", "app-validate", "helper-signature", "intel-team", "missing-runtime", "missing-timestamp", "syspolicy", "gatekeeper", "dmg-signature"} {
 		t.Run(failure, func(t *testing.T) {
 			f := newSigningFixture(t)
 			environment := append(signingProductionEnvironment(), "SIGNING_TEST_FAILURE="+failure)
-			output, err := f.run(t, environment, "package", f.installer, f.destination, "1.2.3")
+			output, err := f.run(t, environment, "package", f.app, f.destination, "1.2.3")
 			if err == nil {
 				t.Fatalf("%s did not stop packaging: %s", failure, output)
 			}
@@ -409,14 +411,14 @@ func TestMacOSSigningFailurePublishesNothingAndRetainsSubmissionEvidence(t *test
 			if strings.Contains(record, "shasum|") {
 				t.Fatalf("failure reached artifact checksums:\n%s", record)
 			}
-			if strings.Contains(failure, "payload") && strings.Contains(record, "hdiutil|create|") {
-				t.Fatalf("payload failure proceeded to disk image creation:\n%s", record)
+			if strings.HasPrefix(failure, "app-") && strings.Contains(record, "hdiutil|create|") {
+				t.Fatalf("app failure proceeded to disk image creation:\n%s", record)
 			}
-			if failure == "payload-timeout" {
+			if failure == "app-timeout" {
 				if !strings.Contains(output, "00000000-0000-0000-0000-000000000001") || !strings.Contains(record, "xcrun|notarytool|log|") {
 					t.Fatalf("timeout lost the recovery identifier or did not attempt diagnostics: %s\n%s", output, record)
 				}
-				paths, _ := filepath.Glob(f.destination + ".notarization/notarization.*/payload.submission.json")
+				paths, _ := filepath.Glob(f.destination + ".notarization/notarization.*/app.submission.json")
 				if len(paths) != 1 {
 					t.Fatalf("timeout lost the submission response: %v", paths)
 				}
@@ -442,7 +444,7 @@ func TestMacOSSigningAPIKeyAndCredentialFreeVerification(t *testing.T) {
 			if issuer != "" {
 				environment = append(environment, "NOTARY_ISSUER_ID="+issuer)
 			}
-			output, err := f.run(t, environment, "package", f.installer, f.destination, "1.2.3")
+			output, err := f.run(t, environment, "package", f.app, f.destination, "1.2.3")
 			if err != nil {
 				t.Fatalf("API key packaging failed: %v: %s", err, output)
 			}
@@ -466,17 +468,17 @@ func TestMacOSSigningAPIKeyAndCredentialFreeVerification(t *testing.T) {
 				t.Fatal(err)
 			}
 			// This command has no identity, Keychain, or notary credentials.
-			if output, err := f.run(t, nil, "verify-installer", f.installer, signingTestTeam); err != nil {
-				t.Fatalf("credential-free installer verification failed: %v: %s", err, output)
+			if output, err := f.run(t, nil, "verify-app", f.app, signingTestTeam); err != nil {
+				t.Fatalf("credential-free app verification failed: %v: %s", err, output)
 			}
-			if output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=intel-team"}, "verify-installer", f.installer, signingTestTeam); err == nil {
+			if output, err := f.run(t, []string{"SIGNING_TEST_FAILURE=intel-team"}, "verify-app", f.app, signingTestTeam); err == nil {
 				t.Fatalf("verification accepted a wrong-team Intel signature: %s", output)
 			}
-			if err := os.Remove(filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app/.stub-staple")); err != nil {
+			if err := os.Remove(filepath.Join(f.app, ".stub-staple")); err != nil {
 				t.Fatal(err)
 			}
-			if output, err := f.run(t, nil, "verify-installer", f.installer, signingTestTeam); err == nil {
-				t.Fatalf("verification accepted an unstapled installed payload: %s", output)
+			if output, err := f.run(t, nil, "verify-app", f.app, signingTestTeam); err == nil {
+				t.Fatalf("verification accepted an unstapled app: %s", output)
 			}
 		})
 	}
@@ -497,12 +499,12 @@ case "$tool" in
   codesign)
     if [[ $1 == --force ]]; then
       case "$failure:$last" in
-        payload-sign-heavy:*/agent-heavy) printf 'error: The specified item could not be found in the keychain.\n' >&2; exit 41;;
-        payload-sign-remote:*/agent-remote) exit 42;;
-        payload-sign-app:*/Agent\ Queue.app) exit 43;;
+        app-sign-heavy:*/agent-heavy) printf 'error: The specified item could not be found in the keychain.\n' >&2; exit 41;;
+        app-sign-remote:*/agent-remote) exit 42;;
+        app-sign-app:*/Agent\ Queue.app) exit 43;;
       esac
     fi
-    if [[ $1 == --verify && $failure == payload-verify-heavy && $last == */agent-heavy ]]; then exit 44; fi
+    if [[ $1 == --verify && $failure == app-verify-heavy && $last == */agent-heavy ]]; then exit 44; fi
     # codesign accepts an inline requirement only with the '=' prefix;
     # otherwise this argument must name a readable requirements file.
     requirement_next=0
@@ -527,12 +529,12 @@ case "$tool" in
   xcrun)
     case "$1:$2" in
       notarytool:submit)
-        case "$3" in */Agent-Job-Queue-Payload-*-universal.zip) number=1; stage=payload;; */Agent-Job-Queue-Installer-*-universal.zip) number=2; stage=installer;; *.dmg) number=3; stage=dmg;; *) exit 92;; esac
+        case "$3" in */Agent-Queue-*-universal.zip) number=1; stage=app;; *.dmg) number=2; stage=dmg;; *) exit 92;; esac
         [[ $failure != "$stage-upload" ]] || exit 18
         if [[ $failure == "$stage-malformed-id" ]]; then printf '{}\n'; else printf '{"id":"00000000-0000-0000-0000-%012d"}\n' "$number"; fi
         ;;
       notarytool:wait)
-        case "$3" in *001) stage=payload;; *002) stage=installer;; *003) stage=dmg;; *) exit 92;; esac
+        case "$3" in *001) stage=app;; *002) stage=dmg;; *) exit 92;; esac
         if [[ $failure == "$stage-malformed-status" ]]; then printf '{}\n'; exit 0; fi
         status=Accepted
         [[ $failure != "$stage-rejected" ]] || status=Invalid
@@ -541,19 +543,19 @@ case "$tool" in
         [[ $failure != "$stage-timeout" ]] || exit 75
         ;;
       notarytool:log)
-        case "$3" in *001) stage=payload;; *002) stage=installer;; *003) stage=dmg;; *) exit 92;; esac
+        case "$3" in *001) stage=app;; *002) stage=dmg;; *) exit 92;; esac
         [[ $failure != "$stage-log" ]] || exit 19
         printf '{"issues":[]}\n' > "$last"
         ;;
       stapler:staple)
-        stage=installer
-        [[ $last != */payload/* ]] || stage=payload
+        stage=dmg
+        [[ ! -d $last ]] || stage=app
         [[ $failure != "$stage-staple" ]] || exit 20
         if [[ -d $last ]]; then printf 'stapled' > "$last/.stub-staple"; else printf '\nstapled' >> "$last"; fi
         ;;
       stapler:validate)
-        stage=installer
-        [[ $last != */payload/* ]] || stage=payload
+        stage=dmg
+        [[ ! -d $last ]] || stage=app
         [[ $failure != "$stage-validate" ]] || exit 21
         if [[ -d $last ]]; then test -f "$last/.stub-staple"; else grep -q stapled "$last"; fi
         ;;
@@ -576,7 +578,6 @@ case "$tool" in
     shift $(($# - 2))
     printf 'archive' > "$2"
     if [[ -f $1/.stub-staple ]]; then printf ' stapled' >> "$2"; fi
-    if [[ -f "$1/Contents/Resources/payload/Agent Queue.app/.stub-staple" ]]; then printf ' payload-stapled' >> "$2"; fi
     ;;
   hdiutil)
     if [[ $1 == create ]]; then
@@ -585,16 +586,10 @@ case "$tool" in
         if [[ $source_next == 1 ]]; then image_source=$argument; source_next=0; fi
         if [[ $argument == -srcfolder ]]; then source_next=1; fi
       done
-      if [[ -d "$image_source/Agent Queue.app" ]]; then
-        [[ -L "$image_source/Applications" && $(readlink "$image_source/Applications") == /Applications ]]
-        [[ ! -e "$image_source/Agent Job Queue Installer.app" ]]
-        printf 'disk-image-layout|Agent Queue.app|Applications->/Applications\n' >> "$SIGNING_TEST_EVENTS"
-      elif [[ -f "$image_source/Contents/MacOS/Installer" ]]; then
-        [[ ! -e "$image_source/Applications" && ! -e "$image_source/Agent Queue.app" ]]
-        printf 'disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n' >> "$SIGNING_TEST_EVENTS"
-      else
-        exit 91
-      fi
+      [[ -d "$image_source/Agent Queue.app" && -L "$image_source/Applications" &&
+        $(readlink "$image_source/Applications") == /Applications ]] || exit 91
+      [[ $(find "$image_source" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') == 2 ]] || exit 91
+      printf 'disk-image-layout|Agent Queue.app|Applications->/Applications\n' >> "$SIGNING_TEST_EVENTS"
       printf 'disk image' > "$last"
     fi
     ;;
@@ -606,67 +601,17 @@ case "$tool" in
 esac
 `
 
-func (f signingFixture) embedManagedApp(t *testing.T) string {
-	t.Helper()
-	source := f.embedAppSupport(t)
-	app := filepath.Join(f.installer, "Contents/Resources/payload/Agent Queue.app")
-	verificationWrite(t, filepath.Join(app, "Contents/Info.plist"), `<?xml version="1.0"?><plist version="1.0"><dict><key>AgentQueueServiceManagement</key><true/></dict></plist>`, 0600)
-	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		if err := os.Rename(filepath.Join(source, "bin", name), filepath.Join(app, "Contents/MacOS", name)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.Remove(filepath.Join(source, "bin")); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"heavy", "resources", "remote"} {
-		filename := "io.went.agent-" + name + ".plist"
-		raw, err := os.ReadFile(filepath.Join("../../native/LaunchAgents", filename))
-		if err != nil {
-			t.Fatal(err)
-		}
-		verificationWrite(t, filepath.Join(app, "Contents/Library/LaunchAgents", filename), string(raw), 0600)
-	}
-	return app
-}
-
-func TestMacOSSigningManagedHelpersInsideOut(t *testing.T) {
-	f := newSigningFixture(t)
-	app := f.embedManagedApp(t)
-	if output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3"); err != nil {
-		t.Fatalf("managed signing: %v: %s", err, output)
-	}
-	record := f.recorded(t)
-	seal := strings.Index(record, "codesign|--force|--sign|Developer ID Application: Fixture ("+signingTestTeam+")|--timestamp|--options|runtime|"+app+"\n")
-	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		path := filepath.Join(app, "Contents/MacOS", name)
-		sign := strings.Index(record, "|--identifier|io.went.agent-queue."+name+"|"+path+"\n")
-		if sign < 0 || seal < sign {
-			t.Fatalf("canonical helper not sealed before app: %s", record)
-		}
-		for _, arch := range []string{"arm64", "x86_64"} {
-			if !strings.Contains(record, "codesign|--display|--verbose=4|--architecture|"+arch+"|"+path+"\n") {
-				t.Fatalf("canonical helper not verified: %s", record)
-			}
-		}
-	}
-	if !strings.Contains(record, "disk-image-layout|Agent Job Queue Installer.app|automatic-setup\n") {
-		t.Fatalf("managed release lost the automatic installer layout: %s", record)
-	}
-	assertNotarySubmissionNames(t, record, "1.2.3")
-}
-
-func TestMacOSSigningRejectsManagedLayoutTampering(t *testing.T) {
-	for _, mutation := range []string{"duplicate bin", "missing helper", "missing plist", "modified plist", "extra login plist", "false marker"} {
+func TestMacOSSigningRejectsAppLayoutTampering(t *testing.T) {
+	for _, mutation := range []string{"embedded bin", "missing helper", "missing plist", "modified plist", "extra login plist", "false marker", "missing marker"} {
 		t.Run(mutation, func(t *testing.T) {
 			f := newSigningFixture(t)
-			app := f.embedManagedApp(t)
-			path := filepath.Join(app, "Contents/Library/LaunchAgents/io.went.agent-heavy.plist")
+			path := filepath.Join(f.app, "Contents/Library/LaunchAgents/io.went.agent-heavy.plist")
+			info := filepath.Join(f.app, "Contents/Info.plist")
 			switch mutation {
-			case "duplicate bin":
-				verificationWrite(t, filepath.Join(app, "Contents/Resources/payload/source/bin/agent-heavy"), "duplicate", 0700)
+			case "embedded bin":
+				verificationWrite(t, filepath.Join(f.app, "Contents/Resources/payload/source/bin/agent-heavy"), "duplicate", 0700)
 			case "missing helper":
-				if err := os.Remove(filepath.Join(app, "Contents/MacOS/agent-remote")); err != nil {
+				if err := os.Remove(filepath.Join(f.app, "Contents/MacOS/agent-remote")); err != nil {
 					t.Fatal(err)
 				}
 			case "missing plist":
@@ -679,13 +624,15 @@ func TestMacOSSigningRejectsManagedLayoutTampering(t *testing.T) {
 			case "extra login plist":
 				verificationWrite(t, filepath.Join(filepath.Dir(path), "io.went.agent-queue.plist"), "login", 0600)
 			case "false marker":
-				verificationWrite(t, filepath.Join(app, "Contents/Info.plist"), `<?xml version="1.0"?><plist version="1.0"><dict><key>AgentQueueServiceManagement</key><false/></dict></plist>`, 0600)
+				verificationWrite(t, info, strings.Replace(signingTestInfoPlist, "<key>AgentQueueServiceManagement</key><true/>", "<key>AgentQueueServiceManagement</key><false/>", 1), 0600)
+			case "missing marker":
+				verificationWrite(t, info, strings.Replace(signingTestInfoPlist, "<key>AgentQueueServiceManagement</key><true/>", "", 1), 0600)
 			}
-			if output, err := f.run(t, signingProductionEnvironment(), "package", f.installer, f.destination, "1.2.3"); err == nil {
-				t.Fatalf("managed tampering accepted: %s", output)
+			if output, err := f.run(t, signingProductionEnvironment(), "package", f.app, f.destination, "1.2.3"); err == nil {
+				t.Fatalf("app tampering accepted: %s", output)
 			}
-			if strings.Contains(f.recorded(t), "notarytool|submit") {
-				t.Fatal("tampered managed app reached Apple submission")
+			if events, _ := os.ReadFile(f.events); strings.Contains(string(events), "notarytool|submit") {
+				t.Fatal("tampered app reached Apple submission")
 			}
 		})
 	}

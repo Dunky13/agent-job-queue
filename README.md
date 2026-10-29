@@ -25,70 +25,46 @@ Screenshots use sample jobs. The Mac image uses the app's safe preview mode.
 
 ## Download and install
 
-### Homebrew
+### Drag and drop
 
-On macOS 15 or later, install the app and CLI through the project's [Homebrew tap](https://github.com/Dunky13/homebrew-agent-job-queue):
+1. Use macOS 15 or later on an Apple Silicon or Intel Mac.
+2. Download `Agent-Queue-<version>-universal.dmg` (or the ZIP) from [Releases](https://github.com/Dunky13/agent-job-queue/releases).
+3. Open the DMG and drag **Agent Queue** onto **Applications**. To install for your account only, drop it in `~/Applications` instead.
+4. Open Agent Queue from Applications. It sets itself up silently and appears in the menu bar.
+
+The app is self-contained: the menu app, the `agent-heavy` and `agent-remote` command-line tools, the queue daemon, the resource controller and the HTTPS runtime all live inside `Agent Queue.app`. There is no installer and nothing is copied out of the bundle. On first launch the app registers its own bundled background services with macOS Service Management, creates its private data directories and adds `agent-heavy` and `agent-remote` wrappers to `~/.local/bin`. Xcode, Go, Python, Pueue and Caddy are not required, and setup never uses `sudo`.
+
+macOS shows a "Background Items Added" notification the first time. If your Mac requires approval, a small window explains what to allow in **System Settings > General > Login Items**; setup continues automatically once you allow it. A window also appears if setup needs a decision from you or cannot finish. Otherwise the first launch shows no window.
+
+To upgrade, quit Agent Queue, drag the new version over the old one and choose **Replace**, then open it. Queue history, settings, credentials and certificates are kept. If jobs are queued or running, setup either hands them over to the new version or waits for them to finish; see [upgrade recovery](docs/upgrade-recovery.md).
+
+If you move the app between `/Applications` and `~/Applications`, delete or replace the old copy first. Setup refuses to adopt a second copy while the recorded one still exists.
+
+To remove Agent Queue, finish queued and running jobs, stop its services, then move the app to the Trash:
+
+```sh
+agent-heavy install --app-bundle "/Applications/Agent Queue.app" --unregister-services
+```
+
+Use the app's actual location if it differs. Private data under `~/.local/share/agent-heavy`, `~/.local/state/agent-heavy` and `~/.config/agent-heavy` is preserved.
+
+### Homebrew
 
 ```sh
 brew install --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
-Homebrew runs the complete installer automatically and links `agent-heavy` and `agent-remote`. Setup repairs verified installation files and opens the menu app when ready. Compatible upgrades keep running and queued jobs across the service handover; older installations wait for those jobs to finish once. No separate Install button, Xcode, Python, Pueue, or Caddy executable is required. If macOS requires background-service approval, allow Agent Queue in System Settings; setup continues automatically after approval.
+The cask places `Agent Queue.app` in Applications and nothing else; open the app once to finish setup. `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` replaces the app, and the next launch completes the upgrade. Homebrew verifies the download's SHA-256 and keeps quarantine so macOS assesses the notarized app. Maintainer setup is documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
 
-New releases produced by the notarized release pipeline use Developer ID signatures and Apple notarization. Their Homebrew cask verifies the download's SHA-256 and retains quarantine for macOS assessment. It does not bypass Gatekeeper. Older published builds remain ad hoc signed; their historical casks are preserved until a newer release replaces them. See [Apple signing and notarization](docs/apple-signing.md) for the release requirements and verification limits.
+### Signing, Gatekeeper and endpoint security
 
-The tap becomes installable after the first validated `main` installer release is published. It tracks published builds, so updates can use:
+Releases from the distribution workflow are Developer ID signed, notarized and stapled (app and DMG). Quarantine is never removed. Because setup only registers services that ship inside the signed app, endpoint security tools see a notarized app from Applications managing its own login items, not a separate process copying executables. See [Apple signing and notarization](docs/apple-signing.md) for verification details.
 
-```sh
-brew upgrade --cask dunky13/agent-job-queue/agent-job-queue
-```
-
-Homebrew upgrades run the same automatic installation. The cask uses Homebrew's documented vendor `installer script:` artifact, which can access queue IPC and native services without changing the hook sandbox. Its installer runs from private staging after publisher signatures and Gatekeeper checks. When the installed daemon, new app and every outstanding job caller support live handover, active work continues while services are replaced. Legacy releases or callers require a drained queue for their first transition. Each successfully published main installer triggers and verifies Homebrew delivery. Maintainer setup and trusted tap tooling synchronization are documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
-
-Homebrew uninstall removes its installer and command links. It leaves the installed Agent Queue app, its private command entry points and services in place. To remove a managed runtime, finish queued and running jobs, then run the following command before moving the app to Trash:
-
-```sh
-agent-heavy install --app-bundle "$HOME/Applications/Agent Queue.app" --unregister-services
-```
-
-Use the app's actual absolute Applications path if it differs. Exit zero confirms service shutdown and retires generated command entry points. Queue history, configuration, credentials and certificate data are preserved. Quitting the menu app during ordinary use leaves the independent queue and enabled phone access running.
-
-### DMG or ZIP installer
-
-1. Use macOS 15 or later on an Apple Silicon or Intel Mac.
-2. Download the DMG or ZIP from [Releases](https://github.com/Dunky13/agent-job-queue/releases). Open the DMG or expand the ZIP, then open **Agent Job Queue Installer.app**.
-3. Installation starts automatically. It verifies and repairs the existing installation, installs the complete app, registers its bundled background services, and checks readiness. Compatible upgrades hand over running and queued jobs without waiting for completion; legacy transitions wait for a drained queue. No Install button or separate setup wizard is required.
-4. If macOS requests background-service approval, allow Agent Queue in Login Items settings. Installation continues automatically after approval and opens the menu app when complete.
-
-The DMG and ZIP carry the same complete installer. All installation and migration happen before the runtime app opens. Ordinary runtime startup only checks installation and authorization; it never copies helpers, installs services, or repairs a failed installation. Reopen the installer to repair an incomplete installation.
-
-The universal package includes the menu app, command-line tools, independent queue daemon, resource controller and HTTPS runtime. Xcode, Go, Python, Pueue, uv and a separate Caddy executable are not required. Setup runs in your account without `sudo` and defaults to your account's Applications folder. Executable locations must be protected from replacement by other accounts. Quarantine and macOS policy remain intact.
-
-Installation and upgrades retain history, pause and concurrency settings, credentials and trusted certificates. Live handover preserves each original caller's outcome and exit status without replaying attempts; new queue changes can be briefly rejected during the swap before acceptance. It requires protocol 1 and queue schema 2 in the daemon, target and all outstanding callers. Unsupported versions fall back to waiting for a drained queue; uncertain attempts, ownership, damaged configuration and endpoint-protection quarantine remain visible failures. Verified incompatible legacy callbacks and service options are backed up before replacement or retirement. Python migration disables incompatible old phone access automatically when required, retaining credentials and certificates for later use. See [upgrade recovery](docs/upgrade-recovery.md) for compatibility and waiting behavior.
-
-Outstanding job callers and running workers retain their complete previous signed app under `~/Applications/Agent Queue Runtimes`. Only a later installer operation removes a retained generation after verifying its attempts are terminal and its original callers and owned workers have exited. The runtime never deletes executable code. Removal and external app-replacement preparation still require queued and running jobs to finish.
-
-Developer ID signatures and Apple notarization identify published packages. They do not establish SentinelOne acceptance. This installer boundary removes setup work from ordinary app launch; verification on a protected Mac remains a separate acceptance check.
-
-### If macOS blocks opening the app
-
-Check the release provenance first: historical releases and local development packages can be ad hoc signed, while releases from the notarized pipeline carry Developer ID signatures and Apple notarization. Signature integrity alone does not establish Gatekeeper acceptance. Neither the new Homebrew cask nor the manual installer removes quarantine; macOS policy still controls whether a downloaded installer or menu app opens.
-
-For a downloaded Agent Job Queue app that you trust, use Apple's per-app approval flow:
-
-1. Dismiss the blocked-app dialog, then open **System Settings → Privacy & Security**.
-2. Find the entry naming **Agent Job Queue Installer** or **Agent Queue**, then choose **Open Anyway** and confirm **Open**. This option appears after an attempt to open the blocked app, when allowed by your Mac's policy.
-3. Reopen the installer; setup starts automatically. If the menu app is separately blocked afterward, approve its own named entry the same way.
-
-Use the app name in Privacy & Security to identify a generic verification popup before approving anything. If no matching entry appears, the popup's source is still unknown. Managed Macs can restrict these choices. See [Apple's opening instructions](https://support.apple.com/102445).
-
-Do not clear quarantine to work around a failed verification of a release advertised as notarized. Preserve the downloaded artifact and check its signatures, stapled tickets and release provenance using [Apple signing and notarization](docs/apple-signing.md). Gatekeeper remains enabled system-wide.
+If macOS blocks a downloaded build you trust, open **System Settings > Privacy & Security**, choose **Open Anyway** next to **Agent Queue**, and confirm. Do not clear quarantine to work around a failed verification of a release advertised as notarized. See [Apple's opening instructions](https://support.apple.com/102445).
 
 ## Version and updates
 
-Choose **About and updates** from the queue's gear menu to see the running app and installed controller versions. **Check for updates** finds published builds, including builds with the same version number. **Download and open installer** verifies the selected build and opens the installer. The installer starts automatically and replaces and registers the bundle-owned services through compatible live handover or a drained legacy transition.
-
-Legacy and local builds are labelled untracked and can explicitly choose a published installer. Checking for updates does not install anything; opening a selected installer starts installation automatically. It preserves Gatekeeper policy and refuses tracked downgrades. CLI equivalents and verification details are in [Installed version and updates](docs/updates.md).
+Choose **About and updates** from the queue's gear menu to see the running app and installed controller versions. **Check for updates** finds published builds. **Download update** downloads and verifies the selected build, places a verified copy of `Agent Queue.app` in your Downloads folder and reveals it in Finder. Quit Agent Queue, drag the new copy into Applications and choose **Replace**; opening it finishes the update. Checking never installs anything and tracked downgrades are refused. Details are in [Installed version and updates](docs/updates.md).
 
 ## Connect your coding agents
 
@@ -244,7 +220,7 @@ For an optional migration bridge, `AGENT_HEAVY_LEGACY_SLOT` selects an existing 
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for local commands and the [CI workflow](.github/workflows/ci.yml) for exact hosted checks. The separate [distribution workflow](.github/workflows/distribution.yml) signs, notarizes, verifies and publishes retained main-build artifacts.
 
-Pull requests run Go formatting, vet, vulnerability scanning and race tests, JavaScript lint, shell and workflow checks, isolated Go daemon acceptance tests, embedded Caddy HTTPS/API tests, browser regression tests, native Swift regression tests, and universal installer verification. The workflow runs macOS behavior on Apple Silicon and Intel runners. All validation jobs feed one required `ci-required` check; a failure, cancellation, or skipped required job fails that check.
+Pull requests run Go formatting, vet, vulnerability scanning and race tests, JavaScript lint, shell and workflow checks, isolated Go daemon acceptance tests, embedded Caddy HTTPS/API tests, browser regression tests, native Swift regression tests, and universal app and disk image verification. The workflow runs macOS behavior on Apple Silicon and Intel runners. All validation jobs feed one required `ci-required` check; a failure, cancellation, or skipped required job fails that check.
 
 `main` requires a pull request, current passing checks, resolved review conversations, and verified commit signatures. Force pushes and deletion are blocked, including for administrators. Commits also require an author-matching DCO sign-off. The initial repository import bootstraps the branch; later changes use pull requests.
 

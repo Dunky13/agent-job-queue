@@ -6,11 +6,11 @@ actor UpdateFixture {
     var latest = QueueRelease(version: "1.0.1", build: 101, commit: String(repeating: "a", count: 40),
         tag: "build-101", url: "https://github.com/Dunky13/agent-job-queue/releases/tag/build-101")
     var comparison = QueueUpdateComparison.available
-    var canInstall = true
+    var canDownload = true
     var calls: [[String]] = []
     var failCheck = false
-    var failInstall = false
-    var installerBuild = 101
+    var failDownload = false
+    var downloadedBuild = 101
     private var shouldHold = false
     private var held: CheckedContinuation<Void, Never>?
     private var waiter: CheckedContinuation<Void, Never>?
@@ -22,11 +22,11 @@ actor UpdateFixture {
     }
     func release() { held?.resume(); held = nil }
     func setCheckFailure(_ value: Bool) { failCheck = value }
-    func setInstallFailure(_ value: Bool) { failInstall = value }
-    func setInstallerBuild(_ value: Int) { installerBuild = value }
+    func setDownloadFailure(_ value: Bool) { failDownload = value }
+    func setDownloadedBuild(_ value: Int) { downloadedBuild = value }
     func setComparison(_ value: QueueUpdateComparison, installable: Bool) {
         comparison = value
-        canInstall = installable
+        canDownload = installable
     }
     func setUnknownInstalled() {
         installed = InstalledQueueVersion(version: "1.0.0", build: nil, bundleBuild: "0", commit: nil,
@@ -34,7 +34,7 @@ actor UpdateFixture {
     }
     func setInvalidRelease() {
         latest = QueueRelease(version: "1.0.1", build: 101, commit: String(repeating: "a", count: 40),
-            tag: "build-101", url: "https://example.test/installer")
+            tag: "build-101", url: "https://example.test/release")
     }
     func load(_ arguments: [String]) async throws -> Data {
         calls.append(arguments)
@@ -51,12 +51,13 @@ actor UpdateFixture {
         if arguments == ["updates", "check", "--json"] {
             if failCheck { throw ClientError.message("Network unavailable") }
             return try encoder.encode(QueueUpdateCheck(installed: installed, latest: latest,
-                comparison: comparison, canInstall: canInstall, message: "Release status confirmed."))
+                comparison: comparison, canDownload: canDownload, message: "Release status confirmed."))
         }
-        if arguments == ["updates", "install", "--build", "101", "--json"] {
-            if failInstall { throw ClientError.message("Checksum mismatch") }
-            return try encoder.encode(QueueInstallerResult(installerOpened: true, build: installerBuild,
-                message: "Installer opened. Setup continues automatically after queued and running jobs finish"))
+        if arguments == ["updates", "download", "--build", "101", "--json"] {
+            if failDownload { throw ClientError.message("Checksum mismatch") }
+            return try encoder.encode(QueueUpdateDownload(downloaded: true, build: downloadedBuild,
+                app: "/Users/test/Downloads/Agent Queue 1.0.1 (build 101)/Agent Queue.app",
+                message: "Quit Agent Queue, then drag the new copy into Applications and choose Replace. Opening it finishes the update automatically."))
         }
         throw ClientError.message("Unexpected update command")
     }
@@ -102,7 +103,7 @@ struct UpdateTests {
         try check(store.running.displayVersion == "1.0.0 · build 100" && store.installed == nil,
             "Running bundle version appears before controller I/O")
         let initialCalls = await fixture.calls
-        try check(initialCalls.isEmpty && !store.canInstall, "Opening the update model performs no implicit network or download")
+        try check(initialCalls.isEmpty && !store.canDownload, "Opening the update model performs no implicit network or download")
         await store.refreshInstalled()
         let offlineCalls = await fixture.calls
         try check(offlineCalls == [["version", "--json"]] && store.installed?.build == 100 && store.check == nil,
@@ -110,93 +111,94 @@ struct UpdateTests {
 
         await fixture.holdNextCall()
         let checking = store.checkForUpdates()
-        try check(checking != nil && store.isBusy && store.checkForUpdates() == nil && store.openInstaller() == nil,
+        try check(checking != nil && store.isBusy && store.checkForUpdates() == nil && store.downloadUpdate() == nil,
             "Explicit checking reserves operation synchronously and prevents duplicate operations")
         await fixture.waitUntilHeld()
         await store.refreshInstalled()
         await fixture.release()
         await checking?.value
-        try check(store.canInstall && store.check?.latest?.build == 101 && !store.isBusy,
-            "Newer release enables explicit installer download after a successful check")
+        try check(store.canDownload && store.check?.latest?.build == 101 && !store.isBusy,
+            "Newer release enables explicit update download after a successful check")
         let checkedCalls = await fixture.calls
         try check(checkedCalls.count == 2, "Version refresh while checking does not start overlapping I/O")
 
         await fixture.holdNextCall()
-        let installation = store.openInstaller()
-        try check(installation != nil && store.operation == .downloading && store.openInstaller() == nil && store.checkForUpdates() == nil,
-            "Download reserves operation and prevents duplicate installation or release changes")
+        let installation = store.downloadUpdate()
+        try check(installation != nil && store.operation == .downloading && store.downloadUpdate() == nil && store.checkForUpdates() == nil,
+            "Download reserves operation and prevents duplicate downloads or release changes")
         await fixture.waitUntilHeld()
         await fixture.release()
         await installation?.value
         let installedCalls = await fixture.calls
-        try check(installedCalls.last == ["updates", "install", "--build", "101", "--json"],
-            "Installer operation pins the exact release build shown to the user")
-        try check(store.installerOpened && !store.canInstall && store.notice?.contains("continues automatically") == true,
-            "Opening the installer reports automatic setup without claiming installation has finished")
+        try check(installedCalls.last == ["updates", "download", "--build", "101", "--json"],
+            "Download operation pins the exact release build shown to the user")
+        try check(store.updateDownloaded && !store.canDownload && store.notice?.contains("drag the new copy into Applications") == true &&
+            store.downloadButtonLabel == "Update downloaded",
+            "Downloading reports the drag-and-drop step without claiming the update has been installed")
 
         await fixture.setCheckFailure(true)
         await store.checkForUpdates()?.value
-        try check(store.error?.contains("Network unavailable") == true && store.check == nil && !store.canInstall,
-            "Failed check clears prior install eligibility while preserving installed version")
+        try check(store.error?.contains("Network unavailable") == true && store.check == nil && !store.canDownload,
+            "Failed check clears prior download eligibility while preserving installed version")
         await fixture.setCheckFailure(false)
         await store.checkForUpdates()?.value
-        await fixture.setInstallFailure(true)
-        await store.openInstaller()?.value
-        try check(store.error?.contains("Checksum mismatch") == true && !store.installerOpened && store.canInstall,
-            "Verification failure is visible and does not report an opened installer")
-        await fixture.setInstallFailure(false)
-        await fixture.setInstallerBuild(102)
-        await store.openInstaller()?.value
-        try check(store.error?.contains("requested installer") == true && !store.installerOpened,
-            "Mismatched installer response cannot claim success")
+        await fixture.setDownloadFailure(true)
+        await store.downloadUpdate()?.value
+        try check(store.error?.contains("Checksum mismatch") == true && !store.updateDownloaded && store.canDownload,
+            "Verification failure is visible and does not report a downloaded update")
+        await fixture.setDownloadFailure(false)
+        await fixture.setDownloadedBuild(102)
+        await store.downloadUpdate()?.value
+        try check(store.error?.contains("requested update was not downloaded") == true && !store.updateDownloaded,
+            "Mismatched download response cannot claim success")
 
         await fixture.setComparison(.current, installable: false)
         await store.checkForUpdates()?.value
-        try check(!store.canInstall && store.openInstaller() == nil, "Current build cannot start an updater download")
+        try check(!store.canDownload && store.downloadUpdate() == nil, "Current build cannot start an updater download")
         await fixture.setComparison(.newer, installable: false)
         await store.checkForUpdates()?.value
-        try check(!store.canInstall, "Newer installed source build cannot downgrade")
+        try check(!store.canDownload, "Newer installed source build cannot downgrade")
         await fixture.setComparison(.available, installable: true)
         let newerRunning = QueueUpdateStore(running: RunningQueueVersion(version: "1.1.0", bundleBuild: "105", publishedBuild: 105),
             command: { try await fixture.load($0) })
         await newerRunning.checkForUpdates()?.value
-        try check(!newerRunning.canInstall && newerRunning.compatibilityMessage?.contains("newer") == true,
+        try check(!newerRunning.canDownload && newerRunning.compatibilityMessage?.contains("newer") == true,
             "A newer running bundle independently prevents backend-triggered downgrade")
         let unknownRunning = QueueUpdateStore(running: RunningQueueVersion(version: "1.0.0", bundleBuild: "0"),
             command: { try await fixture.load($0) })
         await unknownRunning.checkForUpdates()?.value
-        try check(unknownRunning.canInstall && unknownRunning.isReplacement &&
-            unknownRunning.installButtonLabel == "Download published installer…" &&
+        try check(unknownRunning.canDownload && unknownRunning.isReplacement &&
+            unknownRunning.downloadButtonLabel == "Download published build…" &&
             unknownRunning.compatibilityMessage?.contains("replace") == true,
-            "Unknown running build offers an explicit published-installer replacement")
+            "Unknown running build offers an explicit published-build replacement")
         let invalidRunning = QueueUpdateStore(running: RunningQueueVersion(version: "1.0.0", bundleBuild: "100",
             metadataError: "Running metadata is invalid"), command: { try await fixture.load($0) })
         await invalidRunning.checkForUpdates()?.value
-        try check(!invalidRunning.canInstall && invalidRunning.compatibilityMessage == "Running metadata is invalid",
-            "Invalid running provenance disables installation with a visible explanation")
+        try check(!invalidRunning.canDownload && invalidRunning.compatibilityMessage == "Running metadata is invalid",
+            "Invalid running provenance disables downloading with a visible explanation")
         await fixture.setUnknownInstalled()
         await store.refreshInstalled()
-        try check(store.check == nil && !store.canInstall, "Offline change of installed version invalidates earlier release comparison")
+        try check(store.check == nil && !store.canDownload, "Offline change of installed version invalidates earlier release comparison")
         await fixture.setComparison(.untracked, installable: true)
         await store.checkForUpdates()?.value
-        try check(store.canInstall && store.installed?.tracked == false && store.isReplacement,
-            "Legacy installation can explicitly download a published installer to establish release history")
+        try check(store.canDownload && store.installed?.tracked == false && store.isReplacement,
+            "Legacy installation can explicitly download a published build to establish release history")
         await newerRunning.checkForUpdates()?.value
-        try check(!newerRunning.canInstall && newerRunning.compatibilityMessage?.contains("newer") == true,
+        try check(!newerRunning.canDownload && newerRunning.compatibilityMessage?.contains("newer") == true,
             "Untracked controller cannot override a known newer published running app")
-        await fixture.setInstallerBuild(101)
-        await store.openInstaller()?.value
-        try check(store.installerOpened && store.notice?.contains("continues automatically") == true,
-            "Legacy replacement opens the pinned installer for automatic setup without claiming completion")
+        await fixture.setDownloadedBuild(101)
+        await store.downloadUpdate()?.value
+        try check(store.updateDownloaded && store.notice?.contains("finishes the update automatically") == true,
+            "Legacy replacement downloads the pinned build for drag-and-drop without claiming completion")
         await fixture.setInvalidRelease()
         await store.checkForUpdates()?.value
         try check(store.check == nil && store.error?.contains("invalid release") == true,
-            "Untrusted release URL is rejected before it reaches links or install controls")
+            "Untrusted release URL is rejected before it reaches links or download controls")
 
         let callsBeforePreview = await fixture.calls
         let preview = QueueUpdateStore(fixtureMode: true, command: { try await fixture.load($0) })
         await preview.refreshInstalled()
-        try check(preview.checkForUpdates() == nil && preview.openInstaller() == nil && !preview.canInstall,
+        try check(preview.checkForUpdates() == nil && preview.downloadUpdate() == nil && !preview.canDownload,
             "Fixture update controls cannot invoke live commands")
         let callsAfterPreview = await fixture.calls
         try check(callsAfterPreview == callsBeforePreview && preview.check?.latest?.build == 101,
@@ -213,8 +215,8 @@ struct UpdateTests {
             QueueClient.timeout(for: ["cancel", "1"]) == 25 &&
             QueueClient.timeout(for: ["status"], controller: .remote) == 8 &&
             QueueClient.timeout(for: ["configure"], controller: .remote) == 125 &&
-            QueueClient.timeout(for: ["updates", "install"], budget: .updates) == 130 &&
-            QueueClient.timeout(for: ["updates", "install"]) == 25,
+            QueueClient.timeout(for: ["updates", "download"], budget: .updates) == 130 &&
+            QueueClient.timeout(for: ["updates", "download"]) == 25,
             "Explicit update deadline leaves normal queue and remote deadlines unchanged")
     }
 }

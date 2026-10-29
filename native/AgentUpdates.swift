@@ -75,13 +75,14 @@ struct QueueUpdateCheck: Codable, Sendable {
     let installed: InstalledQueueVersion
     let latest: QueueRelease?
     let comparison: QueueUpdateComparison
-    let canInstall: Bool
+    let canDownload: Bool
     let message: String
 }
 
-struct QueueInstallerResult: Codable, Sendable {
-    let installerOpened: Bool
+struct QueueUpdateDownload: Codable, Sendable {
+    let downloaded: Bool
     let build: Int
+    let app: String
     let message: String
 }
 
@@ -93,7 +94,7 @@ final class QueueUpdateStore: ObservableObject {
     @Published private(set) var operation: Operation?
     @Published private(set) var error: String?
     @Published private(set) var notice: String?
-    @Published private(set) var installerOpened = false
+    @Published private(set) var updateDownloaded = false
     let running: RunningQueueVersion
     let fixtureMode: Bool
     private let command: @Sendable ([String]) async throws -> Data
@@ -112,13 +113,13 @@ final class QueueUpdateStore: ObservableObject {
             check = QueueUpdateCheck(installed: preview,
                 latest: QueueRelease(version: "1.0.1", build: 101, commit: String(repeating: "a", count: 40),
                     tag: "build-101", url: "https://github.com/Dunky13/agent-job-queue/releases/tag/build-101"),
-                comparison: .available, canInstall: true, message: "Version 1.0.1 (build 101) is available.")
+                comparison: .available, canDownload: true, message: "Version 1.0.1 (build 101) is available.")
         }
     }
 
     var isBusy: Bool { operation != nil }
-    var canInstall: Bool {
-        guard !fixtureMode, !isBusy, !installerOpened, let check, check.canInstall,
+    var canDownload: Bool {
+        guard !fixtureMode, !isBusy, !updateDownloaded, let check, check.canDownload,
               check.comparison == .available || check.comparison == .untracked,
               running.metadataError == nil,
               let release = check.latest, release.releaseURL != nil else { return false }
@@ -129,13 +130,13 @@ final class QueueUpdateStore: ObservableObject {
         return true
     }
     var isReplacement: Bool { check?.installed.tracked == false || running.publishedBuild == nil }
-    var installButtonLabel: String {
-        if installerOpened { return "Installer opened" }
-        return isReplacement ? "Download published installer…" : "Download and open installer"
+    var downloadButtonLabel: String {
+        if updateDownloaded { return "Update downloaded" }
+        return isReplacement ? "Download published build…" : "Download update"
     }
     var compatibilityMessage: String? {
         if let error = running.metadataError { return error }
-        guard let release = check?.latest, check?.canInstall == true else { return nil }
+        guard let release = check?.latest, check?.canDownload == true else { return nil }
         guard let runningBuild = running.publishedBuild else {
             return check?.installed.tracked == false ? nil : "The running app has no published build number. Choose a published release to replace it."
         }
@@ -147,7 +148,7 @@ final class QueueUpdateStore: ObservableObject {
         switch operation {
         case .version: "Reading installed version…"
         case .checking: "Checking for updates…"
-        case .downloading: "Downloading and verifying installer…"
+        case .downloading: "Downloading and verifying update…"
         case nil: ""
         }
     }
@@ -173,7 +174,7 @@ final class QueueUpdateStore: ObservableObject {
         error = nil
         notice = nil
         check = nil
-        installerOpened = false
+        updateDownloaded = false
         return Task {
             defer { operation = nil }
             do {
@@ -191,22 +192,22 @@ final class QueueUpdateStore: ObservableObject {
     }
 
     @discardableResult
-    func openInstaller() -> Task<Void, Never>? {
-        guard canInstall, let release = check?.latest else { return nil }
+    func downloadUpdate() -> Task<Void, Never>? {
+        guard canDownload, let release = check?.latest else { return nil }
         operation = .downloading
         error = nil
         notice = nil
         return Task {
             defer { operation = nil }
             do {
-                let result = try JSONDecoder().decode(QueueInstallerResult.self,
-                    from: try await command(["updates", "install", "--build", String(release.build), "--json"]))
-                guard result.installerOpened, result.build == release.build else {
-                    throw ClientError.message("The requested installer was not opened. Check for updates before retrying.")
+                let result = try JSONDecoder().decode(QueueUpdateDownload.self,
+                    from: try await command(["updates", "download", "--build", String(release.build), "--json"]))
+                guard result.downloaded, result.build == release.build else {
+                    throw ClientError.message("The requested update was not downloaded. Check for updates before retrying.")
                 }
-                installerOpened = true
+                updateDownloaded = true
                 notice = result.message
-            } catch { self.error = "Could not open the update installer. \(error.localizedDescription)" }
+            } catch { self.error = "Could not download the update. \(error.localizedDescription)" }
         }
     }
 }
@@ -256,7 +257,7 @@ struct QueueUpdatesSettings: View {
                         Label(message, systemImage: store.running.metadataError == nil ? "info.circle" : "exclamationmark.triangle")
                             .font(.callout).foregroundStyle(store.running.metadataError == nil ? Color.secondary : Color.orange)
                     }
-                    Text("Updates download a verified installer and continue setup automatically. Existing jobs finish before background services are updated.")
+                    Text("Updates download a verified copy of the new app into your Downloads folder and show it in Finder. Quit Agent Queue, drag the new copy into Applications and choose Replace. Opening it finishes the update, and existing jobs finish before background services are updated.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let error = store.error {
                         Label(error, systemImage: "exclamationmark.triangle").font(.callout)
@@ -277,8 +278,8 @@ struct QueueUpdatesSettings: View {
                     Button("Done", action: onDone)
                     Spacer()
                     Button("Check for updates") { store.checkForUpdates() }.disabled(store.fixtureMode || store.isBusy)
-                    Button(store.installButtonLabel) { store.openInstaller() }
-                        .buttonStyle(.borderedProminent).disabled(!store.canInstall)
+                    Button(store.downloadButtonLabel) { store.downloadUpdate() }
+                        .buttonStyle(.borderedProminent).disabled(!store.canDownload)
                 }
             }.padding(18)
         }.background(Color(nsColor: .windowBackgroundColor))

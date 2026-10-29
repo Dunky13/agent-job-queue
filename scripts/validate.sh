@@ -11,6 +11,6 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -p 2 -trimpath -o build/queue-too
 npm run test:web
 npm run test:browser
 bash scripts/test-native.sh
-scripts/build-installer.sh
-scripts/test-installer.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip"
-bash scripts/test-dmg.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.dmg"
+scripts/build-app.sh
+scripts/test-installer.sh "dist/Agent-Queue-$(cat VERSION)-universal.zip"
+bash scripts/test-dmg.sh "dist/Agent-Queue-$(cat VERSION)-universal.dmg"

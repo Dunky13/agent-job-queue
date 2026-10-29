@@ -57,7 +57,7 @@ jobs:
           cache: true
       - name: Build trusted artifact verifier
         run: go build -p 2 -trimpath -o "$RUNNER_TEMP/queue-notary-tool" ./cmd/queue-tool
-      - name: Select and verify immutable original installer
+      - name: Select and verify immutable original app
         id: source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -124,26 +124,26 @@ jobs:
       - name: Verify original artifact provenance and bytes before recovery
         env:
           GH_TOKEN: ${{ github.token }}
-        run: scripts/distribution-source.sh download validated-installer
+        run: scripts/distribution-source.sh download validated-app
       - name: Restore the latest checkpoint for this exact main build
         id: restore
         env:
           GH_TOKEN: ${{ github.token }}
         run: scripts/macos-checkpoint.sh restore notarization-state
-      - name: Verify and extract the validated installer
+      - name: Verify and extract the validated app
         if: steps.restore.outputs.restored == 'false'
         run: |
-          (cd validated-installer && shasum -a 256 -c ./*.zip.sha256)
-          mkdir -p prepared-installer
-          ditto -x -k "validated-installer/Agent-Job-Queue-Installer-$BUILD_VERSION-universal.zip" prepared-installer
-          "$QUEUE_NOTARY_TOOL" verify-installer --installer 'prepared-installer/Agent Job Queue Installer.app'
+          (cd validated-app && shasum -a 256 -c ./*.zip.sha256)
+          mkdir -p prepared-app
+          ditto -x -k "validated-app/Agent-Queue-$BUILD_VERSION-universal.zip" prepared-app
+          "$QUEUE_NOTARY_TOOL" verify-app --app 'prepared-app/Agent Queue.app'
       - name: Initialize durable signing state
         if: steps.restore.outputs.restored == 'false'
-        run: scripts/macos-resume.sh init 'prepared-installer/Agent Job Queue Installer.app' notarization-state "$BUILD_VERSION"
-      - name: Bind retained initial installer to the exact original source bytes
+        run: scripts/macos-resume.sh init 'prepared-app/Agent Queue.app' notarization-state "$BUILD_VERSION"
+      - name: Bind retained initial app to the exact original source bytes
         run: |
           scripts/macos-resume.sh bind-origin notarization-state \
-            "validated-installer/Agent-Job-Queue-Installer-$BUILD_VERSION-universal.zip" "$BUILD_VERSION"
+            "validated-app/Agent-Queue-$BUILD_VERSION-universal.zip" "$BUILD_VERSION"
       - name: Verify restored build identity and signed archives
         run: scripts/macos-resume.sh verify-state notarization-state "$BUILD_VERSION"
       - name: Snapshot state before credential setup
@@ -155,23 +155,13 @@ jobs:
           path: ${{ runner.temp }}/checkpoint-initial/*
           if-no-files-found: error
           retention-days: 90
-      - name: Notarize the installed payload
+      - name: Notarize the app
         uses: ./.github/actions/notarization-stage
         with:
-          stage: payload
+          stage: app
           prepared-slot: '01'
           submitted-slot: '02'
           finished-slot: '03'
-          certificate: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
-          certificate-password: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
-          notary-key: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
-      - name: Notarize the enclosing installer
-        uses: ./.github/actions/notarization-stage
-        with:
-          stage: installer
-          prepared-slot: '04'
-          submitted-slot: '05'
-          finished-slot: '06'
           certificate: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
           certificate-password: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
           notary-key: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
@@ -221,21 +211,21 @@ jobs:
       - name: Generate final immutable manifest and Homebrew cask
         run: |
           "$QUEUE_NOTARY_TOOL" render-cask \
-            --archive "dist/Agent-Job-Queue-Installer-$BUILD_VERSION-universal.zip" \
+            --archive "dist/Agent-Queue-$BUILD_VERSION-universal.zip" \
             --version "$BUILD_VERSION" --tag "$BUILD_TAG" \
             --commit "$BUILD_SHA" --build "$BUILD_RUN_NUMBER" --output dist
       - name: Bind permanent public Apple evidence to the exact final assets
         run: cp notarization-state/publication.json dist/apple-notarization.json
-      - name: Upload notarized installer and final checksums
+      - name: Upload notarized app and final checksums
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: Agent-Job-Queue-Notarized-Installer-${{ github.run_attempt }}
+          name: Agent-Queue-Notarized-App-${{ github.run_attempt }}
           path: dist/*
           if-no-files-found: error
           retention-days: 90
       - name: Record final artifact identity
         id: final-artifact-name
-        run: printf 'name=Agent-Job-Queue-Notarized-Installer-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+        run: printf 'name=Agent-Queue-Notarized-App-%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Explain retained state and safe recovery
         if: always()
         run: |
@@ -285,18 +275,18 @@ jobs:
           APPLE_TEAM_ID: ${{ needs.notarize.outputs.team_id }}
         run: |
           (cd dist && shasum -a 256 -c ./*.sha256)
-          scripts/test-notarized-installer.sh "dist/Agent-Job-Queue-Installer-$BUILD_VERSION-universal.zip" "dist/Agent-Job-Queue-Installer-$BUILD_VERSION-universal.dmg" "$APPLE_TEAM_ID"
+          scripts/test-notarized-installer.sh "dist/Agent-Queue-$BUILD_VERSION-universal.zip" "dist/Agent-Queue-$BUILD_VERSION-universal.dmg" "$APPLE_TEAM_ID"
       - name: Exercise the hardened packaged queue and HTTPS gateway
-        run: scripts/test-installer.sh "dist/Agent-Job-Queue-Installer-$BUILD_VERSION-universal.zip"
+        run: scripts/test-installer.sh "dist/Agent-Queue-$BUILD_VERSION-universal.zip"
       - name: Install through the real Homebrew DSL with quarantine retained
         env:
           APPLE_TEAM_ID: ${{ needs.notarize.outputs.team_id }}
           HOMEBREW_NO_AUTO_UPDATE: '1'
           HOMEBREW_DEVELOPER: '1'
         run: |
-          mkdir prepared-signed-installer
-          ditto -x -k "dist/Agent-Job-Queue-Installer-$BUILD_VERSION-universal.zip" prepared-signed-installer
-          export AGENT_QUEUE_TEST_NOTARIZED_PAYLOAD="$PWD/prepared-signed-installer/Agent Job Queue Installer.app/Contents/Resources/payload"
+          mkdir prepared-signed-app
+          ditto -x -k "dist/Agent-Queue-$BUILD_VERSION-universal.zip" prepared-signed-app
+          export AGENT_QUEUE_TEST_NOTARIZED_APP="$PWD/prepared-signed-app/Agent Queue.app"
           go test -p 2 -parallel 2 ./internal/tooling -run '^TestNotarizedHomebrew' -count=1 -v -timeout 3m
 
   publish:

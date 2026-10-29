@@ -1,6 +1,6 @@
 # Contributing
 
-Use Go 1.26.10+, Node.js 26.12.1+, macOS 15+, and Xcode command-line tools. Building the native apps and the Darwin resource sampler requires the macOS SDK. The distributed installer includes universal Apple Silicon and Intel binaries, so installed users need neither Xcode nor a Go toolchain. Python and uv are not used.
+Use Go 1.26.10+, Node.js 26.12.1+, macOS 15+, and Xcode command-line tools. Building the native apps and the Darwin resource sampler requires the macOS SDK. The distributed app includes universal Apple Silicon and Intel binaries, so installed users need neither Xcode nor a Go toolchain. Python and uv are not used.
 
 ```sh
 brew install go actionlint shellcheck
@@ -34,20 +34,20 @@ bash scripts/build-go.sh
 npm run test:web
 npm run test:browser
 bash scripts/test-native.sh
-scripts/build-installer.sh
-scripts/test-installer.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.zip"
-bash scripts/test-dmg.sh "dist/Agent-Job-Queue-Installer-$(cat VERSION)-universal.dmg"
+scripts/build-app.sh
+scripts/test-installer.sh "dist/Agent-Queue-$(cat VERSION)-universal.zip"
+bash scripts/test-dmg.sh "dist/Agent-Queue-$(cat VERSION)-universal.dmg"
 ```
 
 Apply the shared queue policy to broad tests, builds, analyzers, browser suites, and installers. Keep the Go package and test worker limits at two unless explicitly authorized otherwise. Do not nest queue wrappers. Persistent preview servers stay outside the queue.
 
 Core and HTTPS acceptance tests launch temporary private daemons, directories, child processes, ports, and test credentials. They remove inherited queue overrides before creating their fixture. Browser tests use simulated jobs through the actual Go HTTP interface. Installer and agent integration tests use isolated user directories. They must never operate on the installed queue or real agent instructions. The installer artifact test installs the actual packaged Go binaries into a temporary home and exercises their private queue and scheduler. It also runs the actual outer managed installer, setup and removal with a parent-owned native lifecycle fixture; a private HOME alone cannot isolate real Service Management.
 
-The disk-image check requires the DMG explicitly, mounts it read-only at a private mountpoint, and verifies the enclosed installer signatures, executable permissions, universal architectures, and build identities. A failed detach fails validation and retains its temporary directory. Packaging flushes staged files and disables indexing on its HFS+ image; verbose image-creation diagnostics remain available if macOS reports resource contention.
+The disk-image check requires the DMG explicitly, mounts it read-only at a private mountpoint, and verifies that it holds exactly `Agent Queue.app` and an `Applications` link, plus the app's signatures, executable permissions, universal architectures, and build identities. A failed detach fails validation and retains its temporary directory. Packaging flushes staged files and disables indexing on its HFS+ image; verbose image-creation diagnostics remain available if macOS reports resource contention.
 
-Disk images and ZIP archives contain the complete signed installer. Opening it starts automatic setup and launches the runtime only after installation and readiness succeed. The installed app carries its runnable helpers in `Contents/MacOS` and its three agent definitions in `Contents/Library/LaunchAgents`, using `BundleProgram`. Its support payload contains metadata and documents, with no recursive app or duplicate helper binaries. Ordinary runtime launch performs readiness and authorization reads only; all installation and repair stay inside the installer phase. The ZIP retains its explicit installer and outer controller payload for updater and Homebrew compatibility. Homebrew runs the vendor's noninteractive Installer artifact during install and upgrade; publisher-verified private staging avoids executing from group-writable Caskroom paths. Predecessor removal and uninstall retain the independent runtime; the vendor installer replaces it through an authenticated live handover when compatible, otherwise after drain and ownership checks. Disk-image and signature verification retain support for historical layouts. Validate a standalone app with `go run -p 2 ./cmd/queue-tool verify-app --app APP_PATH`.
+Disk images and ZIP archives contain only the self-contained `Agent Queue.app`; the DMG adds an `Applications` link for drag-and-drop. There is no installer. The app carries its runnable helpers in `Contents/MacOS` and its three agent definitions in `Contents/Library/LaunchAgents`, using `BundleProgram`. Its support payload contains metadata and documents, with no recursive app or duplicate helper binaries. Opening the app from `/Applications` or `~/Applications` runs `agent-heavy install --app-bundle` from inside the bundle: it registers the bundle-owned services, writes the CLI wrappers and migrates existing state, without copying executables anywhere. The window appears only for a review, a failure or macOS approval. The Homebrew cask is a plain `app` artifact; the first launch completes setup. Validate a standalone app with `go run -p 2 ./cmd/queue-tool verify-app --app APP_PATH`.
 
-Local installer builds use ad hoc development signatures by default. Main CI validates and retains the universal installer. A separate main-only distribution workflow consumes that exact build, requires Developer ID signing, payload-first Apple notarization, stapled app and DMG tickets, and fresh Apple Silicon and Intel acceptance before publication and Homebrew delivery. Distribution fixes can process a retained build with newer trusted main automation. PRs receive no Apple secrets. See [Apple signing and notarization](docs/apple-signing.md) for credential custody, recovery commands and acceptance evidence. Never remove quarantine to make a notarized release pass.
+Local app builds use ad hoc development signatures by default. Main CI validates and retains the universal app ZIP and DMG. A separate main-only distribution workflow consumes that exact build, requires Developer ID signing, app-first Apple notarization, stapled app and DMG tickets, and fresh Apple Silicon and Intel acceptance before publication and Homebrew delivery. Distribution fixes can process a retained build with newer trusted main automation. PRs receive no Apple secrets. See [Apple signing and notarization](docs/apple-signing.md) for credential custody, recovery commands and acceptance evidence. Never remove quarantine to make a notarized release pass.
 
 The native regression tests are headless. For menu-bar gestures, a logged-in graphical macOS session is also needed:
 
@@ -58,7 +58,7 @@ bash native/tests/run-menu-bar-ui-tests.sh build/menu-bar-verification.json
 
 The runner builds a private fixture app and sends AppKit events through the actual status button, menus, and window handlers. When the invoking terminal already has event-posting permission, it also sends system mouse events to the actual Settings control and a separate private nonactivating helper panel. These checks cover the first click in an inactive popover and outside-click dismissal without application deactivation. The fixture never requests additional input permissions. It records `skippedChecks` when event-posting permission is absent or macOS declines foreground activation. `--require-system-events` and `--require-foreground` fail their respective unavailable checks. `--interaction-regressions` runs only the Settings and cross-process dismissal checks; add `--settings-chevron` to check the Settings arrow in a fresh process. It cleans up its own fixtures, restores the pointer position, and preserves the installed app and clipboard.
 
-Read-only runtime startup, automatic installer execution, explicit `--setup` diagnostics, retries, approval states and guided recovery are included in the headless native suite. Normal packaged launch cannot install, repair or register services. The optional `--setup` diagnostic workflow retains read-only preflight and reviewed recovery actions. Service-management tests inject inert adapters and never register real services. A temporary HOME alone does not isolate macOS's per-user Service Management registry; live registration acceptance needs an isolated login session. See [guided upgrade recovery](docs/upgrade-recovery.md). In a logged-in graphical session, the private fixture verifies the explicit setup window and transition to the simulated queue:
+Silent first-launch setup, retries, approval states and guided recovery are included in the headless native suite. Private test fixtures can disable setup to check read-only startup. Service-management tests inject inert adapters and never register real services. A temporary HOME alone does not isolate macOS's per-user Service Management registry; live registration acceptance needs an isolated login session. See [guided upgrade recovery](docs/upgrade-recovery.md). In a logged-in graphical session, the private fixture verifies silent setup, the approval and failure windows, and the transition to the simulated queue:
 
 ```sh
 agent-heavy run --label "First-launch UI checks" -- bash native/tests/run-bootstrap-ui-tests.sh build/bootstrap-ui-verification
@@ -68,9 +68,9 @@ This runner uses temporary app and home directories and an injected setup execut
 
 ## Preview and screenshots
 
-The app, installer, and dashboard share the stacked-layers identity defined in
+The app and dashboard share the stacked-layers identity defined in
 `native/QueueBrand.swift`. Native surfaces use its template symbol so macOS can
-adapt its color. The app and installer bundles use `native/Resources/AppIcon.icns`;
+adapt its color. The app bundle uses `native/Resources/AppIcon.icns`;
 the dashboard header, browser favicon, and phone home-screen icon use the PNGs in
 `remote/static`. These generated files are committed, so ordinary builds require
 no asset generation. After changing the identity, regenerate them on macOS with
@@ -102,7 +102,7 @@ Private regressions cover live queued/running work, original caller exit status,
 
 The command queue uses the existing pure Go SQLite driver. A durable attempt is claimed before process creation, and detached workers publish their own outcomes. Never automatically retry an attempt with an uncertain outcome. An unclean daemon restart pauses automatic dispatch; verified process ownership and explicit operator recovery remain required. Queue RPC handlers must not acquire backend filesystem locks already held by the scheduler or submitting process.
 
-Go dependencies are pinned in `go.mod` and `go.sum`; run `go mod tidy` after deliberate dependency changes. Installer builds omit Go debug sections to keep universal binaries and downloads within the existing size limits; developer builds keep them. Installer builds collect the runtime and dependency notices into `source/licenses`. The standalone tap helper has no external dependencies. Trusted tap changes require a companion reviewed tap update before the source release, as described in [Homebrew delivery](docs/homebrew-delivery.md).
+Go dependencies are pinned in `go.mod` and `go.sum`; run `go mod tidy` after deliberate dependency changes. App builds omit Go debug sections to keep universal binaries and downloads within the existing size limits; developer builds keep them. Installer builds collect the runtime and dependency notices into `source/licenses`. The standalone tap helper has no external dependencies. Trusted tap changes require a companion reviewed tap update before the source release, as described in [Homebrew delivery](docs/homebrew-delivery.md).
 
 ## Commit policy
 
