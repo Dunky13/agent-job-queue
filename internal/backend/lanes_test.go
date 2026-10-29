@@ -374,3 +374,45 @@ func TestRealDaemonLeaseCLIWaitsOwnersAndStatus(t *testing.T) {
 		t.Fatalf("lane list: %d %v", code, lanes)
 	}
 }
+
+func TestRealDaemonAdaptiveLeasesUseLaneReservations(t *testing.T) {
+	f := daemonAcceptance(t)
+	f.writePlugin("devices", `{"schemaVersion":1,"name":"devices","lanes":[
+  {"name":"mutex","concurrency":1,"sharesLimit":false},
+  {"name":"fits","concurrency":1,"sharesLimit":false,"reservation":{"memoryMiB":2048,"cpuPercent":100}},
+  {"name":"heavy","concurrency":1,"reservation":{"memoryMiB":65536}}]}`)
+	f.reloadPlugins()
+	startAcceptanceController(t, f, "normal")
+	if err := SetSchedulingMode(f.gate, "adaptive"); err != nil {
+		t.Fatal(err)
+	}
+	owner := strconv.Itoa(os.Getpid())
+	if code, lease := f.lane("acquire", "mutex", "--owner-pid", owner, "--timeout", "10"); code != 0 || lease["state"] != "held" {
+		t.Fatalf("zero-reservation lease in adaptive mode: %d %v", code, lease)
+	}
+	if code, lease := f.lane("acquire", "fits", "--owner-pid", owner, "--timeout", "10"); code != 0 || lease["state"] != "held" {
+		t.Fatalf("fitting reservation in adaptive mode: %d %v", code, lease)
+	}
+	code, heavy := f.lane("acquire", "heavy", "--owner-pid", owner, "--timeout", "1")
+	if code != laneExitTimedOut {
+		t.Fatalf("an oversized reservation was admitted: %d %v", code, heavy)
+	}
+	fixtureUntil(t, 5*time.Second, func() bool {
+		status, err := StatusData(f.gate)
+		if err != nil {
+			return false
+		}
+		for _, job := range status["jobs"].([]Object) {
+			if job["id"] == mustInteger(heavy["id"]) {
+				return job["phase"] == "Lane reservation exceeds this machine's budget"
+			}
+		}
+		return false
+	})
+	// Held leases are not unfamiliar workloads: an ordinary job still starts.
+	started, release := filepath.Join(f.root, "job.started"), filepath.Join(f.root, "job.release")
+	client := f.launch(acceptanceHoldingCommand(started, release)...)
+	acceptanceWaitStarted(t, started)
+	acceptanceRelease(t, release)
+	client.wait(t, 0)
+}

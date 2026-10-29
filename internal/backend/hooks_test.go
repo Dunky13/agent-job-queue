@@ -143,7 +143,7 @@ func TestHookTimeoutTerminatesProcessGroup(t *testing.T) {
 
 func TestHookBackgroundChildCannotOutliveTimeout(t *testing.T) {
 	output := t.TempDir()
-	r, plugin := hookRunnerFixture(t, fmt.Sprintf("#!/bin/sh\nsleep 60 > /dev/null 2>&1 &\necho $! > %q/child\nexit 0\n", output))
+	r, plugin := hookRunnerFixture(t, fmt.Sprintf("#!/bin/sh\nsleep 60 &\necho $! > %q/child\nexit 0\n", output))
 	r.dispatch(plugin, "lease.granted", Object{"event": "lease.granted"})
 	fixtureUntil(t, 5*time.Second, func() bool { return acceptanceFileExists(filepath.Join(output, "child")) })
 	body, err := os.ReadFile(filepath.Join(output, "child"))

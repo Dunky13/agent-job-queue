@@ -155,6 +155,9 @@ func (r *hookRunner) run(plugin queuePlugin, relative, event string, input []byt
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
 			result = fmt.Sprintf("exit %d", exit.ExitCode())
+		} else if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil {
+			// A background member still held the output pipe; the hook exited.
+			result = fmt.Sprintf("exit %d", cmd.ProcessState.ExitCode())
 		} else if err != nil {
 			result = "error: " + err.Error()
 		}
