@@ -135,6 +135,41 @@ deliverables are this Markdown handoff and an ignored, self-contained HTML
 version under the local build reports directory. No preview server or external
 runtime resource was created.
 
+## PR 53 Intel CI follow-up
+
+PR 53 at `c0dc450f018623bd8900884eaff08301fa383b0c` exposed two Intel failures
+in CI run `40921983801`:
+
+- [Intel HTTPS](https://github.com/Dunky13/agent-job-queue/actions/runs/40921983801/job/123617379523):
+  the first valid authenticated request in
+  `TestRemoteCaddyLifecycleAcceptance/TLS_authentication_private_state_and_CSRF`
+  exceeded the existing 30-second response budget. It was a cold cost-14 bcrypt
+  calculation in the race-instrumented service. The same selected path passed
+  locally with race detection (33.45 seconds including setup; 19.06 seconds for
+  the selected subtest), and the full remote race suite passed in 151.694
+  seconds. Later authentication cases in the original Intel lifecycle test
+  completed. Transient runner slowdown is the current diagnosis, not a proven
+  product defect. HTTPS source, bcrypt cost and the production deadline were
+  left intact; the next head must pass the Intel gate again.
+- [Intel core](https://github.com/Dunky13/agent-job-queue/actions/runs/40921983801/job/123617379510):
+  `TestWaitStatusesTimeoutCancellationAndPublicOutput/timeout` assumed a 15 ms
+  wall-clock deadline allowed the first synthetic response to be processed.
+  Slow scheduling allowed the deadline to expire during that response,
+  correctly returning `Unknown` rather than the test's expected `In Progress`.
+
+The notarization test now uses Go's `testing/synctest` clock. Its 15 ms deadline
+is unchanged, and virtual time advances only at blocking waits. A separate
+`timeout-during-get` case deliberately expires the first request and asserts
+`Unknown`, the public `timeout` error, one poll, and exact sanitized JSON.
+Every original status, cancellation and privacy assertion remains. The complete
+matrix passed 100 race-enabled repetitions in 3.184 seconds. Independent
+Standards and Spec reviews found no actionable issue in this test-only repair;
+its full patch SHA-256 against `c0dc450` is
+`32bc276935d712e28dafe6e67a5406ebab00c77e2851f59256d0d02eea7cc1a1`.
+No production notarization code or Apple submissions changed.
+The complete notarization package passed with race detection in 1.940 seconds;
+its Go vet, formatting and source-portability checks also passed.
+
 ## Delivery and remaining gates
 
 The user authorized commit and push, then extended that authorization to a PR

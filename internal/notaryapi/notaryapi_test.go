@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
@@ -663,97 +664,110 @@ func TestOfficialS3PutObjectUsesScopedCredentialsAndNoRetry(t *testing.T) {
 }
 
 func TestWaitStatusesTimeoutCancellationAndPublicOutput(t *testing.T) {
-	for _, kind := range []string{"accepted", "invalid", "rejected", "timeout", "cancelled", "cancel-during-get", "unknown", "wrong-id", "wrong-id-after-pending", "malformed-after-pending"} {
+	for _, kind := range []string{"accepted", "invalid", "rejected", "timeout", "timeout-during-get", "cancelled", "cancel-during-get", "unknown", "wrong-id", "wrong-id-after-pending", "malformed-after-pending"} {
 		t.Run(kind, func(t *testing.T) {
-			f := makeFixture(t)
-			calls := 0
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			c := f.client(func(r *http.Request) (*http.Response, error) {
-				calls++
-				if r.Method != "GET" || r.URL.Path != "/notary/v2/submissions/"+testID {
-					t.Fatalf("unexpected request: %s %s", r.Method, r.URL)
-				}
-				if kind == "cancel-during-get" {
+			// CPU scheduling cannot consume the deadline before the first
+			// synthetic response; virtual time advances only while waiting.
+			synctest.Test(t, func(t *testing.T) {
+				f := makeFixture(t)
+				calls := 0
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				c := f.client(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if r.Method != "GET" || r.URL.Path != "/notary/v2/submissions/"+testID {
+						t.Fatalf("unexpected request: %s %s", r.Method, r.URL)
+					}
+					if kind == "cancel-during-get" {
+						cancel()
+						return nil, errors.New("private cancellation error")
+					}
+					if kind == "timeout-during-get" {
+						<-r.Context().Done()
+						return nil, errors.New("private request timeout")
+					}
+					status := "In Progress"
+					id := testID
+					if calls == 2 && kind == "wrong-id-after-pending" {
+						id = testIssuer
+					}
+					if calls == 2 && kind == "malformed-after-pending" {
+						return response(r, 200, `{broken`), nil
+					}
+					switch kind {
+					case "accepted":
+						if calls == 2 {
+							status = "Accepted"
+						}
+					case "invalid":
+						status = "Invalid"
+					case "rejected":
+						status = "Rejected"
+					case "unknown":
+						status = "private provider text"
+					case "wrong-id":
+						status = "Accepted"
+						id = testIssuer
+					}
+					return response(r, 200, `{"data":{"id":"`+id+`","attributes":{"status":"`+status+`"}}}`), nil
+				})
+				if kind == "cancelled" {
 					cancel()
-					return nil, errors.New("private cancellation error")
 				}
-				status := "In Progress"
-				id := testID
-				if calls == 2 && kind == "wrong-id-after-pending" {
-					id = testIssuer
+				timeout := "1s"
+				if kind == "timeout" || kind == "timeout-during-get" {
+					timeout = "15ms"
+					c.pollInterval = time.Second
 				}
-				if calls == 2 && kind == "malformed-after-pending" {
-					return response(r, 200, `{broken`), nil
-				}
+				out, err := f.command(ctx, []string{"wait", "--id", testID, "--timeout", timeout}, c)
+				wantStatus := "Unknown"
 				switch kind {
 				case "accepted":
-					if calls == 2 {
-						status = "Accepted"
+					wantStatus = "Accepted"
+					if err != nil || calls != 2 {
+						t.Fatalf("err=%v calls=%d", err, calls)
 					}
 				case "invalid":
-					status = "Invalid"
+					wantStatus = "Invalid"
+					requireError(t, err, "submission_rejected")
 				case "rejected":
-					status = "Rejected"
-				case "unknown":
-					status = "private provider text"
-				case "wrong-id":
-					status = "Accepted"
-					id = testIssuer
+					wantStatus = "Rejected"
+					requireError(t, err, "submission_rejected")
+				case "timeout":
+					wantStatus = "In Progress"
+					requireError(t, err, "timeout")
+					if calls != 1 {
+						t.Fatalf("polls=%d", calls)
+					}
+				case "timeout-during-get":
+					requireError(t, err, "timeout")
+					if calls != 1 {
+						t.Fatalf("polls=%d", calls)
+					}
+				case "cancelled", "cancel-during-get":
+					requireError(t, err, "cancelled")
+				case "unknown", "wrong-id", "wrong-id-after-pending", "malformed-after-pending":
+					requireError(t, err, "invalid_response")
 				}
-				return response(r, 200, `{"data":{"id":"`+id+`","attributes":{"status":"`+status+`"}}}`), nil
+				wantError := ""
+				switch kind {
+				case "timeout", "timeout-during-get":
+					wantError = "timeout"
+				case "invalid", "rejected":
+					wantError = "submission_rejected"
+				case "cancelled", "cancel-during-get":
+					wantError = "cancelled"
+				case "unknown", "wrong-id", "wrong-id-after-pending", "malformed-after-pending":
+					wantError = "invalid_response"
+				}
+				encodedError := ""
+				if wantError != "" {
+					encodedError = ",\"error\":\"" + wantError + "\""
+				}
+				if out != "{\"id\":\""+testID+"\",\"status\":\""+wantStatus+"\""+encodedError+"}\n" {
+					t.Fatalf("unsafe or incorrect output: %q", out)
+				}
 			})
-			if kind == "cancelled" {
-				cancel()
-			}
-			timeout := "1s"
-			if kind == "timeout" {
-				timeout = "15ms"
-				c.pollInterval = time.Second
-			}
-			out, err := f.command(ctx, []string{"wait", "--id", testID, "--timeout", timeout}, c)
-			wantStatus := "Unknown"
-			switch kind {
-			case "accepted":
-				wantStatus = "Accepted"
-				if err != nil || calls != 2 {
-					t.Fatalf("err=%v calls=%d", err, calls)
-				}
-			case "invalid":
-				wantStatus = "Invalid"
-				requireError(t, err, "submission_rejected")
-			case "rejected":
-				wantStatus = "Rejected"
-				requireError(t, err, "submission_rejected")
-			case "timeout":
-				wantStatus = "In Progress"
-				requireError(t, err, "timeout")
-				if calls != 1 {
-					t.Fatalf("polls=%d", calls)
-				}
-			case "cancelled", "cancel-during-get":
-				requireError(t, err, "cancelled")
-			case "unknown", "wrong-id", "wrong-id-after-pending", "malformed-after-pending":
-				requireError(t, err, "invalid_response")
-			}
-			wantError := ""
-			switch kind {
-			case "timeout":
-				wantError = "timeout"
-			case "invalid", "rejected":
-				wantError = "submission_rejected"
-			case "cancelled", "cancel-during-get":
-				wantError = "cancelled"
-			case "unknown", "wrong-id", "wrong-id-after-pending", "malformed-after-pending":
-				wantError = "invalid_response"
-			}
-			encodedError := ""
-			if wantError != "" {
-				encodedError = ",\"error\":\"" + wantError + "\""
-			}
-			if out != "{\"id\":\""+testID+"\",\"status\":\""+wantStatus+"\""+encodedError+"}\n" {
-				t.Fatalf("unsafe or incorrect output: %q", out)
-			}
 		})
 	}
 }
