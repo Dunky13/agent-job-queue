@@ -14,7 +14,7 @@ Refresh jobs serialize separately from PR validation. A 15-minute schedule and m
 
 When trusted templates change before a new app release, the tap retains a cask that matches its own historical public artifact, checked only as bounded data. It reports that the template change awaits a newer release. The next numbered build uses the updated trusted template. This preserves provenance across repeated tooling changes without rewriting a cask at the same build number.
 
-A tap that still holds metadata for a release built with the earlier installer wrapper is accepted as the current state, checked against its public release and its published cask, and replaced by the first app ZIP release. A latest public release that still uses the installer asset name fails visibly instead of publishing a cask for it.
+A tap that still holds metadata for a release built with the earlier installer wrapper is accepted as the current state and checked against its public release and archive checksum. Its cask must match either the frozen trusted managed-app template or the bounded cask attached to that historical public release. Both are compared only as data, never executed or republished. This covers taps whose trusted template advanced after the old release was published. The first app ZIP release replaces that predecessor; arbitrary cask drift and a latest public release that still uses the installer asset name fail visibly.
 
 ## App installation and upgrade recovery
 

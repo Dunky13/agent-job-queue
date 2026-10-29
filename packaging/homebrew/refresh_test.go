@@ -402,7 +402,7 @@ func TestRefreshHistoricalRubyIsComparedAsDataAndNeverExecuted(t *testing.T) {
 
 // Taps published before the drag-and-drop app hold installer-wrapper metadata.
 // Only that predecessor state may use the old asset name; it is verified but
-// never rendered, and the first app release replaces it.
+// never evaluated, and the first app release replaces it.
 func TestRefreshMigratesLegacyInstallerTapState(t *testing.T) {
 	legacyName := "Agent-Job-Queue-Installer-0.1.0-universal.zip"
 	legacify := func(x *refreshFixture, build int, name string) manifest {
@@ -443,8 +443,51 @@ func TestRefreshMigratesLegacyInstallerTapState(t *testing.T) {
 			if scenario == "upgrade" {
 				for _, call := range x.brewCalls {
 					if strings.Contains(call[len(call)-1], fixtureManifest(1).Tag) {
-						t.Fatal("legacy installer release was rendered into a cask")
+						t.Fatal("legacy installer cask was evaluated by Homebrew")
 					}
+				}
+			}
+		})
+	}
+}
+
+func TestRefreshValidatesLegacyManagedAppCaskAsData(t *testing.T) {
+	for _, scenario := range []string{"known-template", "drift", "bad-archive", "unrelated-release"} {
+		t.Run(scenario, func(t *testing.T) {
+			x := newRefreshFixture(t)
+			current := fixtureManifest(1)
+			current.Asset = "Agent-Job-Queue-Installer-0.1.0-universal.zip"
+			if scenario == "bad-archive" {
+				current.SHA256 = strings.Repeat("f", 64)
+			}
+			x.data[current.Tag] = current
+			asObject(x.source[current.Tag]["assets"].([]any)[1])["name"] = current.Asset
+			// The public release holds an older script-installer template. The
+			// current tap was generated later by the trusted managed-app template.
+			x.setHistorical(current.Tag, []byte("# Original public installer cask\nraise 'never execute'\n"))
+			installed := []byte(legacyManagedAppFixture)
+			if scenario == "drift" {
+				installed = append(installed, []byte("\n# untrusted drift\n")...)
+			}
+			x.installCurrent(current, installed)
+			x.unrelated = scenario == "unrelated-release"
+			err := x.f.refresh(true, "", "")
+			if (err != nil) != (scenario != "known-template") {
+				t.Fatalf("%s: %v", scenario, err)
+			}
+			if scenario == "bad-archive" && !strings.Contains(err.Error(), "checksum") {
+				t.Fatalf("legacy archive was not rejected by checksum verification: %v", err)
+			}
+			want := 0
+			if scenario == "known-template" {
+				want = 1
+			}
+			if len(x.publications) != want {
+				t.Fatalf("unexpected publications: %v", x.publications)
+			}
+			for _, call := range x.brewCalls {
+				if strings.Contains(call[len(call)-1], current.Tag) {
+					t.Fatal("legacy cask was executed instead of compared as data")
 				}
 			}
 		})
@@ -621,3 +664,43 @@ func TestRefreshPublicationEnvironmentGate(t *testing.T) {
 		t.Fatal("fixture unexpectedly empty")
 	}
 }
+
+// Captured legacy managed-app cask, rebased to the build-1 fixture identity.
+const legacyManagedAppFixture = `cask "agent-job-queue" do
+  version "0.1.0,1"
+  sha256 "510e3dbd33aab02ab240110ad683235b3727b8b0137c839ad67ddbf8a9af7b4d"
+
+  url "https://github.com/Dunky13/agent-job-queue/releases/download/build-1-1111111/Agent-Job-Queue-Installer-0.1.0-universal.zip"
+  name "Agent Job Queue"
+  desc "Shared heavy-command queue with a macOS menu-bar app"
+  homepage "https://github.com/Dunky13/agent-job-queue"
+
+  depends_on macos: :sequoia
+
+  # Preserve quarantine so macOS can assess the notarized release.
+
+  application = "#{Dir.home}/Applications/Agent Queue.app"
+  app "Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app", target: application
+
+  # Stable per-user wrappers survive staged cask cleanup and future upgrades.
+  binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/links/agent-heavy"
+  binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/links/agent-remote"
+
+  # The app artifact owns app removal and upgrade rollback.
+  uninstall quit: "io.went.agent-queue",
+            script: {
+              executable: "/bin/rm",
+              args: ["-f", "--", "#{Dir.home}/Library/LaunchAgents/io.went.agent-queue.plist"],
+              sudo: false,
+            }
+
+  caveats <<~EOS
+    Installs Agent Queue for this account without Python, uv, or a Go toolchain.
+    Open Agent Queue to finish setup. Command-line tools are ready after setup completes.
+    Release installer and app are Developer ID signed and notarized.
+    Quarantine is retained. Phone access is off until enabled.
+    Uninstall preserves the independent queue, jobs, credentials and remote access.
+    Disable phone access in settings before uninstall to stop its HTTPS service.
+  EOS
+end
+`

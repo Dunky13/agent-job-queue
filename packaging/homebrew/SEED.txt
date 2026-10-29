@@ -66,6 +66,8 @@ which must run before deleting the app. No destructive zap action is supplied.
 
 A tap that still holds metadata for a release built with the earlier installer
 wrapper is accepted as the current state, checked against its public release and
-its published cask, and replaced by the first app ZIP release. A latest public
+archive checksum, and compared as data against the frozen trusted managed-app
+template or its bounded published cask. Neither legacy template is executed or
+republished. It is replaced by the first app ZIP release. A latest public
 release that still uses the installer asset name fails visibly instead of
 publishing a cask for it.
