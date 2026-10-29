@@ -401,7 +401,8 @@ func boundedFile(path string, limit int) ([]byte, error) {
 }
 
 // A legacy release is only verified as the predecessor of the current tap
-// state: its installer cask is never rendered, so no cask is returned.
+// state. Its frozen trusted cask is returned only for byte comparison, never
+// evaluated by Homebrew or selected for publication.
 func (f *refresher) downloadRelease(release map[string]any, work string, legacy bool) (manifest, string, error) {
 	tag := asString(release["tag_name"])
 	if !tagPattern.MatchString(tag) {
@@ -457,7 +458,7 @@ func (f *refresher) downloadRelease(release map[string]any, work string, legacy 
 		return manifest{}, "", errors.New("Downloaded app archive checksum does not match manifest")
 	}
 	if legacy {
-		return data, "", nil
+		return data, fmt.Sprintf(legacyManagedAppCaskTemplate, data.Version, data.Build, data.SHA256, repository, data.Tag, data.Asset, repository), nil
 	}
 	cask, err := renderCask(data)
 	if err != nil {
@@ -779,6 +780,48 @@ const caskTemplate = `cask "agent-job-queue" do
     macOS may ask you to allow Agent Queue in Login Items settings.
     Before removing the app, stop its services with:
       ~/.local/bin/agent-heavy install --app-bundle "#{appdir}/Agent Queue.app" --unregister-services
+  EOS
+end
+`
+
+// Frozen trusted template from tap b45ee373129beb41bc4658daf5232c90e05994a9.
+// Used only as data to verify a legacy predecessor after its release identity
+// and archive checksum pass. Never execute this template or publish it anew.
+const legacyManagedAppCaskTemplate = `cask "agent-job-queue" do
+  version "%s,%d"
+  sha256 "%s"
+
+  url "https://github.com/%s/releases/download/%s/%s"
+  name "Agent Job Queue"
+  desc "Shared heavy-command queue with a macOS menu-bar app"
+  homepage "https://github.com/%s"
+
+  depends_on macos: :sequoia
+
+  # Preserve quarantine so macOS can assess the notarized release.
+
+  application = "#{Dir.home}/Applications/Agent Queue.app"
+  app "Agent Job Queue Installer.app/Contents/Resources/payload/Agent Queue.app", target: application
+
+  # Stable per-user wrappers survive staged cask cleanup and future upgrades.
+  binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/links/agent-heavy"
+  binary "Agent Job Queue Installer.app/Contents/Resources/payload/source/links/agent-remote"
+
+  # The app artifact owns app removal and upgrade rollback.
+  uninstall quit: "io.went.agent-queue",
+            script: {
+              executable: "/bin/rm",
+              args: ["-f", "--", "#{Dir.home}/Library/LaunchAgents/io.went.agent-queue.plist"],
+              sudo: false,
+            }
+
+  caveats <<~EOS
+    Installs Agent Queue for this account without Python, uv, or a Go toolchain.
+    Open Agent Queue to finish setup. Command-line tools are ready after setup completes.
+    Release installer and app are Developer ID signed and notarized.
+    Quarantine is retained. Phone access is off until enabled.
+    Uninstall preserves the independent queue, jobs, credentials and remote access.
+    Disable phone access in settings before uninstall to stop its HTTPS service.
   EOS
 end
 `
