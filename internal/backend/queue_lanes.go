@@ -106,9 +106,30 @@ func (d *queueDaemon) laneRoom(name string) error {
 	return nil
 }
 
-func (d *queueDaemon) reloadPlugins() {
+func (d *queueDaemon) reloadPlugins() error {
+	next := loadPluginRegistry(d.g)
+	jobs, err := d.store.unfinishedJobs()
+	if err != nil {
+		return err
+	}
+	usage := laneUsage(jobs)
+	// Validate every transition before publishing any of the new registry.
+	// Existing work retains its slots and plugin owner after a refused reload.
+	for name, lane := range next.lanes {
+		count := usage[name]
+		if count == nil || count.occupied()+count.waiting == 0 {
+			continue
+		}
+		previous, _ := d.lane(name, MaxParallel)
+		if previous.Removed || previous.Plugin != lane.Plugin {
+			return fmt.Errorf("Lane %q still has unfinished work owned by its previous plugin; drain it before reusing its name", name)
+		}
+		if count.occupied() > lane.Concurrency {
+			return fmt.Errorf("Lane %q has %d occupied slots; release or finish work before lowering concurrency to %d", name, count.occupied(), lane.Concurrency)
+		}
+	}
 	previous := d.plugins
-	d.plugins = loadPluginRegistry(d.g)
+	d.plugins = next
 	if d.retired == nil {
 		d.retired = map[string]queueLane{}
 	}
@@ -122,6 +143,7 @@ func (d *queueDaemon) reloadPlugins() {
 		delete(d.retired, name)
 	}
 	d.pruneRetiredLanes()
+	return nil
 }
 
 func (d *queueDaemon) pruneRetiredLanes() {

@@ -416,7 +416,9 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		}
 		return d.leaseView(id)
 	case "plugins-reload":
-		d.reloadPlugins()
+		if err := d.reloadPlugins(); err != nil {
+			return nil, err
+		}
 		return d.snapshot()
 	}
 	if op == "limit" {

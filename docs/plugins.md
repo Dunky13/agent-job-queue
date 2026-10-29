@@ -56,6 +56,8 @@ Fields:
 
 Plugins are loaded when the daemon starts and when `agent-heavy plugins reload` runs. Removing a lane while it has queued or held work keeps that work visible and lets it finish or be released; no new work is accepted into a lane that no longer exists.
 
+A reload is refused if it would lower a lane's concurrency below its occupied slots, assign unfinished work to another plugin, or reuse a removed lane's name before that work drains. A refused reload leaves the previous registry and existing work intact. Finish or release the affected work, then retry `agent-heavy plugins reload`.
+
 ### Loading details
 
 - The plugins directory is `plugins` next to the queue configuration file, so it follows `AGENT_HEAVY_CONFIG` in private test setups. Entries starting with `.` are ignored. At most 32 plugins load; each declares 1 to 8 lanes and at most 4 hooks per event.

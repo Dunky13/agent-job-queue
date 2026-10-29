@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -426,6 +427,70 @@ func TestLeaseRemovedLaneKeepsWorkUntilReleased(t *testing.T) {
 	}
 	if snapshot, err = d.control("snapshot", nil); err != nil || obj(snapshot["lanes"])["qa"] != nil {
 		t.Fatalf("finished removed lane still listed: %v %v", snapshot["lanes"], err)
+	}
+}
+
+func TestPluginReloadRejectsConcurrencyBelowOccupancy(t *testing.T) {
+	d, _ := laneDaemon(t, 8, map[string]string{"qa": laneManifest("qa", `{"name":"qa","concurrency":2}`)})
+	first := acquireTestLease(t, d, "qa", nil)
+	second := acquireTestLease(t, d, "qa", nil)
+	pluginFixture(t, d.g, "qa", laneManifest("qa", `{"name":"qa","concurrency":1}`), nil)
+	if _, err := d.control("plugins-reload", Object{}); err == nil {
+		t.Error("reload lowered concurrency below occupied slots")
+	}
+	if lane, _ := d.lane("qa", 8); lane.Concurrency != 2 {
+		t.Fatalf("refused reload changed the active definition: %+v", lane)
+	}
+	requireLeaseState(t, d, first, "held")
+	requireLeaseState(t, d, second, "held")
+	if _, err := d.control("lease-release", Object{"id": first["id"], "force": true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.control("plugins-reload", Object{}); err != nil {
+		t.Fatal("safe concurrency change was refused", err)
+	}
+	if lane, _ := d.lane("qa", 8); lane.Concurrency != 1 {
+		t.Fatalf("safe reload did not apply: %+v", lane)
+	}
+}
+
+func TestPluginReloadRejectsLaneReuseUntilDrained(t *testing.T) {
+	for _, test := range []struct {
+		retired bool
+		plugin  string
+	}{{false, "replacement"}, {true, "replacement"}, {true, "original"}} {
+		t.Run(fmt.Sprintf("retired-%t-%s", test.retired, test.plugin), func(t *testing.T) {
+			d, _ := laneDaemon(t, 8, map[string]string{"original": laneManifest("original", `{"name":"qa","concurrency":1,"sharesLimit":false,"reservation":{"memoryMiB":2048}}`)})
+			held := acquireTestLease(t, d, "qa", nil)
+			queued := acquireTestLease(t, d, "qa", nil)
+			if err := os.RemoveAll(pluginRoot(d.g)); err != nil {
+				t.Fatal(err)
+			}
+			if test.retired {
+				if _, err := d.control("plugins-reload", Object{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			pluginFixture(t, d.g, test.plugin, laneManifest(test.plugin, `{"name":"qa","concurrency":2}`), nil)
+			if _, err := d.control("plugins-reload", Object{}); err == nil {
+				t.Error("reload reused an occupied lane name")
+			}
+			lane, _ := d.lane("qa", 8)
+			if lane.Plugin != "original" || lane.Concurrency != 1 || lane.SharesLimit || lane.MemoryMiB != 2048 || lane.Removed != test.retired {
+				t.Fatalf("refused reuse changed the retained definition: %+v", lane)
+			}
+			for _, lease := range []Object{held, queued} {
+				if _, err := d.control("lease-release", Object{"id": lease["id"], "force": true}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := d.control("plugins-reload", Object{}); err != nil {
+				t.Fatal("drained lane name could not be reused", err)
+			}
+			if lane, _ := d.lane("qa", 8); lane.Plugin != test.plugin || lane.Concurrency != 2 {
+				t.Fatalf("drained replacement not applied: %+v", lane)
+			}
+		})
 	}
 }
 

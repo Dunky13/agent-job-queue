@@ -115,7 +115,7 @@ func TestManagedLoadedBundleProgramRequiresThisHelper(t *testing.T) {
 		want       bool
 	}{
 		{"running helper", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon"), self, true},
-		{"stopped helper", []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = not running", 1)), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", true},
+		{"stopped helper without location", []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = not running", 1)), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", false},
 		{"other executable", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon"), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", false},
 		{"other bundle", output("Contents/MacOS/agent-heavy", "io.example.other", "", "agent-heavy", "daemon"), self, false},
 		{"other helper", output("Contents/MacOS/agent-remote", "io.went.agent-queue", "", "agent-heavy", "daemon"), self, false},
@@ -127,11 +127,37 @@ func TestManagedLoadedBundleProgramRequiresThisHelper(t *testing.T) {
 		{"two identifiers", append(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon"), []byte("\tprogram identifier = Contents/MacOS/agent-heavy (mode: 2)\n")...), self, false},
 		{"missing arguments", []byte("\tprogram identifier = Contents/MacOS/agent-heavy (mode: 2)\n\tparent bundle identifier = io.went.agent-queue\n"), self, false},
 		{"running without pid", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon"), self, false},
-		{"stopped without pid", []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = spawn scheduled", 1)), self, true},
+		{"contradictory program", append([]byte("\tprogram = /another/helper\n"), output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon")...), self, false},
+		{"contradictory stopped program", append([]byte("\tprogram = /another/helper\n"), []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = spawn scheduled", 1))...), self, false},
+		{"stopped without pid or location", []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = spawn scheduled", 1)), self, false},
 	} {
 		if got := managedLoadedBundleProgram(test.raw, test.executable, "agent-heavy", "daemon"); got != test.want {
 			t.Errorf("%s: custody %v, want %v", test.name, got, test.want)
 		}
+	}
+}
+
+func TestManagedStoppedBundleProgramRequiresCanonicalLocation(t *testing.T) {
+	app := "/Applications/Agent Queue.app"
+	executable := filepath.Join(app, "Contents/MacOS/agent-heavy")
+	plist := filepath.Join(app, "Contents/Library/LaunchAgents/io.went.agent-heavy.plist")
+	raw := "\tstate = spawn scheduled\n\tprogram identifier = Contents/MacOS/agent-heavy (mode: 2)\n\tparent bundle identifier = io.went.agent-queue\n\targuments = {\n\t\tagent-heavy\n\t\tdaemon\n\t}\n"
+	for _, test := range []struct {
+		name, location string
+		want           bool
+	}{
+		{"canonical program", "\tprogram = " + executable + "\n", true},
+		{"canonical definition", "\tpath = " + plist + "\n", true},
+		{"other program", "\tprogram = /other/helper\n", false},
+		{"other definition", "\tpath = /other/app/Contents/Library/LaunchAgents/io.went.agent-heavy.plist\n", false},
+		{"contradictory definition", "\tprogram = " + executable + "\n\tpath = /other/definition.plist\n", false},
+		{"duplicate definition", "\tpath = " + plist + "\n\tpath = " + plist + "\n", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := managedLoadedBundleProgram([]byte(raw+test.location), executable, "agent-heavy", "daemon"); got != test.want {
+				t.Fatalf("custody %v, want %v", got, test.want)
+			}
+		})
 	}
 }
 

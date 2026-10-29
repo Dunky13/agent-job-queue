@@ -158,6 +158,66 @@ func TestHookBackgroundChildCannotOutliveTimeout(t *testing.T) {
 	}
 }
 
+func TestHookRetainsGroupLeaderUntilFinalSignal(t *testing.T) {
+	output := t.TempDir()
+	r, plugin := hookRunnerFixture(t, fmt.Sprintf("#!/bin/sh\nsleep 2 &\nprintf '%%s %%s' \"$$\" \"$(ps -o pgid= -p $$)\" > %q/identity\n", output))
+	r.dispatch(plugin, "lease.granted", Object{"event": "lease.granted"})
+	defer r.wait()
+	identity := filepath.Join(output, "identity")
+	fixtureUntil(t, 5*time.Second, func() bool { return acceptanceFileExists(identity) })
+	data, err := os.ReadFile(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) != 2 {
+		t.Fatalf("invalid hook identity: %q", data)
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	pgid, err := strconv.Atoi(fields[1])
+	if err != nil || pgid <= 1 || pgid == syscall.Getpgrp() {
+		t.Fatalf("invalid hook group: %q", data)
+	}
+	fixtureUntil(t, 5*time.Second, func() bool { return processGone(pid) })
+	// An unreaped group leader reserves the numerical PGID until the runner's
+	// last signal, even if all background members finish before the deadline.
+	if err := syscall.Kill(pgid, 0); err != nil {
+		t.Fatalf("hook group leader was reaped before final cleanup: %v", err)
+	}
+}
+
+func TestHookDeadlineSurvivesSlowGroupInspection(t *testing.T) {
+	output := t.TempDir()
+	r, plugin := hookRunnerFixture(t, fmt.Sprintf("#!/bin/sh\nsleep 60 &\necho $! > %q/child\n", output))
+	inspecting, release := make(chan struct{}), make(chan struct{})
+	r.inspectGroup = func(pgid int) ([]Object, error) {
+		close(inspecting)
+		<-release
+		return ProcessGroupMembers(pgid)
+	}
+	r.dispatch(plugin, "lease.granted", Object{"event": "lease.granted"})
+	t.Cleanup(func() { close(release); r.wait() })
+	select {
+	case <-inspecting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("hook did not reach process inspection")
+	}
+	body, err := os.ReadFile(filepath.Join(output, "child"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := strconv.Atoi(strings.TrimSpace(string(body)))
+	if err != nil || child <= 1 {
+		t.Fatalf("invalid child identity: %q", body)
+	}
+	// The hook must be killed at its original deadline while process
+	// inspection is still blocked, rather than after inspection completes.
+	fixtureUntil(t, hookTimeout+2*time.Second, func() bool { return processGone(child) })
+}
+
 func TestHookOutputIsBoundedAndRotated(t *testing.T) {
 	r, plugin := hookRunnerFixture(t, "#!/bin/sh\nhead -c 300000 /dev/zero | tr '\\000' x\necho tail >&2\n")
 	directory := filepath.Join(r.g.State, "plugins", "fixture")

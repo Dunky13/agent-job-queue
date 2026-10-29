@@ -42,6 +42,29 @@ func pluginByName(registry pluginRegistry, name string) queuePlugin {
 	return queuePlugin{}
 }
 
+func TestPluginRegistryRejectsEveryEntryBeyondLimit(t *testing.T) {
+	g := testGate(t)
+	for index := range pluginLimit + 3 {
+		name := fmt.Sprintf("plugin-%02d", index)
+		pluginFixture(t, g, name, laneManifest(name, fmt.Sprintf(`{"name":%q,"concurrency":1}`, name)), nil)
+	}
+	registry := loadPluginRegistry(g)
+	if len(registry.lanes) != pluginLimit {
+		t.Errorf("loaded %d lanes, want %d", len(registry.lanes), pluginLimit)
+	}
+	for index := range pluginLimit + 3 {
+		name := fmt.Sprintf("plugin-%02d", index)
+		plugin := pluginByName(registry, name)
+		if index < pluginLimit {
+			if !plugin.Loaded || plugin.Error != "" {
+				t.Errorf("plugin within limit refused: %+v", plugin)
+			}
+		} else if plugin.Loaded || plugin.Error == "" || len(plugin.Lanes) != 0 || len(plugin.Hooks) != 0 {
+			t.Errorf("plugin beyond limit accepted: %+v", plugin)
+		}
+	}
+}
+
 func TestPluginManifestLoadsDefaultsAndHooks(t *testing.T) {
 	g := testGate(t)
 	pluginFixture(t, g, "teifi-qa", `{

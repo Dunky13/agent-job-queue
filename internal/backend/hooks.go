@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,12 +25,13 @@ const hookLogLimit = 1024 * 1024
 // hookRunner starts plugin hooks off the scheduling path. dispatch never
 // blocks: it either claims one of the bounded slots or counts a dropped event.
 type hookRunner struct {
-	g       *Gate
-	slots   chan struct{}
-	mu      sync.Mutex
-	logMu   sync.Mutex
-	drops   map[string]int
-	running sync.WaitGroup
+	g            *Gate
+	slots        chan struct{}
+	mu           sync.Mutex
+	logMu        sync.Mutex
+	drops        map[string]int
+	running      sync.WaitGroup
+	inspectGroup func(int) ([]Object, error)
 }
 
 func newHookRunner(g *Gate) *hookRunner {
@@ -131,7 +135,30 @@ func (r *hookRunner) run(plugin queuePlugin, relative, event string, input []byt
 		return
 	}
 	output := &hookOutput{limit: hookOutputLimit}
-	cmd := exec.Command(path)
+	completed, report, err := os.Pipe()
+	if err != nil {
+		r.log(plugin.Name, event, relative, "failed to create hook supervisor: "+err.Error(), nil)
+		return
+	}
+	defer completed.Close()
+	defer report.Close()
+	release, finish, err := os.Pipe()
+	if err != nil {
+		r.log(plugin.Name, event, relative, "failed to create hook supervisor: "+err.Error(), nil)
+		return
+	}
+	defer release.Close()
+	defer finish.Close()
+	// Keep an unreaped group leader until the last group signal. A hook can
+	// exit before its descendants, and reaping it would allow its PGID to be
+	// reused during the remaining deadline. The hook receives only its event
+	// on stdin; the supervisor's status and release pipes are closed in it.
+	cmd := exec.Command("/bin/sh", "-c", `"$1" 3>&- 4<&-
+status=$?
+printf '%s\n' "$status" >&3
+IFS= read -r _ <&4
+exit "$status"`, "agent-queue-hook", path)
+	cmd.ExtraFiles = []*os.File{report, release}
 	cmd.Dir = plugin.Dir
 	cmd.Env = hookEnvironment(r.g, plugin.Name, event)
 	cmd.Stdin = bytes.NewReader(input)
@@ -145,33 +172,56 @@ func (r *hookRunner) run(plugin queuePlugin, relative, event string, input []byt
 		r.log(plugin.Name, event, relative, "failed to start: "+err.Error(), output)
 		return
 	}
+	report.Close()
+	release.Close()
 	pgid := cmd.Process.Pid
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	done := make(chan string, 1)
+	go func() {
+		line, err := bufio.NewReader(completed).ReadString('\n')
+		code, parseErr := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || parseErr != nil || code < 0 || code > 255 {
+			done <- "hook supervisor did not report an exit status"
+			return
+		}
+		done <- fmt.Sprintf("exit %d", code)
+	}()
 	result := ""
 	select {
-	case err = <-done:
-		result = "exit 0"
-		var exit *exec.ExitError
-		if errors.As(err, &exit) {
-			result = fmt.Sprintf("exit %d", exit.ExitCode())
-		} else if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil {
-			// A background member still held the output pipe; the hook exited.
-			result = fmt.Sprintf("exit %d", cmd.ProcessState.ExitCode())
-		} else if err != nil {
-			result = "error: " + err.Error()
-		}
-		// Background members keep the process group, and so its ID, alive;
-		// nothing a hook starts may outlive the timeout.
-		if probe := syscall.Kill(-pgid, 0); probe == nil || errors.Is(probe, syscall.EPERM) {
-			<-deadline.C
+	case result = <-done:
+		inspected := make(chan bool, 1)
+		go func() {
+			inspect := r.inspectGroup
+			if inspect == nil {
+				inspect = ProcessGroupMembers
+			}
+			members, inspectErr := inspect(pgid)
+			background := inspectErr != nil
+			for _, member := range members {
+				pid, _ := integer(member["pid"])
+				background = background || pid != pgid
+			}
+			inspected <- background
+		}()
+		select {
+		case background := <-inspected:
+			if background {
+				<-deadline.C
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			}
+		case <-deadline.C:
 			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			// Join the bounded inspection after signalling, so slow process
+			// discovery cannot extend a hook's lifetime or outlive this run.
+			<-inspected
 		}
 	case <-deadline.C:
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		<-done
 		result = "timed out after 10 seconds; process group terminated"
 	}
+	finish.Close()
+	// Only now may Wait reap the supervisor and release its numerical PID.
+	_ = cmd.Wait()
+	completed.Close()
 	r.log(plugin.Name, event, relative, result, output)
 }
 

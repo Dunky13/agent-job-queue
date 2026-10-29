@@ -465,7 +465,7 @@ func loadPluginRegistry(g *Gate) pluginRegistry {
 		if strings.HasPrefix(entry.Name(), ".") {
 			continue
 		}
-		if len(registry.plugins) == pluginLimit {
+		if len(registry.plugins) >= pluginLimit {
 			registry.plugins = append(registry.plugins, queuePlugin{Name: DisplayText(entry.Name(), 32), Error: fmt.Sprintf("At most %d plugins are loaded", pluginLimit), Lanes: []string{}})
 			declared = append(declared, nil)
 			continue
