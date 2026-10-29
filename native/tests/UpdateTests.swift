@@ -56,7 +56,7 @@ actor UpdateFixture {
         if arguments == ["updates", "download", "--build", "101", "--json"] {
             if failDownload { throw ClientError.message("Checksum mismatch") }
             return try encoder.encode(QueueUpdateDownload(downloaded: true, build: downloadedBuild,
-                app: "/Users/test/Downloads/Agent Queue 1.0.1 (build 101)/Agent Queue.app",
+                app: "/private/tmp/fixture/Downloads/Agent Queue 1.0.1 (build 101)/Agent Queue.app",
                 message: "Quit Agent Queue, then drag the new copy into Applications and choose Replace. Opening it finishes the update automatically."))
         }
         throw ClientError.message("Unexpected update command")

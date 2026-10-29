@@ -168,7 +168,8 @@ func (install *installer) managedReadReceipt() (*managedPublicationReceipt, []by
 // When setup adopts a bundle the user placed with Finder, a candidate-only
 // receipt without pending setup or a retained backup guards nothing.
 func (install *installer) managedReceiptSuperseded(receipt *managedPublicationReceipt) (bool, error) {
-	if !install.appBundle || install.prepareReplacement || install.unregisterServices || receipt.SchemaVersion != 1 || receipt.Backup != nil {
+	if !install.appBundle || install.prepareReplacement || install.unregisterServices || receipt.SchemaVersion != 1 || receipt.Backup != nil ||
+		receipt.Candidate.Inode == 0 || receipt.Candidate.Digest == [32]byte{} {
 		return false, nil
 	}
 	if pending, err := updateExists(filepath.Join(install.root, "install-in-progress.json")); err != nil || pending {

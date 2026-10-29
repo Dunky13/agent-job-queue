@@ -29,7 +29,7 @@ func (install *installer) managedPublicationParent(require bool) (*os.File, erro
 		if err := unix.Fstat(root, &rootInfo); err != nil {
 			return nil, err
 		}
-		if err := managedSystemPublicationParentInfo(&rootInfo); err != nil {
+		if err := managedSystemPublicationParentInfo(&rootInfo, false); err != nil {
 			return nil, err
 		}
 		fd, err := unix.Openat(root, "Applications", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
@@ -42,7 +42,7 @@ func (install *installer) managedPublicationParent(require bool) (*os.File, erro
 			parent.Close()
 			return nil, err
 		}
-		if err := managedSystemPublicationParentInfo(&info); err != nil {
+		if err := managedSystemPublicationParentInfo(&info, true); err != nil {
 			parent.Close()
 			return nil, err
 		}
@@ -63,8 +63,8 @@ func (install *installer) managedPublicationParent(require bool) (*os.File, erro
 	}
 }
 
-func managedSystemPublicationParentInfo(info *unix.Stat_t) error {
-	if uint32(info.Mode)&unix.S_IFMT != unix.S_IFDIR || info.Uid != 0 || uint32(info.Mode)&0022 != 0 && !appservices.StockApplications(info) {
+func managedSystemPublicationParentInfo(info *unix.Stat_t, applications bool) error {
+	if uint32(info.Mode)&unix.S_IFMT != unix.S_IFDIR || info.Uid != 0 || uint32(info.Mode)&0022 != 0 && !(applications && appservices.StockApplications(info)) {
 		return errors.New("Managed application publication requires a protected root-owned Applications directory without group/world write permission; use your per-user Applications directory with the explicit installer, or an approved protected location for shared deployments")
 	}
 	return nil

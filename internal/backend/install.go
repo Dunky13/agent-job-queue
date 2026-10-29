@@ -2229,7 +2229,12 @@ func InstallMain(args []string) int {
 		err = install.execute(ctx)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Agent Queue installer: %v\n", err)
+		var approval *installApprovalError
+		if errors.As(err, &approval) {
+			// The app waits for macOS approval, then runs setup again.
+			fmt.Fprintln(os.Stderr, "AGENT_QUEUE_SETUP_STATE:requires-approval")
+		}
+		fmt.Fprintf(os.Stderr, "Agent Queue setup: %v\n", err)
 		if errors.Is(err, errInstallLegacyPhoneAccess) {
 			fmt.Fprintln(os.Stderr, installDisablePhoneAccessRecovery)
 		}

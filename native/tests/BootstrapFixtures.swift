@@ -123,6 +123,36 @@ actor BootstrapInstallerProgressFixture {
     var isHeld: Bool { held != nil }
 }
 
+// The first setup run stops because macOS has not allowed the services yet;
+// status reads report approval twice before the user allows them.
+actor BootstrapApprovalRetryFixture {
+    let fixture: BootstrapFixture
+    private(set) var installations = 0
+    private var approvalReads = 0
+
+    init(_ fixture: BootstrapFixture) { self.fixture = fixture }
+
+    func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) async throws -> Data {
+        if request.arguments.suffix(2) == ["--preflight", "--json"] {
+            return try JSONEncoder().encode(QueueBootstrapReport.clear)
+        }
+        if request.arguments.count == 3, request.arguments.prefix(2) == ["--service-management", "status"], let service = request.arguments.last {
+            approvalReads += 1
+            let status = installations == 1 && approvalReads <= 2 ? "requiresApproval" : "enabled"
+            return try JSONEncoder().encode(BootstrapFixtureServiceStatus(service: service, status: status))
+        }
+        guard request.arguments == ["install", "--app-bundle", fixture.environment.app.path] else {
+            throw ClientError.message("Setup used an unexpected request.")
+        }
+        installations += 1
+        guard installations > 1 else {
+            throw ClientError.message(QueueSetupProgress.approvalMarker + "\nAgent Queue setup: The queue service is requiresApproval; allow Agent Queue in System Settings before setup can finish")
+        }
+        try fixture.installManaged()
+        return Data("Fixture setup complete.".utf8)
+    }
+}
+
 actor BootstrapServiceStatusFixture {
     private(set) var requests: [QueueBootstrapRequest] = []
     private var status: String

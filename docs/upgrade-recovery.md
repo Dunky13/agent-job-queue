@@ -1,8 +1,8 @@
 # Automatic installation and upgrade recovery
 
-Homebrew install and upgrade run the vendor installer automatically. Opening the complete installer from a DMG or ZIP also starts setup automatically. The package includes the queue, resource controller and HTTPS runtime; installed users need no development toolchain or separately installed Python, Pueue or Caddy executable.
+Opening `Agent Queue.app` from `/Applications` or `~/Applications` runs setup automatically, whether the app arrived from the DMG, the ZIP, an update download or the Homebrew cask (Homebrew itself runs nothing at install or upgrade). The app includes the queue, resource controller and HTTPS runtime; installed users need no development toolchain or separately installed Python, Pueue or Caddy executable.
 
-All setup finishes inside the installer before it opens the runtime app. Ordinary runtime launch performs readiness and authorization reads only; it never starts installation, recovery, helper copying or service registration. An incomplete runtime directs the operator back to the installer.
+Setup runs from inside the app bundle (`agent-heavy install --app-bundle`), registers the bundle-owned services with Service Management, writes the CLI wrappers to `~/.local/bin` and copies no executables out of the bundle. A launch that finds a completed, current installation only reads readiness and authorization state; it never repeats installation or recovery. An incomplete installation is finished on the next launch, and the setup window appears only for a review, a failure or macOS approval.
 
 Setup inspects ownership and readiness, performs supported repairs, selects a compatible live handover or waits for jobs to finish, and verifies installation before opening the queue. It restores verified missing service definitions, cleans completed jobs through the normal ownership checks, starts a verified stopped legacy Go service, and disables incompatible phone access when migration requires it. Credentials, trusted certificates, history and queue settings remain retained.
 
@@ -10,11 +10,15 @@ For an incompatible legacy cleanup callback, automatic setup backs up the exact 
 
 ## Upgrading while jobs continue
 
-A managed upgrade can hand over without waiting for running or queued jobs when the installed daemon, target controller and every outstanding job caller support handover protocol 1 and queue schema 2. The installer authenticates the transfer against the exact target, database and attempt identities before replacing services. Existing workers finish their original attempts, callers retain their original outcomes and exit statuses, and queued jobs remain queued. Pause state and the parallel limit survive the transfer. No attempt is replayed. New queue mutations can be briefly rejected before acceptance while the handover is in progress.
+A managed upgrade can hand over without waiting for running or queued jobs when the installed daemon, target controller and every outstanding job caller support handover protocol 1 and queue schema 2. Setup authenticates the transfer against the exact target, database and attempt identities before replacing services. Existing workers finish their original attempts, callers retain their original outcomes and exit statuses, and queued jobs remain queued. Pause state and the parallel limit survive the transfer. No attempt is replayed. New queue mutations can be briefly rejected before acceptance while the handover is in progress.
 
-The installer retains each complete previous signed app needed by outstanding callers or workers visibly under `~/Applications/Agent Queue Runtimes`. A private durable record binds its device, inode, build and digest to the original attempts; matching names or content alone do not authorize adoption. Multiple upgrades may retain multiple generations. Only a later installer operation removes a generation after matching terminal attempts and dead original callers and owned workers are established. Missing or uncertain evidence keeps the generation. The app and daemon never delete executable code.
+Setup retains each complete previous signed app needed by outstanding callers or workers visibly under `~/Applications/Agent Queue Runtimes`. A private durable record binds its device, inode, build and digest to the original attempts; matching names or content alone do not authorize adoption. Multiple upgrades may retain multiple generations. Only a later setup operation removes a generation after matching terminal attempts and dead original callers and owned workers are established. Missing or uncertain evidence keeps the generation. The app and daemon never delete executable code.
 
 Legacy releases or outstanding callers without this protocol require one drained upgrade before live handover becomes available. Unsupported capabilities or schemas fall back to drain. Uncertain attempts, ownership or changed custody still fail closed; setup never discards their evidence. Removal and preparation for external app replacement always require a drained queue.
+
+## Upgrading from an installer-era install
+
+Earlier releases installed `~/Applications/Agent Queue.app` through `Agent Job Queue Installer.app` and ran the services from that copy. That location stays recorded as the managed one, and setup refuses a new copy placed elsewhere (for example `/Applications`) while the recorded copy exists. Either drag the new app over `~/Applications/Agent Queue.app` and choose **Replace**, or stop the services with `~/.local/bin/agent-heavy install --app-bundle "$HOME/Applications/Agent Queue.app" --unregister-services`, move the old app to the Trash, then open the new app. Homebrew users coming from the installer cask must use the second route. Legacy `~/Library/LaunchAgents/io.went.agent-*.plist` definitions can be retired and backed up during migration, and incompatible options are backed up first.
 
 ## Waiting and platform approval
 
@@ -32,8 +36,7 @@ The bundled controller supports read-only preflight and automatic installation:
 
 ```sh
 agent-heavy install --app-bundle ABSOLUTE_APP_PATH --preflight --json
-agent-heavy install --payload ABSOLUTE_PAYLOAD_PATH --preflight --json
-agent-heavy install --payload ABSOLUTE_PAYLOAD_PATH --repair-and-continue
+agent-heavy install --app-bundle ABSOLUTE_APP_PATH --repair-and-continue
 ```
 
 Preflight returns a schema-versioned JSON report with an `issues` array. Each issue has a stable ID, title, explanation, optional affected path or jobs, and supported actions. An empty array permits an installation attempt; it does not establish completed installation. Automatic setup emits progress and returns success only after installation completes.
@@ -53,4 +56,4 @@ Each recovery rechecks current eligibility and ownership, then returns a fresh p
 
 ## Verification
 
-Run the finite shared-queue validation batch documented in CONTRIBUTING.md. Backend regressions cover automatic legacy migration, original configuration and service backups, live queued/running jobs and original caller results, pause and limit preservation, legacy fallback, interrupted handover and publication, retained runtime custody and later installer reclamation, approval waiting without repeated registration, stale revisions, changed backup evidence and unrelated ownership. Native regressions exercise read-only packaged launch across fresh, incomplete and stale installations, missing registration, approval resumption, diagnostic isolation and installation readback. Graphical fixtures use disposable homes and injected executors; Homebrew fixtures exercise the real Installer artifact and private lifecycle adapters. These local proofs do not establish native Service Management worker survival, Apple signing, notarization, release publication, SentinelOne acceptance or live registration on another account or architecture.
+Run the finite shared-queue validation batch documented in CONTRIBUTING.md. Backend regressions cover automatic legacy migration, original configuration and service backups, live queued/running jobs and original caller results, pause and limit preservation, legacy fallback, interrupted handover and publication, retained runtime custody and later setup reclamation, approval waiting without repeated registration, stale revisions, changed backup evidence and unrelated ownership. Native regressions exercise read-only packaged launch across fresh, incomplete and stale installations, missing registration, approval resumption, diagnostic isolation and installation readback. Graphical fixtures use disposable homes and injected executors; Homebrew fixtures exercise the plain app cask, quarantine retention and uninstall without touching runtime files. These local proofs do not establish native Service Management worker survival, Apple signing, notarization, release publication, SentinelOne acceptance or live registration on another account or architecture.

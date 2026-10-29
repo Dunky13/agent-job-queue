@@ -1935,7 +1935,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        bootstrap?.isRunning == true ? .terminateCancel : .terminateNow
+        guard bootstrap?.isRunning == true else { return .terminateNow }
+        // Silent setup has no window; explain why quitting or logout waits.
+        showSetupWindow()
+        return .terminateCancel
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let bootstrap, bootstrap.phase != .complete, bootstrap.phase != .idle { showSetupWindow() }
+        return false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

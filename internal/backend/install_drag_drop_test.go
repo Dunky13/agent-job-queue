@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -114,11 +115,19 @@ func TestManagedLoadedBundleProgramRequiresThisHelper(t *testing.T) {
 		want       bool
 	}{
 		{"running helper", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon"), self, true},
-		{"stopped helper", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon"), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", true},
+		{"stopped helper", []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = not running", 1)), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", true},
 		{"other executable", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon"), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", false},
 		{"other bundle", output("Contents/MacOS/agent-heavy", "io.example.other", "", "agent-heavy", "daemon"), self, false},
 		{"other helper", output("Contents/MacOS/agent-remote", "io.went.agent-queue", "", "agent-heavy", "daemon"), self, false},
 		{"other command", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "scheduler"), self, false},
+		{"pid zero", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "0", "agent-heavy", "daemon"), self, false},
+		{"pid one", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "1", "agent-heavy", "daemon"), self, false},
+		{"malformed pid", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "abc", "agent-heavy", "daemon"), self, false},
+		{"two pids", append(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon"), []byte("\tpid = "+pid+"\n")...), self, false},
+		{"two identifiers", append(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon"), []byte("\tprogram identifier = Contents/MacOS/agent-heavy (mode: 2)\n")...), self, false},
+		{"missing arguments", []byte("\tprogram identifier = Contents/MacOS/agent-heavy (mode: 2)\n\tparent bundle identifier = io.went.agent-queue\n"), self, false},
+		{"running without pid", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon"), self, false},
+		{"stopped without pid", []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = spawn scheduled", 1)), self, true},
 	} {
 		if got := managedLoadedBundleProgram(test.raw, test.executable, "agent-heavy", "daemon"); got != test.want {
 			t.Errorf("%s: custody %v, want %v", test.name, got, test.want)
@@ -173,4 +182,101 @@ func TestManagedAppBundleNewerBuildSupersedesInterruptedSetup(t *testing.T) {
 	if _, err := os.Lstat(marker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("completed setup retained the interrupted marker", err)
 	}
+}
+
+func TestManagedAppBundlePlanningReadsStoppedStoreWhenDaemonIsUnreachable(t *testing.T) {
+	m := managedTestFixture(t)
+	if err := m.run(t); err != nil {
+		t.Fatal(err)
+	}
+	i := m.installer
+	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
+	store, err := openQueueStore(i.state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.close()
+	i.queueSnapshot = func(context.Context) (Object, error) { return nil, errors.New("queue daemon temporarily unavailable") }
+	ctx := context.Background()
+	if _, err := i.planManaged(ctx); err != nil {
+		t.Fatal("a drained stopped store did not authorize planning", err)
+	}
+	held, err := installLock(i.state, "queue-daemon.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.planManaged(ctx); err == nil || !strings.Contains(err.Error(), "Cannot verify the installed queue is drained") {
+		t.Fatal("a daemon holding its lifetime lock was bypassed", err)
+	}
+	held.Close()
+	i.appBundle, i.payload = false, filepath.Join(filepath.Dir(i.payload), "unused")
+	if _, err := i.planManaged(ctx); err == nil {
+		t.Fatal("payload setup used the stopped-store fallback")
+	}
+	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
+	store, err = openQueueStore(i.state, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.db.Exec("INSERT INTO queue_jobs(id,token,task,phase) VALUES(41,'fixture','{}','running')")
+	store.close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := i.planManaged(ctx); err == nil {
+		t.Fatal("an unfinished stopped job was accepted")
+	}
+}
+
+func TestManagedAppBundleKeepsCustodyThatStillGuardsABundle(t *testing.T) {
+	t.Run("backup beside deleted app", func(t *testing.T) {
+		m, old := managedDraggedFixture(t, false)
+		if err := os.MkdirAll(filepath.Join(filepath.Dir(old), ".Agent Queue.previous.app"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.run(t); err == nil {
+			t.Fatal("a deleted app with a retained backup was adopted")
+		}
+		managedRequireNoServiceMutation(t, m.calls)
+	})
+	t.Run("receipt with pending setup", func(t *testing.T) {
+		m, _ := managedDraggedFixture(t, true)
+		i := m.installer
+		identity, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := installAtomic(filepath.Join(i.root, "install-in-progress.json"), mustMetadataJSON(t, identity), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.run(t); err == nil {
+			t.Fatal("a receipt for pending setup was treated as superseded")
+		}
+		if _, err := os.Lstat(i.managedReceiptPath()); err != nil {
+			t.Fatal("pending publication receipt was not preserved", err)
+		}
+	})
+	t.Run("newer build with retained receipt", func(t *testing.T) {
+		m := managedTestFixture(t)
+		if err := m.run(t); err != nil {
+			t.Fatal(err)
+		}
+		i := m.installer
+		marker := filepath.Join(i.root, "install-in-progress.json")
+		if err := installAtomic(marker, mustMetadataJSON(t, metadataTestInfo(t, "124")), 0600); err != nil {
+			t.Fatal(err)
+		}
+		integrationTestWrite(t, i.managedReceiptPath(), []byte("{}"))
+		managedCandidate(t, m, "125")
+		if err := os.RemoveAll(i.app); err != nil {
+			t.Fatal(err)
+		}
+		if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
+			t.Fatal(err)
+		}
+		i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
+		if superseded, err := i.managedPendingSuperseded(metadataTestInfo(t, "125"), metadataTestInfo(t, "124")); err != nil || superseded {
+			t.Fatal("a retained receipt did not keep the pending build authoritative", superseded, err)
+		}
+	})
 }

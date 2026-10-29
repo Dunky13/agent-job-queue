@@ -259,9 +259,10 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		// A registered daemon that launchd cannot spawn, such as a replaced
 		// bundle awaiting re-registration, answers nothing and holds no
 		// lifetime lock. Its stopped store is then authoritative for planning.
-		// The owned resource controller may still run; quiescence stops it and
-		// repeats the complete offline drain before any mutation.
-		if busy, lockErr := installInspectLock(install.state, "queue-daemon.lock"); lockErr == nil && !busy && exists {
+		// The owned resource controller may still run: it never writes the
+		// queue store, and app-bundle setup quiesces it and repeats the
+		// complete offline drain before any mutation.
+		if busy, lockErr := installInspectLock(install.state, "queue-daemon.lock"); install.appBundle && lockErr == nil && !busy && exists {
 			return install.managedOfflineDrainHolding(ctx, "queue-daemon.lock")
 		}
 		return fmt.Errorf("Cannot verify the installed queue is drained; no service was changed: %w", err)
@@ -382,6 +383,11 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	}
 	if p.previous != nil {
 		if p.previous.App != install.app {
+			if exists, err := updateExists(p.previous.App); err != nil {
+				return nil, err
+			} else if !exists {
+				return nil, fmt.Errorf("Agent Queue was installed at %s and its background services are still registered there. Stop them with: agent-heavy install --app-bundle %s --unregister-services, then open Agent Queue again", p.previous.App, installQuote(p.previous.App))
+			}
 			return nil, fmt.Errorf("Agent Queue is already installed at %s; that location changed. Quit Agent Queue and drag this copy over that one, or move that copy to the Trash, then open Agent Queue again", p.previous.App)
 		}
 		if err := appservices.ValidateApp(install.home, p.previous.App); err != nil {
@@ -634,7 +640,7 @@ func (install *installer) managedLoaded(raw []byte, label, app string) error {
 // be stopped in error, so this app's bundle and helper identity suffice.
 func managedLoadedBundleProgram(raw []byte, executable, helper, command string) bool {
 	identifiers, bundles, pids, blocks := 0, 0, 0, 0
-	identified, bundled := false, false
+	identified, bundled, running := false, false, false
 	pid := 0
 	arguments := []string{}
 	inArguments := false
@@ -662,6 +668,8 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 		case strings.HasPrefix(trimmed, "parent bundle identifier = "):
 			bundles++
 			bundled = trimmed == "parent bundle identifier = io.went.agent-queue"
+		case line == "\tstate = running":
+			running = true
 		case strings.HasPrefix(line, "\tpid = "):
 			pids++
 			value, err := strconv.Atoi(strings.TrimPrefix(line, "\tpid = "))
@@ -675,7 +683,7 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 		return false
 	}
 	if pids == 0 {
-		return true
+		return !running
 	}
 	if pid <= 1 {
 		return false

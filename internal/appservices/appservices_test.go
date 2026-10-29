@@ -50,7 +50,15 @@ func TestStockApplicationsHoldsDragAndDropExecutables(t *testing.T) {
 		{0775, 0, 20, false},
 		{0775, 501, AdminGroup, false},
 	} {
-		st := unix.Stat_t{Mode: uint16(unix.S_IFDIR | test.mode), Uid: test.uid, Gid: test.gid}
+		path := t.TempDir()
+		if err := os.Chmod(path, os.FileMode(test.mode)); err != nil {
+			t.Fatal(err)
+		}
+		var st unix.Stat_t
+		if err := unix.Stat(path, &st); err != nil {
+			t.Fatal(err)
+		}
+		st.Uid, st.Gid = test.uid, test.gid
 		if got := serviceParentSafe("/Applications", boundary, true, true, &st); got != test.want {
 			t.Fatalf("mode %o uid %d gid %d: executable custody %v, want %v", test.mode, test.uid, test.gid, got, test.want)
 		}

@@ -60,17 +60,17 @@ func makeFixture(t *testing.T) *fixture {
 	}
 	f.keyPath = filepath.Join(f.dir, "AuthKey.p8")
 	writeFile(t, f.keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
-	f.archive = filepath.Join(f.dir, "payload.zip")
+	f.archive = filepath.Join(f.dir, "Agent-Queue-0.1.0-universal.zip")
 	writeFile(t, f.archive, []byte("synthetic archive, no provider writes"))
 	digest := sha256.Sum256([]byte("synthetic archive, no provider writes"))
 	f.hash = hex.EncodeToString(digest[:])
-	f.record = filepath.Join(f.dir, "payload.json")
+	f.record = filepath.Join(f.dir, "app.json")
 	f.env = map[string]string{"NOTARY_KEY_FILE": f.keyPath, "NOTARY_KEY_ID": testKeyID, "NOTARY_ISSUER_ID": testIssuer, "GITHUB_RUN_ATTEMPT": "2"}
 	f.creds, err = loadCredentials(f.getenv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.writeRecord(t, stageRecord{Stage: "payload", Phase: "prepared", PreparedAttempt: "2", ArchiveSHA256: f.hash})
+	f.writeRecord(t, stageRecord{Stage: "app", Phase: "prepared", PreparedAttempt: "2", ArchiveSHA256: f.hash})
 	return f
 }
 func writeFile(t *testing.T, path string, data []byte) {
@@ -348,6 +348,39 @@ func TestInvalidPreparedStateNeverContactsProvider(t *testing.T) {
 	}
 }
 
+func TestSubmitAcceptsOnlyAppAndDiskImageStages(t *testing.T) {
+	for _, test := range []struct {
+		stage    string
+		accepted bool
+	}{{"app", true}, {"dmg", true}, {"payload", false}, {"installer", false}, {"", false}} {
+		t.Run("stage-"+test.stage, func(t *testing.T) {
+			f := makeFixture(t)
+			r := f.readRecord(t)
+			r.Stage = test.stage
+			f.writeRecord(t, r)
+			posts := 0
+			c := f.client(func(req *http.Request) (*http.Response, error) {
+				if req.Method == "POST" {
+					posts++
+				}
+				return nil, errors.New("synthetic transport stop")
+			})
+			_, err := f.command(context.Background(), f.submitArgs(), c)
+			if test.accepted {
+				// Reaching the transport proves the record passed validation.
+				if err == failure("invalid_record") || err == nil {
+					t.Fatalf("stage %q was not accepted: %v", test.stage, err)
+				}
+				return
+			}
+			requireError(t, err, "invalid_record")
+			if posts != 0 {
+				t.Fatalf("refused stage %q reached the provider", test.stage)
+			}
+		})
+	}
+}
+
 func TestSubmitDurableOrderingAndNoRecreation(t *testing.T) {
 	for _, kind := range []string{"success", "run-owned", "partial-upload", "malformed-attrs", "wrong-type-attrs", "persist-id-failure", "persist-intent-failure", "auth-failure"} {
 		t.Run(kind, func(t *testing.T) {
@@ -384,7 +417,7 @@ func TestSubmitDurableOrderingAndNoRecreation(t *testing.T) {
 				if err = json.Unmarshal(data, &body); err != nil {
 					t.Fatal(err)
 				}
-				if body["sha256"] != f.hash || body["submissionName"] != "payload.zip" || len(body) != 2 {
+				if body["sha256"] != f.hash || body["submissionName"] != "Agent-Queue-0.1.0-universal.zip" || len(body) != 2 {
 					t.Fatalf("bad body: %s", data)
 				}
 				attrs := goodAttrs
@@ -913,8 +946,8 @@ func TestCLIPhysicalParentsAndPrivateMktempOutput(t *testing.T) {
 	}
 	f.keyPath = filepath.Join(alias, "AuthKey.p8")
 	f.env["NOTARY_KEY_FILE"] = f.keyPath
-	f.archive = filepath.Join(alias, "payload.zip")
-	f.record = filepath.Join(alias, "payload.json")
+	f.archive = filepath.Join(alias, "Agent-Queue-0.1.0-universal.zip")
+	f.record = filepath.Join(alias, "app.json")
 	calls := 0
 	c := f.client(func(r *http.Request) (*http.Response, error) {
 		calls++

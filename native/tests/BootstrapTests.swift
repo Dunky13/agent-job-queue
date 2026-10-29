@@ -116,8 +116,16 @@ struct BootstrapTests {
             var completed = false
             let startup = QueueBootstrapModel(environment: managed.environment, execute: { request, _ in
                 try await readback.execute(request)
-            }) { completed = true }
-            await startup.start()?.value
+            }, waitInterval: .milliseconds(1)) { completed = true }
+            let task = startup.start()
+            if status == "requiresApproval" {
+                // Approval polling continues until macOS allows the services.
+                try await waitUntil { startup.phase == .waiting }
+                try check(startup.requiresServiceApproval && !completed,
+                    "Managed requiresApproval waits for macOS approval without re-registration")
+                startup.cancelWaiting()
+            }
+            await task?.value
             let requests = await readback.requests
             try check(!requests.isEmpty && requests.allSatisfy { $0.arguments.prefix(2) == ["--service-management", "status"] },
                 "Managed startup reads service status only for \(status)")
@@ -127,10 +135,9 @@ struct BootstrapTests {
             } else if status == "invalid" {
                 try check(startup.phase == .failed && !completed,
                     "Malformed managed service status cannot authorize readiness")
-            } else {
-                try check(startup.phase == .setupRequired && !completed &&
-                    startup.requiresServiceApproval == (status == "requiresApproval"),
-                    "Managed \(status) respects macOS approval and cannot trigger re-registration")
+            } else if status != "requiresApproval" {
+                try check(startup.phase == .setupRequired && !completed && !startup.requiresServiceApproval,
+                    "Managed \(status) cannot trigger re-registration during startup")
             }
         }
 
@@ -169,6 +176,20 @@ struct BootstrapTests {
         try check(!deniedCompleted && !deniedModel.isRunning &&
             deniedRequests.allSatisfy({ $0.arguments.prefix(2) == ["--service-management", "status"] }),
             "Cancelling macOS approval waiting stops polling without registering or enabling a denied service")
+
+        let awaiting = try BootstrapFixture(parent: temporary, managed: true)
+        let awaitingExecutor = BootstrapApprovalRetryFixture(awaiting)
+        var awaitingCompleted = false
+        var awaitingShown = 0
+        let awaitingModel = QueueBootstrapModel(environment: awaiting.environment, execute: { request, output in
+            try await awaitingExecutor.execute(request, output: output)
+        }, waitInterval: .milliseconds(1)) { awaitingCompleted = true }
+        awaitingModel.onSetupRequired = { awaitingShown += 1 }
+        await awaitingModel.start()?.value
+        let awaitingInstalls = await awaitingExecutor.installations
+        try check(awaitingCompleted && awaitingModel.phase == .complete && awaitingInstalls == 2 && awaitingShown >= 1 &&
+            !awaitingModel.requiresServiceApproval,
+            "Setup stopped for macOS approval waits visibly, then runs setup again and opens the queue")
 
         let tamperedManaged = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try tamperedManaged.installManaged()

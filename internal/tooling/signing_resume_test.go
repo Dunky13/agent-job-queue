@@ -370,10 +370,11 @@ func TestMacOSResumeRESTTimeoutCompatibility(t *testing.T) {
 	}
 }
 
-func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T) {
-	f := newRESTResumeFixture(t)
-	f.step(t, "prepare", "app")
-	f.step(t, "submit", "app")
+// buildRealNotaryCLI builds the production queue-tool and writes a synthetic
+// API key, so a test can drive the real notarization client against a refused
+// local proxy instead of Apple.
+func buildRealNotaryCLI(t *testing.T, f resumeFixture) string {
+	t.Helper()
 	tool := filepath.Join(f.root, "tools", "queue-tool-real")
 	build := exec.Command("go", "build", "-p", "2", "-o", tool, "../../cmd/queue-tool")
 	build.Env = signingTestEnvironment()
@@ -391,18 +392,39 @@ func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T
 	if err := os.WriteFile(filepath.Join(f.root, "synthetic-notary.p8"), pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0600); err != nil {
 		t.Fatal(err)
 	}
-	// Refuse CONNECT locally, before TLS or any provider request. Both commands
-	// must reach this proxy, proving real key/output parsing accepted the same
-	// temporary paths used by the shell, including macOS system parent aliases.
+	return tool
+}
+
+// refusingConnectProxy answers every CONNECT to Apple with 502 before TLS and
+// counts them. Other methods are ignored: local developer tooling can probe
+// any localhost listener, and the Go client only ever sends CONNECT here.
+func refusingConnectProxy(t *testing.T) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
 	var connects atomic.Int32
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodConnect || r.Host != "appstoreconnect.apple.com:443" || r.Header.Get("Authorization") != "" {
+		if r.Method != http.MethodConnect {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if r.Host != "appstoreconnect.apple.com:443" || r.Header.Get("Authorization") != "" {
 			t.Errorf("unexpected proxy request: %s %s", r.Method, r.Host)
 		}
 		connects.Add(1)
 		w.WriteHeader(http.StatusBadGateway)
 	}))
-	defer proxy.Close()
+	t.Cleanup(proxy.Close)
+	return proxy, &connects
+}
+
+func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T) {
+	f := newRESTResumeFixture(t)
+	f.step(t, "prepare", "app")
+	f.step(t, "submit", "app")
+	tool := buildRealNotaryCLI(t, f)
+	// Refuse CONNECT locally, before TLS or any provider request. Both commands
+	// must reach this proxy, proving real key/output parsing accepted the same
+	// temporary paths used by the shell, including macOS system parent aliases.
+	proxy, connects := refusingConnectProxy(t)
 	output, err := f.run(t, []string{
 		"QUEUE_NOTARY_TOOL=" + tool, "NOTARY_KEY_ID=TESTKEY001",
 		"NOTARY_TIMEOUT=300",
@@ -416,6 +438,31 @@ func TestMacOSResumeRESTActualCLIWaitAndLogUsePrivateTemporaryPaths(t *testing.T
 		t.Fatal("real CLI failure fell back to native notarization")
 	}
 	f.command(t, nil, "verify-state", f.state, "0.1.0")
+}
+
+func TestMacOSResumeRESTActualCLISubmitAcceptsAppStageRecord(t *testing.T) {
+	f := newRESTResumeFixture(t)
+	f.step(t, "prepare", "app")
+	tool := buildRealNotaryCLI(t, f)
+	// Refuse CONNECT locally. Reaching the proxy proves the real client parsed
+	// the app record and passed every pre-provider check; it never contacts Apple.
+	proxy, connects := refusingConnectProxy(t)
+	output, err := f.run(t, []string{
+		"QUEUE_NOTARY_TOOL=" + tool, "NOTARY_KEY_ID=TESTKEY001",
+		"HTTPS_PROXY=" + proxy.URL, "HTTP_PROXY=" + proxy.URL, "ALL_PROXY=", "NO_PROXY=",
+		"https_proxy=" + proxy.URL, "http_proxy=" + proxy.URL, "all_proxy=", "no_proxy=",
+	}, "submit", f.state, "app", "0.1.0")
+	if err == nil || strings.Contains(output, "invalid_record") || connects.Load() != 1 || !strings.Contains(output, "notarization: request_failed") {
+		t.Fatalf("real CLI did not accept the app record and reach authentication: connects=%d, %v\n%s", connects.Load(), err, output)
+	}
+	// Authentication precedes the upload-intent write, so the record stays resubmittable.
+	record, readErr := os.ReadFile(filepath.Join(f.state, "stages/app.json"))
+	if readErr != nil || !strings.Contains(string(record), `"phase": "prepared"`) && !strings.Contains(string(record), `"phase":"prepared"`) {
+		t.Fatalf("failed authentication changed the app record: %v: %s", readErr, record)
+	}
+	if strings.Contains(f.recorded(t), "xcrun|notarytool|") {
+		t.Fatal("real CLI failure fell back to native notarization")
+	}
 }
 
 func TestMacOSResumeBindsLegacyStateOnlyAfterActualOriginVerification(t *testing.T) {

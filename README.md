@@ -62,6 +62,19 @@ Releases from the distribution workflow are Developer ID signed, notarized and s
 
 If macOS blocks a downloaded build you trust, open **System Settings > Privacy & Security**, choose **Open Anyway** next to **Agent Queue**, and confirm. Do not clear quarantine to work around a failed verification of a release advertised as notarized. See [Apple's opening instructions](https://support.apple.com/102445).
 
+### Upgrading from the installer
+
+Earlier releases shipped `Agent Job Queue Installer.app`, which installed `~/Applications/Agent Queue.app` and ran the services from that copy. That location stays recorded as the managed one, and setup refuses a new copy placed anywhere else (for example `/Applications` from the new DMG or cask) while the recorded copy exists. Either:
+
+- Quit Agent Queue, drag the new app over `~/Applications/Agent Queue.app` and choose **Replace**, then open it; or
+- Stop the old services, move the old app to the Trash, then open the new app wherever you installed it:
+
+  ```sh
+  ~/.local/bin/agent-heavy install --app-bundle "$HOME/Applications/Agent Queue.app" --unregister-services
+  ```
+
+Homebrew users upgrading from the installer cask must use the second route: the old cask left `~/Applications/Agent Queue.app` in place, so run the command above, move that app to the Trash, then `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` (or install it) and open the app from Applications. Queue history, settings, credentials and certificates are kept. If jobs are queued or running, finish them first or see [upgrade recovery](docs/upgrade-recovery.md).
+
 ## Version and updates
 
 Choose **About and updates** from the queue's gear menu to see the running app and installed controller versions. **Check for updates** finds published builds. **Download update** downloads and verifies the selected build, places a verified copy of `Agent Queue.app` in your Downloads folder and reveals it in Finder. Quit Agent Queue, drag the new copy into Applications and choose **Replace**; opening it finishes the update. Checking never installs anything and tracked downgrades are refused. Details are in [Installed version and updates](docs/updates.md).
@@ -201,12 +214,14 @@ The installation uses these intentional per-user locations:
 
 | Purpose | Location |
 | --- | --- |
-| App | `~/Applications/Agent Queue.app` |
-| CLI commands | `~/.local/bin/agent-heavy`, `~/.local/bin/agent-remote` |
-| Go backend binaries, build identity, and licenses | `~/.local/share/agent-heavy/` |
+| App (everything runs from inside it) | `/Applications/Agent Queue.app` or `~/Applications/Agent Queue.app` |
+| CLI commands (wrappers that call the app's bundled tools) | `~/.local/bin/agent-heavy`, `~/.local/bin/agent-remote` |
+| Installation markers (`installation.json`, `build-info.json`), no binaries | `~/.local/share/agent-heavy/` |
 | Private configuration | `~/.config/agent-heavy/` |
 | Private jobs, receipts, logs and daemon state | `~/.local/state/agent-heavy/` |
-| Login services | `~/Library/LaunchAgents/io.went.agent-*.plist` |
+| Login services | Bundle-owned, registered with Service Management from `Agent Queue.app/Contents/Library/LaunchAgents/io.went.agent-*.plist` |
+
+No executables are copied out of the app bundle, and new installs write nothing to `~/Library/LaunchAgents`. When migrating from an earlier installer-based install, setup can retire and back up legacy `io.went.agent-*.plist` definitions found there.
 
 The dedicated Go daemon uses a private Unix socket and a durable SQLite database. The queue fails closed when its daemon, state, or process ownership cannot be verified. Do not clear a lock or kill a process to bypass an unknown owner.
 

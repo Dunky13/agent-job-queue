@@ -27,7 +27,7 @@ struct QueueBootstrapEnvironment: Sendable {
 
     func validateDiagnostics() throws {
         if arguments.filter({ $0 == "--setup" }).count > 1 || arguments.contains(where: { $0.hasPrefix("--setup=") }) {
-            throw ClientError.message("Use --setup once to open the explicit installation workflow.")
+            throw ClientError.message("Pass --setup at most once; setup runs automatically on launch.")
         }
         let fixtureIndices = arguments.indices.filter { arguments[$0] == "--fixture" }
         if !fixtureIndices.isEmpty || arguments.contains(where: { $0.hasPrefix("--fixture=") }) {
@@ -586,17 +586,17 @@ final class QueueBootstrapModel: ObservableObject {
                     self.request = request
                     if disablePhoneAccess {
                         legacyPhoneAccess = false
-                        try await install(QueueBootstrapRequest(executable: request.executable,
+                        try await installAwaitingApproval(QueueBootstrapRequest(executable: request.executable,
                             arguments: request.arguments + ["--disable-phone-access"]), reason: reason, current: current)
                     } else if try await preflight(request, current: current) {
-                        try await install(request, reason: reason, current: current)
+                        try await installAwaitingApproval(request, reason: reason, current: current)
                     }
                 } else {
                     for statusRequest in try environment.serviceStatusRequests() {
                         let status = try await serviceStatus(statusRequest)
                         guard status == "enabled" else {
                             requiresServiceApproval = status == "requiresApproval"
-                            if requiresServiceApproval && !environment.allowsInstallation {
+                            if requiresServiceApproval {
                                 _ = try await continueAfterServiceApproval(current: current, alreadyObserved: true)
                                 return
                             }
@@ -645,7 +645,7 @@ final class QueueBootstrapModel: ObservableObject {
                 _ = try QueueBootstrapReport.decode(data)
                 guard attempt == current else { return }
                 if try await preflight(request, current: current) {
-                    try await install(request, reason: reason, current: current)
+                    try await installAwaitingApproval(request, reason: reason, current: current)
                 }
             } catch { await fail(error, current: current) }
         }
@@ -665,7 +665,7 @@ final class QueueBootstrapModel: ObservableObject {
                     guard case let .install(request, reason) = decision else { finish(current); return }
                     self.request = request
                     if try await preflight(request, current: current, waiting: true) {
-                        try await install(request, reason: reason, current: current)
+                        try await installAwaitingApproval(request, reason: reason, current: current)
                         return
                     }
                     guard issues.allSatisfy({ Self.approvedRepairStep($0) != nil }) else {
@@ -730,7 +730,7 @@ final class QueueBootstrapModel: ObservableObject {
                     guard case let .install(request, reason) = decision else { finish(current); return }
                     self.request = request
                     if try await preflight(request, current: current, waiting: true) {
-                        try await install(request, reason: reason, current: current)
+                        try await installAwaitingApproval(request, reason: reason, current: current)
                         return
                     }
                     guard issues.allSatisfy({ $0.actions.contains(where: { $0.id == "wait" }) }) else {
@@ -863,6 +863,25 @@ final class QueueBootstrapModel: ObservableObject {
         var statuses: [String] = []
         for request in requests { statuses.append(try await serviceStatus(request)) }
         guard alreadyObserved || statuses.contains("requiresApproval") else { return false }
+        statuses = try await awaitServiceApproval(requests, statuses: statuses, current: current)
+        let decision = try await Task.detached(priority: .utility, operation: inspect).value
+        guard attempt == current else { throw CancellationError() }
+        if decision == .ready && statuses.allSatisfy({ $0 == "enabled" }) {
+            finish(current)
+        } else if case let .install(request, reason) = decision, allowsInstallation {
+            self.request = request
+            try await installAwaitingApproval(request, reason: reason, current: current)
+        } else {
+            phase = .setupRequired
+            message = "Setup must finish before Agent Queue can open"
+            output = allowsInstallation ? "Check again to finish setup." : "Setup is disabled for this launch, so background services were not installed, repaired or registered."
+        }
+        return true
+    }
+
+    /// Opens the window and polls until macOS no longer requires approval.
+    private func awaitServiceApproval(_ requests: [QueueBootstrapRequest], statuses initial: [String], current: Int) async throws -> [String] {
+        var statuses = initial
         requiresServiceApproval = true
         onSetupRequired?()
         while statuses.contains("requiresApproval") {
@@ -879,16 +898,27 @@ final class QueueBootstrapModel: ObservableObject {
         try Task.checkCancellation()
         requiresServiceApproval = false
         phase = .checking
-        let decision = try await Task.detached(priority: .utility, operation: inspect).value
-        guard attempt == current else { throw CancellationError() }
-        if decision == .ready && statuses.allSatisfy({ $0 == "enabled" }) {
-            finish(current)
-        } else {
-            phase = .setupRequired
-            message = "Setup must finish before Agent Queue can open"
-            output = "Setup is disabled for this launch, so background services were not installed, repaired or registered."
+        return statuses
+    }
+
+    /// Setup stops with the approval marker while macOS has not yet allowed
+    /// the app's background services. Wait for approval, then run setup again.
+    private func installAwaitingApproval(_ request: QueueBootstrapRequest, reason: String, current: Int) async throws {
+        while true {
+            do {
+                try await install(request, reason: reason, current: current)
+                return
+            } catch {
+                guard !(error is CancellationError), attempt == current,
+                      QueueSetupProgress.parse(error.localizedDescription).requiresServiceApproval else { throw error }
+                let requests = try environment.serviceStatusRequests()
+                var statuses: [String] = []
+                for status in requests { statuses.append(try await serviceStatus(status)) }
+                // Without a pending approval another attempt would fail the same way.
+                guard statuses.contains("requiresApproval") else { throw error }
+                _ = try await awaitServiceApproval(requests, statuses: statuses, current: current)
+            }
         }
-        return true
     }
 
     private func finish(_ current: Int) {

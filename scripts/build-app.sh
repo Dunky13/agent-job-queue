@@ -57,6 +57,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
+<key>NSDownloadsFolderUsageDescription</key><string>Agent Queue saves verified updates to your Downloads folder.</string>
 <key>AgentQueueEmbeddedPayload</key><true/>
 <key>AgentQueueServiceManagement</key><true/>
 </dict></plist>

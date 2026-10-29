@@ -54,6 +54,7 @@ func updateTestFixture(t *testing.T) *updateFixture {
 	f.client = NewUpdateClient(f.root, f.app, f.state)
 	f.client.download = f.download(t)
 	f.client.Downloads = f.downloads
+	f.client.now = func() time.Time { return time.Unix(1800000000, 0) }
 	f.client.command = func(ctx context.Context, args []string) error {
 		f.commands = append(f.commands, append([]string{}, args...))
 		if args[0] == "/usr/bin/ditto" && args[1] != "-x" {
@@ -549,8 +550,12 @@ func TestUpdatesDownloadDeliversVerifiedAppAndNeverOverwrites(t *testing.T) {
 	for _, args := range f.commands {
 		commands = append(commands, args[0])
 	}
-	if strings.Join(commands, ",") != "/usr/bin/ditto,/usr/bin/codesign,/usr/bin/ditto,/usr/bin/codesign,/usr/bin/open" || !strings.HasPrefix(f.commands[2][1], filepath.Join(f.state, "updates")) || f.commands[2][2] != delivered || f.commands[4][1] != "-R" || f.commands[4][2] != delivered {
+	if strings.Join(commands, ",") != "/usr/bin/ditto,/usr/bin/codesign,/usr/bin/ditto,/usr/bin/codesign,/usr/bin/xattr,/usr/bin/open" || !strings.HasPrefix(f.commands[2][1], filepath.Join(f.state, "updates")) || f.commands[2][2] != delivered || f.commands[5][1] != "-R" || f.commands[5][2] != delivered {
 		t.Fatalf("unsafe delivery: %v", f.commands)
+	}
+	// The bundle is quarantined like a browser download, after both verifications.
+	if want := []string{"/usr/bin/xattr", "-w", "com.apple.quarantine", "0081;6b49d200;Agent Queue;", delivered}; !reflect.DeepEqual(f.commands[4], want) {
+		t.Fatalf("quarantine command = %v, want %v", f.commands[4], want)
 	}
 	if _, err := f.client.verifyPackage(context.Background(), filepath.Dir(delivered), f.manifest); err != nil {
 		t.Fatalf("delivered app is not the verified build: %v", err)
@@ -671,6 +676,88 @@ func TestUpdatesFailuresNeverDeliverOrLeakPreparation(t *testing.T) {
 				t.Fatalf("stage leaked: %v", entries)
 			}
 		})
+	}
+}
+
+func TestUpdatesQuarantineFailureRemovesOnlyTheCreatedFolder(t *testing.T) {
+	f := updateTestFixture(t)
+	f.install(t, 10, strings.Repeat("b", 40))
+	occupied := filepath.Join(f.downloads, "Agent Queue 0.1.0 (build 20)")
+	integrationTestWrite(t, filepath.Join(occupied, "keep"), []byte("user file"))
+	command := f.client.command
+	f.client.command = func(ctx context.Context, args []string) error {
+		if args[0] == "/usr/bin/xattr" {
+			f.commands = append(f.commands, append([]string{}, args...))
+			return errors.New("xattr failed")
+		}
+		return command(ctx, args)
+	}
+	if _, err := f.client.DownloadUpdate(20); err == nil || !strings.Contains(err.Error(), "Could not mark the new copy as downloaded") {
+		t.Fatalf("quarantine failure was not reported: %v", err)
+	}
+	if string(integrationTestRead(t, filepath.Join(occupied, "keep"))) != "user file" {
+		t.Fatal("existing download folder was changed")
+	}
+	entries, err := os.ReadDir(f.downloads)
+	if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(occupied) {
+		t.Fatalf("created folder was not removed alone: %v %v", entries, err)
+	}
+	for _, args := range f.commands {
+		if args[0] == "/usr/bin/open" {
+			t.Fatal("failure revealed an unquarantined update")
+		}
+	}
+	staged, err := os.ReadDir(filepath.Join(f.state, "updates"))
+	if err != nil || len(staged) != 0 {
+		t.Fatalf("staging retained: %v %v", staged, err)
+	}
+}
+
+func TestUpdatesDownloadsPermissionDeniedIsExplained(t *testing.T) {
+	for _, kind := range []string{"create", "stat"} {
+		t.Run(kind, func(t *testing.T) {
+			f := updateTestFixture(t)
+			f.install(t, 10, strings.Repeat("b", 40))
+			if kind == "create" {
+				// Searchable but not writable: mkdir fails with EACCES, as EPERM does under macOS privacy.
+				if err := os.Chmod(f.downloads, 0500); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Chmod(f.downloads, 0); err != nil {
+					t.Fatal(err)
+				}
+				f.client.Downloads = filepath.Join(f.downloads, "inner")
+			}
+			t.Cleanup(func() { _ = os.Chmod(f.downloads, 0700) })
+			if unix.Access(f.downloads, unix.W_OK) == nil {
+				t.Skip("directory permissions are not enforced for this user")
+			}
+			_, err := f.client.DownloadUpdate(20)
+			want := "Agent Queue cannot write to your Downloads folder. Allow it in System Settings > Privacy & Security > Files and Folders, then try again"
+			if err == nil || err.Error() != want {
+				t.Fatalf("permission error = %v, want %q", err, want)
+			}
+			for _, args := range f.commands {
+				if args[0] == "/usr/bin/xattr" || args[0] == "/usr/bin/open" {
+					t.Fatalf("denied download continued: %v", f.commands)
+				}
+			}
+		})
+	}
+}
+
+func TestUpdatesDestinationMapsEPERMToPrivacyMessage(t *testing.T) {
+	// macOS reports EPERM, not EACCES, while Downloads access is undecided.
+	f := updateTestFixture(t)
+	f.install(t, 10, strings.Repeat("b", 40))
+	f.client.mkdir = func(string, os.FileMode) error { return &os.PathError{Op: "mkdir", Path: f.downloads, Err: unix.EPERM} }
+	_, err := f.client.DownloadUpdate(20)
+	if err == nil || !strings.HasPrefix(err.Error(), "Agent Queue cannot write to your Downloads folder. Allow it in System Settings > Privacy & Security > Files and Folders") {
+		t.Fatalf("EPERM was not explained: %v", err)
+	}
+	if entries, readErr := os.ReadDir(f.downloads); readErr != nil || len(entries) != 0 {
+		t.Fatalf("denied download left files: %v %v", entries, readErr)
 	}
 }
 

@@ -527,6 +527,8 @@ type UpdateClient struct {
 	Downloads        string
 	download         func(context.Context, string, int64, string) ([]byte, error)
 	command          func(context.Context, []string) error
+	now              func() time.Time
+	mkdir            func(string, os.FileMode) error
 	pages            int
 }
 
@@ -537,7 +539,7 @@ func NewUpdateClient(root, app, state string) *UpdateClient {
 	httpClient := updateHTTPClient()
 	return &UpdateClient{Root: root, App: app, State: state, Downloads: filepath.Join(integrationHome(), "Downloads"), download: func(ctx context.Context, url string, limit int64, dest string) ([]byte, error) {
 		return updateDownload(ctx, httpClient, url, limit, dest)
-	}, command: updateCommand, pages: updateMaxPages}
+	}, command: updateCommand, now: time.Now, mkdir: os.Mkdir, pages: updateMaxPages}
 }
 
 type updateSelection struct {
@@ -705,10 +707,26 @@ func (client *UpdateClient) verifyPackage(ctx context.Context, directory string,
 	return app, nil
 }
 
+var errUpdateDownloadsDenied = errors.New("Agent Queue cannot write to your Downloads folder. Allow it in System Settings > Privacy & Security > Files and Folders, then try again")
+
+// updateQuarantine marks the delivered bundle like a browser download. Go's HTTP
+// client sets no quarantine attribute, so without it Gatekeeper would never
+// assess the app on first open. 0081 is "downloaded, not yet approved by the user".
+func (client *UpdateClient) updateQuarantine(ctx context.Context, app string) error {
+	value := fmt.Sprintf("0081;%x;Agent Queue;", client.now().Unix())
+	if err := client.command(ctx, []string{"/usr/bin/xattr", "-w", "com.apple.quarantine", value, app}); err != nil {
+		return errors.New("Could not mark the new copy as downloaded. Download the app from the release page")
+	}
+	return nil
+}
+
 // updateDestination claims a fresh folder in Downloads with an exclusive mkdir,
 // so an earlier download or any other user file is never overwritten.
 func (client *UpdateClient) updateDestination(manifest Manifest) (string, error) {
 	info, err := os.Stat(client.Downloads)
+	if errors.Is(err, os.ErrPermission) {
+		return "", errUpdateDownloadsDenied
+	}
 	if err != nil || !info.IsDir() {
 		return "", errors.New("The Downloads folder is not available. Create it and try again")
 	}
@@ -719,9 +737,13 @@ func (client *UpdateClient) updateDestination(manifest Manifest) (string, error)
 			name = fmt.Sprintf("%s %d", base, suffix)
 		}
 		directory := filepath.Join(client.Downloads, name)
-		err := os.Mkdir(directory, 0755)
+		err := client.mkdir(directory, 0755)
 		if err == nil {
 			return directory, nil
+		}
+		if errors.Is(err, os.ErrPermission) {
+			// macOS answers EPERM until the user allows Downloads access for the app.
+			return "", errUpdateDownloadsDenied
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return "", err
@@ -839,6 +861,9 @@ func (client *UpdateClient) DownloadUpdate(build int) (Object, error) {
 		return nil, err
 	}
 	if _, err := client.verifyPackage(ctx, directory, manifest); err != nil {
+		return nil, err
+	}
+	if err := client.updateQuarantine(ctx, delivered); err != nil {
 		return nil, err
 	}
 	copied = true

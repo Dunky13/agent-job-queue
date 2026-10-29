@@ -80,7 +80,7 @@ func resetServer(t *testing.T, resetMethod string, resetCode http2.ErrCode, goAw
 						Name string `json:"submissionName"`
 						Hash string `json:"sha256"`
 					}
-					if err := json.Unmarshal(bodies[stream], &request); err != nil || request.Name != "payload.zip" || request.Hash != hash {
+					if err := json.Unmarshal(bodies[stream], &request); err != nil || request.Name != "Agent-Queue-0.1.0-universal.zip" || request.Hash != hash {
 						t.Errorf("invalid or incomplete create body: %q (%v)", bodies[stream], err)
 						return fmt.Errorf("invalid create body")
 					}
