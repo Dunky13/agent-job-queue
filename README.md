@@ -150,6 +150,19 @@ Replace `17` with a real job ID. The default parallel limit is one, adjustable f
 
 The queue limits how many wrapped commands can run. A command may still create many workers or use substantial memory, so configure worker limits within your build and test tools too. There is no host memory quota, and persistent agent processes are not controlled by this queue.
 
+## Plugins and lanes
+
+Plugins add **lanes**: named queues with their own concurrency, priority and share of the parallel limit. A plugin is a declarative manifest in `~/.config/agent-heavy/plugins/<name>/plugin.json`; it runs no code inside the queue. Optional hooks are separate, time-limited processes started on queue events. Without plugins, the queue behaves exactly as before in its `default` lane.
+
+```sh
+agent-heavy plugins list
+agent-heavy run --lane qa -- npm run e2e
+agent-heavy lane acquire qa --owner-pid "$PPID" --label "QA session" --timeout 60
+agent-heavy lane release 42 --owner-pid "$PPID"
+```
+
+A **lease** holds a lane slot without a command, for multi-step work such as driving an emulator across many agent tool calls. It ends when released, when its owner process exits, or when its optional TTL passes. See [plugins and lanes](docs/plugins.md) for the manifest, scheduling rules, lease commands, status fields and hooks.
+
 ## Learn job costs and schedule by available resources
 
 The installer also starts an independent resource controller. It samples host CPU, memory pressure, available memory, swap activity and disk capacity, and measures the owned workers of running jobs. Job details show predicted memory and CPU demand, observed memory peaks, CPU-seconds, sample counts and confidence. Monitoring keeps working when the menu app or submitting terminal closes.

@@ -1,6 +1,6 @@
 # Plugins and lanes
 
-Status: implementation contract (v1). Sections marked **Contract** are binding for the daemon, CLI, app, dashboard and any plugin. Once implemented, this file is the user documentation.
+Status: v1. Sections marked **Contract** are binding for the daemon, CLI, app, dashboard and any plugin. The queue daemon and CLI implement them; the notes after each Contract section describe details of that implementation. App and dashboard lane views follow separately.
 
 Plugins tweak the queue without running code inside it. A plugin is a declarative manifest that adds **lanes** (named queues with their own concurrency and priority) and optional **hooks** (separate, time-limited processes the daemon starts when queue events happen). The motivating plugin is a Teifi QA lane: QA must run one session at a time, while builds and tests keep using the ordinary queue.
 
@@ -56,6 +56,15 @@ Fields:
 
 Plugins are loaded when the daemon starts and when `agent-heavy plugins reload` runs. Removing a lane while it has queued or held work keeps that work visible and lets it finish or be released; no new work is accepted into a lane that no longer exists.
 
+### Loading details
+
+- The plugins directory is `plugins` next to the queue configuration file, so it follows `AGENT_HEAVY_CONFIG` in private test setups. Entries starting with `.` are ignored. At most 32 plugins load; each declares 1 to 8 lanes and at most 4 hooks per event.
+- `description` is optional (at most 200 characters, no control characters). `label` defaults to the lane name. `null` is never accepted as a value, and field names match exactly.
+- Manifests and hooks must have a single link; a hard link is refused like a symlink. Hooks must also be executable by you.
+- A hook that fails its checks is skipped and reported in the plugin's `warning`; the plugin's lanes still load. A plugin that fails to load reports `loaded: false` and an `error`. A lane collision keeps both plugins loaded without that lane and reports it as an `error`. An unsafe plugins directory is reported as one entry named `plugins`.
+- A removed lane keeps its last definition while it has queued or held work, and is listed with `removed: true`. If the daemon restarts after the plugin was removed, that work runs with concurrency 1, priority 0 and the shared limit until it finishes.
+- `agent-heavy plugins validate DIRECTORY` runs the same checks on a directory anywhere on disk and exits 1 when the manifest or any hook fails them.
+
 ## Scheduling (Contract)
 
 A waiting job or lease may start only when all hold:
@@ -70,6 +79,14 @@ Ordering: among candidates that may start, the highest lane priority wins; withi
 **Start now** overrides the global parallel limit and resource admission exactly as today, but it **never** exceeds the target lane's concurrency. If the lane is full, Start now is refused with an explanation (CLI exit status, app and dashboard message).
 
 The default lane with no plugins loaded must behave byte-for-byte as before: same ordering, same limits, same status output apart from new additive fields. Existing tests must pass unmodified.
+
+### Scheduling details
+
+- The daemon recounts a lane from its durable state immediately before every start or grant, whichever path asked (dispatch, **Start now**, the resource controller or `lane acquire`). A full lane refuses the transition.
+- A lane's occupancy includes jobs that have finished but whose process group is still being cleaned up, as the default lane's count always has.
+- A lane at its concurrency never holds back other lanes. In adaptive mode, lanes that share the limit keep the existing head-of-line fairness among themselves; a lane with `sharesLimit: false` only waits behind work in its own lane.
+- In adaptive mode the resource controller admits leases as it admits jobs, one admission per pass. A lease with a zero reservation does not wait for resource samples. Lease decisions appear as the lease's `phase` in status.
+- The default lane has no plugin and never starts hooks. Leases always belong to a plugin lane.
 
 ## Leases (Contract)
 
@@ -112,6 +129,25 @@ agent-heavy plugins reload
 - Exit statuses: 0 success, 1 lease gone or refused, 2 usage error, 75 timed out while still queued.
 - `run --lane` behaves like `run` today (waits, streams output, returns the command's exit status) in the given lane. Unknown lane: exit 2 with the list of lanes. Without `--lane`, behaviour is unchanged.
 
+### Lease details
+
+- How a lease ends sets its `state` and `reason`:
+
+  | Ended by | Held lease | Queued lease | Event |
+  | --- | --- | --- | --- |
+  | `lane release` | `released`, reason `released` | `dropped`, reason `released` | `lease.released` or `lease.dropped` |
+  | `cancel` (CLI, app, dashboard) | `released`, reason `cancelled` | `dropped`, reason `cancelled` | `lease.released` or `lease.dropped` |
+  | Owner exited | `expired`, reason `owner-exited` | `dropped`, reason `owner-exited` | `lease.expired` or `lease.dropped` |
+  | TTL | `expired`, reason `ttl` | `expired`, reason `ttl` | `lease.expired` |
+
+- The owner must be a running process of your user when the lease is acquired. The daemon checks owners about once per second. A missing process, a zombie, a different start time or a different boot ends the lease; if the process table cannot be read, leases stay as they are.
+- `--owner-pid` defaults to `AGENT_QUEUE_OWNER_PID` when that is set, for both `acquire` and `release`. A lease acquired with only a TTL has no recorded owner and can be released without `--force`.
+- A TTL runs from acquisition, restarts when the lease is granted, and restarts on every `renew`. Queued leases expire too, so renew while waiting. `renew` on a lease without a TTL succeeds and changes nothing.
+- `--timeout 0` checks once. Interrupting a blocking `acquire` (Ctrl-C, SIGTERM or SIGHUP) withdraws the lease it created and exits 130; `wait` never changes the lease.
+- `lane status` exits 0 for any lease that exists, including ended ones, and 1 for an unknown ID.
+- An older daemon makes `lane` and `plugins` commands exit 1, and `run --lane` exit 2, with "This queue does not support lanes; update Agent Queue". Lane submissions use their own daemon operation, so an older daemon rejects them rather than running them in the default lane.
+- Held leases do not mark the queue as having active processes, so restarting the daemon does not pause the queue. Held and queued leases survive a daemon restart.
+
 ### Status JSON (Contract)
 
 Additive only. `agent-heavy status --json` gains:
@@ -121,6 +157,15 @@ Additive only. `agent-heavy status --json` gains:
 
 Every consumer is updated together: Swift decoders and fixtures (`native/tests/fixtures/queue.json`), the dashboard schema (`remote/static/schema.mjs` and its tests), and the live handover payload.
 
+### Status details
+
+- Lease entries keep every field existing clients require: `title` is the label (or `Lease`), `project`, `branch`, `directory`, `executable` and `logPath` are empty and `exitCode` is `null`. `state` uses the lease vocabulary. `position` is the lease's position within its lane; `queuePosition` stays the position across all lanes.
+- `phase` describes the lease: `Held`, `Waiting for lane capacity` (or the adaptive decision), or how it ended.
+- Held leases count in `queue.running` and queued leases in `queue.waiting`.
+- `lanes` entries add `removed: true` for a removed lane that still has work. `plugins` entries add `warning`, which reports skipped hooks and dropped hook events.
+- Status from a daemon without lane support has no `lanes` or `plugins`; `agent-heavy status --json` then reports the default lane alone.
+- The live handover payload is unchanged (protocol 1). Instead, unfinished lane work or any queued or held lease makes live upgrade ineligible, so setup waits for that work to finish or be released, as a drained upgrade does.
+
 ## Hooks (Contract)
 
 Hooks are code execution from a configuration directory, so they follow the repository's safety posture:
@@ -129,6 +174,13 @@ Hooks are code execution from a configuration directory, so they follow the repo
 - The daemon starts hooks off the scheduling path, fire-and-forget: a hook can never delay, block or change admission, ownership or queue state. At most 4 hook processes run at once; extra events are dropped with a counted, reported warning.
 - Process: no arguments; the event as one JSON object on stdin (at most 16 KiB); environment limited to `HOME`, `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `AGENT_QUEUE_EVENT=<event name>`, `AGENT_QUEUE_PLUGIN=<name>`; working directory is the plugin directory; stdout and stderr captured, bounded to 64 KiB, kept in a private per-plugin log under `~/.local/state/agent-heavy/plugins/<name>/hooks.log` with rotation; 10 second timeout, then the hook's process group is terminated.
 - Events: `job.queued`, `job.started`, `job.finished` (with exit status), `lease.queued`, `lease.granted`, `lease.released`, `lease.expired` (with reason), `lease.dropped`. Event JSON: `{"schemaVersion":1,"event":...,"time":...,"lane":...,"id":...,"kind":...,"label":...,"meta":{...},"ownerPid":...,"reason":...,"exitStatus":...}` with absent fields omitted. Hooks receive events only for their own plugin's lanes.
+
+### Hook details
+
+- Job events are sent for commands run with `run --lane`. `job.finished` carries `exitStatus` and is sent when the daemon first sees the result, so a daemon restart during cleanup can send it again. `lease.dropped` carries `reason` too.
+- Anything a hook leaves running in its process group is terminated at the 10 second deadline, even when the hook itself exited earlier.
+- Each log entry records the time, event, hook path and result (exit status, timeout or refusal) followed by the output. At 1 MiB the log is renamed to `hooks.log.1`, replacing the previous generation.
+- Dropped events, including any event whose JSON exceeds 16 KiB, are counted in the plugin's `warning` until the daemon restarts.
 
 ## App and dashboard
 
