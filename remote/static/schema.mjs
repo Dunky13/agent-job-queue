@@ -27,6 +27,11 @@ const resourcesSchema = z.object({
   }).nullable(),
   decision: z.object({ allowed: z.boolean(), reason: z.string() }).nullable(),
 });
+const laneNameSchema = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/);
+// The vendored zod subset has no record type; a catchall object checks the same.
+const leaseMetaSchema = z.object({}).catchall(z.string().max(512)).refine((meta) =>
+  Object.keys(meta).length <= 8 && Object.keys(meta).every((key) => /^[a-z][a-z0-9_]{0,31}$/.test(key)));
+// Lane and lease fields are optional: daemons that predate plugin lanes omit them.
 export const jobSchema = z.object({
   id: integer.nonnegative(), state: z.string().min(1), title: z.string(),
   project: z.string(), branch: z.string(), directory: z.string(),
@@ -36,6 +41,23 @@ export const jobSchema = z.object({
   logPath: z.string(), canReorder: z.boolean(), canStart: z.boolean(),
   canCancel: z.boolean(), phase: z.string(),
   resources: resourcesSchema.optional(),
+  lane: laneNameSchema.optional(), kind: z.literal(["command", "lease"]).optional(),
+  label: z.string().max(120).optional(),
+  meta: leaseMetaSchema.optional(),
+  ownerPid: integer.positive().nullable().optional(), ownerAlive: z.boolean().nullable().optional(),
+  position: integer.positive().nullable().optional(), queuedAt: timestamp.nullable().optional(),
+  grantedAt: timestamp.nullable().optional(), renewedAt: timestamp.nullable().optional(),
+  expiresAt: timestamp.nullable().optional(), reason: z.string().max(64).nullable().optional(),
+});
+export const laneSchema = z.object({
+  name: laneNameSchema, label: z.string().min(1).max(40), plugin: laneNameSchema.nullable(),
+  concurrency: integer.min(1).max(8), priority: integer.min(-100).max(100), sharesLimit: z.boolean(),
+  running: integer.nonnegative(), held: integer.nonnegative(), waiting: integer.nonnegative(),
+  removed: z.boolean().optional(),
+});
+export const pluginSchema = z.object({
+  name: z.string().min(1).max(64), loaded: z.boolean(), error: z.string().max(4096).nullable(),
+  warning: z.string().max(4096).nullable().optional(), lanes: z.array(laneNameSchema).max(8),
 });
 export const snapshotSchema = z.object({
   updatedAt: timestamp,
@@ -48,6 +70,8 @@ export const snapshotSchema = z.object({
     mode: schedulingModeSchema, available: z.boolean(), reason: z.string(),
     updatedAt: timestamp.nullable(), host: hostSchema.nullable(),
   }).optional(),
+  lanes: z.array(laneSchema).max(512).optional(),
+  plugins: z.array(pluginSchema).max(64).optional(),
 }).refine((snapshot) => new Set(snapshot.jobs.map((job) => job.id)).size === snapshot.jobs.length);
 export const csrfSchema = z.object({ token: z.string().min(1).max(4096) });
 export const resultSchema = z.object({ ok: z.literal(true) });

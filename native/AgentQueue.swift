@@ -9,10 +9,34 @@ struct QueueSnapshot: Codable, Sendable {
     let queue: QueueSummary
     let jobs: [QueueJob]
     var scheduler: QueueScheduler? = nil
+    // Daemons that predate plugin lanes omit these; treat that as the default lane alone.
+    var lanes: [QueueLane]? = nil
+    var plugins: [QueuePlugin]? = nil
 
     func hasSameContent(as other: QueueSnapshot) -> Bool {
-        queue == other.queue && jobs == other.jobs && scheduler == other.scheduler
+        queue == other.queue && jobs == other.jobs && scheduler == other.scheduler && lanes == other.lanes && plugins == other.plugins
     }
+}
+
+struct QueueLane: Codable, Sendable, Equatable {
+    let name: String
+    let label: String
+    let plugin: String?
+    let concurrency: Int
+    let priority: Int
+    let sharesLimit: Bool
+    let running: Int
+    let held: Int
+    let waiting: Int
+    var removed: Bool? = nil
+}
+
+struct QueuePlugin: Codable, Sendable, Equatable {
+    let name: String
+    let loaded: Bool
+    let error: String?
+    var warning: String? = nil
+    let lanes: [String]
 }
 
 struct QueueSummary: Codable, Sendable, Equatable {
@@ -128,7 +152,21 @@ struct QueueJob: Codable, Identifiable, Sendable, Equatable {
     let phase: String
     var canStart: Bool? = nil
     var resources: JobResources? = nil
+    var lane: String? = nil
+    var kind: String? = nil
+    // Lease fields; absent for ordinary commands.
+    var label: String? = nil
+    var meta: [String: String]? = nil
+    var ownerPid: Int? = nil
+    var ownerAlive: Bool? = nil
+    var position: Int? = nil
+    var queuedAt: String? = nil
+    var grantedAt: String? = nil
+    var renewedAt: String? = nil
+    var expiresAt: String? = nil
+    var reason: String? = nil
 
+    var isLease: Bool { kind == "lease" }
     var name: String { title.isEmpty ? executable : title }
     var isWaiting: Bool { state == "queued" || state == "waiting" }
     var isRunning: Bool { state == "running" || state == "starting" || state == "cancelling" }

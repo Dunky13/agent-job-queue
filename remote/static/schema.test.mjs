@@ -89,3 +89,25 @@ test("learning schemas accept bounded numeric evidence and reject malformed prof
   const learnedJob = { ...job, resources: { ...resources, learning: { id: profile.id, label: profile.label, reason: "Operator shared this family" } } };
   assert.deepEqual(snapshotSchema.parse({ ...snapshot, jobs: [learnedJob] }).jobs[0], learnedJob);
 });
+test("accepts lane, lease and plugin fields and keeps older status valid", () => {
+  const lease = { ...job, id: 5, state: "held", title: "QA session", project: "", branch: "", directory: "",
+    executable: "", queuePosition: null, logPath: "", canReorder: false, canStart: false, phase: "Held",
+    lane: "qa", kind: "lease", label: "QA session", meta: { ticket: "WM-123" }, ownerPid: 4242, ownerAlive: true,
+    position: null, queuedAt: "2026-10-29T10:00:00Z", grantedAt: "2026-10-29T10:00:01Z", renewedAt: null,
+    expiresAt: null, reason: null };
+  const lanes = [
+    { name: "qa", label: "QA", plugin: "teifi-qa", concurrency: 1, priority: 50, sharesLimit: false, running: 0, held: 1, waiting: 0 },
+    { name: "default", label: "Default", plugin: null, concurrency: 1, priority: 0, sharesLimit: true, running: 0, held: 0, waiting: 1 },
+  ];
+  const plugins = [{ name: "teifi-qa", loaded: true, error: null, warning: null, lanes: ["qa"] },
+    { name: "broken", loaded: false, error: "Invalid plugin.json: unknown field \"concurency\"", lanes: [] }];
+  const value = { ...snapshot, jobs: [{ ...job, lane: "default", kind: "command" }, lease], lanes, plugins };
+  assert.deepEqual(snapshotSchema.parse(value), value);
+  assert.deepEqual(snapshotSchema.parse(snapshot), snapshot);
+  assert.equal(snapshotSchema.safeParse({ ...value, jobs: [{ ...lease, kind: "daemon" }] }).success, false);
+  assert.equal(snapshotSchema.safeParse({ ...value, jobs: [{ ...lease, meta: { Ticket: "x" } }] }).success, false);
+  assert.equal(snapshotSchema.safeParse({ ...value, lanes: [{ ...lanes[0], concurrency: 9 }] }).success, false);
+  assert.equal(snapshotSchema.safeParse({ ...value, lanes: [{ ...lanes[0], name: "Bad Lane" }] }).success, false);
+  assert.equal(eligible({ ...lease, state: "queued", canStart: true }, "start"), true);
+  assert.equal(eligible(lease, "cancel"), true);
+});
