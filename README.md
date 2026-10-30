@@ -239,7 +239,7 @@ No executables are copied out of the app bundle, and new installs write nothing 
 
 The dedicated Go daemon uses a private Unix socket and a durable SQLite database. The app restarts it after a failure, adopts a daemon that is already running instead of starting a second one, and the daemon's own lifetime locks refuse duplicate instances. Restart policy: the daemon and resource controller restart after any exit while the app runs; the phone-access service restarts after a failure or while its settings remain enabled, and a restart waits until 10 seconds after the previous start. The queue fails closed when its daemon, state, or process ownership cannot be verified. Do not clear a lock or kill a process to bypass an unknown owner.
 
-After an unclean daemon restart, including quitting the app while jobs are active, automatic scheduling remains paused while owned workers and their outcomes are reconciled. Inspect `agent-heavy status`, then use `agent-heavy resume` to resume the queue. `agent-heavy pause` holds future automatic starts without stopping active jobs. An uncertain command attempt is never automatically replayed.
+After an unclean daemon restart, including quitting the app while jobs are active, automatic scheduling remains paused while owned workers and their outcomes are reconciled. Inspect `agent-heavy status`, then choose **Resume** in the app’s paused banner or use `agent-heavy resume` to resume the queue. `agent-heavy pause` holds future automatic starts without stopping active jobs. An uncertain command attempt is never automatically replayed.
 
 `agent-remote status --json` reports the remote service. `agent-remote disable` stops it. Passwords are passed privately through the native settings form, not command-line arguments.
 

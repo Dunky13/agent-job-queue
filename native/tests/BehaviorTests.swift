@@ -53,6 +53,13 @@ struct BehaviorTests {
             throw ClientError.message("Native behavior tests require a recorded fixture.")
         }
         let navigation = QueueNavigation()
+        store.snapshot = QueueSnapshot(updatedAt: original.updatedAt,
+            queue: QueueSummary(status: "paused", limit: original.queue.limit, running: 0,
+                                waiting: original.queue.waiting, legacyOccupied: false), jobs: original.jobs)
+        let beforeResume = recorder.actions.count
+        try check(store.dispatchResume() == nil && recorder.actions.count == beforeResume,
+                  "Read-only fixtures cannot dispatch Resume even with an action recorder")
+        store.snapshot = original
         navigation.show(queued)
         navigation.back()
         try check(navigation.selected == nil, "Done returns to queue navigation")

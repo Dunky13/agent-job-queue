@@ -514,6 +514,7 @@ final class QueueStore: ObservableObject {
     @Published var lastRefreshed: Date?
     @Published var isRefreshing = false
     @Published var isMutating = false
+    @Published private(set) var isResuming = false
     @Published var notice: String?
     private(set) var visibleSurfaces = 0
     private var pollTask: Task<Void, Never>?
@@ -531,11 +532,11 @@ final class QueueStore: ObservableObject {
     }, command: @escaping @Sendable ([String]) async throws -> Data = { try await QueueClient.run($0) },
          snapshotPreparer: @escaping @Sendable (Data, QueueSnapshot?) async throws -> PreparedQueueSnapshot? = {
              try await PreparedQueueSnapshot.decode($0, comparedTo: $1)
-         }) {
+         }, arguments: [String] = CommandLine.arguments) {
         self.statusLoader = statusLoader
         self.command = command
         self.snapshotPreparer = snapshotPreparer
-        let args = CommandLine.arguments
+        let args = arguments
         if let index = args.firstIndex(of: "--fixture"), args.indices.contains(index + 1) {
             fixtureMode = true
             if args.contains("--verify-confirmation-navigation") { fixtureRecorder = FixtureDispatchRecorder() }
@@ -550,6 +551,7 @@ final class QueueStore: ObservableObject {
     var running: [QueueJob] { prepared?.running ?? [] }
     var waiting: [QueueJob] { prepared?.waiting ?? [] }
     var recent: [QueueJob] { prepared?.recent ?? [] }
+    var isPaused: Bool { snapshot?.queue.status.lowercased() == "paused" }
     var actionsDisabled: Bool { (fixtureMode && fixtureRecorder == nil) || isRefreshing || isMutating || error != nil }
     func start() {
         guard !fixtureMode, pollTask == nil else { return }
@@ -642,6 +644,30 @@ final class QueueStore: ObservableObject {
         }
         isMutating = false
         await refresh()
+    }
+
+    @discardableResult
+    func dispatchResume() -> Task<Void, Never>? {
+        guard !fixtureMode, !actionsDisabled, isPaused else { return nil }
+        isMutating = true
+        isResuming = true
+        mutationRevision += 1
+        notice = nil
+        return Task {
+            do {
+                _ = try await command(["resume"])
+                notice = "Queue resumed."
+                error = nil
+            } catch {
+                self.error = error.localizedDescription
+                isResuming = false
+                isMutating = false
+                return
+            }
+            isResuming = false
+            isMutating = false
+            await refresh()
+        }
     }
 
     @discardableResult
@@ -1508,9 +1534,21 @@ struct QueuePanel: View {
 
     private var queueList: some View {
         List {
-            if store.snapshot?.queue.status.lowercased() == "paused" {
-                Label("Queue paused. Waiting jobs will not start automatically.", systemImage: "pause.circle")
-                    .font(.callout).foregroundStyle(.orange).padding(.vertical, 5)
+            if store.isPaused {
+                HStack(spacing: 12) {
+                    Label("Queue paused. Waiting jobs will not start automatically.", systemImage: "pause.circle")
+                        .foregroundStyle(.orange)
+                    Spacer(minLength: 0)
+                    Button(store.isResuming ? "Resuming…" : "Resume", systemImage: "play.fill") {
+                        store.dispatchResume()
+                    }
+                    .buttonStyle(.bordered)
+                    .fixedSize()
+                    .disabled(store.actionsDisabled)
+                    .accessibilityLabel("Resume queue")
+                    .accessibilityIdentifier("queue.resume")
+                    .help("Resume automatic starts for waiting jobs.")
+                }.font(.callout).padding(.vertical, 5)
             }
             if store.snapshot?.queue.legacyOccupied == true {
                 Label("A legacy validation batch holds the shared slot.", systemImage: "hourglass")
@@ -1519,10 +1557,12 @@ struct QueuePanel: View {
             Section {
                 if store.running.isEmpty {
                     HStack(spacing: 10) {
-                        Image(systemName: store.waiting.isEmpty ? "checkmark.circle" : "hourglass").foregroundStyle(.secondary)
+                        Image(systemName: store.isPaused ? "pause.circle" : store.waiting.isEmpty ? "checkmark.circle" : "hourglass")
+                            .foregroundStyle(.secondary)
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(store.waiting.isEmpty ? "Ready for the next command" : "Waiting for the shared slot").font(.callout)
-                            Text(store.waiting.isEmpty ? "Heavy jobs appear here when agents submit them." : "Queued jobs start automatically when the slot is available.")
+                            Text(store.isPaused ? "Queue paused" : store.waiting.isEmpty ? "Ready for the next command" : "Waiting for the shared slot").font(.callout)
+                            Text(store.isPaused ? "Resume the queue to start jobs automatically."
+                                 : store.waiting.isEmpty ? "Heavy jobs appear here when agents submit them." : "Queued jobs start automatically when the slot is available.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }.padding(.vertical, 10)

@@ -45,8 +45,8 @@ git diff --check
 These tests use private homes, fake native adapters and isolated helper
 processes. The supervisor runner compiles both arm64 and x86_64 and executes the
 host architecture. Local validation ran on macOS 27.0.1, arm64, Go 1.26.10 and
-Apple Swift 6.4. The repair changes no rendered UI; its evidence is command
-and regression output.
+Apple Swift 6.4. The initial lifecycle repairs used command and regression
+evidence. Resume-control visual evidence is recorded below.
 
 ## Native CI follow-up
 
@@ -116,8 +116,36 @@ mandatory input to `ci-required`; no required check or budget was weakened.
 Independent Standards and Spec reviews found no actionable findings, pinned to
 repair diff SHA-256
 `713df2248abf3a9fa35925640698bb7b75324d2067d9bd1ba60263c128d3ffb9`
-against `9d64fb5`, before this evidence-only handoff update. Fresh hosted Intel
-execution is still required to establish the new workload fits its budget.
+against `9d64fb5`, before this evidence-only handoff update. Hosted CI then
+passed all 20 checks on `6bafe90888c31dbc62439f21be7a4906e1c452d9`, including
+both core shards on both architectures and `ci-required`. This closes the
+workload follow-up; the subsequent Resume change needs its own fresh CI run.
+
+## Native Resume control
+
+The paused banner now includes **Resume** in both the menu panel and full
+window. The action uses the existing `agent-heavy resume` command, reserves the
+shared mutation guard before asynchronous work, shows `Resuming…`, rejects
+concurrent actions and refreshes the controller's confirmed state. A failure
+retains the paused snapshot, exposes its error and releases the busy state;
+refreshing the connection permits retry. Read-only fixtures cannot dispatch it.
+The paused empty state now says **Queue paused** and explains the Resume action.
+
+Controller regressions pass for unknown/running queues, one exact command,
+duplicate/concurrent actions, authoritative refresh, failure and retry. The full
+native suite and workflow-gate regression pass. Graphical fixtures sent actual
+AppKit events to their own Resume control in a 500×650 empty menu and an 800×700
+window with a waiting job. Both confirmed one command, retained jobs and removal
+of the paused control after refresh. No installed queue or user data was used.
+
+Before/after screenshots use the same public snapshots, viewport sizes and dark
+appearance. The baseline is native source from `2295abe1`; only its constructor
+argument injection seam is backported by the fixture runner, with no baseline
+view changes. This keeps fixture badges and control availability equal in both
+captures. Global settings controllers remain in fixture mode in every case.
+Required native jobs capture and retain PNGs and verification reports as
+`Native-resume` workflow artifacts on both architectures. Hosted capture and
+fresh-head CI remain separate gates. Screenshot files remain outside Git.
 
 ## Hosted and platform evidence
 

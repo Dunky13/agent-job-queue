@@ -63,6 +63,28 @@ private actor PreparationFixture {
     }
 }
 
+private actor ResumeFixture {
+    let status: StatusFixture
+    let commandGate: StatusFixture
+    private(set) var commands: [[String]] = []
+    var fails = false
+    init(status: StatusFixture, commandGate: StatusFixture) { self.status = status; self.commandGate = commandGate }
+    func setFailure(_ value: Bool) { fails = value }
+    func command(_ arguments: [String]) async throws -> Data {
+        commands.append(arguments)
+        _ = try await commandGate.load()
+        guard arguments == ["resume"], !fails else { throw ClientError.message("Resume rejected by fixture") }
+        let previous = try JSONDecoder().decode(QueueSnapshot.self, from: await status.load())
+        let queue = previous.queue
+        let next = QueueSnapshot(updatedAt: previous.updatedAt,
+            queue: QueueSummary(status: "running", limit: queue.limit, running: queue.running,
+                                waiting: queue.waiting, legacyOccupied: queue.legacyOccupied), jobs: previous.jobs,
+            scheduler: previous.scheduler, lanes: previous.lanes, plugins: previous.plugins)
+        await status.set(try JSONEncoder().encode(next))
+        return Data("{}".utf8)
+    }
+}
+
 @main
 struct RefreshTests {
     @MainActor static func main() async throws {
@@ -113,6 +135,40 @@ struct RefreshTests {
         await store.refresh()
         try check(store.snapshot?.queue.limit == 1, "refresh resumes after mutation")
         subscription.cancel()
+
+        let pausedData = try JSONEncoder().encode(QueueSnapshot(updatedAt: "resume-fixture",
+            queue: QueueSummary(status: "Paused", limit: 3, running: 0, waiting: 0, legacyOccupied: false), jobs: []))
+        let resumeStatus = StatusFixture(pausedData)
+        let commandGate = StatusFixture(Data())
+        let resumeFixture = ResumeFixture(status: resumeStatus, commandGate: commandGate)
+        let resumable = QueueStore(statusLoader: { try await resumeStatus.load() },
+                                   command: { try await resumeFixture.command($0) })
+        try check(resumable.dispatchResume() == nil, "An unknown queue cannot be resumed")
+        await resumable.refresh()
+        await commandGate.holdNextRead()
+        let resuming = resumable.dispatchResume()
+        try check(resuming != nil && resumable.isMutating && resumable.isResuming
+                  && resumable.dispatchResume() == nil && resumable.dispatchLimit(2) == nil,
+                  "Resume reserves the shared mutation guard and rejects duplicate actions")
+        await commandGate.waitUntilReadHeld()
+        await commandGate.releaseRead()
+        await resuming?.value
+        let resumedCommands = await resumeFixture.commands
+        try check(resumedCommands == [["resume"]] && !resumable.isPaused && !resumable.isMutating
+                  && !resumable.isResuming && resumable.notice == "Queue resumed." && resumable.error == nil,
+                  "Resume sends the exact CLI action and refreshes confirmed queue state")
+        try check(resumable.dispatchResume() == nil, "An already running queue does not dispatch Resume")
+        await resumeStatus.set(pausedData)
+        await resumable.refresh()
+        await resumeFixture.setFailure(true)
+        await resumable.dispatchResume()?.value
+        try check(resumable.isPaused && !resumable.isMutating && !resumable.isResuming && resumable.notice == nil
+                  && resumable.error?.contains("Resume rejected") == true && resumable.dispatchResume() == nil,
+                  "Failed Resume preserves paused state, displays the error and releases busy state")
+        await resumeFixture.setFailure(false)
+        await resumable.refresh()
+        await resumable.dispatchResume()?.value
+        try check(!resumable.isPaused && resumable.error == nil, "Resume can retry after connection recovery")
 
         var telemetry = try JSONDecoder().decode(QueueSnapshot.self, from: snapshot("2026-10-19T10:00:00Z"))
         try check(telemetry.scheduler == nil, "Older status without telemetry decodes as unavailable")
