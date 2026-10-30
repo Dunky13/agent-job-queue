@@ -50,11 +50,11 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         if !condition { throw ClientError.message(name) }
     }
 
-    private func waitUntil(_ predicate: () async -> Bool) async throws {
+    private func waitUntil(_ state: String = "the expected state", _ predicate: () async -> Bool) async throws {
         let deadline = ProcessInfo.processInfo.systemUptime + 8
         while !(await predicate()) {
             guard ProcessInfo.processInfo.systemUptime < deadline else {
-                throw ClientError.message("Bootstrap UI fixture did not reach the expected state. Phase: \(String(describing: production?.bootstrap?.phase)); output: \(production?.bootstrap?.output ?? "no model")")
+                throw ClientError.message("Bootstrap UI fixture did not reach \(state). Phase: \(String(describing: production?.bootstrap?.phase)); output: \(production?.bootstrap?.output ?? "no model")")
             }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -154,9 +154,15 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "Readiness transfers the exact status item once and keeps default launch menu-bar-only")
         try check(delegate.bootstrap?.start() == nil, "Completed startup cannot create another controller")
-        // A direct performClick on a background app can have its activation
-        // request declined. Exercise the user's actual status-button event path,
-        // as the dedicated menu-bar fixtures do, without moving the real pointer.
+        // AppKit can report a visible status window while its first layout still
+        // has zero height. Wait for a usable on-screen target before posting the
+        // actual mouse event path, without moving the real pointer.
+        try await waitUntil("usable on-screen status-button geometry") {
+            guard let button = controller.statusItem.button, let window = button.window,
+                  window.isVisible, !button.bounds.isEmpty, !button.visibleRect.isEmpty,
+                  !window.frame.isEmpty else { return false }
+            return NSScreen.screens.contains { $0.frame.intersects(window.frame) }
+        }
         guard let button = controller.statusItem.button, let window = button.window, window.isVisible else {
             throw ClientError.message("Transferred status button has no visible window")
         }
@@ -170,7 +176,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             }
             NSApp.postEvent(event, atStart: false)
         }
-        try await waitUntil { controller.popover.isShown }
+        try await waitUntil("the transferred status item's queue popover") { controller.popover.isShown }
         try check(controller.popover.contentViewController != nil, "Retained menu item opens the normal usable queue popover")
         if let window = controller.popover.contentViewController?.view.window { try snapshot(window, name: "03-ready-popover") }
         controller.closePopover()
