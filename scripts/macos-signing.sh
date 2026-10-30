@@ -186,12 +186,14 @@ macos_signing_prepare_logs() {
 
 macos_verify_signer_details() {
   local path=$1 details=$2 runtime=$3
-  if ! printf '%s\n' "$details" | grep -Fxq "TeamIdentifier=$APPLE_TEAM_ID" ||
-    ! printf '%s\n' "$details" | grep -q '^Authority=Developer ID Application:' ||
-    ! printf '%s\n' "$details" | grep -q '^Timestamp=.'; then
+  # A quiet grep can close a pipeline before printf finishes, making valid
+  # metadata fail under pipefail. Feed the captured details without a producer.
+  if ! grep -Fxq "TeamIdentifier=$APPLE_TEAM_ID" <<< "$details" ||
+    ! grep -q '^Authority=Developer ID Application:' <<< "$details" ||
+    ! grep -q '^Timestamp=.' <<< "$details"; then
     macos_signing_error "Expected Developer ID team and secure timestamp are missing: $path"; return 1
   fi
-  if [[ $runtime == 1 ]] && ! printf '%s\n' "$details" | grep -Eq '^CodeDirectory .*flags=.*\([^)]*runtime[^)]*\)'; then
+  if [[ $runtime == 1 ]] && ! grep -Eq '^CodeDirectory .*flags=.*\([^)]*runtime[^)]*\)' <<< "$details"; then
     macos_signing_error "Hardened Runtime is missing: $path"; return 1
   fi
 }

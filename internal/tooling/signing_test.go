@@ -12,6 +12,61 @@ import (
 
 const signingTestTeam = "U9GXK89565"
 
+func TestMacOSSignerDetailsConsumeCompleteMetadata(t *testing.T) {
+	script, err := filepath.Abs("../../scripts/macos-signing.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := []string{
+		"TeamIdentifier=" + signingTestTeam,
+		"Authority=Developer ID Application: Fixture",
+		"Timestamp=Oct 21, 2026",
+		"CodeDirectory v=20500 size=123 flags=0x10000(runtime)",
+	}
+	// A match near the start must not close a pipe while Bash is still writing
+	// metadata. Keep enough trailing data to exceed the operating system buffer.
+	padding := strings.Repeat("Unrelated signing metadata\n", 40000)
+	for _, test := range []struct {
+		name    string
+		omit    int
+		runtime string
+		wantOK  bool
+	}{
+		{"universal code", -1, "1", true},
+		{"disk image", 3, "0", true},
+		{"missing team", 0, "1", false},
+		{"missing authority", 1, "1", false},
+		{"missing timestamp", 2, "1", false},
+		{"missing runtime", 3, "1", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var details strings.Builder
+			for index, field := range fields {
+				if index != test.omit {
+					details.WriteString(field + "\n")
+				}
+			}
+			details.WriteString(padding)
+			path := filepath.Join(t.TempDir(), "details")
+			if err := os.WriteFile(path, []byte(details.String()), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("/bin/bash", "-c", `set -euo pipefail
+source "$1"
+details=$(cat "$2")
+macos_verify_signer_details fixture "$details" "$3"`, "signer-details-test", script, path, test.runtime)
+			cmd.Env = signingTestEnvironment("APPLE_TEAM_ID=" + signingTestTeam)
+			output, err := cmd.CombinedOutput()
+			if (err == nil) != test.wantOK {
+				t.Fatalf("signer verification success=%t, want %t: %v: %s", err == nil, test.wantOK, err, output)
+			}
+			if strings.Contains(string(output), "Broken pipe") {
+				t.Fatalf("verification closed its metadata input early: %s", output)
+			}
+		})
+	}
+}
+
 func signingTestEnvironment(extra ...string) []string {
 	var environment []string
 	for _, entry := range os.Environ() {
