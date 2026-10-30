@@ -711,6 +711,8 @@ final class RemoteAccessStore: ObservableObject {
     @Published var isRefreshing = false
     private var pollTask: Task<Void, Never>?
     let fixtureMode: Bool
+    /// Runs `agent-remote serve` as a child of the app. Nil for fixtures and unmanaged launches.
+    var supervisor: QueueHelperSupervisor?
 
     init(fixtureMode: Bool) {
         self.fixtureMode = fixtureMode
@@ -767,6 +769,7 @@ final class RemoteAccessStore: ObservableObject {
             do {
                 let data = try await QueueClient.run([enabled ? "enable" : "disable"], controller: .remote)
                 self.status = try JSONDecoder().decode(RemoteStatus.self, from: data)
+                if enabled { supervisor?.start(.remote) } else { await supervisor?.stop(.remote) }
                 error = self.status?.error
                 notice = enabled ? "Remote access enabled." : "Remote access disabled. Local jobs continue running."
             } catch { self.error = error.localizedDescription }
@@ -806,6 +809,7 @@ final class RemoteAccessStore: ObservableObject {
                 if enable {
                     status = try JSONDecoder().decode(RemoteStatus.self,
                         from: await QueueClient.run(["enable"], controller: .remote))
+                    supervisor?.start(.remote)
                 }
                 error = status?.error
                 notice = enable ? "Password saved and remote access enabled." : "Remote access password updated."
@@ -953,7 +957,7 @@ enum QueueAppAction: Int, CaseIterable, Identifiable {
     case openWindow, learnedWorkloads, updates, integration, remoteAccess, quit
     var id: Int { rawValue }
     static let settings: [Self] = [.learnedWorkloads, .updates, .integration, .remoteAccess]
-    static let quitExplanation = "Quitting this app leaves jobs running."
+    static let quitExplanation = "Quitting stops the queue. Running jobs keep running."
 
     var title: String {
         switch self {
@@ -1015,10 +1019,9 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
     private var observation: AnyCancellable?
     private var ownsStatusItem = true
     private(set) var isTornDown = false
-    private let status = NSMenuItem(title: "Preparing Agent Queue…", action: nil, keyEquivalent: "")
+    private let status = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: "")
     private let detail = NSMenuItem()
     private var detailText: String?
-    private let settings = NSMenuItem(title: "Open Login Items Settings…", action: #selector(openSettings), keyEquivalent: "")
     private let retry = NSMenuItem(title: "Retry", action: #selector(retryStartup), keyEquivalent: "")
     private let applications = NSMenuItem(title: "Open Applications", action: #selector(openApplications), keyEquivalent: "")
     private let download = NSMenuItem(title: "Download Agent Queue…", action: #selector(downloadRelease), keyEquivalent: "")
@@ -1032,7 +1035,7 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(status)
         menu.addItem(detail)
         menu.addItem(.separator())
-        for item in [settings, retry, applications, download] {
+        for item in [retry, applications, download] {
             item.target = self
             menu.addItem(item)
         }
@@ -1059,15 +1062,17 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
     func update() {
         guard !isTornDown else { return }
         let blocked = !model.isRunning && model.phase != .complete && model.phase != .idle
-        status.title = model.requiresServiceApproval ? "Allow Agent Queue in Login Items Settings" : model.message
+        // A successful launch is one step for the user: setup wording and diagnostics
+        // appear only once preparation has actually failed.
+        status.title = blocked ? model.message : "Starting…"
         let summary = "Agent Queue, " + status.title
-        statusItem.button?.title = blocked || model.requiresServiceApproval ? "!" : ""
+        statusItem.button?.title = blocked ? "!" : ""
         statusItem.button?.toolTip = summary
         statusItem.button?.setAccessibilityLabel(summary)
         // Keep the controller's bounded diagnostic readable from the menu,
         // including unknown failures. Scroll long output without opening a window.
-        let text = ([model.output] + model.issues.map { $0.title + "\n" + $0.detail })
-            .filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let text = blocked ? ([model.output] + model.issues.map { $0.title + "\n" + $0.detail })
+            .filter { !$0.isEmpty }.joined(separator: "\n\n") : ""
         detail.isHidden = text.isEmpty
         if detailText != text {
             detailText = text
@@ -1085,14 +1090,12 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
             scroll.documentView = content
             detail.view = scroll
         }
-        settings.isHidden = !model.requiresServiceApproval
         retry.isHidden = !blocked || !model.allowsInstallation
         applications.isHidden = !model.issues.contains { $0.actions.contains { $0.id == "move-app" } }
         download.isHidden = !blocked
         retry.isEnabled = !model.isRunning
     }
 
-    @objc private func openSettings() { model.showLoginItems() }
     @objc private func retryStartup() { model.start() }
     @objc private func openApplications() { model.showApplications() }
     @objc private func downloadRelease() { model.downloadRelease() }
@@ -1916,22 +1919,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var bootstrap: QueueBootstrapModel?
     private(set) var setupWindow: NSWindow?
     private(set) var startupMenuBarController: QueueStartupMenuBarController?
+    private(set) var supervisor: QueueHelperSupervisor?
+    private var helperStartup: Task<Void, Never>?
     private var terminationPending = false
     private var normalLaunchStarted = false
     private var bootstrapEnvironment: QueueBootstrapEnvironment?
     private var bootstrapExecutor: QueueBootstrapModel.Executor = QueueBootstrapModel.runInstaller
     private var replyToTermination: @MainActor () -> Void = { NSApp.reply(toApplicationShouldTerminate: true) }
+    private var makeSupervisor: @MainActor (QueueBootstrapEnvironment) -> QueueHelperSupervisor? = {
+        $0.makeSupervisor(fixtureMode: AppRuntime.store.fixtureMode)
+    }
 
     override init() { super.init() }
 
     // The separate graphical fixture supplies a private bundle/home and an inert
     // executor. Normal launch still follows the production path with --fixture.
+    // Fixtures never supervise helpers unless a test injects a fake supervisor.
     init(environment: QueueBootstrapEnvironment,
          terminationReply: @escaping @MainActor () -> Void = { NSApp.reply(toApplicationShouldTerminate: true) },
+         supervisor: QueueHelperSupervisor? = nil,
          executor: @escaping QueueBootstrapModel.Executor) {
         bootstrapEnvironment = environment
         bootstrapExecutor = executor
         replyToTermination = terminationReply
+        makeSupervisor = { _ in supervisor }
         super.init()
     }
 
@@ -1989,7 +2000,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let statusItem = startupMenuBarController?.transferStatusItem()
         startupMenuBarController = nil
         AppRuntime.menuBarController = QueueMenuBarController(store: AppRuntime.store, statusItem: statusItem)
-        AppRuntime.store.start()
+        if let helpers = makeSupervisor(bootstrapEnvironment ?? .current()) { startHelpers(helpers) }
+        else { AppRuntime.store.start() }
         let arguments = CommandLine.arguments
         if let index = arguments.firstIndex(of: "--snapshot"), arguments.indices.contains(index + 1) {
             guard AppRuntime.store.fixtureMode else { diagnostic("--snapshot requires --fixture JSONFILE"); exit(EXIT_FAILURE) }
@@ -2119,11 +2131,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.terminate(nil)
             }
         } else {
-            if arguments.contains("--open-window") { AppRuntime.showWindow() }
+            if arguments.contains("--open-window"), supervisor == nil { AppRuntime.showWindow() }
+        }
+    }
+
+    /// Bootstrap has completed, so setup is no longer running: nothing here can race the installer.
+    private func startHelpers(_ helpers: QueueHelperSupervisor) {
+        supervisor = helpers
+        AppRuntime.remoteStore.supervisor = helpers
+        helpers.start()
+        helperStartup = Task { @MainActor in
+            // Let the daemon come up first so the menu does not flash "Queue unavailable".
+            _ = await helpers.waitUntilQueueReachable(timeout: .seconds(5))
+            guard !Task.isCancelled else { return }
+            AppRuntime.store.start()
+            if CommandLine.arguments.contains("--open-window") { AppRuntime.showWindow() }
+            await AppRuntime.remoteStore.refresh()
+            guard !Task.isCancelled, AppRuntime.remoteStore.status?.enabled == true else { return }
+            helpers.start(.remote)
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        helperStartup?.cancel()
+        supervisor?.terminateRemaining()
         startupMenuBarController?.tearDown()
         startupMenuBarController = nil
         AppRuntime.menuBarController?.tearDown()
@@ -2131,19 +2162,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let bootstrap, bootstrap.isRunning else { return .terminateNow }
+        let setupRunning = bootstrap?.isRunning == true
+        guard setupRunning || supervisor != nil else { return .terminateNow }
         if terminationPending { return .terminateLater }
-        if let stopped = bootstrap.stopForTermination() {
-            terminationPending = true
-            Task { @MainActor in
-                await stopped.value
-                self.replyToTermination()
+        var setupStop: Task<Void, Never>?
+        if setupRunning, let bootstrap {
+            guard let stopped = bootstrap.stopForTermination() else {
+                // Explicit diagnostic mutations retain their existing guard.
+                showSetupWindow()
+                return .terminateCancel
             }
-            return .terminateLater
+            setupStop = stopped
         }
-        // Explicit diagnostic mutations retain their existing guard.
-        showSetupWindow()
-        return .terminateCancel
+        terminationPending = true
+        helperStartup?.cancel()
+        let helpers = supervisor
+        Task { @MainActor in
+            await setupStop?.value
+            await helpers?.stopAll()
+            self.replyToTermination()
+        }
+        return .terminateLater
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

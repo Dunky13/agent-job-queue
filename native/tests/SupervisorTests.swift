@@ -379,6 +379,21 @@ struct SupervisorTests {
             let spawner = FakeSpawner()
             let supervisor = f.fake(spawner)
             supervisor.start()
+            supervisor.start(.remote)
+            _ = await eventually { spawner.launches.count == 3 }
+            supervisor.terminateRemaining()
+            try check(spawner.launches.allSatisfy { $0.signals == [SIGTERM] }, "terminateRemaining signals every live child synchronously")
+            _ = await eventually { Helper.Name.allCases.allSatisfy { supervisor.state($0).phase == .stopped } }
+            supervisor.terminateRemaining()
+            supervisor.start()
+            await sleep(0.5)
+            try check(spawner.launches.count == 3 && spawner.launches.allSatisfy { $0.signals == [SIGTERM] },
+                      "terminateRemaining is idempotent and nothing starts afterwards")
+        }
+        try await scenario { f in
+            let spawner = FakeSpawner()
+            let supervisor = f.fake(spawner)
+            supervisor.start()
             _ = await eventually { spawner.launches.count == 2 }
             spawner.finish(.queue, .code(1))
             _ = await eventually { supervisor.state(.queue).phase == .waiting }

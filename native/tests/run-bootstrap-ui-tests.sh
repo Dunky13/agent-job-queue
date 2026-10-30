@@ -70,7 +70,7 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
     --temporary "$temporary" --output "$output/cancellable-wait" --cancellable-wait
 [[ "$(plutil -extract passed raw -o - "$output/cancellable-wait/verification.json")" == "true" ]]
 
-for scenario in quit-mutation unknown-requirement; do
+for scenario in quit-mutation unknown-requirement supervised-quit; do
   mkdir -p -- "$output/$scenario"
   HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
     "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \

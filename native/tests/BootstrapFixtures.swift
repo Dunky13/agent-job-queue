@@ -98,6 +98,7 @@ private struct BootstrapFixtureInstallation: Encodable {
 }
 
 actor BootstrapInstallerProgressFixture {
+    static let loginNote = "Agent Queue is set up. Opening it at login is waiting for approval in System Settings > General > Login Items & Extensions; allow it there if you want that."
     let fixture: BootstrapFixture
     let report: QueueBootstrapReport
     private(set) var installations = 0
@@ -116,8 +117,8 @@ actor BootstrapInstallerProgressFixture {
             throw ClientError.message("Diagnostic setup used an unexpected request.")
         }
         installations += 1
-        output(Data("AGENT_QUEUE_SETUP_STATE:requires-".utf8))
-        output(Data((QueueSetupProgress.approvalMarker + "\nWaiting for macOS background service approval. Setup will continue automatically.").utf8))
+        // The installer registers only the login item and never waits for its approval.
+        output(Data(Self.loginNote.utf8))
         await withCheckedContinuation { held = $0 }
         try fixture.install()
         return Data("Diagnostic fixture setup complete.".utf8)
@@ -127,12 +128,12 @@ actor BootstrapInstallerProgressFixture {
     var isHeld: Bool { held != nil }
 }
 
-// The first setup run stops because macOS has not allowed the services yet;
-// status reads report approval twice before the user allows them.
+// An installer error that carries the retired approval marker is an ordinary failure:
+// the app never polls for approval. Only an explicit retry runs setup again.
 actor BootstrapApprovalRetryFixture {
     let fixture: BootstrapFixture
     private(set) var installations = 0
-    private var approvalReads = 0
+    private(set) var statusReads = 0
 
     init(_ fixture: BootstrapFixture) { self.fixture = fixture }
 
@@ -141,9 +142,8 @@ actor BootstrapApprovalRetryFixture {
             return try JSONEncoder().encode(QueueBootstrapReport.clear)
         }
         if request.arguments.count == 3, request.arguments.prefix(2) == ["--service-management", "status"], let service = request.arguments.last {
-            approvalReads += 1
-            let status = installations == 1 && approvalReads <= 2 ? "requiresApproval" : "enabled"
-            return try JSONEncoder().encode(BootstrapFixtureServiceStatus(service: service, status: status))
+            statusReads += 1
+            return try JSONEncoder().encode(BootstrapFixtureServiceStatus(service: service, status: "requiresApproval"))
         }
         guard request.arguments == ["install", "--app-bundle", fixture.environment.app.path, "--repair-and-continue"] else {
             throw ClientError.message("Setup used an unexpected request.")
@@ -154,24 +154,6 @@ actor BootstrapApprovalRetryFixture {
         }
         try fixture.installManaged()
         return Data("Fixture setup complete.".utf8)
-    }
-}
-
-actor BootstrapServiceStatusFixture {
-    private(set) var requests: [QueueBootstrapRequest] = []
-    private var status: String
-
-    init(status: String = "enabled") { self.status = status }
-
-    func updateStatus(_ value: String) { status = value }
-
-    func execute(_ request: QueueBootstrapRequest) throws -> Data {
-        requests.append(request)
-        guard request.arguments.count == 3, request.arguments.prefix(2) == ["--service-management", "status"],
-              let service = request.arguments.last else {
-            throw ClientError.message("Ordinary startup attempted a service mutation.")
-        }
-        return try JSONEncoder().encode(BootstrapFixtureServiceStatus(service: service, status: status))
     }
 }
 
@@ -270,7 +252,7 @@ actor BootstrapAutomaticSetupFixture {
     private var status: String
     private(set) var requests: [QueueBootstrapRequest] = []
 
-    init(_ fixture: BootstrapFixture, report: QueueBootstrapReport = .clear, status: String = "enabled") {
+    init(_ fixture: BootstrapFixture, report: QueueBootstrapReport = .clear, status: String = "notRegistered") {
         self.fixture = fixture
         self.report = report
         self.status = status
@@ -288,7 +270,7 @@ actor BootstrapAutomaticSetupFixture {
             throw ClientError.message("Automatic setup did not use the backend's verified repair contract")
         }
         try fixture.installManaged()
-        status = "enabled"
+        status = "notRegistered"
         return Data("Verified setup complete".utf8)
     }
 }
@@ -391,4 +373,53 @@ actor BootstrapQuitMutationFixture {
         return Data("Accepted mutation completed".utf8)
     }
     func release() { held?.resume(); held = nil }
+}
+
+/// A supervisor spawner that starts no process. A fake child ends on SIGTERM only after
+/// `releaseExits()`, so a test can observe termination waiting for its children.
+final class BootstrapFakeSpawner: @unchecked Sendable {
+    private struct Record {
+        let name: QueueHelper.Name
+        var signals: [Int32] = []
+        var onExit: (@Sendable (QueueHelper.Exit) -> Void)?
+    }
+
+    private let lock = NSLock()
+    private var records: [Record] = []
+    private var holdsExits = true
+
+    var spawner: QueueHelper.Spawner {
+        { launch, onExit in
+            let index = self.lock.withLock { () -> Int in
+                self.records.append(Record(name: launch.name, onExit: onExit))
+                return self.records.count - 1
+            }
+            return QueueHelper.Child(pid: 90_000 + Int32(index), signal: { signal in
+                let release = self.lock.withLock { () -> Bool in
+                    self.records[index].signals.append(signal)
+                    return signal == SIGKILL || !self.holdsExits
+                }
+                if release { self.finish(index) }
+            })
+        }
+    }
+
+    var launched: [QueueHelper.Name] { lock.withLock { records.map(\.name) } }
+    func signals(_ name: QueueHelper.Name) -> [Int32] { lock.withLock { records.filter { $0.name == name }.flatMap(\.signals) } }
+
+    func releaseExits() {
+        let pending = lock.withLock { () -> [Int] in
+            holdsExits = false
+            return records.indices.filter { records[$0].onExit != nil && records[$0].signals.contains(SIGTERM) }
+        }
+        pending.forEach(finish)
+    }
+
+    private func finish(_ index: Int) {
+        let callback = lock.withLock { () -> (@Sendable (QueueHelper.Exit) -> Void)? in
+            defer { records[index].onExit = nil }
+            return records[index].onExit
+        }
+        callback?(.signal(SIGTERM))
+    }
 }

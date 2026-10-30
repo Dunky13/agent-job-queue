@@ -42,8 +42,19 @@ struct BootstrapTests {
             await model.start()?.value
             let requests = await executor.requests
             try check(completed && model.phase == .complete && windows == 0 &&
-                requests.filter({ $0.arguments.contains("--repair-and-continue") }).count == 1,
-                "Ordinary \(scenario) completes silently through backend verified setup")
+                requests.filter({ $0.arguments.contains("--repair-and-continue") }).count == (scenario == "retained-pending" ? 1 : 0),
+                scenario == "retained-pending" ? "Ordinary \(scenario) completes silently through backend verified setup"
+                    : "Ordinary \(scenario) is the healthy supervised state and finishes without installing")
+        }
+
+        // Only a real managed launch supervises helpers; fixtures and unmanaged bundles stay inert.
+        for scenario in ["managed", "fixture-flag", "setup-disabled", "unmanaged", "fixture-mode"] {
+            let supervised = try BootstrapFixture(parent: temporary, setupMode: scenario != "setup-disabled", managed: scenario != "unmanaged",
+                arguments: scenario == "fixture-flag" ? ["--fixture", "queue.json"] : [])
+            let helpers = supervised.environment.makeSupervisor(fixtureMode: scenario == "fixture-mode")
+            try check((helpers != nil) == (scenario == "managed") && supervised.environment.supervisesHelpers == (scenario != "unmanaged" && scenario != "fixture-flag" && scenario != "setup-disabled"),
+                scenario == "managed" ? "A real managed launch creates a helper supervisor"
+                    : "No helper supervisor is created for \(scenario) launches")
         }
 
         // Runtime launch never performs installation. Only the installer stage
@@ -117,46 +128,26 @@ struct BootstrapTests {
         let streaming = try BootstrapFixture(parent: temporary)
         let streamingExecutor = BootstrapInstallerProgressFixture(streaming)
         var streamingComplete = false
+        var streamingWindows = 0
         let streamingModel = QueueBootstrapModel(environment: streaming.environment, execute: { request, output in
             try await streamingExecutor.execute(request, output: output)
         }) { streamingComplete = true }
+        streamingModel.onSetupRequired = { streamingWindows += 1 }
         let streamingTask = streamingModel.start()
-        try await waitUntil { streamingModel.requiresServiceApproval && streamingModel.output.contains("Waiting for macOS") }
+        try await waitUntil { streamingModel.output.contains("Opening it at login is waiting for approval") }
         let streamingCalls = await streamingExecutor.installations
-        try check(streamingModel.phase == .waiting && streamingModel.canStopWaiting && !streamingComplete && streamingCalls == 1 &&
-            !streamingModel.output.contains("AGENT_QUEUE_SETUP_STATE") && streamingModel.start() == nil,
-            "Actual installer streaming exposes the Settings action without displaying protocol markers, retrying or establishing readiness")
+        try check(streamingModel.phase == .installing && !streamingModel.canStopWaiting && !streamingComplete && streamingCalls == 1 &&
+            streamingWindows == 0 && !streamingModel.output.contains("AGENT_QUEUE_SETUP_STATE") && streamingModel.start() == nil,
+            "A pending login item approval is shown as an informational line, never as a wait, window or retry")
         await streamingExecutor.release()
         await streamingTask?.value
-        try check(streamingComplete && streamingModel.phase == .complete && !streamingModel.requiresServiceApproval,
-            "Successful installation readback clears the streamed approval hint")
+        try check(streamingComplete && streamingModel.phase == .complete && streamingWindows == 0,
+            "Setup completes without the login item being approved")
         try check(!QueueSetupProgress.parse("Diagnostic contains " + QueueSetupProgress.approvalMarker).requiresServiceApproval,
             "Approval display hints require their exact protocol line")
         let resumed = QueueSetupProgress.parse(QueueSetupProgress.approvalMarker + "\nWaiting\n" + QueueSetupProgress.installingMarker + "\nInstalling")
         try check(!resumed.isWaiting && !resumed.requiresServiceApproval && !resumed.output.contains("AGENT_QUEUE_"),
             "A resumed mutation clears historical waiting and approval markers")
-
-        let approvalPreflightFixture = try BootstrapFixture(parent: temporary)
-        let approvalPreflightExecutor = BootstrapInstallerProgressFixture(approvalPreflightFixture,
-            report: .init(schemaVersion: 1, issues: [.init(id: "service-approval", title: "Allow background services",
-                detail: "Allow Agent Queue in macOS settings. Setup will continue automatically.",
-                actions: [.init(id: "wait", title: "Wait and continue", destructive: false)])]))
-        var approvalPreflightComplete = false
-        var approvalPreflightWindows = 0
-        let approvalPreflightModel = QueueBootstrapModel(environment: approvalPreflightFixture.environment, execute: { request, output in
-            try await approvalPreflightExecutor.execute(request, output: output)
-        }) { approvalPreflightComplete = true }
-        approvalPreflightModel.onSetupRequired = { approvalPreflightWindows += 1 }
-        let approvalPreflightTask = approvalPreflightModel.start()
-        try await waitUntil { approvalPreflightModel.requiresServiceApproval }
-        let approvalPreflightInstalls = await approvalPreflightExecutor.installations
-        try check(approvalPreflightWindows > 0 && approvalPreflightInstalls == 1 && !approvalPreflightComplete &&
-            approvalPreflightModel.start() == nil,
-            "Ordinary approval preflight enters the backend wait, shows Settings and prevents duplicate installation")
-        await approvalPreflightExecutor.release()
-        await approvalPreflightTask?.value
-        try check(approvalPreflightComplete && approvalPreflightModel.phase == .complete,
-            "Ordinary approval preflight resumes and completes without Check again")
 
         let stalled = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try stalled.installManaged()
@@ -185,73 +176,42 @@ struct BootstrapTests {
             ProcessInfo.processInfo.systemUptime - stoppedAt < 1 && !stalledCompleted && !stalledModel.isRunning,
             "Stopping ordinary startup cancels and reaps the actual private native status child")
 
-        for status in ["enabled", "requiresApproval", "notRegistered", "notFound", "invalid"] {
-            let managed = try BootstrapFixture(parent: temporary, setupMode: status == "requiresApproval", managed: true)
-            try managed.installManaged()
-            let readback = BootstrapServiceStatusFixture(status: status)
-            var completed = false
-            let startup = QueueBootstrapModel(environment: managed.environment, execute: { request, _ in
-                try await readback.execute(request)
-            }, waitInterval: .milliseconds(1)) { completed = true }
-            let task = startup.start()
-            if status == "requiresApproval" {
-                // Approval polling continues until macOS allows the services.
-                try await waitUntil { startup.phase == .waiting }
-                try check(startup.requiresServiceApproval && !completed,
-                    "Managed requiresApproval waits for macOS approval without re-registration")
-                await startup.cancelWaiting()?.value
-            }
-            await task?.value
-            let requests = await readback.requests
-            try check(!requests.isEmpty && requests.allSatisfy { $0.arguments.prefix(2) == ["--service-management", "status"] },
-                "Managed startup reads service status only for \(status)")
-            if status == "enabled" {
-                try check(startup.phase == .complete && completed && requests.count == 2,
-                    "Enabled managed services open the queue without registration")
-            } else if status == "invalid" {
-                try check(startup.phase == .failed && !completed,
-                    "Malformed managed service status cannot authorize readiness")
-            } else if status != "requiresApproval" {
-                try check(startup.phase == .setupRequired && !completed && !startup.requiresServiceApproval,
-                    "Managed \(status) cannot trigger re-registration during startup")
+        // notRegistered and notFound are the healthy supervised state. enabled or requiresApproval is a
+        // leftover registration from an older version: migrate it once when setup is allowed, never wait.
+        for status in ["notRegistered", "notFound", "enabled", "requiresApproval", "invalid"] {
+            for allowed in [true, false] {
+                let managed = try BootstrapFixture(parent: temporary, setupMode: allowed, managed: true)
+                try managed.installManaged()
+                let executor = BootstrapAutomaticSetupFixture(managed, status: status)
+                var completed = false
+                var waits = 0
+                let startup = QueueBootstrapModel(environment: managed.environment, execute: { request, _ in
+                    try await executor.execute(request)
+                }, waitInterval: .milliseconds(1)) { completed = true }
+                startup.onSetupRequired = { waits += startup.phase == .waiting ? 1 : 0 }
+                await startup.start()?.value
+                let requests = await executor.requests
+                let reads = requests.filter { $0.arguments.prefix(2) == ["--service-management", "status"] }
+                let installs = requests.filter { $0.arguments.first == "install" && $0.arguments.last != "--json" }
+                let mutations = requests.filter { $0.arguments.first == "--service-management" && $0.arguments.dropFirst().first != "status" }
+                let label = "\(status), setup \(allowed ? "allowed" : "disabled")"
+                try check(mutations.isEmpty && waits == 0 && !startup.isRunning, "Startup never mutates or waits on a service registration (\(label))")
+                if status == "invalid" {
+                    try check(startup.phase == .failed && !completed && installs.isEmpty,
+                        "Malformed managed service status cannot authorize readiness (\(label))")
+                } else if status == "notRegistered" || status == "notFound" {
+                    try check(startup.phase == .complete && completed && installs.isEmpty && reads.count == 3,
+                        "Healthy unregistered services finish without installing (\(label))")
+                } else if allowed {
+                    try check(startup.phase == .complete && completed && reads.count == 1 && installs.count == 1 &&
+                        installs[0].arguments == ["install", "--app-bundle", managed.environment.app.path, "--repair-and-continue"],
+                        "A leftover registration runs exactly one migration install, then finishes without approval (\(label))")
+                } else {
+                    try check(startup.phase == .setupRequired && !completed && reads.count == 1 && installs.isEmpty,
+                        "A leftover registration with setup disabled stays read-only and does not wait (\(label))")
+                }
             }
         }
-
-        let externallyRepaired = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
-        try externallyRepaired.installManaged()
-        let changingStatus = BootstrapServiceStatusFixture(status: "requiresApproval")
-        var externalCompleted = false
-        let externalModel = QueueBootstrapModel(environment: externallyRepaired.environment, execute: { request, _ in
-            try await changingStatus.execute(request)
-        }) { externalCompleted = true }
-        let approvalTask = externalModel.start()
-        try await waitUntil { externalModel.phase == .waiting }
-        let pendingApprovalRequests = await changingStatus.requests
-        try check(externalModel.requiresServiceApproval && !pendingApprovalRequests.isEmpty &&
-            pendingApprovalRequests.allSatisfy({ $0.arguments.prefix(2) == ["--service-management", "status"] }),
-            "Runtime startup waits for macOS approval using only service status reads")
-        await changingStatus.updateStatus("enabled")
-        await approvalTask?.value
-        let externalRequests = await changingStatus.requests
-        try check(externalCompleted && externalModel.phase == .complete && !externalModel.allowsInstallation &&
-            externalRequests.allSatisfy({ $0.arguments.prefix(2) == ["--service-management", "status"] }),
-            "Granting macOS approval automatically continues startup without Check again or service mutation")
-
-        let denied = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
-        try denied.installManaged()
-        let deniedStatus = BootstrapServiceStatusFixture(status: "requiresApproval")
-        var deniedCompleted = false
-        let deniedModel = QueueBootstrapModel(environment: denied.environment, execute: { request, _ in
-            try await deniedStatus.execute(request)
-        }, waitInterval: .milliseconds(1)) { deniedCompleted = true }
-        let deniedTask = deniedModel.start()
-        try await waitUntil { deniedModel.phase == .waiting }
-        await deniedModel.cancelWaiting()?.value
-        await deniedTask?.value
-        let deniedRequests = await deniedStatus.requests
-        try check(!deniedCompleted && !deniedModel.isRunning &&
-            deniedRequests.allSatisfy({ $0.arguments.prefix(2) == ["--service-management", "status"] }),
-            "Cancelling macOS approval waiting stops polling without registering or enabling a denied service")
 
         let awaiting = try BootstrapFixture(parent: temporary, managed: true)
         let awaitingExecutor = BootstrapApprovalRetryFixture(awaiting)
@@ -262,10 +222,15 @@ struct BootstrapTests {
         }, waitInterval: .milliseconds(1)) { awaitingCompleted = true }
         awaitingModel.onSetupRequired = { awaitingShown += 1 }
         await awaitingModel.start()?.value
-        let awaitingInstalls = await awaitingExecutor.installations
-        try check(awaitingCompleted && awaitingModel.phase == .complete && awaitingInstalls == 2 && awaitingShown >= 1 &&
-            !awaitingModel.requiresServiceApproval,
-            "Setup stopped for macOS approval waits visibly, then runs setup again and opens the queue")
+        let failedInstalls = await awaitingExecutor.installations
+        let approvalReads = await awaitingExecutor.statusReads
+        try check(awaitingModel.phase == .failed && !awaitingCompleted && failedInstalls == 1 && approvalReads == 0 &&
+            !awaitingModel.output.contains("AGENT_QUEUE_SETUP_STATE"),
+            "An installer error mentioning approval is an ordinary failure with no approval polling")
+        await awaitingModel.start()?.value
+        let retriedInstalls = await awaitingExecutor.installations
+        try check(awaitingCompleted && awaitingModel.phase == .complete && retriedInstalls == 2 && awaitingShown >= 1,
+            "Only an explicit retry runs setup again, then opens the queue")
 
         let tamperedManaged = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try tamperedManaged.installManaged()

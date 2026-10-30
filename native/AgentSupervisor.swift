@@ -336,6 +336,18 @@ final class QueueHelperSupervisor {
         for slot in all where slot.child == nil { setPhase(slot, .stopped) }
     }
 
+    /// Synchronous last resort for the moment the app exits: SIGTERM whatever is still
+    /// alive without waiting, and never restart anything afterwards.
+    func terminateRemaining() {
+        isShutDown = true
+        for slot in slots.values {
+            slot.wanted = false
+            slot.stopRequested = true
+            cancelPending(slot)
+            slot.child?.signal(SIGTERM)
+        }
+    }
+
     /// True once some daemon answers the probe, so the menu need not flash an error at launch.
     func waitUntilQueueReachable(timeout: Duration = .seconds(10)) async -> Bool {
         let deadline = ContinuousClock.now + timeout
