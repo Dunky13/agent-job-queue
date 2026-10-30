@@ -315,12 +315,12 @@ func TestRenderedCaskRetainsQuarantine(t *testing.T) {
 			t.Fatalf("rendered cask contains quarantine bypass: %s", unsafe)
 		}
 	}
-	for _, expected := range []string{"Agent-Queue-0.1.0-universal.zip\"", "\n  app \"Agent Queue.app\"\n", "\n  uninstall quit: \"io.went.agent-queue\"\n", "Open Agent Queue from Applications to finish setup", "--unregister-services", "Preserve quarantine so macOS can assess the notarized release."} {
+	for _, expected := range []string{"Agent-Queue-0.1.0-universal.zip\"", "\n  app \"Agent Queue.app\"\n", "\n  uninstall quit: \"io.went.agent-queue\"\n", "Open Agent Queue from Applications to use its menu bar.", "--unregister-services", "Preserve quarantine so macOS can assess the notarized release."} {
 		if !strings.Contains(cask, expected) {
 			t.Fatalf("rendered cask is missing %q", expected)
 		}
 	}
-	for _, forbidden := range []string{"installer script:", "uninstall script:", "binary \"", "target:", "--repair-and-continue", "postflight", "sudo: true", "system_command", "run \"", "Installer.app"} {
+	for _, forbidden := range []string{"finish setup", "after setup completes", "installer script:", "uninstall script:", "binary \"", "target:", "--repair-and-continue", "postflight", "sudo: true", "system_command", "run \"", "Installer.app"} {
 		if strings.Contains(cask, forbidden) {
 			t.Fatalf("rendered cask contains setup execution or installer ownership: %s", forbidden)
 		}

@@ -581,8 +581,8 @@ final class QueueBootstrapModel: ObservableObject {
                         onSetupRequired?()
                         return
                     }
-                    // A clean drag-and-drop install runs silently. The window
-                    // opens only for a review, a failure or macOS approval.
+                    // Ordinary launches prepare behind the startup menu. Only
+                    // explicit --setup can present the diagnostic window.
                     self.request = request
                     if disablePhoneAccess {
                         legacyPhoneAccess = false
@@ -759,6 +759,19 @@ final class QueueBootstrapModel: ObservableObject {
     @discardableResult func cancelWaiting() -> Task<Void, Never>? {
         if phase == .stopping { return operation }
         guard canStopWaiting else { return nil }
+        return stopOperation()
+    }
+
+    // Ordinary startup owns only the automatic controller. Its cooperative stop
+    // cancels inspections/waits while accepted mutations retain their finite
+    // context and response. Diagnostic mutations cannot use this escape hatch.
+    @discardableResult func stopForTermination() -> Task<Void, Never>? {
+        if phase == .stopping { return operation }
+        guard canStopWaiting || (!environment.arguments.contains("--setup") && isRunning) else { return nil }
+        return stopOperation()
+    }
+
+    private func stopOperation() -> Task<Void, Never> {
         attempt += 1
         let current = attempt
         let stopped = operation
@@ -922,7 +935,7 @@ final class QueueBootstrapModel: ObservableObject {
         return true
     }
 
-    /// Opens the window and polls until macOS no longer requires approval.
+    /// Publishes the approval requirement and polls until macOS allows it.
     private func awaitServiceApproval(_ requests: [QueueBootstrapRequest], statuses initial: [String], current: Int) async throws -> [String] {
         var statuses = initial
         requiresServiceApproval = true

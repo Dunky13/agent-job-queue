@@ -225,7 +225,7 @@ actor BootstrapExecutorFixture {
             }
             throw ClientError.message("Fixture service could not start. Correct the issue, then Retry.")
         }
-        if phoneAccessBlocker && !request.arguments.contains("--disable-phone-access") {
+        if phoneAccessBlocker && !request.arguments.contains("--disable-phone-access") && !request.arguments.contains("--repair-and-continue") {
             throw ClientError.message("Fixture recovery did not request disabling phone access.")
         }
         try fixture.install()
@@ -369,4 +369,26 @@ actor BootstrapRawPreflightFixture {
         calls += 1
         return data
     }
+}
+
+// Models an already accepted finite mutation: cancellation must wait for its
+// response, rather than abandoning it or starting a competing retry.
+actor BootstrapQuitMutationFixture {
+    let fixture: BootstrapFixture
+    private var held: CheckedContinuation<Void, Never>?
+    private(set) var completed = false
+    var isHeld: Bool { held != nil }
+    init(_ fixture: BootstrapFixture) { self.fixture = fixture }
+    func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) async throws -> Data {
+        if request.arguments.suffix(2) == ["--preflight", "--json"] {
+            return try JSONEncoder().encode(QueueBootstrapReport.clear)
+        }
+        guard request.arguments.last == "--repair-and-continue" else { throw ClientError.message("Unexpected quit fixture mutation") }
+        output(Data("Preparing private fixture services…".utf8))
+        await withCheckedContinuation { held = $0 }
+        try fixture.install()
+        completed = true
+        return Data("Accepted mutation completed".utf8)
+    }
+    func release() { held?.resume(); held = nil }
 }

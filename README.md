@@ -34,7 +34,7 @@ Screenshots use sample jobs. The Mac image uses the app's safe preview mode.
 
 The app is self-contained: the menu app, the `agent-heavy` and `agent-remote` command-line tools, the queue daemon, the resource controller and the HTTPS runtime all live inside `Agent Queue.app`. There is no installer and nothing is copied out of the bundle. On first launch the app registers its own bundled background services with macOS Service Management, creates its private data directories and adds `agent-heavy` and `agent-remote` wrappers to `~/.local/bin`. Xcode, Go, Python, Pueue and Caddy are not required, and setup never uses `sudo`.
 
-macOS shows a "Background Items Added" notification the first time. If your Mac requires approval, a small window explains what to allow in **System Settings > General > Login Items**; setup continues automatically once you allow it. A window also appears if setup needs a decision from you or cannot finish. Otherwise the first launch shows no window.
+Opening the app immediately adds its menu-bar icon and prepares services automatically in the background, on both first launch and upgrades. There is no setup wizard or progress window. macOS may show a "Background Items Added" notification or require approval in **System Settings > General > Login Items**. The menu shows status, a Settings shortcut when approval is needed, and diagnostics with Retry if preparation fails. Setup resumes automatically after approval. Only the explicit `--setup` diagnostic mode opens a recovery window.
 
 To upgrade, quit Agent Queue, drag the new version over the old one and choose **Replace**, then open it. Queue history, settings, credentials and certificates are kept. If jobs are queued or running, setup either hands them over to the new version or waits for them to finish; see [upgrade recovery](docs/upgrade-recovery.md).
 
@@ -54,7 +54,7 @@ Use the app's actual location if it differs. Private data under `~/.local/share/
 brew install --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
-The cask places `Agent Queue.app` in Applications and nothing else; open the app once to finish setup. `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` replaces the app, and the next launch completes the upgrade. Homebrew verifies the download's SHA-256 and keeps quarantine so macOS assesses the notarized app. Maintainer setup is documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
+The cask places `Agent Queue.app` in Applications and nothing else; open it to use the menu bar while services prepare automatically. `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` replaces the app, and the next launch immediately shows the menu bar and completes the upgrade in the background. Homebrew verifies the download's SHA-256 and keeps quarantine so macOS assesses the notarized app. Maintainer setup is documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
 
 ### Signing, Gatekeeper and endpoint security
 

@@ -806,8 +806,8 @@ struct BootstrapTests {
         let acceptedTask = accepted.repairAndContinue(confirmed: true)
         try await waitUntil { await acceptedExecutor.isRecoveryHeld }
         accepted.cancelWaiting()
-        try check(accepted.phase == .recovering && !accepted.canStopWaiting,
-            "Stopping waiting cannot cancel an accepted repair mutation")
+        try check(accepted.phase == .recovering && !accepted.canStopWaiting && accepted.stopForTermination() == nil,
+            "Stopping or quitting cannot cancel an accepted diagnostic repair mutation")
         await acceptedExecutor.releaseRecovery()
         await acceptedTask?.value
         let acceptedMutations = await acceptedExecutor.mutations

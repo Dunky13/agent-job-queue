@@ -90,7 +90,7 @@ brew update
 brew upgrade --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
-Publishing a release or updating the tap does not modify the operator's Mac. Running the updated cask's install or upgrade command places the app only; open it to finish setup. Version visibility requires the new app to be installed and running; open its gear menu and choose **About and updates**.
+Publishing a release or updating the tap does not modify the operator's Mac. Running the updated cask's install or upgrade command places the app only; open it to use the menu bar while services prepare automatically in the background. Version visibility requires the new app to be installed and running; open its gear menu and choose **About and updates**.
 
 ## Validation
 
