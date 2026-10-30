@@ -305,6 +305,12 @@ final class QueueHelperSupervisor {
     typealias Name = QueueHelper.Name
     typealias Exit = QueueHelper.Exit
 
+    /// Keep restart timing controllable independently of process and shutdown I/O.
+    struct RestartClock {
+        var now: @MainActor () -> ContinuousClock.Instant = { .now }
+        var sleep: @MainActor (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    }
+
     enum Phase: Equatable, Sendable {
         case stopped
         /// Waiting out the restart throttle, or probing for an already running daemon.
@@ -335,6 +341,7 @@ final class QueueHelperSupervisor {
     private let stateDirectory: URL
     private let environment: [String: String]
     private let throttle: Duration
+    private let restartClock: RestartClock
     private let probe: QueueHelper.Probe
     private let spawner: QueueHelper.Spawner
     private let slots: [Name: Slot]
@@ -352,7 +359,8 @@ final class QueueHelperSupervisor {
 
     init(app: URL, stateDirectory: URL = QueueHelper.defaultStateDirectory,
          environment: [String: String] = ProcessInfo.processInfo.environment, throttle: Duration = .seconds(10),
-         probe: QueueHelper.Probe? = nil, settingsDirectory: URL? = nil, settingsDebounce: Duration = .seconds(1),
+         restartClock: RestartClock = .init(), probe: QueueHelper.Probe? = nil,
+         settingsDirectory: URL? = nil, settingsDebounce: Duration = .seconds(1),
          makeLifeline: @escaping () -> QueueHelper.Lifeline? = QueueHelper.Lifeline.make,
          spawner: @escaping QueueHelper.Spawner = QueueHelper.spawn) {
         let scrubbed = QueueHelper.childEnvironment(from: environment)
@@ -366,6 +374,7 @@ final class QueueHelperSupervisor {
         self.stateDirectory = stateDirectory
         self.environment = scrubbed
         self.throttle = throttle
+        self.restartClock = restartClock
         self.probe = probe ?? QueueHelper.statusProbe(app: app, environment: scrubbed)
         self.spawner = spawner
         slots = Dictionary(uniqueKeysWithValues: Name.allCases.map { ($0, Slot($0)) })
@@ -459,10 +468,10 @@ final class QueueHelperSupervisor {
 
     private func schedule(_ slot: Slot, after delay: Duration? = nil) {
         guard slot.wanted, !isShutDown, !slot.stopRequested, slot.child == nil, slot.pending == nil else { return }
-        let wait = delay ?? slot.lastStart.map { throttle - ($0.duration(to: .now)) } ?? .zero
+        let wait = delay ?? slot.lastStart.map { throttle - $0.duration(to: restartClock.now()) } ?? .zero
         if slot.name == .queue || wait > .zero { setPhase(slot, .waiting) }
-        slot.pending = Task { [weak self] in
-            if wait > .zero { try? await Task.sleep(for: wait) }
+        slot.pending = Task { [weak self, restartClock] in
+            if wait > .zero { try? await restartClock.sleep(wait) }
             guard !Task.isCancelled, let self else { return }
             await self.attempt(slot)
         }
@@ -483,7 +492,7 @@ final class QueueHelperSupervisor {
     }
 
     private func launch(_ slot: Slot) {
-        slot.lastStart = .now
+        slot.lastStart = restartClock.now()
         // Without the pipe these own-session children would survive an app crash.
         // Retry allocation with the normal launch throttle instead of spawning them.
         if lifeline == nil { lifeline = makeLifeline() }

@@ -84,6 +84,44 @@ private final class Flag: @unchecked Sendable {
     }
 }
 
+/// Advances restart time explicitly; cancellation releases every suspended task.
+@MainActor
+private final class ManualRestartClock {
+    private var instant = ContinuousClock.now
+    private var waiters: [UUID: (deadline: ContinuousClock.Instant, continuation: CheckedContinuation<Void, Error>)] = [:]
+    private(set) var requests: [Duration] = []
+    var pending: Int { waiters.count }
+
+    var clock: Supervisor.RestartClock {
+        .init(now: { self.instant }, sleep: { try await self.sleep($0) })
+    }
+
+    private func sleep(_ duration: Duration) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    requests.append(duration)
+                    waiters[id] = (instant + duration, continuation)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                self.waiters.removeValue(forKey: id)?.continuation.resume(throwing: CancellationError())
+            }
+        }
+    }
+
+    func advance(_ duration: Duration) {
+        instant += duration
+        let ready = waiters.filter { $0.value.deadline <= instant }.map(\.key)
+        for id in ready { waiters.removeValue(forKey: id)?.continuation.resume() }
+    }
+}
+
 private func sleep(_ seconds: Double) async {
     try? await Task.sleep(for: .milliseconds(Int(seconds * 1000)))
 }
@@ -181,8 +219,10 @@ private final class Fixture {
                    settingsDebounce: .milliseconds(100))
     }
 
-    func fake(_ spawner: FakeSpawner, probe: @escaping Helper.Probe = { false }) -> Supervisor {
-        Supervisor(app: app, stateDirectory: state, environment: environment, throttle: throttle, probe: probe,
+    func fake(_ spawner: FakeSpawner, restartClock: Supervisor.RestartClock = .init(),
+              probe: @escaping Helper.Probe = { false }) -> Supervisor {
+        Supervisor(app: app, stateDirectory: state, environment: environment, throttle: throttle,
+                   restartClock: restartClock, probe: probe,
                    settingsDebounce: .milliseconds(100), spawner: spawner.spawner)
     }
 }
@@ -251,61 +291,83 @@ struct SupervisorTests {
             try check(fcntl(lifelineDescriptors[0], F_GETFD) == -1, "stopAll closes the lifeline")
         }
 
-        // Restart policy.
-        try await scenario { f in
-            let spawner = FakeSpawner()
-            let supervisor = f.fake(spawner)
-            var changes = 0
-            supervisor.onChange = { changes += 1 }
-            supervisor.start()
-            _ = await eventually { spawner.launches.count == 2 }
-            spawner.finish(.queue, .code(0))
-            _ = await eventually { supervisor.state(.queue).lastExit == .code(0) }
-            try check(supervisor.state(.queue).phase == .waiting, "queue exit 0 waits out the throttle")
-            _ = await eventually { spawner.count(.queue) == 2 }
-            try check(spawner.count(.queue) == 2 && spawner.count(.resources) == 1 && supervisor.state(.queue).lastExit == .code(0),
-                      "queue restarts after exit 0, such as an external SIGTERM")
-            try check(changes > 0, "state changes are announced")
-            spawner.finish(.queue, .signal(SIGTERM))
-            _ = await eventually { spawner.count(.queue) == 3 }
-            try check(spawner.count(.queue) == 3, "queue restarts after an external SIGTERM")
-            supervisor.start()
-            await sleep(0.1)
-            try check(spawner.count(.queue) == 3, "start does not duplicate a running queue")
+        // Restart policy: a loaded executor can observe an exit after its throttle expires.
+        // Record transitions synchronously; the separate clock test checks exact launch spacing.
+        for observationDelay in [0.0, 0.35] {
+            try await scenario { f in
+                let spawner = FakeSpawner()
+                let supervisor = f.fake(spawner)
+                var changes = 0
+                var waitingExits: [Helper.Exit] = []
+                supervisor.onChange = { [weak supervisor] in
+                    changes += 1
+                    guard let supervisor else { return }
+                    if supervisor.state(.queue).phase == .waiting, let exit = supervisor.state(.queue).lastExit {
+                        waitingExits.append(exit)
+                    }
+                }
+                supervisor.start()
+                _ = await eventually { spawner.launches.count == 2 }
+                spawner.finish(.queue, .code(0))
+                await sleep(observationDelay)
+                _ = await eventually { spawner.count(.queue) == 2 }
+                try check(spawner.count(.queue) == 2 && spawner.count(.resources) == 1 && supervisor.state(.queue).lastExit == .code(0),
+                          "queue restarts after exit 0, such as an external SIGTERM")
+                try check(waitingExits.contains(.code(0)),
+                          "queue exit 0 publishes its waiting transition before restart (observation delay \(observationDelay)s)")
+                try check(changes > 0, "state changes are announced")
+                spawner.finish(.queue, .signal(SIGTERM))
+                _ = await eventually { spawner.count(.queue) == 3 }
+                try check(spawner.count(.queue) == 3, "queue restarts after an external SIGTERM")
+                supervisor.start()
+                await sleep(0.1)
+                try check(spawner.count(.queue) == 3, "start does not duplicate a running queue")
 
-            spawner.finish(.queue, .code(1))
-            await sleep(0.1)
-            try check(spawner.count(.queue) == 3 && supervisor.state(.queue).phase == .waiting, "non-zero exit waits out the throttle")
-            _ = await eventually { spawner.count(.queue) == 4 }
-            try check(spawner.count(.queue) == 4, "queue restarts after a non-zero exit")
-            spawner.finish(.queue, .signal(SIGSEGV))
-            _ = await eventually { spawner.count(.queue) == 5 }
-            try check(spawner.count(.queue) == 5 && supervisor.state(.queue).lastExit == .signal(SIGSEGV), "queue restarts after signal death")
+                // In the delayed case the helper has already outlived the throttle;
+                // immediate restart is correct, even before this test observes its exit.
+                await sleep(observationDelay)
+                spawner.finish(.queue, .code(1))
+                await sleep(observationDelay)
+                _ = await eventually { spawner.count(.queue) == 4 }
+                try check(spawner.count(.queue) == 4 && supervisor.state(.queue).lastExit == .code(1),
+                          "queue restarts after a non-zero exit")
+                try check(waitingExits.contains(.code(1)),
+                          "non-zero queue exit publishes its waiting transition before restart (observation delay \(observationDelay)s)")
+                spawner.finish(.queue, .signal(SIGSEGV))
+                _ = await eventually { spawner.count(.queue) == 5 }
+                try check(spawner.count(.queue) == 5 && supervisor.state(.queue).lastExit == .signal(SIGSEGV), "queue restarts after signal death")
 
-            spawner.finish(.resources, .code(0))
-            _ = await eventually { spawner.count(.resources) == 2 }
-            try check(spawner.count(.resources) == 2, "resources restarts even after exit 0")
-            spawner.finish(.resources, .code(7))
-            _ = await eventually { spawner.count(.resources) == 3 }
-            try check(spawner.count(.resources) == 3, "resources restarts after failure")
-            await supervisor.stopAll(grace: .seconds(1))
+                spawner.finish(.resources, .code(0))
+                _ = await eventually { spawner.count(.resources) == 2 }
+                try check(spawner.count(.resources) == 2, "resources restarts even after exit 0")
+                spawner.finish(.resources, .code(7))
+                _ = await eventually { spawner.count(.resources) == 3 }
+                try check(spawner.count(.resources) == 3, "resources restarts after failure")
+                await supervisor.stopAll(grace: .seconds(1))
+            }
         }
 
         // Throttle: measured from the start, not the exit.
         try await scenario(throttle: .milliseconds(500)) { f in
             let spawner = FakeSpawner()
-            let supervisor = f.fake(spawner)
+            let clock = ManualRestartClock()
+            let supervisor = f.fake(spawner, restartClock: clock.clock)
             supervisor.start(.remote)
             _ = await eventually { spawner.count(.remote) == 1 }
             spawner.finish(.remote, .code(1))
+            try check(await eventually { clock.pending == 1 }, "a fast failure schedules its remaining throttle")
+            try check(clock.requests == [.milliseconds(500)], "fast failures wait from the previous start")
+            clock.advance(.milliseconds(499))
+            await Task.yield()
+            try check(spawner.count(.remote) == 1, "a helper cannot restart before its throttle boundary")
+            clock.advance(.milliseconds(1))
             _ = await eventually { spawner.count(.remote) == 2 }
-            let starts = spawner.launches(.remote).map(\.at)
-            try check(seconds(starts[0].duration(to: starts[1])) >= 0.49, "fast failures are spaced by the throttle interval")
-            await sleep(0.6)
-            let exited = ContinuousClock.now
+            try check(spawner.count(.remote) == 2, "a helper restarts at its throttle boundary")
+            clock.advance(.milliseconds(600))
             spawner.finish(.remote, .code(1))
             _ = await eventually { spawner.count(.remote) == 3 }
-            try check(seconds(exited.duration(to: spawner.launches(.remote)[2].at)) < 0.3, "a child that outlived the throttle restarts at once")
+            try check(spawner.count(.remote) == 3 && clock.requests.count == 1 && clock.pending == 0,
+                      "a child that outlived the throttle restarts without another timer")
             await supervisor.stopAll(grace: .seconds(1))
         }
 
@@ -316,7 +378,7 @@ struct SupervisorTests {
             let supervisor = f.fake(spawner)
             supervisor.start(.resources)
             _ = await eventually { supervisor.state(.resources).lastExit == .launchFailed(ENOENT) }
-            try check(supervisor.state(.resources).lastExit == .launchFailed(ENOENT) && spawner.count(.resources) == 0, "spawn failure is recorded")
+            try check(supervisor.state(.resources).lastExit == .launchFailed(ENOENT), "spawn failure is recorded even if its retry has already run")
             _ = await eventually { spawner.count(.resources) == 1 }
             try check(spawner.count(.resources) == 1, "spawn failure is retried")
             await supervisor.stopAll(grace: .seconds(1))
@@ -496,13 +558,16 @@ struct SupervisorTests {
         }
         try await scenario { f in
             let spawner = FakeSpawner()
-            let supervisor = f.fake(spawner)
+            let clock = ManualRestartClock()
+            let supervisor = f.fake(spawner, restartClock: clock.clock)
             supervisor.start()
             _ = await eventually { spawner.launches.count == 2 }
             spawner.finish(.queue, .code(1))
-            _ = await eventually { supervisor.state(.queue).phase == .waiting }
+            try check(await eventually { clock.pending == 1 }, "queue failure has a controlled pending restart")
             await supervisor.stopAll()
-            await sleep(0.8)
+            try check(await eventually { clock.pending == 0 }, "stopAll cancels its pending restart timer")
+            clock.advance(.seconds(1))
+            await Task.yield()
             try check(spawner.count(.queue) == 1, "a pending restart is cancelled by stopAll")
         }
         try await scenario { f in
