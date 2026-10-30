@@ -81,7 +81,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-15, macos-15-intel]
-        scope: [core, https, installer]
+        scope: [core-1, core-2, https, installer]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:

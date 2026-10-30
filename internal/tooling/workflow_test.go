@@ -58,7 +58,7 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 		if name == "tooling-tests" && !reflect.DeepEqual(job.Strategy.Matrix.Shard, []int{1, 2}) {
 			t.Fatal("both tooling shards must run on every required architecture")
 		}
-		if name == "macos-tests" && !reflect.DeepEqual(job.Strategy.Matrix.Scope, []string{"core", "https", "installer"}) {
+		if name == "macos-tests" && !reflect.DeepEqual(job.Strategy.Matrix.Scope, []string{"core-1", "core-2", "https", "installer"}) {
 			t.Fatal("complete core, HTTPS and installer partitions must run independently on every required architecture")
 		}
 		found := false

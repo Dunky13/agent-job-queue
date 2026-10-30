@@ -72,8 +72,52 @@ Final local native suite: PASS, including 118 supervisor checks and compilation
 for arm64 and x86_64. Independent Standards and Spec rechecks found no remaining
 actionable findings in the repair diff against `d5dd64c`, SHA-256
 `3957baf6edbb8a5c4611fbf838f02d086b104014045962c4776b3701f372adb4`.
-Hosted validation of the follow-up commit remains pending. The delayed fixture's
-scratch source and binary were removed; its failure log is retained locally.
+Both hosted native jobs subsequently passed on `9d64fb5`. Its remaining Intel
+core failure is covered below. The delayed fixture's scratch source and binary
+were removed; its failure log is retained locally.
+
+## Intel core CI budget follow-up
+
+Run `41077165345` on `9d64fb573799438b7f84ea880c5b9bc5159a7a95` passed
+the native matrices and all other jobs except Intel core and its aggregate.
+The backend package exhausted its twelve-minute test budget while
+`TestExplicitGenericLabelSurvivesCachedDescription` had only just started.
+That test passes alone in 120 ms. A full local ordinary-backend race run passed
+in 524.487 seconds, with per-test timings showing cumulative work across the
+suite. The aggregate correctly refused this incomplete validation.
+
+The CI core workload is now two independently required shards on each
+architecture. The driver discovers the complete backend inventory, sorts and
+alternates its 486 ordinary tests, examples and fuzz seeds, with 243 selected
+per shard. It excludes only the managed live-upgrade test, which retains its
+separate required installer job. Core-1 also runs the remaining dynamically
+discovered runtime packages, and core-2 runs only its backend selection. HTTPS
+is unchanged. Legacy unsharded `core` and default `all` remain available.
+
+Selection rejects missing installer coverage, duplicate or malformed records,
+incomplete summaries, unsafe names and empty shards before execution. Fixture
+regressions prove exact-once selection, future-package coverage, anchored
+installer-prefix handling, malformed-inventory refusal and preservation of
+backend and later-package failure exit codes. They pass with race detection.
+Bash 3.2 syntax, ShellCheck and Actionlint pass. Both actual shard commands passed locally: core-1 backend in 289.732 seconds
+and core-2 backend in 253.847 seconds. Core-1's other runtime package batch also
+passed. Comparing actual top-level execution records with the full baseline
+proved 486 entries covered exactly once, 243 per shard, with no omissions or
+overlaps. Reproduce from the repository root:
+
+```sh
+bash scripts/test-go-runtime.sh core-1
+bash scripts/test-go-runtime.sh core-2
+```
+
+Every CI shard keeps race detection, two package/test workers, the existing
+12-minute test timeout and 20-minute job budget. The complete matrix remains a
+mandatory input to `ci-required`; no required check or budget was weakened.
+Independent Standards and Spec reviews found no actionable findings, pinned to
+repair diff SHA-256
+`713df2248abf3a9fa35925640698bb7b75324d2067d9bd1ba60263c128d3ffb9`
+against `9d64fb5`, before this evidence-only handoff update. Fresh hosted Intel
+execution is still required to establish the new workload fits its budget.
 
 ## Hosted and platform evidence
 

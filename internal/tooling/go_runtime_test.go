@@ -256,7 +256,7 @@ func TestGoRuntimeCoreHTTPSAndInstallerCoverOriginalScopeExactlyOnce(t *testing.
 }
 
 func TestGoRuntimeRejectsInvalidSelectionBeforeEnumeration(t *testing.T) {
-	for _, selection := range [][]string{{""}, {"unknown"}, {"--run=Nothing"}, {"core", "https"}} {
+	for _, selection := range [][]string{{""}, {"unknown"}, {"core-0"}, {"core-3"}, {"--run=Nothing"}, {"core", "https"}} {
 		root, err, output := goRuntimeFixture(t, "unused", "0", "0", selection...)
 		if err == nil || !strings.Contains(output, "Usage:") {
 			t.Fatalf("invalid selection accepted: %q: %v: %s", selection, err, output)
@@ -274,6 +274,8 @@ func TestGoRuntimeRejectsIncompleteSelectedScope(t *testing.T) {
 		{"core", goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/remote"},
 		{"https", goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend"},
 		{"installer", goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/remote"},
+		{"core-1", goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/remote"},
+		{"core-2", goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend"},
 	} {
 		root, err, output := goRuntimeFixture(t, suite.packages, "0", "0", suite.name)
 		if err == nil || !strings.Contains(output, "nonempty runtime suite") {
@@ -318,7 +320,7 @@ func TestGoRuntimeFailsBeforeTestingInvalidEnumeration(t *testing.T) {
 		{"trailing slash", valid + runtime + "/", "0", "Unsafe Go package"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			for _, scope := range []string{"all", "core", "https", "installer"} {
+			for _, scope := range []string{"all", "core", "core-1", "core-2", "https", "installer"} {
 				t.Run(scope, func(t *testing.T) {
 					root, err, output := goRuntimeFixture(t, test.packages, test.status, "0", scope)
 					var exit *exec.ExitError
@@ -419,5 +421,125 @@ func TestGoRuntimePartialBackendSelectionRequiresCompleteExactInventory(t *testi
 				})
 			}
 		})
+	}
+}
+
+func TestGoRuntimeCoreShardsCoverInventoryAndPackagesExactlyOnce(t *testing.T) {
+	packages := []string{goRuntimeModule + "/internal/tooling", goRuntimeModule + "/internal/backend",
+		goRuntimeModule + "/internal/remote", goRuntimeModule + "/cmd/future", goRuntimeModule + "/internal/backend/child",
+		goRuntimeModule + "/internal/remote/child"}
+	names := []string{"TestZulu", "ExampleFuture", "FuzzFuture", "TestAlpha", goRuntimeInstallerTest + "Suffix", "TestFuture"}
+	config := goRuntimeDefaultConfig(strings.Join(packages, "\n"), "0", "0")
+	config.inventory = strings.Join(names, "\n") + "\nBenchmarkFuture\n" + goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary
+	selected := map[string]int{}
+	for _, scope := range []string{"core-1", "core-2", "https", "installer"} {
+		fixture := config
+		if scope == "installer" {
+			fixture.inventory = goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary
+		}
+		root, err, output := goRuntimeConfiguredFixture(t, fixture, scope)
+		if err != nil {
+			t.Fatalf("%s: %v: %s", scope, err, output)
+		}
+		calls := goRuntimeTestCalls(t, root)
+		wantCount := 1
+		if scope == "core-1" {
+			wantCount = 2
+		}
+		if len(calls) != wantCount {
+			t.Fatalf("%s calls: %q", scope, calls)
+		}
+		if strings.HasPrefix(scope, "core-") {
+			want := []string{"test", "-race", "-p", "2", "./internal/backend", "-list", "."}
+			if got := goRuntimeArguments(t, root, "inventory"); !reflect.DeepEqual(got, want) {
+				t.Fatalf("%s must discover the complete race-built inventory: %q", scope, got)
+			}
+			pattern := "^(ExampleFuture|TestAlpha|" + goRuntimeInstallerTest + "Suffix)$"
+			if scope == "core-2" {
+				pattern = "^(FuzzFuture|TestFuture|TestZulu)$"
+			}
+			want = []string{"test", "-p", "2", "-parallel", "2", "-race", "-v", packages[1], "-run", pattern, "-timeout", "12m"}
+			if !reflect.DeepEqual(calls[0], want) {
+				t.Fatalf("%s changed deterministic selection, timings or budgets: %q", scope, calls[0])
+			}
+		}
+		for _, call := range calls {
+			var run *regexp.Regexp
+			for index, value := range call {
+				if value == "-run" {
+					run = regexp.MustCompile(call[index+1])
+				}
+			}
+			for _, pkg := range call {
+				if !strings.HasPrefix(pkg, goRuntimeModule+"/") {
+					continue
+				}
+				for _, name := range append(append([]string{}, names...), goRuntimeInstallerTest) {
+					if run == nil || run.MatchString(name) {
+						selected[pkg+"/"+name]++
+					}
+				}
+			}
+		}
+	}
+	for _, pkg := range packages[1:] {
+		for _, name := range append(append([]string{}, names...), goRuntimeInstallerTest) {
+			if got := selected[pkg+"/"+name]; got != 1 {
+				t.Fatalf("test omitted or duplicated: %s/%s: %d", pkg, name, got)
+			}
+		}
+	}
+}
+
+func TestGoRuntimeCoreShardsRefuseIncompleteInventory(t *testing.T) {
+	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n" + goRuntimeModule + "/internal/remote\n"
+	valid := "TestAlpha\nExampleFuture\nFuzzFuture\n" + goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary
+	for _, test := range []struct{ name, inventory, status string }{
+		{"enumeration error", valid, "23"},
+		{"empty", "", "0"},
+		{"missing installer", strings.Replace(valid, goRuntimeInstallerTest+"\n", "", 1), "0"},
+		{"missing summary", strings.TrimSuffix(valid, goRuntimeInstallerSummary), "0"},
+		{"duplicate test", "TestAlpha\n" + valid, "0"},
+		{"duplicate installer", goRuntimeInstallerTest + "\n" + valid, "0"},
+		{"duplicate summary", valid + goRuntimeInstallerSummary, "0"},
+		{"test after summary", valid + "TestAfter\n", "0"},
+		{"unsafe regex", "TestAlpha|TestOther\n" + valid, "0"},
+		{"wrong package", strings.Replace(valid, "/backend", "/other", 1), "0"},
+		{"invalid summary", strings.Replace(valid, "0.123s", "unfinished", 1), "0"},
+		{"empty shard", "TestOnly\n" + goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary, "0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, scope := range []string{"core-1", "core-2"} {
+				config := goRuntimeDefaultConfig(packages, "0", "0")
+				config.inventory, config.inventoryStatus = test.inventory, test.status
+				root, err, output := goRuntimeConfiguredFixture(t, config, scope)
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || !strings.Contains(output, "inventory") || len(goRuntimeTestCalls(t, root)) != 0 {
+					t.Fatalf("%s accepted invalid inventory: %v: %s", scope, err, output)
+				}
+				if test.status != "0" && exit.ExitCode() != 23 {
+					t.Fatal("inventory failure status lost", exit.ExitCode())
+				}
+			}
+		})
+	}
+}
+
+func TestGoRuntimeCoreShardsPreserveFailures(t *testing.T) {
+	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n" + goRuntimeModule + "/internal/remote\n" + goRuntimeModule + "/cmd/future\n"
+	for _, scope := range []string{"core-1", "core-2"} {
+		for _, call := range []int{1, 2} {
+			if scope == "core-2" && call == 2 {
+				continue
+			}
+			config := goRuntimeDefaultConfig(packages, "0", "37")
+			config.inventory = "TestAlpha\nTestBeta\n" + goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary
+			config.failTestCall = call
+			root, err, output := goRuntimeConfiguredFixture(t, config, scope)
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 37 || len(goRuntimeTestCalls(t, root)) != call {
+				t.Fatalf("%s failure %d lost: %v: %s", scope, call, err, output)
+			}
+		}
 	}
 }

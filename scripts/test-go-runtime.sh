@@ -3,13 +3,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 if [[ $# -gt 1 ]]; then
-  printf 'Usage: %s [all|core|https|installer]\n' "$0" >&2
+  printf 'Usage: %s [all|core|core-1|core-2|https|installer]\n' "$0" >&2
   exit 1
 fi
 scope=${1-all}
 case "$scope" in
-  all|core|https|installer) ;;
-  *) printf 'Usage: %s [all|core|https|installer]\n' "$0" >&2; exit 1 ;;
+  all|core|core-1|core-2|https|installer) ;;
+  *) printf 'Usage: %s [all|core|core-1|core-2|https|installer]\n' "$0" >&2; exit 1 ;;
 esac
 
 # Keep the original CI scope dynamic, and stop before testing on list errors.
@@ -20,6 +20,7 @@ https="$module/internal/remote"
 backend="$module/internal/backend"
 installer_test=TestInstallerManagedLiveUpgradeRetainsRunningAttempts
 installer_pattern="^${installer_test}$"
+summary_detail='^([0-9]+([.][0-9]+)?s([[:space:]]+\(cached\))?|\(cached\))$'
 runtime=()
 seen=()
 found_tooling=false
@@ -53,7 +54,7 @@ while IFS= read -r package || [[ -n "$package" ]]; do
       runtime+=("$package")
     fi
   else
-    if [[ "$scope" == all || "$scope" == core || ( "$scope" == installer && "$package" == "$backend" ) ]]; then
+    if [[ "$scope" == all || "$scope" == core || "$scope" == core-1 || ( ( "$scope" == installer || "$scope" == core-2 ) && "$package" == "$backend" ) ]]; then
       runtime+=("$package")
     fi
   fi
@@ -69,7 +70,6 @@ if [[ "$scope" == core || "$scope" == installer ]]; then
   inventory=$(go test -race -p 2 ./internal/backend -list "$installer_pattern")
   found_test=false
   summary=false
-  summary_detail='^([0-9]+([.][0-9]+)?s([[:space:]]+\(cached\))?|\(cached\))$'
   while IFS= read -r name || [[ -n "$name" ]]; do
     if [[ "$name" == "$installer_test" ]]; then
       if [[ "$found_test" == true || "$summary" == true ]]; then
@@ -96,8 +96,57 @@ if [[ "$scope" == installer ]]; then
   go test -p 2 -parallel 2 -race "$backend" -run "$installer_pattern" -timeout 12m
   exit
 fi
-if [[ "$scope" == core ]]; then
-  go test -p 2 -parallel 2 -race "$backend" -skip "$installer_pattern" -timeout 12m
+if [[ "$scope" == core || "$scope" == core-1 || "$scope" == core-2 ]]; then
+  if [[ "$scope" == core ]]; then
+    go test -p 2 -parallel 2 -race "$backend" -skip "$installer_pattern" -timeout 12m
+  else
+    # Enumerate before selecting so every ordinary test, example and fuzz seed
+    # runs exactly once. The live-upgrade test retains its independent job.
+    inventory=$(go test -race -p 2 ./internal/backend -list .)
+    tests=()
+    listed_tests=()
+    summary=false
+    found_installer=false
+    while IFS= read -r name || [[ -n "$name" ]]; do
+      if [[ $name =~ ^(Test|Example|Fuzz|Benchmark)[a-zA-Z0-9_]*$ ]]; then
+        [[ $summary == false ]] || { printf 'Test after backend inventory summary.\n' >&2; exit 1; }
+        for previous in ${listed_tests[@]+"${listed_tests[@]}"}; do
+          [[ $previous != "$name" ]] || { printf 'Duplicate backend inventory test: %s\n' "$name" >&2; exit 1; }
+        done
+        listed_tests+=("$name")
+        case "$name" in
+          "$installer_test") found_installer=true ;;
+          Benchmark*) ;;
+          *) tests+=("$name") ;;
+        esac
+      else
+        read -r status listed detail <<< "$name"
+        if [[ $summary != false || $status != ok || $listed != "$backend" || ! $detail =~ $summary_detail ]]; then
+          printf 'Unexpected backend inventory record: %s\n' "$name" >&2
+          exit 1
+        fi
+        summary=true
+      fi
+    done <<< "$inventory"
+    [[ $summary == true && $found_installer == true && ${#tests[@]} -ge 2 ]] || {
+      printf 'Backend inventory requires a complete installer and nonempty two-shard suite.\n' >&2
+      exit 1
+    }
+    sorted=$(printf '%s\n' "${tests[@]}" | LC_ALL=C sort)
+    selected=()
+    index=0
+    shard=${scope#core-}
+    while IFS= read -r name; do
+      if (( index % 2 + 1 == shard )); then selected+=("$name"); fi
+      index=$((index + 1))
+    done <<< "$sorted"
+    [[ ${#selected[@]} -gt 0 ]] || { printf 'Empty backend inventory shard.\n' >&2; exit 1; }
+    printf 'Backend shard %s/2: %s of %s tests, examples and fuzz seeds\n' "$shard" "${#selected[@]}" "${#tests[@]}"
+    pattern=$(IFS='|'; printf '%s' "${selected[*]}")
+    go test -p 2 -parallel 2 -race -v "$backend" -run "^($pattern)$" -timeout 12m
+    # Non-backend runtime packages belong only to the first core shard.
+    if [[ "$scope" == core-2 ]]; then exit; fi
+  fi
   other=()
   for package in "${runtime[@]}"; do
     if [[ "$package" != "$backend" ]]; then other+=("$package"); fi
