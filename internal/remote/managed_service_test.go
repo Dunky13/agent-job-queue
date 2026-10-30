@@ -118,7 +118,7 @@ func fixtureManagedController(t *testing.T) *controller {
 
 func TestManagedPhoneServiceUsesOwningBundleAndNoUserPlist(t *testing.T) {
 	c := fixtureManagedController(t)
-	state := "notRegistered"
+	state := "enabled"
 	var actions []string
 	c.managedCommand = func(args []string) ([]byte, error) {
 		if len(args) != 4 || args[0] != filepath.Join(c.p.managedApp, "Contents/MacOS/AgentQueue") || args[1] != "--service-management" || args[3] != "remote" {
@@ -126,7 +126,7 @@ func TestManagedPhoneServiceUsesOwningBundleAndNoUserPlist(t *testing.T) {
 		}
 		actions = append(actions, args[2])
 		if args[2] == "register" {
-			state = "enabled"
+			t.Fatal("managed phone access registered a Service Management job")
 		} else if args[2] == "unregister" {
 			state = "notRegistered"
 		}
@@ -141,75 +141,177 @@ func TestManagedPhoneServiceUsesOwningBundleAndNoUserPlist(t *testing.T) {
 	if err := c.serviceAction("start"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.serviceAction("stop"); err != nil {
-		t.Fatal(err)
+	if len(actions) != 0 {
+		t.Fatalf("starting managed phone access called the native bridge: %v", actions)
 	}
-	if !slices.Equal(actions, []string{"status", "register", "status", "unregister"}) {
+	// A registration left by an earlier version is retired once; afterwards
+	// stopping has nothing to unregister.
+	for range 2 {
+		if err := c.serviceAction("stop"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !slices.Equal(actions, []string{"status", "unregister", "status"}) {
 		t.Fatalf("unexpected lifecycle actions: %v", actions)
 	}
 }
 
-func TestManagedPhoneEnablePreservesRevokedApprovalAndConfiguration(t *testing.T) {
+func TestManagedPhoneStopRetiresRegistrationAwaitingApproval(t *testing.T) {
 	c := fixtureManagedController(t)
+	state := "requiresApproval"
+	var actions []string
+	c.managedCommand = func(args []string) ([]byte, error) {
+		actions = append(actions, args[2])
+		if args[2] == "unregister" {
+			state = "notRegistered"
+		}
+		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: state})
+	}
+	if err := c.serviceAction("stop"); err != nil {
+		t.Fatal("a leftover registration awaiting approval blocked migration", err)
+	}
+	if !slices.Equal(actions, []string{"status", "unregister"}) {
+		t.Fatalf("unexpected lifecycle actions: %v", actions)
+	}
+}
+
+func TestManagedPhoneEnableIgnoresApprovalAndReturnsWithoutWaiting(t *testing.T) {
+	c := fixtureManagedController(t)
+	c.bootFn = func() (string, error) { return "fixture-boot", nil }
 	settings := testSettings()
 	settings.Enabled = false
 	if err := writePrivate(c.p.config, settings); err != nil {
 		t.Fatal(err)
 	}
-	before, err := os.ReadFile(c.p.config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var calls int
-	c.managedCommand = func(args []string) ([]byte, error) {
-		calls++
-		if args[2] != "status" {
-			t.Fatal("revoked approval caused a registration mutation")
-		}
-		return []byte(`{"schemaVersion":1,"service":"remote","status":"requiresApproval"}`), nil
-	}
-	if err := c.enable(); err == nil || !strings.Contains(err.Error(), "Login Items") {
-		t.Fatalf("revoked approval did not block enable: %v", err)
-	}
-	after, err := os.ReadFile(c.p.config)
-	if err != nil || string(before) != string(after) || calls != 1 {
-		t.Fatalf("revoked approval mutated configuration or retried: %v %d", err, calls)
-	}
-}
-
-func TestManagedPhoneStartRegistersVerifiedNotFoundService(t *testing.T) {
-	c := fixtureManagedController(t)
+	state := "requiresApproval"
 	var actions []string
 	c.managedCommand = func(args []string) ([]byte, error) {
 		actions = append(actions, args[2])
-		state := "notFound"
-		if args[2] == "register" {
-			state = "enabled"
+		switch args[2] {
+		case "register":
+			t.Fatal("enable registered a Service Management job")
+		case "unregister":
+			state = "notRegistered"
 		}
 		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: state})
 	}
-	if err := c.managedServiceAction("start"); err != nil {
-		t.Fatal("explicit phone start refused verified service before registration", err)
+	started := time.Now()
+	if err := c.enable(); err != nil {
+		t.Fatal("approval state of a leftover registration blocked enable", err)
 	}
-	if !slices.Equal(actions, []string{"status", "register"}) {
-		t.Fatal("phone registration did not attempt exactly once", actions)
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("enable waited for the service to start: %s", elapsed)
+	}
+	actual, err := loadSettings(c.p)
+	if err != nil || actual == nil || !actual.Enabled || actual.PasswordHash != settings.PasswordHash || actual.SecretKey != settings.SecretKey {
+		t.Fatal("enable did not record the user's choice with credentials intact", actual, err)
+	}
+	if !slices.Equal(actions, []string{"status", "unregister"}) {
+		t.Fatalf("unexpected native calls: %v", actions)
+	}
+	// Only an unmanaged install starts its own agent and waits for readiness.
+	c.p.testing = false
+	if c.waitsForServiceStart() {
+		t.Fatal("a managed install waits for a service its app supervises")
+	}
+	c.p.managedApp = ""
+	if !c.waitsForServiceStart() {
+		t.Fatal("an unmanaged install no longer confirms its service started")
+	}
+}
+
+// A terminal user who runs enable on a managed install must learn that the
+// app, not this command, starts phone access. Only the text of the existing
+// "error" field changes: the keys and every other value stay as they were.
+func TestManagedPhoneEnableExplainsThatTheAppStartsIt(t *testing.T) {
+	c := fixtureManagedController(t)
+	c.bootFn = func() (string, error) { return "fixture-boot", nil }
+	settings := testSettings()
+	settings.Enabled = false
+	if err := writePrivate(c.p.config, settings); err != nil {
+		t.Fatal(err)
+	}
+	c.managedCommand = func(args []string) ([]byte, error) {
+		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: "notRegistered"})
+	}
+	if err := c.enable(); err != nil {
+		t.Fatal(err)
+	}
+	status, err := c.status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["error"] != remoteNotRunning {
+		t.Fatalf("status of a stopped service changed: %v", status["error"])
+	}
+	c.explainManagedEnable(status)
+	if !strings.Contains(fmt.Sprint(status["error"]), "starts when Agent Queue is running") {
+		t.Fatalf("enable did not explain who starts phone access: %v", status["error"])
+	}
+	var before, after map[string]any
+	explained, _ := json.Marshal(status)
+	if err := json.Unmarshal(plain, &before); err != nil || json.Unmarshal(explained, &after) != nil {
+		t.Fatal("status is not JSON", err)
+	}
+	if len(before) != len(after) {
+		t.Fatalf("enable output keys changed: %v vs %v", before, after)
+	}
+	for key, value := range before {
+		if _, ok := after[key]; !ok {
+			t.Fatalf("enable output lost %s", key)
+		}
+		if key != "error" && fmt.Sprint(after[key]) != fmt.Sprint(value) {
+			t.Fatalf("enable output changed %s: %v vs %v", key, value, after[key])
+		}
+	}
+	// A running service, an unrelated failure and an unmanaged install are left alone.
+	for name, change := range map[string]func(*controller, map[string]any){
+		"running":   func(_ *controller, s map[string]any) { s["running"] = true; s["error"] = nil },
+		"failure":   func(_ *controller, s map[string]any) { s["error"] = "Gateway could not start" },
+		"unmanaged": func(c *controller, s map[string]any) { c.p.managedApp = "" },
+	} {
+		c.p.managedApp = filepath.Join(c.p.home, "Applications/Agent Queue.app")
+		other := map[string]any{"running": false, "error": remoteNotRunning}
+		change(c, other)
+		want := fmt.Sprint(other["error"])
+		c.explainManagedEnable(other)
+		if fmt.Sprint(other["error"]) != want {
+			t.Fatalf("%s: enable rewrote %q", name, want)
+		}
+	}
+}
+
+func TestManagedPhoneStartNeverRegisters(t *testing.T) {
+	for _, state := range []string{"notRegistered", "notFound", "requiresApproval", "enabled"} {
+		t.Run(state, func(t *testing.T) {
+			c := fixtureManagedController(t)
+			c.managedCommand = func(args []string) ([]byte, error) {
+				t.Fatal("starting managed phone access reached the native bridge", args)
+				return nil, nil
+			}
+			if err := c.managedServiceAction("start"); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
 func TestManagedPhoneEnableNotFoundStillRequiresCredentials(t *testing.T) {
 	c := fixtureManagedController(t)
 	c.managedCommand = func(args []string) ([]byte, error) {
-		if args[2] != "status" {
-			t.Fatal("unconfigured phone access attempted registration")
-		}
-		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: "notFound"})
+		t.Fatal("unconfigured phone access reached the native bridge", args)
+		return nil, nil
 	}
 	if err := c.enable(); err == nil || !strings.Contains(err.Error(), "Configure a password") {
 		t.Fatal("lookup miss bypassed or obscured the credential requirement", err)
 	}
 }
 
-func TestManagedPhoneConfiguredEnableAfterLookupMiss(t *testing.T) {
+func TestManagedPhoneConfiguredEnableAfterLookupMissNeverRegisters(t *testing.T) {
 	for _, action := range []string{"enable", "migrate"} {
 		t.Run(action, func(t *testing.T) {
 			c := fixtureManagedController(t)
@@ -242,14 +344,14 @@ func TestManagedPhoneConfiguredEnableAfterLookupMiss(t *testing.T) {
 				err = c.migrate()
 			}
 			if err != nil {
-				t.Fatal("configured phone access did not reach registration after verified shutdown", err)
+				t.Fatal("configured phone access did not complete after verified shutdown", err)
 			}
 			actual, err := loadSettings(c.p)
 			if err != nil || actual == nil || !actual.Enabled || actual.PasswordHash != settings.PasswordHash || actual.SecretKey != settings.SecretKey {
 				t.Fatal("phone recovery lost credentials or enabled intent", actual, err)
 			}
-			if !slices.Equal(actions, []string{"status", "status", "status", "register"}) {
-				t.Fatal("unexpected native lifecycle or duplicate registration", actions)
+			if !slices.Equal(actions, []string{"status"}) {
+				t.Fatal("unexpected native lifecycle or a registration", actions)
 			}
 		})
 	}
@@ -329,7 +431,7 @@ func TestManagedPhoneServiceFailsClosedOnNativeErrors(t *testing.T) {
 		t.Run(response, func(t *testing.T) {
 			c := fixtureManagedController(t)
 			c.managedCommand = func([]string) ([]byte, error) { return []byte(response), nil }
-			if err := c.serviceAction("start"); err == nil {
+			if err := c.serviceAction("stop"); err == nil {
 				t.Fatal("invalid native status accepted")
 			}
 			if _, err := os.Lstat(c.p.plist); !errors.Is(err, os.ErrNotExist) {
@@ -345,17 +447,17 @@ func TestManagedPhoneServiceFailsClosedOnNativeErrors(t *testing.T) {
 	}
 }
 
-func TestManagedPhonePendingRegistrationIsNotSuccess(t *testing.T) {
+func TestManagedPhoneUnfinishedRemovalIsNotSuccess(t *testing.T) {
 	c := fixtureManagedController(t)
 	c.managedCommand = func(args []string) ([]byte, error) {
-		state := "notRegistered"
-		if args[2] == "register" {
+		state := "enabled"
+		if args[2] == "unregister" {
 			state = "requiresApproval"
 		}
 		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: state})
 	}
-	if err := c.serviceAction("start"); err == nil || !strings.Contains(err.Error(), "Login Items") {
-		t.Fatalf("pending registration reported success: %v", err)
+	if err := c.serviceAction("stop"); err == nil || !strings.Contains(err.Error(), "Login Items") {
+		t.Fatalf("unfinished removal reported success: %v", err)
 	}
 }
 

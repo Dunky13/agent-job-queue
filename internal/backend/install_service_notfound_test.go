@@ -99,14 +99,19 @@ func TestManagedInstallRegistersNotFoundServices(t *testing.T) {
 			if err := m.run(t); err != nil {
 				t.Fatal("explicit setup could not register a verified owning app", err)
 			}
-			for _, service := range []string{"queue", "resources", "login"} {
+			required := []string{"queue", "resources", "login"}
+			if inPlace {
+				// The menu bar app supervises the helpers; only its login item registers.
+				required = []string{"login"}
+			}
+			for _, service := range required {
 				if m.statuses[service] != "enabled" {
 					t.Fatal("required registration was not verified", service)
 				}
 			}
 			for _, args := range m.calls {
-				if len(args) == 4 && slices.Equal(args[1:], []string{"--service-management", "register", "remote"}) {
-					t.Fatal("disabled phone access was registered")
+				if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" && (args[3] == "remote" || inPlace && args[3] != "login") {
+					t.Fatal("setup registered a service it must not", args)
 				}
 			}
 		})

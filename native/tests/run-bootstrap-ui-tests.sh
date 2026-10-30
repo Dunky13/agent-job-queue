@@ -31,7 +31,7 @@ PLIST
 sed '/^@main$/d' "$root/native/AgentQueue.swift" > "$temporary/AgentQueue.swift"
 xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -framework SwiftUI -framework AppKit -framework ServiceManagement \
   "$root/native/QueueBrand.swift" "$temporary/AgentQueue.swift" "$root/native/AgentIntegration.swift" "$root/native/AgentUpdates.swift" \
-  "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/AgentServices.swift" \
+  "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/AgentServices.swift" "$root/native/AgentSupervisor.swift" \
   "$root/native/tests/BootstrapFixtures.swift" "$root/native/tests/BootstrapUITests.swift" -o "$app/Contents/MacOS/BootstrapUITests"
 if [[ "${1:-}" == "--build-only" ]]; then exit 0; fi
 if [[ $# -ne 0 ]]; then echo "Unknown bootstrap UI fixture argument" >&2; exit 2; fi
@@ -64,13 +64,18 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
     --temporary "$temporary" --output "$output/silent-recovery" --silent-recovery
 [[ "$(plutil -extract passed raw -o - "$output/silent-recovery/verification.json")" == "true" ]]
+mkdir -p -- "$output/status-layout"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --temporary "$temporary" --output "$output/status-layout" --silent-recovery --pending-status-layout
+[[ "$(plutil -extract passed raw -o - "$output/status-layout/verification.json")" == "true" ]]
 mkdir -p -- "$output/cancellable-wait"
 HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
     --temporary "$temporary" --output "$output/cancellable-wait" --cancellable-wait
 [[ "$(plutil -extract passed raw -o - "$output/cancellable-wait/verification.json")" == "true" ]]
 
-for scenario in quit-mutation unknown-requirement; do
+for scenario in quit-mutation unknown-requirement supervised-quit; do
   mkdir -p -- "$output/$scenario"
   HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
     "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \

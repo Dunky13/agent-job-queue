@@ -2270,8 +2270,12 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 		return command
 	}
 	cli := filepath.Join(home, ".local/bin/agent-heavy")
-	if !managed {
-		start("daemon", cli, "daemon")
+	// Setup starts no helper for an app bundle: the menu bar app does, as its
+	// own children, once setup returns. This test plays that supervisor.
+	supervised := !managed || appBundle
+	var daemon *exec.Cmd
+	if supervised {
+		daemon = start("daemon", cli, "daemon")
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	ready := false
@@ -2294,16 +2298,26 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 		t.Fatalf("packaged queue database is not a private regular file: %v %v", info, err)
 	}
 	if appBundle {
-		// Re-run setup with the real packaged daemon live, then exercise a job
-		// through that same daemon and scheduler below.
+		// Setup refuses to run beside helpers holding their lifetime locks, so
+		// the supervisor stops its children first, then starts them again.
+		_ = daemon.Process.Signal(syscall.SIGTERM)
+		_ = daemon.Wait()
 		if err := runPackaged(); err != nil {
-			t.Fatalf("packaged app setup could not retry with a live daemon: %v", err)
+			t.Fatalf("packaged app setup could not retry after its helpers stopped: %v", err)
 		}
+		daemon = start("daemon", cli, "daemon")
+		fixtureUntil(t, 10*time.Second, func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, cli, "status", "--json")
+			command.Env = childEnv
+			return command.Run() == nil
+		})
 	}
 	if _, err := os.Stat(filepath.Join(install.config, "pueue.yml")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("packaged upgrade or daemon generated legacy queue configuration")
 	}
-	if !managed {
+	if supervised {
 		start("scheduler", cli, "scheduler")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

@@ -41,7 +41,7 @@ func TestManagedSetupStopRetainsAcceptedMutation(t *testing.T) {
 	}
 }
 
-func TestManagedSetupStopReachesNestedPendingApproval(t *testing.T) {
+func TestManagedSetupStopReachesNestedPendingDrainWait(t *testing.T) {
 	m := managedTestFixture(t)
 	m.nativeFailure = "register resources"
 	if err := m.run(t); err == nil {
@@ -50,18 +50,20 @@ func TestManagedSetupStopReachesNestedPendingApproval(t *testing.T) {
 	i := m.installer
 	pending := i.identity
 	managedCandidate(t, m, "124")
-	m.nativeFailure, m.approval = "", "resources"
+	m.nativeFailure = ""
+	// Recovery of the retained candidate waits inside its own nested loop for
+	// running jobs; stopping must reach that wait.
+	m.tasks["7"] = Object{"id": 7, "status": Object{"Running": Object{}}}
 	stop := make(chan struct{})
 	i.setupStop = stop
-	original := i.command
 	requested := false
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		raw, err := original(ctx, args)
-		if !requested && len(args) == 4 && args[1] == "--service-management" && args[2] == "status" && args[3] == "resources" && m.statuses["resources"] == "requiresApproval" {
+	snapshot := i.queueSnapshot
+	i.queueSnapshot = func(ctx context.Context) (Object, error) {
+		if !requested {
 			requested = true
 			close(stop)
 		}
-		return raw, err
+		return snapshot(ctx)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()

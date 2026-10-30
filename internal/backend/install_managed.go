@@ -53,7 +53,7 @@ func (install *installer) managedAction(ctx context.Context, app, action, servic
 	if err != nil {
 		return err
 	}
-	if status == "requiresApproval" && !(action == "unregister" && install.unregisterServices) {
+	if status == "requiresApproval" && !(action == "unregister" && install.managedMayUnregisterPending(service)) {
 		if action == "register" {
 			return &installApprovalError{service: service}
 		}
@@ -103,6 +103,14 @@ func (install *installer) managedAction(ctx context.Context, app, action, servic
 		return fmt.Errorf("The %s service is %s after %s; setup is incomplete", service, status, action)
 	}
 	return nil
+}
+
+// A queue, resources or phone registration awaiting approval is a leftover from
+// before the menu bar app supervised those helpers: it owns no process and
+// migration always retires it. The login item stays pending for the user to
+// approve unless its registration is being removed.
+func (install *installer) managedMayUnregisterPending(service string) bool {
+	return service != "login" || install.unregisterServices
 }
 
 func (install *installer) managedVerify(ctx context.Context, app string) error {
@@ -253,7 +261,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		return nil
 	}
 	if !p.loaded["io.went.agent-heavy"] {
-		return install.managedOfflineDrain(ctx)
+		return install.managedOfflineDrainHolding(ctx, p, "queue-daemon.lock", "resource-controller.lock")
 	}
 	snapshot, err := install.managedSnapshot(ctx)
 	if err != nil {
@@ -264,7 +272,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		// queue store, and app-bundle setup quiesces it and repeats the
 		// complete offline drain before any mutation.
 		if busy, lockErr := installInspectLock(install.state, "queue-daemon.lock"); install.appBundle && lockErr == nil && !busy && exists {
-			return install.managedOfflineDrainHolding(ctx, "queue-daemon.lock")
+			return install.managedOfflineDrainHolding(ctx, p, "queue-daemon.lock")
 		}
 		return fmt.Errorf("Cannot verify the installed queue is drained; no service was changed: %w", err)
 	}
@@ -300,11 +308,18 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 // Inspect a stopped queue using private copies. SQLite may create sidecars even
 // in read-only mode, so never open the user's live database during preflight.
 func (install *installer) managedOfflineDrain(ctx context.Context) error {
-	return install.managedOfflineDrainHolding(ctx, "queue-daemon.lock", "resource-controller.lock")
+	return install.managedOfflineDrainHolding(ctx, nil, "queue-daemon.lock", "resource-controller.lock")
 }
 
 // Each named lifetime lock must be free; its owner could still change the store.
-func (install *installer) managedOfflineDrainHolding(ctx context.Context, locks ...string) error {
+// Payload setup requires the stopped store to be drained. A supervised app
+// bundle recovering at the same location does not: the app stops its daemon
+// when it quits, and only the app can start the daemon whose
+// dirty-restart recovery pauses and re-adopts unfinished jobs. A drain wait
+// could therefore never end. Only a running launchd daemon, which unregistering
+// would disconnect from its callers, is waited for (see managedDrain).
+// Removal and relocation always retain the full drain and attempt checks.
+func (install *installer) managedOfflineDrainHolding(ctx context.Context, p *managedPlan, locks ...string) error {
 	for _, name := range locks {
 		busy, err := installInspectLock(install.state, name)
 		if err != nil {
@@ -347,6 +362,12 @@ func (install *installer) managedOfflineDrainHolding(ctx context.Context, locks 
 	}
 	if version != 1 && version != 2 {
 		return errors.New("Unsupported stopped queue schema")
+	}
+	// Only recovery at the same app location can preserve unfinished work for
+	// the supervised daemon to reconcile. Removal and relocation retire custody
+	// that its original callers and workers may still need.
+	if p != nil && install.managedSupervised(p) && !install.unregisterServices && !install.prepareReplacement && p.relocation == nil {
+		return install.requireLegacyCleanup()
 	}
 	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM queue_jobs WHERE phase != 'done'").Scan(&unfinished); err != nil {
 		return err
@@ -508,7 +529,9 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 				if err != nil {
 					return nil, err
 				}
-				if status == "requiresApproval" && !install.unregisterServices {
+				// App-bundle setup migrates registrations awaiting approval and never
+				// waits for the login item. The payload path still pauses for approval.
+				if status == "requiresApproval" && !install.unregisterServices && !install.appBundle {
 					return nil, &installApprovalError{service: service}
 				}
 				if status == "notFound" && (install.prepareReplacement || install.unregisterServices) {
@@ -634,9 +657,13 @@ func (install *installer) managedLoaded(raw []byte, label, app string) error {
 
 // Newer launchd prints a bundle-relative "program identifier" for Service
 // Management agents instead of an absolute program. A running instance
-// establishes custody only through its kernel-recorded executable. Without a
-// process, the registration must name this app's absolute program or bundled
-// definition. Bundle identifiers alone cannot distinguish two installed copies.
+// establishes custody only through its kernel-recorded executable. A
+// registration with no process, such as a crash-looping job pinned to an older
+// build, has nothing to stop or hijack: it is accepted for unregistration when
+// it names this app's bundle identifier and helper, and either states a
+// canonical absolute location or is a Service Management submission.
+// Bundle identifiers alone cannot distinguish two installed copies, so a live
+// process still requires the exact executable.
 func managedLoadedBundleProgram(raw []byte, executable, helper, command string) bool {
 	identifiers, bundles, pids, blocks := 0, 0, 0, 0
 	programs, paths := 0, 0
@@ -647,7 +674,7 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 		label = "io.went.agent-remote"
 	}
 	definition := filepath.Join(filepath.Dir(filepath.Dir(executable)), "Library/LaunchAgents", label+".plist")
-	identified, bundled, running, definitionPath := false, false, false, false
+	identified, bundled, running, definitionPath, submitted := false, false, false, false, false
 	pid := 0
 	arguments := []string{}
 	inArguments := false
@@ -683,6 +710,7 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 				if err != nil || submitter <= 1 {
 					return false
 				}
+				submitted = true
 			}
 		case trimmed == "arguments = {":
 			blocks++
@@ -712,7 +740,7 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 		return false
 	}
 	if pids == 0 {
-		return !running && (programs == 1 || definitionPath)
+		return !running && (programs == 1 || definitionPath || submitted)
 	}
 	if pid <= 1 {
 		return false
@@ -1430,7 +1458,7 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 		}
 	}
 	for _, service := range []string{"resources", "remote", "queue", "login"} {
-		if p.statuses[service] == "enabled" || install.unregisterServices && p.statuses[service] == "requiresApproval" {
+		if p.statuses[service] == "enabled" || p.statuses[service] == "requiresApproval" && install.managedMayUnregisterPending(service) {
 			if err := install.requireManagedRelocation(ctx, p.relocation); err != nil {
 				return err
 			}
@@ -1465,7 +1493,7 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 			if err := install.validateManagedLive(ctx, p.live); err != nil {
 				return err
 			}
-		} else if err := install.managedOfflineDrain(ctx); err != nil {
+		} else if err := install.managedOfflineDrainHolding(ctx, p, "queue-daemon.lock", "resource-controller.lock"); err != nil {
 			return err
 		}
 	}
@@ -1675,34 +1703,10 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err := installAtomic(filepath.Join(install.root, "installation.json"), append(metadata, '\n'), 0600); err != nil {
 		return err
 	}
-	for _, service := range []string{"queue", "resources", "login"} {
-		if err := managedRequireBundle(install.app, published); err != nil {
-			return err
-		}
-		if err := install.managedAction(ctx, install.app, "register", service); err != nil {
-			return err
-		}
-	}
-	// Service Management can take well over 30 seconds to apply a fresh
-	// registration.
-	ready := false
-	for attempt := 0; attempt < 120; attempt++ {
-		output, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-heavy"), "status", "--json")
-		if err == nil {
-			if err := managedReadiness(output); err != nil {
-				return err
-			}
-			ready = true
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-		}
-	}
-	if !ready {
-		return errors.New("The managed queue daemon did not become ready; setup remains incomplete")
+	supervised := install.managedSupervised(p)
+	loginPending, err := install.managedActivate(ctx, published, supervised)
+	if err != nil {
+		return err
 	}
 	if p.python {
 		if err := install.removeLegacy(); err != nil {
@@ -1731,47 +1735,8 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, service := range []string{"queue", "resources", "login"} {
-		status, err := install.managedStatus(ctx, install.app, service)
-		if err != nil {
-			return err
-		}
-		if status != "enabled" {
-			return fmt.Errorf("Managed service %s is %s; setup remains incomplete", service, status)
-		}
-	}
-	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
-		output, loaded, err := install.inspectService(ctx, label)
-		if err != nil {
-			return err
-		}
-		if !loaded {
-			return fmt.Errorf("Managed service %s is not loaded; setup remains incomplete", label)
-		}
-		if err := install.managedLoaded(output, label, install.app); err != nil {
-			return err
-		}
-	}
-	remoteStatus, err := install.managedStatus(ctx, install.app, "remote")
-	if err != nil {
+	if err := install.managedVerifyRegistrations(ctx, remoteEnabled, loginPending, supervised); err != nil {
 		return err
-	}
-	if !remoteEnabled && remoteStatus == "notFound" {
-		// No registration is needed for disabled access. A lookup miss alone
-		// cannot prove shutdown: independently verify no loaded job or cleanup.
-		_, loaded, err := install.inspectService(ctx, "io.went.agent-remote")
-		if err != nil {
-			return err
-		}
-		cleanup, err := install.disabledRemoteCleanup(ctx)
-		if err != nil {
-			return err
-		}
-		if loaded || cleanup {
-			return errors.New("Phone access lookup is unresolved and owned work remains; setup remains incomplete")
-		}
-	} else if remoteEnabled && remoteStatus != "enabled" || !remoteEnabled && remoteStatus != "notRegistered" {
-		return errors.New("Phone access service does not match its retained enabled setting; setup remains incomplete")
 	}
 	if err := install.managedVerify(ctx, install.app); err != nil {
 		return err
@@ -1835,6 +1800,142 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		if _, err := install.run(ctx, "/usr/bin/open", "-a", install.app); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// managedSupervised reports whether the menu bar app supervises the helpers.
+// The payload path registers them with Service Management instead, and so does
+// an app bundle completing a live handover, whose replacement daemon launchd
+// has already started and must be waited for. Live handovers are only begun by
+// the payload path.
+func (install *installer) managedSupervised(p *managedPlan) bool {
+	return install.appBundle && p.live == nil
+}
+
+// managedActivate registers what the installed build needs. A supervised app
+// registers only its login item and returns: it starts the helper processes
+// itself once setup finishes. Approval for that item never blocks setup, since
+// it only decides whether the app opens at login. The result reports whether
+// the login item is still awaiting approval.
+func (install *installer) managedActivate(ctx context.Context, published managedBundleIdentity, supervised bool) (bool, error) {
+	if supervised {
+		if err := managedRequireBundle(install.app, published); err != nil {
+			return false, err
+		}
+		err := install.managedAction(ctx, install.app, "register", "login")
+		var approval *installApprovalError
+		if errors.As(err, &approval) {
+			install.announce("Agent Queue is set up. Opening it at login is waiting for approval in System Settings > General > Login Items & Extensions; allow it there if you want that.")
+			return true, nil
+		}
+		return false, err
+	}
+	for _, service := range []string{"queue", "resources", "login"} {
+		if err := managedRequireBundle(install.app, published); err != nil {
+			return false, err
+		}
+		if err := install.managedAction(ctx, install.app, "register", service); err != nil {
+			return false, err
+		}
+	}
+	// Service Management can take well over 30 seconds to apply a fresh
+	// registration.
+	for attempt := 0; attempt < 120; attempt++ {
+		output, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-heavy"), "status", "--json")
+		if err == nil {
+			return false, managedReadiness(output)
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return false, errors.New("The managed queue daemon did not become ready; setup remains incomplete")
+}
+
+// managedVerifyRegistrations reads back the final registrations. A supervised
+// app leaves nothing registered but its login item and nothing loaded in launchd.
+func (install *installer) managedVerifyRegistrations(ctx context.Context, remoteEnabled, loginPending, supervised bool) error {
+	if supervised {
+		for _, service := range []string{"queue", "resources", "remote"} {
+			status, err := install.managedStatus(ctx, install.app, service)
+			if err != nil {
+				return err
+			}
+			if status != "notRegistered" && status != "notFound" {
+				return fmt.Errorf("Managed service %s is still %s; the menu bar app supervises it, so setup remains incomplete", service, status)
+			}
+			if service == "remote" && status == "notFound" && !remoteEnabled {
+				// A lookup miss alone cannot prove that disabled phone access
+				// stopped: independently verify no owned work remains.
+				cleanup, err := install.disabledRemoteCleanup(ctx)
+				if err != nil {
+					return err
+				}
+				if cleanup {
+					return errors.New("Phone access lookup is unresolved and owned work remains; setup remains incomplete")
+				}
+			}
+		}
+		for _, label := range installBackgroundLabels {
+			if _, loaded, err := install.inspectService(ctx, label); err != nil {
+				return err
+			} else if loaded {
+				return fmt.Errorf("Service %s is still loaded in launchd; setup remains incomplete", label)
+			}
+		}
+		status, err := install.managedStatus(ctx, install.app, "login")
+		if err != nil {
+			return err
+		}
+		if status != "enabled" && !(loginPending && status == "requiresApproval") {
+			return fmt.Errorf("Managed service login is %s; setup remains incomplete", status)
+		}
+		return nil
+	}
+	for _, service := range []string{"queue", "resources", "login"} {
+		status, err := install.managedStatus(ctx, install.app, service)
+		if err != nil {
+			return err
+		}
+		if status != "enabled" {
+			return fmt.Errorf("Managed service %s is %s; setup remains incomplete", service, status)
+		}
+	}
+	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
+		output, loaded, err := install.inspectService(ctx, label)
+		if err != nil {
+			return err
+		}
+		if !loaded {
+			return fmt.Errorf("Managed service %s is not loaded; setup remains incomplete", label)
+		}
+		if err := install.managedLoaded(output, label, install.app); err != nil {
+			return err
+		}
+	}
+	remoteStatus, err := install.managedStatus(ctx, install.app, "remote")
+	if err != nil {
+		return err
+	}
+	if !remoteEnabled && remoteStatus == "notFound" {
+		// No registration is needed for disabled access. A lookup miss alone
+		// cannot prove shutdown: independently verify no loaded job or cleanup.
+		_, loaded, err := install.inspectService(ctx, "io.went.agent-remote")
+		if err != nil {
+			return err
+		}
+		cleanup, err := install.disabledRemoteCleanup(ctx)
+		if err != nil {
+			return err
+		}
+		if loaded || cleanup {
+			return errors.New("Phone access lookup is unresolved and owned work remains; setup remains incomplete")
+		}
+	} else if remoteEnabled && remoteStatus != "enabled" || !remoteEnabled && remoteStatus != "notRegistered" {
+		return errors.New("Phone access service does not match its retained enabled setting; setup remains incomplete")
 	}
 	return nil
 }

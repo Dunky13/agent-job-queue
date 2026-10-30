@@ -1,7 +1,6 @@
 import AppKit
 import Darwin
 import Foundation
-import ServiceManagement
 import SwiftUI
 
 // This is a read-only startup decision. The backend remains the authority for
@@ -181,6 +180,21 @@ struct QueueBootstrapEnvironment: Sendable {
         return .ready
     }
 
+    /// A real managed bundle launch with setup permitted: the only launch that runs the helpers itself.
+    var supervisesHelpers: Bool {
+        guard allowsInstallation else { return false }
+        let scope = QueueBootstrapFiles.Scope(root: app, bundled: true)
+        let packaging = try? Self.readPlist(QueueBootstrapPackaging.self, at: app.appendingPathComponent("Contents/Info.plist"), scope: scope)
+        return packaging?.serviceManagement == true
+    }
+
+    /// Nil for fixtures, private test fixtures, setup-disabled and unmanaged bundles, so they stay inert.
+    @MainActor func makeSupervisor(fixtureMode: Bool) -> QueueHelperSupervisor? {
+        guard !fixtureMode, supervisesHelpers else { return nil }
+        return QueueHelperSupervisor(app: app, stateDirectory: home.appendingPathComponent(".local/state/agent-heavy", isDirectory: true),
+                                     settingsDirectory: home.appendingPathComponent(".config/agent-heavy", isDirectory: true))
+    }
+
     func serviceStatusRequests() throws -> [QueueBootstrapRequest] {
         guard !arguments.contains("--fixture"), Self.exists(app.appendingPathComponent("Contents/Info.plist")) else { return [] }
         let scope = QueueBootstrapFiles.Scope(root: app, bundled: true)
@@ -191,7 +205,7 @@ struct QueueBootstrapEnvironment: Sendable {
         guard try QueueBootstrapFiles.safeExecutable(executable, scope: scope) else {
             throw ClientError.message("The app launcher is missing or unsafe. Download Agent Queue again.")
         }
-        return ["queue", "resources"].map {
+        return ["queue", "resources", "remote"].map {
             QueueBootstrapRequest(executable: executable, arguments: ["--service-management", "status", $0])
         }
     }
@@ -483,7 +497,6 @@ final class QueueBootstrapModel: ObservableObject {
     @Published private(set) var issues: [QueueBootstrapIssue] = []
     @Published private(set) var reviewedIssueID: String?
     @Published private(set) var canDisablePhoneAccess = false
-    @Published private(set) var requiresServiceApproval = false
     private static let phoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
     var isRunning: Bool { [.checking, .waiting, .stopping, .recovering, .installing].contains(phase) }
     var canStopWaiting: Bool { phase == .waiting || phase == .checking }
@@ -569,7 +582,6 @@ final class QueueBootstrapModel: ObservableObject {
         let current = begin(.checking, message: "Checking installation requirements…")
         issues = []
         request = nil
-        requiresServiceApproval = false
         let task = Task { [self] in
             do {
                 let decision = try await inspectDecision(current)
@@ -586,43 +598,32 @@ final class QueueBootstrapModel: ObservableObject {
                     self.request = request
                     if disablePhoneAccess {
                         legacyPhoneAccess = false
-                        try await installAwaitingApproval(QueueBootstrapRequest(executable: request.executable,
+                        try await install(QueueBootstrapRequest(executable: request.executable,
                             arguments: request.arguments + ["--disable-phone-access"]), reason: reason, current: current)
                     } else if try await preflight(request, current: current, automatic: true) {
                         let setup = environment.arguments.contains("--setup") ? request : QueueBootstrapRequest(executable: request.executable,
                             arguments: request.arguments + ["--repair-and-continue"])
-                        try await installAwaitingApproval(setup, reason: reason, current: current)
+                        try await install(setup, reason: reason, current: current)
+                    }
+                } else if try await hasLeftoverRegistrations() {
+                    // The menu bar app supervises the helpers now. A queue, resources or
+                    // phone registration from an older version is migrated away once.
+                    guard allowsInstallation else {
+                        phase = .setupRequired
+                        message = "Setup must retire an older background service registration"
+                        output = "Setup is disabled for this launch, so the registration left by an older version was not removed."
+                        onSetupRequired?()
+                        return
+                    }
+                    let setup = QueueBootstrapRequest(executable: environment.app.appendingPathComponent("Contents/MacOS/agent-heavy"),
+                        arguments: ["install", "--app-bundle", environment.app.path])
+                    request = setup
+                    serviceSetupRequest = setup
+                    if try await preflight(setup, current: current, automatic: true) {
+                        try await install(.init(executable: setup.executable, arguments: setup.arguments + ["--repair-and-continue"]),
+                            reason: "Retiring background services from an older version…", current: current)
                     }
                 } else {
-                    for statusRequest in try environment.serviceStatusRequests() {
-                        let status = try await serviceStatus(statusRequest)
-                        guard status == "enabled" else {
-                            requiresServiceApproval = status == "requiresApproval"
-                            if requiresServiceApproval {
-                                _ = try await continueAfterServiceApproval(current: current, alreadyObserved: true)
-                                return
-                            }
-                            if !requiresServiceApproval && allowsInstallation {
-                                let setup = QueueBootstrapRequest(executable: environment.app.appendingPathComponent("Contents/MacOS/agent-heavy"),
-                                    arguments: ["install", "--app-bundle", environment.app.path])
-                                request = setup
-                                serviceSetupRequest = setup
-                                if try await preflight(setup, current: current, automatic: true) {
-                                    try await installAwaitingApproval(.init(executable: setup.executable,
-                                        arguments: setup.arguments + ["--repair-and-continue"]),
-                                        reason: "Setting up background services…", current: current)
-                                }
-                                return
-                            }
-                            phase = .setupRequired
-                            message = requiresServiceApproval ? "Allow background services in System Settings" : "Setup must finish background service setup"
-                            output = requiresServiceApproval
-                                ? "Open Login Items settings, allow Agent Queue's background services, then check again."
-                                : (allowsInstallation ? "Check again to register this app's background services." : "Setup is disabled for this launch, so background services were not registered or repaired.")
-                            onSetupRequired?()
-                            return
-                        }
-                    }
                     finish(current)
                 }
             } catch { await fail(error, current: current) }
@@ -653,7 +654,7 @@ final class QueueBootstrapModel: ObservableObject {
                 _ = try QueueBootstrapReport.decode(data)
                 guard attempt == current else { return }
                 if try await preflight(request, current: current) {
-                    try await installAwaitingApproval(request, reason: reason, current: current)
+                    try await install(request, reason: reason, current: current)
                 }
             } catch { await fail(error, current: current) }
         }
@@ -673,7 +674,7 @@ final class QueueBootstrapModel: ObservableObject {
                     guard case let .install(request, reason) = decision else { finish(current); return }
                     self.request = request
                     if try await preflight(request, current: current, waiting: true) {
-                        try await installAwaitingApproval(request, reason: reason, current: current)
+                        try await install(request, reason: reason, current: current)
                         return
                     }
                     guard issues.allSatisfy({ Self.approvedRepairStep($0) != nil }) else {
@@ -738,7 +739,7 @@ final class QueueBootstrapModel: ObservableObject {
                     guard case let .install(request, reason) = decision else { finish(current); return }
                     self.request = request
                     if try await preflight(request, current: current, waiting: true) {
-                        try await installAwaitingApproval(request, reason: reason, current: current)
+                        try await install(request, reason: reason, current: current)
                         return
                     }
                     guard issues.allSatisfy({ $0.actions.contains(where: { $0.id == "wait" }) }) else {
@@ -798,8 +799,6 @@ final class QueueBootstrapModel: ObservableObject {
         !isRunning && (allowsInstallation || QueueBootstrapAction.navigation.contains(action.id)) &&
             (action.id != "reset-callback" || (reviewedIssueID == issue.id && revision != nil))
     }
-
-    func showLoginItems() { SMAppService.openSystemSettingsLoginItems() }
 
     func reveal(_ issue: QueueBootstrapIssue) {
         guard !isRunning, issues.contains(issue), let path = issue.path else { return }
@@ -872,7 +871,6 @@ final class QueueBootstrapModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.attempt == current, [.installing, .waiting].contains(self.phase) else { return }
                 let progress = QueueSetupProgress.parse(String(decoding: data, as: UTF8.self))
-                self.requiresServiceApproval = progress.requiresServiceApproval
                 self.phase = progress.isWaiting ? .waiting : .installing
                 self.output = String(decoding: progress.output.utf8.suffix(8_000), as: UTF8.self)
                 if progress.isWaiting { self.onSetupRequired?() }
@@ -897,88 +895,13 @@ final class QueueBootstrapModel: ObservableObject {
         return state.status
     }
 
-    private func continueAfterServiceApproval(current: Int, alreadyObserved: Bool = false) async throws -> Bool {
-        let requests = try environment.serviceStatusRequests()
-        guard !requests.isEmpty else { return false }
-        var statuses: [String] = []
-        for request in requests { statuses.append(try await serviceStatus(request)) }
-        guard alreadyObserved || statuses.contains("requiresApproval") else { return false }
-        statuses = try await awaitServiceApproval(requests, statuses: statuses, current: current)
-        let decision = try await Task.detached(priority: .utility, operation: inspect).value
-        guard attempt == current else { throw CancellationError() }
-        if decision == .ready && statuses.allSatisfy({ $0 == "enabled" }) {
-            finish(current)
-        } else if case let .install(request, reason) = decision, allowsInstallation {
-            self.request = request
-            if try await preflight(request, current: current, automatic: true) {
-                let setup = environment.arguments.contains("--setup") ? request : QueueBootstrapRequest(executable: request.executable,
-                    arguments: request.arguments + ["--repair-and-continue"])
-                try await installAwaitingApproval(setup, reason: reason, current: current)
-            }
-        } else if decision == .ready, allowsInstallation {
-            // Approval can clear one registration while another service still
-            // needs setup. Continue here instead of requiring Check again.
-            let setup = QueueBootstrapRequest(executable: environment.app.appendingPathComponent("Contents/MacOS/agent-heavy"),
-                arguments: ["install", "--app-bundle", environment.app.path])
-            request = setup
-            serviceSetupRequest = setup
-            if try await preflight(setup, current: current, automatic: true) {
-                try await installAwaitingApproval(.init(executable: setup.executable,
-                    arguments: setup.arguments + ["--repair-and-continue"]),
-                    reason: "Finishing background service setup…", current: current)
-            }
-        } else {
-            phase = .setupRequired
-            message = "Setup must finish before Agent Queue can open"
-            output = allowsInstallation ? "Check again to finish setup." : "Setup is disabled for this launch, so background services were not installed, repaired or registered."
+    /// notRegistered and notFound are healthy. enabled or requiresApproval is a registration
+    /// from before the app supervised its helpers, owned by no process of its own.
+    private func hasLeftoverRegistrations() async throws -> Bool {
+        for request in try environment.serviceStatusRequests() {
+            if ["enabled", "requiresApproval"].contains(try await serviceStatus(request)) { return true }
         }
-        return true
-    }
-
-    /// Publishes the approval requirement and polls until macOS allows it.
-    private func awaitServiceApproval(_ requests: [QueueBootstrapRequest], statuses initial: [String], current: Int) async throws -> [String] {
-        var statuses = initial
-        requiresServiceApproval = true
-        onSetupRequired?()
-        while statuses.contains("requiresApproval") {
-            guard attempt == current else { throw CancellationError() }
-            try Task.checkCancellation()
-            phase = .waiting
-            message = "Allow background services in System Settings"
-            output = "macOS requires your approval. Allow Agent Queue in Login Items settings; setup will continue automatically."
-            try await Task.sleep(for: waitInterval)
-            statuses = []
-            for request in requests { statuses.append(try await serviceStatus(request)) }
-        }
-        guard attempt == current else { throw CancellationError() }
-        try Task.checkCancellation()
-        requiresServiceApproval = false
-        phase = .checking
-        return statuses
-    }
-
-    /// Setup stops with the approval marker while macOS has not yet allowed
-    /// the app's background services. Wait for approval, then run setup again.
-    private func installAwaitingApproval(_ request: QueueBootstrapRequest, reason: String, current: Int) async throws {
-        while true {
-            do {
-                try await install(request, reason: reason, current: current)
-                return
-            } catch {
-                guard !(error is CancellationError), attempt == current,
-                      QueueSetupProgress.parse(error.localizedDescription).requiresServiceApproval else { throw error }
-                // The app's login item can need approval as well as its agents.
-                var requests = try environment.serviceStatusRequests()
-                if let launcher = requests.first?.executable {
-                    requests.append(QueueBootstrapRequest(executable: launcher, arguments: ["--service-management", "status", "login"]))
-                }
-                var statuses: [String] = []
-                for status in requests { statuses.append(try await serviceStatus(status)) }
-                // Without a pending approval another attempt would fail the same way.
-                guard statuses.contains("requiresApproval") else { throw error }
-                _ = try await awaitServiceApproval(requests, statuses: statuses, current: current)
-            }
-        }
+        return false
     }
 
     private func finish(_ current: Int) {
@@ -986,7 +909,6 @@ final class QueueBootstrapModel: ObservableObject {
         phase = .complete
         issues = []
         canDisablePhoneAccess = false
-        requiresServiceApproval = false
         completed()
     }
 
@@ -994,7 +916,6 @@ final class QueueBootstrapModel: ObservableObject {
         guard attempt == current else { return }
         let wasMutation = phase == .installing || phase == .recovering
         let progress = QueueSetupProgress.parse(error.localizedDescription)
-        requiresServiceApproval = requiresServiceApproval || progress.requiresServiceApproval
         let lines = progress.output.components(separatedBy: .newlines)
         legacyPhoneAccess = lines.contains(Self.phoneAccessRecovery)
         if wasMutation && !legacyPhoneAccess && !Task.isCancelled, let request {
@@ -1118,13 +1039,9 @@ struct QueueBootstrapView: View {
             HStack {
                 if model.canStopWaiting { Button("Stop waiting") { model.cancelWaiting() } }
                 Spacer()
-                if model.requiresServiceApproval { Button("Login Items settings") { model.showLoginItems() } }
                 Button("Quit") { NSApp.terminate(nil) }.disabled(model.isRunning && !model.canStopWaiting && model.phase != .stopping)
                 if !model.isRunning && model.phase != .complete {
-                    if model.requiresServiceApproval {
-                        Button("Check again") { model.start() }
-                            .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-                    } else if !model.allowsInstallation {
+                    if !model.allowsInstallation {
                         Button("Download Agent Queue") { model.downloadRelease() }
                         Button("Check again") { model.start() }
                             .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)

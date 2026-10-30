@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -166,6 +167,44 @@ func TestInstallerAutomaticManagedApprovalWaitsWithoutReregistering(t *testing.T
 	}
 	if _, err := os.Stat(filepath.Join(m.installer.root, "install-in-progress.json")); !os.IsNotExist(err) {
 		t.Fatal("approved installation did not finish", err)
+	}
+}
+
+func TestInstallerAutomaticManagedLoginApprovalNeverWaits(t *testing.T) {
+	m := managedAppBundleFixture(t)
+	notices := managedSetupNotices(m)
+	m.approval = "login"
+	nativeExit := exec.Command("/bin/sh", "-c", "exit 2").Run()
+	if nativeExit == nil {
+		t.Fatal("approval fixture did not reproduce native exit 2")
+	}
+	original := m.installer.command
+	m.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
+		output, err := original(ctx, args)
+		if err == nil && len(args) == 4 && args[1] == "--service-management" && args[2] == "register" && m.statuses[args[3]] == "requiresApproval" {
+			return output, nativeExit
+		}
+		return output, err
+	}
+	progress := []string{}
+	err := installRunApprovedRepair(context.Background(), m.installer.preflight, m.installer.recover, m.installer.execute,
+		func(context.Context) error {
+			t.Fatal("a pending login item made setup wait")
+			return nil
+		}, func(message string) { progress = append(progress, message) })
+	if err != nil {
+		t.Fatal("a pending login item blocked automatic setup", err)
+	}
+	if got := managedServiceCalls(m, "register"); !slices.Equal(got, []string{"login"}) {
+		t.Fatalf("registered %v, want only the login item exactly once", got)
+	}
+	for _, message := range append(progress, *notices...) {
+		if strings.Contains(message, "requires-approval") {
+			t.Fatalf("setup reported the blocking approval state: %q", message)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(m.installer.root, "install-in-progress.json")); !os.IsNotExist(err) {
+		t.Fatal("setup stayed pending behind the login approval", err)
 	}
 }
 

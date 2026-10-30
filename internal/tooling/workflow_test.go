@@ -58,17 +58,26 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 		if name == "tooling-tests" && !reflect.DeepEqual(job.Strategy.Matrix.Shard, []int{1, 2}) {
 			t.Fatal("both tooling shards must run on every required architecture")
 		}
-		if name == "macos-tests" && !reflect.DeepEqual(job.Strategy.Matrix.Scope, []string{"core", "https", "installer"}) {
+		if name == "macos-tests" && !reflect.DeepEqual(job.Strategy.Matrix.Scope, []string{"core-1", "core-2", "https", "installer"}) {
 			t.Fatal("complete core, HTTPS and installer partitions must run independently on every required architecture")
 		}
 		found := false
+		resumeControls := false
+		resumeEvidence := false
 		for _, step := range job.Steps {
+			if strings.Contains(step.Run, "bash native/tests/run-resume-ui-tests.sh ") && step.If == "" {
+				resumeControls = true
+			}
+			if step.If == "${{ !cancelled() && steps.resume-ui.outcome != 'skipped' }}" {
+				resumeEvidence = true
+			}
 			// Evidence upload must run after a failed graphical fixture. Only
 			// this pinned, non-validation action may have a condition; every
 			// actual validation step remains unconditional and failure-fatal.
 			retainsFailedFixture := name == "native-tests" &&
 				step.Uses == "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9" &&
-				step.Run == "" && step.If == "${{ !cancelled() && steps.bootstrap-ui.outcome != 'skipped' }}"
+				step.Run == "" && (step.If == "${{ !cancelled() && steps.bootstrap-ui.outcome != 'skipped' }}" ||
+				step.If == "${{ !cancelled() && steps.resume-ui.outcome != 'skipped' }}")
 			if step.ContinueOnError || (step.If != "" && !retainsFailedFixture) {
 				t.Fatalf("%s may skip or ignore a validation failure", name)
 			}
@@ -78,6 +87,9 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 					t.Fatalf("%s combines unrelated validation phases", name)
 				}
 			}
+		}
+		if name == "native-tests" && (!resumeControls || !resumeEvidence) {
+			t.Fatal("native Resume interaction and screenshot retention must remain required")
 		}
 		if !found {
 			t.Fatalf("%s omits its complete suite", name)

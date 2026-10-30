@@ -102,7 +102,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     private func postClick(in window: NSWindow, at point: NSPoint, count: Int = 1,
                            secondary: Bool = false, modifiers: NSEvent.ModifierFlags = []) throws {
         let now = ProcessInfo.processInfo.systemUptime
-        for (offset, type) in (secondary ? [NSEvent.EventType.rightMouseDown, .rightMouseUp] : [.leftMouseDown, .leftMouseUp]).enumerated() {
+        let types: [NSEvent.EventType] = secondary ? [.rightMouseDown, .rightMouseUp] : [.leftMouseDown, .leftMouseUp]
+        for (offset, type) in types.enumerated() {
             guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: modifiers,
                 timestamp: now + Double(offset) * 0.001, windowNumber: window.windowNumber,
                 context: nil, eventNumber: offset, clickCount: count, pressure: offset == 0 ? 1 : 0) else {
@@ -228,7 +229,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         let actionItems = controller.menu.items.filter { $0.action != nil }
         try check(actionItems.map(\.title) == QueueAppAction.allCases.map(\.title), "nativeMenuMatchesSharedFooterActions")
         try check(controller.menu.items.contains { $0.title == QueueAppAction.quitExplanation && !$0.isEnabled }
-            && actionItems.last?.keyEquivalent == "q", "nativeMenuExplainsBackgroundJobsAndKeepsQuitShortcut")
+            && actionItems.last?.keyEquivalent == "q", "nativeMenuExplainsQuitAndKeepsQuitShortcut")
         for action in QueueAppAction.settings + [.quit] {
             guard let item = actionItems.first(where: { $0.tag == action.rawValue }) else {
                 throw ClientError.message("Missing native menu action")

@@ -53,6 +53,13 @@ struct BehaviorTests {
             throw ClientError.message("Native behavior tests require a recorded fixture.")
         }
         let navigation = QueueNavigation()
+        store.snapshot = QueueSnapshot(updatedAt: original.updatedAt,
+            queue: QueueSummary(status: "paused", limit: original.queue.limit, running: 0,
+                                waiting: original.queue.waiting, legacyOccupied: false), jobs: original.jobs)
+        let beforeResume = recorder.actions.count
+        try check(store.dispatchResume() == nil && recorder.actions.count == beforeResume,
+                  "Read-only fixtures cannot dispatch Resume even with an action recorder")
+        store.snapshot = original
         navigation.show(queued)
         navigation.back()
         try check(navigation.selected == nil, "Done returns to queue navigation")
@@ -167,8 +174,8 @@ struct BehaviorTests {
         try check(QueueAppAction.allCases == [.openWindow] + QueueAppAction.settings + [.quit],
                   "Context menu and footer share all application actions in order")
         try check(QueueAppAction.settings.map(\.title) == ["Learned workloads…", "About and updates…", "Agent integration…", "Remote access settings…"]
-            && QueueAppAction.quitExplanation == "Quitting this app leaves jobs running.",
-                  "Application actions retain existing settings and background-job explanation")
+            && QueueAppAction.quitExplanation == "Quitting stops the queue. Running jobs continue; the queue reopens paused if any were active.",
+                  "Application actions retain existing settings and the quit explanation")
         let summary = QueueSummary(status: "running", limit: 1, running: 2, waiting: 3, legacyOccupied: false)
         let snapshot = QueueSnapshot(updatedAt: "fixture", queue: summary, jobs: [])
         let presentation = QueueStatusPresentation(snapshot: snapshot, error: nil)

@@ -43,6 +43,16 @@ type installer struct {
 	unregisterServices                                    bool
 	automaticSetup                                        bool
 	command                                               func(context.Context, []string) ([]byte, error)
+	notice                                                func(string)
+}
+
+// announce reports an informational line that never changes setup's outcome.
+func (install *installer) announce(message string) {
+	if install.notice != nil {
+		install.notice(message)
+		return
+	}
+	fmt.Fprintln(os.Stdout, message)
 }
 
 var errInstallLegacyPhoneAccess = errors.New("Phone access from the previous installation must be disabled before setup can continue. Credentials and configuration will be preserved")

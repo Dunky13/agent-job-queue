@@ -28,6 +28,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Dunky13/agent-job-queue/internal/appservices"
+	"github.com/Dunky13/agent-job-queue/internal/lifeline"
 	"github.com/caddyserver/caddy/v2"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -557,7 +558,7 @@ func (c *controller) status() (map[string]any, error) {
 	if !enabled && c.unresolvedChildren() && errorValue == nil {
 		errorValue = "Remote access is disabled, but owned service cleanup is incomplete"
 	} else if enabled && !running && errorValue == nil {
-		errorValue = "Remote service is not running"
+		errorValue = remoteNotRunning
 	}
 	url, port, cert := "", defaultPort, ""
 	if settings != nil {
@@ -572,6 +573,20 @@ func (c *controller) status() (map[string]any, error) {
 		admission = *settings.AuthAdmission
 	}
 	return map[string]any{"authAdmission": admission, "enabled": enabled, "configured": settings != nil, "running": running, "url": url, "port": port, "username": username, "certificatePath": cert, "error": errorValue}, nil
+}
+
+const remoteNotRunning = "Remote service is not running"
+
+const managedEnableNotice = "Phone access is turned on. It starts when Agent Queue is running; the app watches these settings and starts it."
+
+// A managed install's enable only records the choice, because the menu bar app
+// starts the service. Say so in place of reporting a failure, so a terminal user
+// is not left thinking the command did nothing. Only the text of the existing
+// "error" field changes; the JSON shape does not.
+func (c *controller) explainManagedEnable(status map[string]any) {
+	if c.p.managedApp != "" && status["running"] == false && status["error"] == remoteNotRunning {
+		status["error"] = managedEnableNotice
+	}
 }
 
 func readConfigurationInput(reader io.Reader) (map[string]json.RawMessage, error) {
@@ -759,6 +774,13 @@ func (c *controller) serviceAction(action string) error {
 	return err
 }
 
+// A managed install returns at once: the menu bar app starts the service after
+// this command exits, so there is nothing to wait for. An unmanaged install
+// starts its own LaunchAgent and confirms that it became ready.
+func (c *controller) waitsForServiceStart() bool {
+	return !c.p.testing && c.p.managedApp == ""
+}
+
 func (c *controller) enable() error {
 	if c.p.managedCandidate != "" && c.p.managedApp == "" {
 		return errors.New("Complete Agent Queue installation before enabling phone access")
@@ -771,13 +793,6 @@ func (c *controller) enable() error {
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("Cannot verify completed installation before enabling phone access: %w", err)
 			}
-		}
-		state, err := c.managedServiceState("status")
-		if err != nil {
-			return err
-		}
-		if state == "requiresApproval" {
-			return errors.New("Allow Agent Queue's background services in Login Items settings before enabling phone access")
 		}
 	}
 	if err := c.p.prepare(); err != nil {
@@ -808,7 +823,7 @@ func (c *controller) enable() error {
 	if err := c.serviceFn("start"); err != nil {
 		return err
 	}
-	if !c.p.testing {
+	if c.waitsForServiceStart() {
 		deadline := time.Now().Add(15 * time.Second)
 		for !c.isRunning() && time.Now().Before(deadline) && c.ctx.Err() == nil {
 			time.Sleep(150 * time.Millisecond)
@@ -1631,6 +1646,8 @@ func (c *controller) supervisor() (result error) {
 
 // Main is the standalone remote controller entrypoint.
 func Main(arguments []string) int {
+	// First, before anything can spawn a process: see internal/lifeline.
+	lifeline.Adopt(len(arguments) > 0 && arguments[0] == "serve")
 	return runMain(arguments, os.Stdin, prepareConfiguration, defaultLifecycleContext)
 }
 
@@ -1737,6 +1754,9 @@ func runMain(arguments []string, inputReader io.Reader, prepare func(map[string]
 	status, err := c.status()
 	if err != nil {
 		return printFailure(err)
+	}
+	if action == "enable" {
+		c.explainManagedEnable(status)
 	}
 	_ = json.NewEncoder(os.Stdout).Encode(status)
 	return 0
