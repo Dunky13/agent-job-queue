@@ -73,19 +73,22 @@ func TestManagedAppBundleAdoptsLocationRecordOfDeletedApp(t *testing.T) {
 	}
 }
 
-func TestManagedAppBundleKeepsRecordOfExistingOrRunningApp(t *testing.T) {
+func TestManagedAppBundleRelocatesAnExistingCompletedApp(t *testing.T) {
 	m, old := managedDraggedFixture(t, false)
 	i := m.installer
 	if err := installCopyTree(i.app, old); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.run(t); err == nil || !strings.Contains(err.Error(), "location changed") {
-		t.Fatal("setup adopted a new location while the recorded app still exists", err)
+	if err := m.run(t); err != nil {
+		t.Fatal("setup could not relocate the verified completed app", err)
 	}
-	managedRequireNoServiceMutation(t, m.calls)
-	if err := os.RemoveAll(old); err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(old); err != nil {
+		t.Fatal("relocation did not preserve the old app", err)
 	}
+}
+
+func TestManagedAppBundleKeepsRecordOfMissingRunningApp(t *testing.T) {
+	m, _ := managedDraggedFixture(t, false)
 	m.statuses["queue"] = "enabled"
 	m.loaded["io.went.agent-heavy"] = true
 	if err := m.run(t); err == nil {
@@ -115,6 +118,11 @@ func TestManagedLoadedBundleProgramRequiresThisHelper(t *testing.T) {
 		want       bool
 	}{
 		{"running helper", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon"), self, true},
+		{"running submitted helper", append([]byte("\tpath = (submitted by smd.99177)\n"), output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon")...), self, true},
+		{"stopped submitted helper", append([]byte("\tpath = (submitted by smd.99177)\n"), []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = not running", 1))...), self, false},
+		{"submitted other executable", append([]byte("\tpath = (submitted by smd.99177)\n"), output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon")...), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", false},
+		{"invalid submitted descriptor", append([]byte("\tpath = (submitted by smd.invalid)\n"), output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon")...), self, false},
+		{"duplicate submitted path", append([]byte("\tpath = (submitted by smd.99177)\n\tpath = (submitted by smd.99177)\n"), output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon")...), self, false},
 		{"stopped helper without location", []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = not running", 1)), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", false},
 		{"other executable", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon"), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", false},
 		{"other bundle", output("Contents/MacOS/agent-heavy", "io.example.other", "", "agent-heavy", "daemon"), self, false},

@@ -15,7 +15,8 @@ struct TransportTests {
         }
         if CommandLine.arguments.dropFirst().first == "install", CommandLine.arguments.count >= 4 {
             let marker = CommandLine.arguments[3]
-            try stub([URL(fileURLWithPath: marker).lastPathComponent == "preflight-read" ? "hold" : "mutation", marker])
+            let name = URL(fileURLWithPath: marker).lastPathComponent
+            try stub([["automatic-wait", "automatic-transition", "automatic-hint"].contains(name) ? name : (name == "preflight-read" ? "hold" : "mutation"), marker])
             return
         }
         let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("agent-queue-transport-\(UUID().uuidString)")
@@ -136,6 +137,62 @@ struct TransportTests {
                 "Preflight syntax with additional options retains its accepted operation")
         }
 
+        let setupWaitMarker = temporary.appendingPathComponent("automatic-wait")
+        let setupWait = Task { try await QueueClient.run(["install", "--app-bundle", setupWaitMarker.path, "--repair-and-continue"],
+            budget: .setup, transport: transport) }
+        try await waitForFile(setupWaitMarker)
+        setupWait.cancel()
+        do { _ = try await setupWait.value; throw ClientError.message("Cancelled automatic wait succeeded") }
+        catch is CancellationError { }
+        try check(childIsGone(setupWaitMarker), "Stopping automatic waiting terminates and reaps only its private setup controller")
+        let hintMarker = temporary.appendingPathComponent("automatic-hint")
+        let hint = Task {
+            try await QueueClient.run(["install", "--app-bundle", hintMarker.path, "--repair-and-continue"],
+                budget: .setup, transport: transport, onOutput: { data in
+                    if QueueSetupProgress.parse(String(decoding: data, as: UTF8.self)).isWaiting {
+                        try? Data().write(to: hintMarker.appendingPathExtension("delivered"))
+                    }
+                })
+        }
+        try await waitForFile(hintMarker.appendingPathExtension("delivered"))
+        hint.cancel()
+        do { _ = try await hint.value; throw ClientError.message("Cancelled hint wait succeeded") }
+        catch is CancellationError { }
+        try check(childIsGone(hintMarker), "Throttled waiting progress is delivered even when the child emits no more output")
+
+        let setupMutationMarker = temporary.appendingPathComponent("automatic-mutation")
+        let setupMutation = Task { try await QueueClient.run(["install", "--app-bundle", setupMutationMarker.path, "--repair-and-continue"],
+            budget: .setup, transport: transport) }
+        try await waitForFile(setupMutationMarker)
+        setupMutation.cancel()
+        let setupMutationResult = try await setupMutation.value
+        try check(String(decoding: setupMutationResult, as: UTF8.self) == "accepted" && childIsGone(setupMutationMarker),
+            "Automatic setup cancellation preserves an accepted mutation until it completes or reaches another wait")
+
+        // Hold the reader in its waiting callback while the real child enters
+        // a mutation. Cancellation must not trust the reader's stale marker.
+        let transitionMarker = temporary.appendingPathComponent("automatic-transition")
+        let resumeReader = DispatchSemaphore(value: 0)
+        defer { resumeReader.signal() }
+        let transition = Task {
+            try await QueueClient.run(["install", "--app-bundle", transitionMarker.path, "--repair-and-continue"],
+                budget: .setup, transport: transport, onOutput: { data in
+                    if QueueSetupProgress.parse(String(decoding: data, as: UTF8.self)).isWaiting {
+                        try? Data().write(to: transitionMarker.appendingPathExtension("observed"))
+                        resumeReader.wait()
+                    }
+                })
+        }
+        try await waitForFile(transitionMarker.appendingPathExtension("observed"))
+        try Data().write(to: transitionMarker.appendingPathExtension("continue"))
+        try await waitForFile(transitionMarker.appendingPathExtension("mutating"))
+        transition.cancel()
+        resumeReader.signal()
+        let transitionResult = try await transition.value
+        try check(String(decoding: transitionResult, as: UTF8.self).hasSuffix("accepted") &&
+            FileManager.default.fileExists(atPath: transitionMarker.appendingPathExtension("done").path) && childIsGone(transitionMarker),
+            "A stale waiting marker cannot interrupt an accepted setup mutation")
+
         let interleavedInput = Data(repeating: 66, count: 16_384)
         let interleaved = try await QueueClient.run(arguments("interleaved", temporary.appendingPathComponent("interleaved"), mutation: true),
                                                     input: interleavedInput, transport: transport)
@@ -233,6 +290,10 @@ struct TransportTests {
     private static func stub(_ arguments: [String]) throws {
         let scenario = arguments[0]
         let marker = URL(fileURLWithPath: arguments[1])
+        if CommandLine.arguments.contains("--repair-and-continue") {
+            if ["automatic-wait", "automatic-hint"].contains(scenario) { signal(SIGUSR1) { _ in _exit(0) } }
+            else { signal(SIGUSR1, SIG_IGN) }
+        }
         if scenario == "resist" { signal(SIGTERM, SIG_IGN) }
         if scenario == "detail" {
             let others = try FileManager.default.contentsOfDirectory(at: marker.deletingLastPathComponent(), includingPropertiesForKeys: nil)
@@ -261,6 +322,25 @@ struct TransportTests {
             if scenario == "exact" { return }
         case "continuous":
             while true { try FileHandle.standardOutput.write(contentsOf: Data("tick".utf8)); Thread.sleep(forTimeInterval: 0.002) }
+        case "automatic-transition":
+            try FileHandle.standardOutput.write(contentsOf: Data((QueueSetupProgress.waitingMarker + "\nWaiting\n").utf8))
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while !FileManager.default.fileExists(atPath: marker.appendingPathExtension("continue").path) {
+                guard ProcessInfo.processInfo.systemUptime < deadline else { throw ClientError.message("Transition fixture was not released") }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            try FileHandle.standardOutput.write(contentsOf: Data((QueueSetupProgress.installingMarker + "\n").utf8))
+            try Data().write(to: marker.appendingPathExtension("mutating"))
+            Thread.sleep(forTimeInterval: 0.25)
+            try Data().write(to: marker.appendingPathExtension("done"))
+            try FileHandle.standardOutput.write(contentsOf: Data("accepted".utf8))
+            return
+        case "automatic-hint":
+            try FileHandle.standardOutput.write(contentsOf: Data("Preparing\n".utf8))
+            Thread.sleep(forTimeInterval: 0.01)
+            try FileHandle.standardOutput.write(contentsOf: Data((QueueSetupProgress.waitingMarker + "\nWaiting\n").utf8))
+        case "automatic-wait":
+            try FileHandle.standardOutput.write(contentsOf: Data((QueueSetupProgress.waitingMarker + "\nWaiting for original callers\n").utf8))
         case "mutation":
             Thread.sleep(forTimeInterval: 0.25)
             try Data().write(to: marker.appendingPathExtension("done"))

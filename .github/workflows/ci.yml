@@ -129,6 +129,17 @@ jobs:
           persist-credentials: false
       - name: Native regression tests
         run: bash scripts/test-native.sh
+      - name: First-launch graphical regressions
+        run: bash native/tests/run-bootstrap-ui-tests.sh "$RUNNER_TEMP/bootstrap-ui"
+      - name: Retain first-launch fixture evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: First-launch-${{ matrix.os }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bootstrap-ui/**/*.png
+            ${{ runner.temp }}/bootstrap-ui/**/verification.json
+          if-no-files-found: error
+          retention-days: 14
 
   web-tests:
     name: Web tests

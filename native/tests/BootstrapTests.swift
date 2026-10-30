@@ -13,7 +13,7 @@ struct BootstrapTests {
         try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: temporary) }
         func fixture(_ location: String = "Applications", tracked: Bool = true) throws -> BootstrapFixture {
-            try BootstrapFixture(parent: temporary, location: location, tracked: tracked)
+            try BootstrapFixture(parent: temporary, location: location, tracked: tracked, arguments: ["--setup"])
         }
         func needsSetup(_ environment: QueueBootstrapEnvironment) throws -> Bool {
             if case .install = try environment.inspect() { return true }
@@ -22,6 +22,28 @@ struct BootstrapTests {
         func rejects(_ environment: QueueBootstrapEnvironment, containing text: String) -> Bool {
             do { _ = try environment.inspect(); return false }
             catch { return error.localizedDescription.contains(text) }
+        }
+
+        for scenario in ["retained-pending", "ready-unregistered", "ready-not-found"] {
+            let copied = try BootstrapFixture(parent: temporary, managed: true)
+            let pending = QueueBootstrapIssue(id: "pending-installation", title: "Finish the previous installation",
+                detail: "Finish the exact retained build before continuing with this app.",
+                actions: [.init(id: "finish-pending-installation", title: "Continue setup", destructive: true)])
+            if scenario != "retained-pending" { try copied.installManaged() }
+            let executor = BootstrapAutomaticSetupFixture(copied,
+                report: scenario == "retained-pending" ? .init(schemaVersion: 1, issues: [pending]) : .clear,
+                status: scenario == "ready-not-found" ? "notFound" : "notRegistered")
+            var completed = false
+            var windows = 0
+            let model = QueueBootstrapModel(environment: copied.environment, execute: { request, _ in
+                try await executor.execute(request)
+            }) { completed = true }
+            model.onSetupRequired = { windows += 1 }
+            await model.start()?.value
+            let requests = await executor.requests
+            try check(completed && model.phase == .complete && windows == 0 &&
+                requests.filter({ $0.arguments.contains("--repair-and-continue") }).count == 1,
+                "Ordinary \(scenario) completes silently through backend verified setup")
         }
 
         // Runtime launch never performs installation. Only the installer stage
@@ -63,6 +85,35 @@ struct BootstrapTests {
             }
         }
 
+        for marker in [QueueSetupProgress.approvalMarker, "AGENT_QUEUE_SETUP_STATE:waiting"] {
+            let waitingFixture = try BootstrapFixture(parent: temporary)
+            var completed = false
+            var presentations = 0
+            let model = QueueBootstrapModel(environment: waitingFixture.environment, execute: { request, output in
+                if request.arguments.suffix(2) == ["--preflight", "--json"] {
+                    return try JSONEncoder().encode(QueueBootstrapReport.clear)
+                }
+                output(Data((marker + "\nwaiting-regression").utf8))
+                try await Task.sleep(for: .seconds(60))
+                throw ClientError.message("The cancelled setup wait continued")
+            }) { completed = true }
+            model.onSetupRequired = { presentations += 1 }
+            let task = model.start()
+            try await waitUntil { model.output.contains("waiting-regression") }
+            try check(model.phase == .waiting && model.canStopWaiting && presentations > 0 && !completed,
+                "Automatic \(marker) is visible and cancellable without establishing readiness")
+            let stopping = model.cancelWaiting()
+            try check(model.phase == .stopping && model.start() == nil,
+                "Retry remains blocked until the previous setup controller finishes stopping")
+            await stopping?.value
+            await task?.value
+            let retry = model.start()
+            try check(!completed && retry != nil,
+                "Stopping automatic setup preserves retry and never launches the queue")
+            await model.cancelWaiting()?.value
+            await retry?.value
+        }
+
         let streaming = try BootstrapFixture(parent: temporary)
         let streamingExecutor = BootstrapInstallerProgressFixture(streaming)
         var streamingComplete = false
@@ -72,7 +123,7 @@ struct BootstrapTests {
         let streamingTask = streamingModel.start()
         try await waitUntil { streamingModel.requiresServiceApproval && streamingModel.output.contains("Waiting for macOS") }
         let streamingCalls = await streamingExecutor.installations
-        try check(streamingModel.phase == .installing && !streamingComplete && streamingCalls == 1 &&
+        try check(streamingModel.phase == .waiting && streamingModel.canStopWaiting && !streamingComplete && streamingCalls == 1 &&
             !streamingModel.output.contains("AGENT_QUEUE_SETUP_STATE") && streamingModel.start() == nil,
             "Actual installer streaming exposes the Settings action without displaying protocol markers, retrying or establishing readiness")
         await streamingExecutor.release()
@@ -81,6 +132,31 @@ struct BootstrapTests {
             "Successful installation readback clears the streamed approval hint")
         try check(!QueueSetupProgress.parse("Diagnostic contains " + QueueSetupProgress.approvalMarker).requiresServiceApproval,
             "Approval display hints require their exact protocol line")
+        let resumed = QueueSetupProgress.parse(QueueSetupProgress.approvalMarker + "\nWaiting\n" + QueueSetupProgress.installingMarker + "\nInstalling")
+        try check(!resumed.isWaiting && !resumed.requiresServiceApproval && !resumed.output.contains("AGENT_QUEUE_"),
+            "A resumed mutation clears historical waiting and approval markers")
+
+        let approvalPreflightFixture = try BootstrapFixture(parent: temporary)
+        let approvalPreflightExecutor = BootstrapInstallerProgressFixture(approvalPreflightFixture,
+            report: .init(schemaVersion: 1, issues: [.init(id: "service-approval", title: "Allow background services",
+                detail: "Allow Agent Queue in macOS settings. Setup will continue automatically.",
+                actions: [.init(id: "wait", title: "Wait and continue", destructive: false)])]))
+        var approvalPreflightComplete = false
+        var approvalPreflightWindows = 0
+        let approvalPreflightModel = QueueBootstrapModel(environment: approvalPreflightFixture.environment, execute: { request, output in
+            try await approvalPreflightExecutor.execute(request, output: output)
+        }) { approvalPreflightComplete = true }
+        approvalPreflightModel.onSetupRequired = { approvalPreflightWindows += 1 }
+        let approvalPreflightTask = approvalPreflightModel.start()
+        try await waitUntil { approvalPreflightModel.requiresServiceApproval }
+        let approvalPreflightInstalls = await approvalPreflightExecutor.installations
+        try check(approvalPreflightWindows > 0 && approvalPreflightInstalls == 1 && !approvalPreflightComplete &&
+            approvalPreflightModel.start() == nil,
+            "Ordinary approval preflight enters the backend wait, shows Settings and prevents duplicate installation")
+        await approvalPreflightExecutor.release()
+        await approvalPreflightTask?.value
+        try check(approvalPreflightComplete && approvalPreflightModel.phase == .complete,
+            "Ordinary approval preflight resumes and completes without Check again")
 
         let stalled = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try stalled.installManaged()
@@ -102,7 +178,7 @@ struct BootstrapTests {
             try await Task.sleep(for: .milliseconds(5))
         }
         let stoppedAt = ProcessInfo.processInfo.systemUptime
-        stalledModel.cancelWaiting()
+        await stalledModel.cancelWaiting()?.value
         await stalledTask?.value
         let childPID = Int32(try String(contentsOf: stalledPID, encoding: .utf8)) ?? -1
         try check(childPID > 1 && kill(childPID, 0) == -1 && errno == ESRCH &&
@@ -123,7 +199,7 @@ struct BootstrapTests {
                 try await waitUntil { startup.phase == .waiting }
                 try check(startup.requiresServiceApproval && !completed,
                     "Managed requiresApproval waits for macOS approval without re-registration")
-                startup.cancelWaiting()
+                await startup.cancelWaiting()?.value
             }
             await task?.value
             let requests = await readback.requests
@@ -170,7 +246,7 @@ struct BootstrapTests {
         }, waitInterval: .milliseconds(1)) { deniedCompleted = true }
         let deniedTask = deniedModel.start()
         try await waitUntil { deniedModel.phase == .waiting }
-        deniedModel.cancelWaiting()
+        await deniedModel.cancelWaiting()?.value
         await deniedTask?.value
         let deniedRequests = await deniedStatus.requests
         try check(!deniedCompleted && !deniedModel.isRunning &&
@@ -795,10 +871,11 @@ struct BootstrapTests {
         await cancelledRepairExecutor.holdPreflight()
         let cancelledApprovedTask = cancelledRepair.repairAndContinue(confirmed: true)
         try await waitUntil { await cancelledRepairExecutor.isHeld }
-        cancelledRepair.cancelWaiting()
+        let cancelledRepairStop = cancelledRepair.cancelWaiting()
         await cancelledRepairExecutor.update(.clear)
         await cancelledRepairExecutor.releasePreflight()
         await cancelledApprovedTask?.value
+        await cancelledRepairStop?.value
         let cancelledRepairInstalls = await cancelledRepairExecutor.installations
         try check(cancelledRepair.phase == .reviewing && cancelledRepairInstalls == 0,
             "Stopping an approved read-only check revokes approval and fences its late clean result")
@@ -825,10 +902,11 @@ struct BootstrapTests {
         let cancelledWait = waiting.waitAndContinue()
         try await waitUntil { await waitExecutor.isHeld }
         try check(waiting.phase == .waiting && waiting.start() == nil, "Waiting prevents duplicate setup attempts")
-        waiting.cancelWaiting()
+        let cancelledWaitStop = waiting.cancelWaiting()
         await waitExecutor.update(.clear)
         await waitExecutor.releasePreflight()
         await cancelledWait?.value
+        await cancelledWaitStop?.value
         let cancelledInstalls = await waitExecutor.installations
         try check(waiting.phase == .reviewing && cancelledInstalls == 0,
             "Stopping waiting prevents a late clean report from installing or completing startup")
@@ -854,9 +932,10 @@ struct BootstrapTests {
         }) { summaryCompletions += 1 }
         let stoppedCheck = stopped.start()
         try await waitUntil { await stoppedExecutor.isHeld }
-        stopped.cancelWaiting()
+        let stoppedWait = stopped.cancelWaiting()
         await stoppedExecutor.releasePreflight()
         await stoppedCheck?.value
+        await stoppedWait?.value
         let stoppedInstalls = await stoppedExecutor.installations
         try check(stopped.phase == .failed && !stopped.isRunning && stoppedInstalls == 0,
             "Stopping the initial read-only preflight fences its eventual clean response")

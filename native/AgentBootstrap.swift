@@ -476,7 +476,7 @@ struct QueueBootstrapReport: Codable, Equatable, Sendable {
 @MainActor
 final class QueueBootstrapModel: ObservableObject {
     typealias Executor = @Sendable (QueueBootstrapRequest, @escaping @Sendable (Data) -> Void) async throws -> Data
-    enum Phase { case idle, checking, setupRequired, reviewing, waiting, recovering, installing, failed, complete }
+    enum Phase { case idle, checking, setupRequired, reviewing, waiting, stopping, recovering, installing, failed, complete }
     @Published private(set) var phase = Phase.idle
     @Published private(set) var message = "Checking setup…"
     @Published private(set) var output = ""
@@ -485,7 +485,7 @@ final class QueueBootstrapModel: ObservableObject {
     @Published private(set) var canDisablePhoneAccess = false
     @Published private(set) var requiresServiceApproval = false
     private static let phoneAccessRecovery = "AGENT_QUEUE_SETUP_RECOVERY:disable-phone-access"
-    var isRunning: Bool { [.checking, .waiting, .recovering, .installing].contains(phase) }
+    var isRunning: Bool { [.checking, .waiting, .stopping, .recovering, .installing].contains(phase) }
     var canStopWaiting: Bool { phase == .waiting || phase == .checking }
     var allowsInstallation: Bool { environment.allowsInstallation }
     var onSetupRequired: (() -> Void)?
@@ -529,11 +529,11 @@ final class QueueBootstrapModel: ObservableObject {
                 return .recovery("cleanup-job", job.id)
             }
             return has("wait") ? .wait : nil
-        case "legacy-jobs":
+        case "legacy-jobs", "managed-jobs":
             guard let jobs = issue.jobs, !jobs.isEmpty,
                   jobs.allSatisfy({ ["Running", "Queued"].contains($0.status) }) else { return nil }
             return has("wait") ? .wait : nil
-        case "installer-busy", "scheduling-busy", "remote-busy", "controller-stopping":
+        case "installer-busy", "scheduling-busy", "remote-busy", "controller-stopping", "service-approval":
             return has("wait") ? .wait : nil
         default:
             return nil
@@ -588,8 +588,10 @@ final class QueueBootstrapModel: ObservableObject {
                         legacyPhoneAccess = false
                         try await installAwaitingApproval(QueueBootstrapRequest(executable: request.executable,
                             arguments: request.arguments + ["--disable-phone-access"]), reason: reason, current: current)
-                    } else if try await preflight(request, current: current) {
-                        try await installAwaitingApproval(request, reason: reason, current: current)
+                    } else if try await preflight(request, current: current, automatic: true) {
+                        let setup = environment.arguments.contains("--setup") ? request : QueueBootstrapRequest(executable: request.executable,
+                            arguments: request.arguments + ["--repair-and-continue"])
+                        try await installAwaitingApproval(setup, reason: reason, current: current)
                     }
                 } else {
                     for statusRequest in try environment.serviceStatusRequests() {
@@ -605,6 +607,12 @@ final class QueueBootstrapModel: ObservableObject {
                                     arguments: ["install", "--app-bundle", environment.app.path])
                                 request = setup
                                 serviceSetupRequest = setup
+                                if try await preflight(setup, current: current, automatic: true) {
+                                    try await installAwaitingApproval(.init(executable: setup.executable,
+                                        arguments: setup.arguments + ["--repair-and-continue"]),
+                                        reason: "Setting up background services…", current: current)
+                                }
+                                return
                             }
                             phase = .setupRequired
                             message = requiresServiceApproval ? "Allow background services in System Settings" : "Setup must finish background service setup"
@@ -748,13 +756,24 @@ final class QueueBootstrapModel: ObservableObject {
         return task
     }
 
-    func cancelWaiting() {
-        guard canStopWaiting else { return }
+    @discardableResult func cancelWaiting() -> Task<Void, Never>? {
+        if phase == .stopping { return operation }
+        guard canStopWaiting else { return nil }
         attempt += 1
-        operation?.cancel()
-        operation = nil
-        phase = issues.isEmpty ? .failed : .reviewing
-        message = "Setup check stopped. You can continue when you are ready."
+        let current = attempt
+        let stopped = operation
+        stopped?.cancel()
+        phase = .stopping
+        message = "Stopping the setup wait…"
+        let stopping = Task { [self] in
+            await stopped?.value
+            guard attempt == current else { return }
+            operation = nil
+            phase = issues.isEmpty ? .failed : .reviewing
+            message = "Setup check stopped. You can continue when you are ready."
+        }
+        operation = stopping
+        return stopping
     }
 
     func review(_ issueID: String) {
@@ -806,7 +825,7 @@ final class QueueBootstrapModel: ObservableObject {
         return result
     }
 
-    private func preflight(_ request: QueueBootstrapRequest, current: Int, waiting: Bool = false) async throws -> Bool {
+    private func preflight(_ request: QueueBootstrapRequest, current: Int, waiting: Bool = false, automatic: Bool = false) async throws -> Bool {
         let data = try await execute(.init(executable: request.executable,
             arguments: request.arguments + ["--preflight", "--json"])) { _ in }
         guard attempt == current else { throw CancellationError() }
@@ -815,6 +834,13 @@ final class QueueBootstrapModel: ObservableObject {
         issues = report.issues
         revision = report.revision
         canDisablePhoneAccess = issues.contains(where: { $0.actions.contains(where: { $0.id == "disable-phone-access" }) })
+        // Ordinary first launch delegates known repairs and waits to the backend,
+        // which rechecks the full report under its normal lifecycle locks. Explicit
+        // diagnostic setup keeps the reviewed, individual-action workflow.
+        if automatic && !environment.arguments.contains("--setup") && issues.allSatisfy({ issue in
+            Self.approvedRepairStep(issue) != nil || (issue.id == "custom-callback" && revision != nil &&
+                issue.actions.contains(where: { $0.id == "reset-callback" }))
+        }) { return true }
         if !issues.isEmpty {
             if !waiting { phase = .reviewing }
             message = waiting ? "Waiting for the listed requirements to clear…" : "Review these requirements before continuing."
@@ -831,11 +857,12 @@ final class QueueBootstrapModel: ObservableObject {
         canDisablePhoneAccess = false
         let result = try await execute(request) { [weak self] data in
             Task { @MainActor [weak self] in
-                guard let self, self.attempt == current, self.phase == .installing else { return }
+                guard let self, self.attempt == current, [.installing, .waiting].contains(self.phase) else { return }
                 let progress = QueueSetupProgress.parse(String(decoding: data, as: UTF8.self))
-                self.requiresServiceApproval = self.requiresServiceApproval || progress.requiresServiceApproval
+                self.requiresServiceApproval = progress.requiresServiceApproval
+                self.phase = progress.isWaiting ? .waiting : .installing
                 self.output = String(decoding: progress.output.utf8.suffix(8_000), as: UTF8.self)
-                if self.requiresServiceApproval { self.onSetupRequired?() }
+                if progress.isWaiting { self.onSetupRequired?() }
             }
         }
         guard attempt == current else { return }
@@ -870,7 +897,23 @@ final class QueueBootstrapModel: ObservableObject {
             finish(current)
         } else if case let .install(request, reason) = decision, allowsInstallation {
             self.request = request
-            try await installAwaitingApproval(request, reason: reason, current: current)
+            if try await preflight(request, current: current, automatic: true) {
+                let setup = environment.arguments.contains("--setup") ? request : QueueBootstrapRequest(executable: request.executable,
+                    arguments: request.arguments + ["--repair-and-continue"])
+                try await installAwaitingApproval(setup, reason: reason, current: current)
+            }
+        } else if decision == .ready, allowsInstallation {
+            // Approval can clear one registration while another service still
+            // needs setup. Continue here instead of requiring Check again.
+            let setup = QueueBootstrapRequest(executable: environment.app.appendingPathComponent("Contents/MacOS/agent-heavy"),
+                arguments: ["install", "--app-bundle", environment.app.path])
+            request = setup
+            serviceSetupRequest = setup
+            if try await preflight(setup, current: current, automatic: true) {
+                try await installAwaitingApproval(.init(executable: setup.executable,
+                    arguments: setup.arguments + ["--repair-and-continue"]),
+                    reason: "Finishing background service setup…", current: current)
+            }
         } else {
             phase = .setupRequired
             message = "Setup must finish before Agent Queue can open"
@@ -1063,7 +1106,7 @@ struct QueueBootstrapView: View {
                 if model.canStopWaiting { Button("Stop waiting") { model.cancelWaiting() } }
                 Spacer()
                 if model.requiresServiceApproval { Button("Login Items settings") { model.showLoginItems() } }
-                Button("Quit") { NSApp.terminate(nil) }.disabled(model.isRunning)
+                Button("Quit") { NSApp.terminate(nil) }.disabled(model.isRunning && !model.canStopWaiting && model.phase != .stopping)
                 if !model.isRunning && model.phase != .complete {
                     if model.requiresServiceApproval {
                         Button("Check again") { model.start() }

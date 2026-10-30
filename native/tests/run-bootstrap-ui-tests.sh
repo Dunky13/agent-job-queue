@@ -59,6 +59,16 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
     --open-window --temporary "$temporary" --output "$output/drag-and-drop" --drag-and-drop
 [[ "$(plutil -extract passed raw -o - "$output/drag-and-drop/verification.json")" == "true" ]]
+mkdir -p -- "$output/silent-recovery"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --open-window --temporary "$temporary" --output "$output/silent-recovery" --silent-recovery
+[[ "$(plutil -extract passed raw -o - "$output/silent-recovery/verification.json")" == "true" ]]
+mkdir -p -- "$output/cancellable-wait"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --open-window --temporary "$temporary" --output "$output/cancellable-wait" --cancellable-wait
+[[ "$(plutil -extract passed raw -o - "$output/cancellable-wait/verification.json")" == "true" ]]
 {
   printf '# Bootstrap fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
   cat "$output/verification.json"

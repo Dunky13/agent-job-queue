@@ -208,6 +208,7 @@ private final class QueueReadCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
     func cancel() { lock.withLock { cancelled = true } }
+    var isCancelled: Bool { lock.withLock { cancelled } }
     func check() throws { if lock.withLock({ cancelled }) { throw CancellationError() } }
 }
 
@@ -223,12 +224,14 @@ enum QueueClient {
     static func run(_ arguments: [String], controller: Controller = .heavy, input: Data? = nil,
                     budget: Budget = .normal, transport: Transport? = nil,
                     onOutput: (@Sendable (Data) -> Void)? = nil) async throws -> Data {
-        // Only known, discardable reads observe task cancellation. Accepted changes
-        // keep their original response/deadline and are never retried or rolled back.
+        // Known reads are discardable. Automatic setup can stop only while its
+        // controller reports a wait; its pending identity and custody survive.
+        // Other accepted changes retain their original response and deadline.
+        let automaticSetup = input == nil && controller == .heavy && budget == .setup && isAutomaticSetup(arguments)
         let discardable = input == nil && (arguments.first == "status" ||
             (controller == .heavy && arguments.first == "profiles" &&
                 ["list", "show"].contains(arguments.dropFirst().first ?? "")) ||
-            (controller == .heavy && (isSetupPreflight(arguments) || isNativeServiceStatus(arguments))))
+            (controller == .heavy && (isSetupPreflight(arguments) || isNativeServiceStatus(arguments)))) || automaticSetup
         let cancellation = discardable ? QueueReadCancellation() : nil
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -250,6 +253,12 @@ enum QueueClient {
             ["--app-bundle", "--payload"].contains(arguments[1]) &&
             arguments[2].hasPrefix("/") && !arguments[2].contains("\0") &&
             Array(arguments.suffix(2)) == ["--preflight", "--json"]
+    }
+
+    private static func isAutomaticSetup(_ arguments: [String]) -> Bool {
+        arguments.count == 4 && arguments[0] == "install" &&
+            ["--app-bundle", "--payload"].contains(arguments[1]) &&
+            arguments[2].hasPrefix("/") && !arguments[2].contains("\0") && arguments[3] == "--repair-and-continue"
     }
 
     private static func isNativeServiceStatus(_ arguments: [String]) -> Bool {
@@ -340,10 +349,23 @@ enum QueueClient {
         var response = Data()
         let captureLimit = budget == .setup ? 32_768 : 2_097_152
         var lastOutputDelivery = 0.0
+        var pendingOutputDelivery = false
         var buffer = [UInt8](repeating: 0, count: 16_384)
         var observedChildExit = false
+        let automaticSetup = controller == .heavy && budget == .setup && isAutomaticSetup(arguments)
+        var setupIsWaiting = false
+        var requestedSetupStop = false
         while true {
-            try cancellation?.check()
+            // Progress can lag a mutation. The backend, rather than this cached
+            // display state, decides when a stop request is safe to honor.
+            if automaticSetup {
+                if !requestedSetupStop, cancellation?.isCancelled == true, process.isRunning {
+                    guard kill(process.processIdentifier, SIGUSR1) == 0 || errno == ESRCH else {
+                        throw ClientError.message("Could not ask setup to stop waiting. Its installation evidence is preserved.")
+                    }
+                    requestedSetupStop = true
+                }
+            } else { try cancellation?.check() }
             if ProcessInfo.processInfo.systemUptime >= deadline {
                 if budget == .setup {
                     throw ClientError.message("Setup did not finish within \(Int(timeout)) seconds. Quit and reopen Agent Queue, or retry setup.\n" + String(decoding: response.suffix(8_000), as: UTF8.self))
@@ -363,13 +385,20 @@ enum QueueClient {
                     throw ClientError.message("The queue response exceeds the 2 MB display limit.")
                 }
                 response.append(contentsOf: buffer.prefix(count))
-                if response.count > captureLimit { response.removeFirst(response.count - captureLimit) }
-                if let onOutput, ProcessInfo.processInfo.systemUptime - lastOutputDelivery >= 0.1 {
-                    onOutput(response)
-                    lastOutputDelivery = ProcessInfo.processInfo.systemUptime
+                if automaticSetup {
+                    setupIsWaiting = QueueSetupProgress.parse(String(decoding: response, as: UTF8.self)).isWaiting
                 }
+                if response.count > captureLimit { response.removeFirst(response.count - captureLimit) }
+                pendingOutputDelivery = true
             } else if count < 0 && readError != EAGAIN && readError != EINTR {
                 throw ClientError.message("Could not read the private controller response.")
+            }
+            // Flush the last throttled update even when the child then waits
+            // silently for jobs or approval and emits no additional bytes.
+            if pendingOutputDelivery, let onOutput, ProcessInfo.processInfo.systemUptime - lastOutputDelivery >= 0.1 {
+                onOutput(response)
+                lastOutputDelivery = ProcessInfo.processInfo.systemUptime
+                pendingOutputDelivery = false
             }
             if !inputClosed, let input, let inputPipe {
                 let written = input.withUnsafeBytes { bytes in
@@ -409,7 +438,7 @@ enum QueueClient {
                 Thread.sleep(forTimeInterval: 0.01)
             }
         }
-        try cancellation?.check()
+        if !automaticSetup || setupIsWaiting { try cancellation?.check() }
         onOutput?(response)
         guard process.terminationStatus == 0 else {
             if arguments.first == "profiles", let failure = try? JSONDecoder().decode(QueueControllerFailure.self, from: response) {
@@ -1780,14 +1809,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var normalLaunchStarted = false
     private var bootstrapEnvironment: QueueBootstrapEnvironment?
     private var bootstrapExecutor: QueueBootstrapModel.Executor = QueueBootstrapModel.runInstaller
+    private var replyToTermination: @MainActor () -> Void = { NSApp.reply(toApplicationShouldTerminate: true) }
 
     override init() { super.init() }
 
     // The separate graphical fixture supplies a private bundle/home and an inert
     // executor. Normal launch still follows the production path with --fixture.
-    init(environment: QueueBootstrapEnvironment, executor: @escaping QueueBootstrapModel.Executor) {
+    init(environment: QueueBootstrapEnvironment,
+         terminationReply: @escaping @MainActor () -> Void = { NSApp.reply(toApplicationShouldTerminate: true) },
+         executor: @escaping QueueBootstrapModel.Executor) {
         bootstrapEnvironment = environment
         bootstrapExecutor = executor
+        replyToTermination = terminationReply
         super.init()
     }
 
@@ -1974,6 +2007,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard bootstrap?.isRunning == true else { return .terminateNow }
+        if let bootstrap, bootstrap.canStopWaiting || bootstrap.phase == .stopping {
+            let stopped = bootstrap.cancelWaiting()
+            Task { @MainActor in
+                await stopped?.value
+                self.replyToTermination()
+            }
+            return .terminateLater
+        }
         // Silent setup has no window; explain why quitting or logout waits.
         showSetupWindow()
         return .terminateCancel

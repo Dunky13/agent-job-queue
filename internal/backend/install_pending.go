@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"time"
+
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 )
 
 const installFinishPending = "finish-pending-installation"
@@ -31,6 +33,15 @@ func (err *installPendingError) Error() string {
 func (install *installer) managedPendingSuperseded(identity, pending BuildInfo) (bool, error) {
 	if !install.appBundle || install.prepareReplacement || install.unregisterServices || install.pendingIdentity != nil ||
 		identity.Build == nil || pending.Build == nil || *identity.Build <= *pending.Build {
+		return false, nil
+	}
+	previous, err := appservices.Load(install.home)
+	if err != nil {
+		return false, err
+	}
+	if previous != nil && previous.App != install.app {
+		// A separate retained bundle can still finish its exact candidate.
+		// Finder has not replaced that app, so its pending marker is binding.
 		return false, nil
 	}
 	for _, retained := range []string{install.managedPreviousPath(), install.managedReceiptPath()} {
@@ -60,7 +71,16 @@ func (install *installer) pendingInstallation(ctx context.Context) (*installer, 
 	}
 	retained := *install
 	retained.appBundle = true
-	retained.payload = filepath.Join(install.app, "Contents/Resources/payload")
+	if install.appBundle {
+		previous, err := appservices.Load(install.home)
+		if err != nil {
+			return nil, err
+		}
+		if previous != nil {
+			retained.app = previous.App
+		}
+	}
+	retained.payload = filepath.Join(retained.app, "Contents/Resources/payload")
 	retained.prepareReplacement = false
 	retained.unregisterServices = false
 	retained.pendingIdentity = &pending.identity
@@ -72,6 +92,14 @@ func (install *installer) pendingInstallation(ctx context.Context) (*installer, 
 	}
 	if retained.managed {
 		if err := retained.managedVerify(ctx, retained.app); err != nil {
+			return nil, err
+		}
+		selected, err := managedCaptureBundle(retained.app)
+		if err != nil {
+			return nil, err
+		}
+		retained.pendingBundle = &selected
+		if err := retained.managedBackupAccess(); err != nil {
 			return nil, err
 		}
 	} else {

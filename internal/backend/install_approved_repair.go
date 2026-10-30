@@ -138,11 +138,18 @@ func installRunApprovedRepair(ctx context.Context, inspect func(context.Context)
 				// one custody-checked resume, but fence repeated no-progress exits.
 				approvalResumed[approval.service] = true
 			}
-			reportProgress("Setup requirements are clear. Continuing installation…")
+			reportProgress("AGENT_QUEUE_SETUP_STATE:installing\nSetup requirements are clear. Continuing installation…")
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 			err := execute(ctx)
+			if errors.Is(err, errInstallRelocationWaiting) {
+				reportProgress("AGENT_QUEUE_SETUP_STATE:waiting\n" + err.Error())
+				if err := pause(ctx); err != nil {
+					return err
+				}
+				continue
+			}
 			var approval *installApprovalError
 			if errors.As(err, &approval) {
 				// Registration can legitimately pause the exact pending candidate
@@ -158,7 +165,7 @@ func installRunApprovedRepair(ctx context.Context, inspect func(context.Context)
 				approvalObserved = true
 				reportProgress("AGENT_QUEUE_SETUP_STATE:requires-approval\nWaiting for macOS background service approval. Allow Agent Queue in System Settings > General > Login Items & Extensions. Installation will continue automatically.")
 			} else {
-				reportProgress("Waiting for queue work and setup requirements. Installation will continue automatically; active jobs are preserved.")
+				reportProgress("AGENT_QUEUE_SETUP_STATE:waiting\nWaiting for queue work and setup requirements. Installation will continue automatically; active jobs are preserved.")
 			}
 			if err := pause(ctx); err != nil {
 				return err
@@ -176,7 +183,7 @@ func installRunApprovedRepair(ctx context.Context, inspect func(context.Context)
 			return errors.New("Setup reached its verified repair limit; review the remaining requirements before approving another attempt")
 		}
 		performed[key] = true
-		reportProgress("Running verified setup repair: " + step.action)
+		reportProgress("AGENT_QUEUE_SETUP_STATE:installing\nRunning verified setup repair: " + step.action)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -190,9 +197,22 @@ func (install *installer) repairAndExecute(ctx context.Context) error {
 	previous := install.automaticSetup
 	install.automaticSetup = true
 	defer func() { install.automaticSetup = previous }()
+	// Stop waiting cancels inspections and waits only. An accepted mutation
+	// retains its original context until its response, even if progress lags.
+	run, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	if install.setupStop != nil {
+		go func() {
+			select {
+			case <-install.setupStop:
+				cancelRun()
+			case <-run.Done():
+			}
+		}()
+	}
 	// Queue drain can take as long as the running workload. Each individual
 	// inspection, repair and installation still has a finite execution budget.
-	return installRunApprovedRepair(ctx, func(ctx context.Context) installPreflightReport {
+	return installRunApprovedRepair(run, func(ctx context.Context) installPreflightReport {
 		operation, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 		report := install.preflight(operation)
@@ -200,7 +220,7 @@ func (install *installer) repairAndExecute(ctx context.Context) error {
 			report.add("inspection-failed", "Installation inspection did not complete", err.Error(), "")
 		}
 		return report
-	}, func(ctx context.Context, action string, jobID *int, revision string) error {
+	}, func(_ context.Context, action string, jobID *int, revision string) error {
 		if action == installFinishPending {
 			// Its retained installer owns bounded individual operations and
 			// may need an arbitrarily long drain or OS approval wait.
@@ -209,7 +229,7 @@ func (install *installer) repairAndExecute(ctx context.Context) error {
 		operation, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 		return install.recover(operation, action, jobID, revision)
-	}, func(ctx context.Context) error {
+	}, func(_ context.Context) error {
 		operation, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 		return install.execute(operation)

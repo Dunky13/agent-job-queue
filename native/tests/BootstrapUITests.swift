@@ -71,6 +71,14 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             try await verifyDragAndDropLaunch(notification)
             return
         }
+        if CommandLine.arguments.contains("--cancellable-wait") {
+            try await verifyCancellableWait(notification)
+            return
+        }
+        if CommandLine.arguments.contains("--silent-recovery") {
+            try await verifySilentRecovery(notification)
+            return
+        }
         if CommandLine.arguments.contains("--approved-repair") {
             try await verifyApprovedRepair(notification)
             return
@@ -122,8 +130,8 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         }
         let requests = await executor.requests
         try check(delegate.setupWindow == nil && !setup.isVisible && AppRuntime.store.fixtureMode &&
-            requests.count == 2 && requests[0].arguments == ["install", "--app-bundle", fixture.environment.app.path] &&
-            requests[1].arguments == requests[0].arguments + (phoneAccessBlocker ? ["--disable-phone-access"] : []),
+            requests.count == 2 && requests[0].arguments == ["install", "--app-bundle", fixture.environment.app.path, "--repair-and-continue"] &&
+            requests[1].arguments == ["install", "--app-bundle", fixture.environment.app.path] + (phoneAccessBlocker ? ["--disable-phone-access"] : ["--repair-and-continue"]),
             "Successful recovery verifies readback, closes setup and continues real fixture startup")
         try check(model.start() == nil && AppRuntime.menuBarController === controller &&
             delegate.applicationShouldTerminate(NSApp) == .terminateNow,
@@ -132,7 +140,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func verifyPreflight(_ notification: Notification) async throws {
-        let fixture = try BootstrapFixture(parent: temporary)
+        let fixture = try BootstrapFixture(parent: temporary, arguments: ["--setup"])
         let waitingIssue = QueueBootstrapIssue(id: "installer-busy", title: "Another installation is running",
             detail: "Wait for the other installation to finish. Its lock and files will be preserved.",
             actions: [.init(id: "wait", title: "Wait and continue", destructive: false)])
@@ -181,13 +189,14 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         await executor.holdPreflight()
         let waiting = model.waitAndContinue()
         try await waitUntil { await executor.isHeld }
-        try check(model.phase == .waiting && model.canStopWaiting && delegate.applicationShouldTerminate(NSApp) == .terminateCancel,
-            "Waiting shows progress and an explicit stop control while retaining the termination guard")
+        try check(model.phase == .waiting && model.canStopWaiting,
+            "Waiting shows progress and an explicit stop control while jobs continue independently")
         try snapshot(setup, name: "02-waiting")
-        model.cancelWaiting()
+        let stopping = model.cancelWaiting()
         await executor.update(.clear)
         await executor.releasePreflight()
         await waiting?.value
+        await stopping?.value
         let cancelledInstalls = await executor.installations
         try check(model.phase == .reviewing && cancelledInstalls == 0 && delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "Stopping a pending preflight prevents its late result from installing")
@@ -219,7 +228,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         guard let setup = delegate.setupWindow, let model = delegate.bootstrap else {
             throw ClientError.message("macOS approval did not present the setup window")
         }
-        try check(setup.isVisible && model.phase == .installing && !model.output.contains("AGENT_QUEUE_SETUP_STATE") &&
+        try check(setup.isVisible && model.phase == .waiting && model.canStopWaiting && !model.output.contains("AGENT_QUEUE_SETUP_STATE") &&
             AppRuntime.menuBarController == nil,
             "A first launch opens the setup window only when macOS asks for background service approval")
         try snapshot(setup, name: "01-approval")
@@ -233,7 +242,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func verifyApprovedRepair(_ notification: Notification) async throws {
-        let fixture = try BootstrapFixture(parent: temporary)
+        let fixture = try BootstrapFixture(parent: temporary, arguments: ["--setup"])
         let busy = QueueBootstrapIssue(id: "installer-busy", title: "Another installation is running",
             detail: "Setup will wait without changing its files.", actions: [.init(id: "wait", title: "Wait and continue", destructive: false)])
         let missing = QueueBootstrapIssue(id: "service-definitions-missing", title: "Restore missing background service files",
@@ -300,6 +309,81 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             "One accepted dialog repairs, waits and verifies normal startup without further intervention")
         guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Approved repair did not start the simulated queue") }
         try snapshot(queue, name: "04-approved-startup")
+    }
+
+    private func verifyCancellableWait(_ notification: Notification) async throws {
+        let fixture = try BootstrapFixture(parent: temporary)
+        var terminationAcknowledged = false
+        let delegate = AppDelegate(environment: fixture.environment, terminationReply: { terminationAcknowledged = true }) { request, output in
+            if request.arguments.suffix(2) == ["--preflight", "--json"] {
+                return try JSONEncoder().encode(QueueBootstrapReport.clear)
+            }
+            output(Data((QueueSetupProgress.waitingMarker + "\nWaiting for existing queue jobs. They will continue normally.").utf8))
+            try await Task.sleep(for: .seconds(60))
+            throw ClientError.message("Cancelled fixture setup continued")
+        }
+        production = delegate
+        delegate.applicationDidFinishLaunching(notification)
+        try await waitUntil { delegate.bootstrap?.phase == .waiting && delegate.setupWindow?.isVisible == true }
+        guard let model = delegate.bootstrap, let setup = delegate.setupWindow else {
+            throw ClientError.message("Automatic waiting did not display its controls")
+        }
+        try check(model.canStopWaiting && AppRuntime.menuBarController == nil,
+            "Automatic queue waiting presents its cancellable setup window without starting an unready runtime")
+        try snapshot(setup, name: "01-waiting")
+        let stopping = model.cancelWaiting()
+        try check(model.phase == .stopping && model.start() == nil,
+            "Stop waiting blocks retry while its controller is still stopping")
+        let reply = delegate.applicationShouldTerminate(NSApp)
+        try check(reply == .terminateLater && !terminationAcknowledged,
+            "Quit and logout wait for the private controller to stop before acknowledging termination")
+        try await waitUntil { terminationAcknowledged }
+        await stopping?.value
+        try check(!model.isRunning && model.phase == .failed && delegate.setupWindow === setup && AppRuntime.menuBarController == nil,
+            "Stop waiting leaves retry available and preserves the independent queue")
+        try snapshot(setup, name: "02-stopped")
+    }
+
+    private func verifySilentRecovery(_ notification: Notification) async throws {
+        let fixture = try BootstrapFixture(parent: temporary, managed: true)
+        // Replay the reveal-only report from the recording in this same private
+        // environment, then exercise the recoverable report produced by the fix.
+        let originalIssue = QueueBootstrapIssue(id: "pending-installation", title: "Finish the previous installation",
+            detail: "Another candidate installation is pending. Finish that exact build before replacing it.",
+            actions: [.init(id: "reveal", title: "Show affected file", destructive: false)])
+        let originalExecutor = BootstrapAutomaticSetupFixture(fixture, report: .init(schemaVersion: 1, issues: [originalIssue]))
+        let original = AppDelegate(environment: fixture.environment) { request, _ in
+            try await originalExecutor.execute(request)
+        }
+        production = original
+        original.applicationDidFinishLaunching(notification)
+        try await waitUntil { original.bootstrap?.phase == .reviewing && original.setupWindow?.isVisible == true }
+        guard let blocked = original.setupWindow else { throw ClientError.message("The recorded blocker was not reproduced") }
+        let originalRequests = await originalExecutor.requests
+        try check(originalRequests.allSatisfy({ $0.arguments.suffix(2) == ["--preflight", "--json"] }),
+            "The original reveal-only report reproduces the blocked setup without installing")
+        try snapshot(blocked, name: "00-before-recorded-blocker")
+        blocked.close()
+        let pending = QueueBootstrapIssue(id: "pending-installation", title: "Finish the previous installation",
+            detail: "Finish the exact retained build before setting up this app at its new location.",
+            actions: [.init(id: "finish-pending-installation", title: "Continue setup", destructive: true)])
+        let executor = BootstrapAutomaticSetupFixture(fixture, report: .init(schemaVersion: 1, issues: [pending]))
+        let delegate = AppDelegate(environment: fixture.environment) { request, _ in
+            try await executor.execute(request)
+        }
+        production = delegate
+        delegate.applicationDidFinishLaunching(notification)
+        guard let model = delegate.bootstrap else { throw ClientError.message("Silent recovery did not start") }
+        var setupPresentations = 0
+        let present = model.onSetupRequired
+        model.onSetupRequired = { setupPresentations += 1; present?() }
+        try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
+        let requests = await executor.requests
+        try check(setupPresentations == 0 && delegate.setupWindow == nil && AppRuntime.menuBarController != nil &&
+            requests.filter({ $0.arguments.contains("--repair-and-continue") }).count == 1 && AppRuntime.store.fixtureMode,
+            "Verified retained-build recovery opens a usable menu bar without a setup popup or extra click")
+        guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Silent recovery did not open the simulated queue") }
+        try snapshot(queue, name: "01-recovered-runtime")
     }
 
     private func sendReturn(to window: NSWindow) throws {
