@@ -213,7 +213,7 @@ func TestManagedPreparationFreezesBeforeAppMoveAndPostflightRetries(t *testing.T
 	i.prepareReplacement = false
 	i.appBundle = true
 	i.payload = filepath.Join(i.app, "Contents/Resources/payload")
-	m.nativeFailure = "register resources"
+	m.nativeFailure = "register login"
 	if err := m.run(t); err == nil {
 		t.Fatal("missing postflight partial failure")
 	}

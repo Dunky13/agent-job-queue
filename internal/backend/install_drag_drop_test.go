@@ -68,8 +68,8 @@ func TestManagedAppBundleAdoptsLocationRecordOfDeletedApp(t *testing.T) {
 	if _, err := os.Lstat(i.managedReceiptPath()); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("superseded publication receipt was retained", err)
 	}
-	if m.statuses["queue"] != "enabled" || m.statuses["resources"] != "enabled" {
-		t.Fatal("adopted bundle did not register its services", m.statuses)
+	if m.statuses["login"] != "enabled" || m.statuses["queue"] != "notRegistered" || m.statuses["resources"] != "notRegistered" || m.statuses["remote"] != "notRegistered" {
+		t.Fatal("adopted bundle registered more than its login item", m.statuses)
 	}
 }
 
@@ -119,7 +119,7 @@ func TestManagedLoadedBundleProgramRequiresThisHelper(t *testing.T) {
 	}{
 		{"running helper", output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon"), self, true},
 		{"running submitted helper", append([]byte("\tpath = (submitted by smd.99177)\n"), output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon")...), self, true},
-		{"stopped submitted helper", append([]byte("\tpath = (submitted by smd.99177)\n"), []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = not running", 1))...), self, false},
+		{"stopped submitted helper owns no process to hijack", append([]byte("\tpath = (submitted by smd.99177)\n"), []byte(strings.Replace(string(output("Contents/MacOS/agent-heavy", "io.went.agent-queue", "", "agent-heavy", "daemon")), "\tstate = running", "\tstate = not running", 1))...), self, true},
 		{"submitted other executable", append([]byte("\tpath = (submitted by smd.99177)\n"), output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon")...), "/Applications/Agent Queue.app/Contents/MacOS/agent-heavy", false},
 		{"invalid submitted descriptor", append([]byte("\tpath = (submitted by smd.invalid)\n"), output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon")...), self, false},
 		{"duplicate submitted path", append([]byte("\tpath = (submitted by smd.99177)\n\tpath = (submitted by smd.99177)\n"), output("Contents/MacOS/agent-heavy", "io.went.agent-queue", pid, "agent-heavy", "daemon")...), self, false},

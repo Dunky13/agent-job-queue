@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -86,7 +87,8 @@ func TestManagedApprovedRepairPreservesUnrecoverablePending(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			m := managedTestFixture(t)
 			i := m.installer
-			m.nativeFailure = "register resources"
+			// Recovery registers only the login item, so interrupt after the others.
+			m.nativeFailure = "register login"
 			if err := m.run(t); err == nil {
 				t.Fatal("expected interrupted installation")
 			}
@@ -158,6 +160,32 @@ func TestManagedAutomaticRetainedCandidateWaitsForApprovalThenUpgrades(t *testin
 	completed, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
 	if err != nil || completed.Build == nil || *completed.Build != 124 {
 		t.Fatal("new candidate did not follow approved retained candidate", completed, err)
+	}
+}
+
+func TestManagedAutomaticRetainedCandidateMigratesOldApprovalThenUpgrades(t *testing.T) {
+	m := managedTestFixture(t)
+	m.approval = "resources"
+	if err := m.run(t); err == nil {
+		t.Fatal("expected pending approval")
+	}
+	i := m.installer
+	managedCandidate(t, m, "124")
+	m.approval = ""
+	m.calls = nil
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	// Recovery of the retained candidate retires the registration awaiting
+	// approval instead of waiting for consent that app-bundle setup never needs.
+	if err := i.repairAndExecute(ctx); err != nil {
+		t.Fatal("retained approval blocked recovery", err)
+	}
+	completed, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
+	if err != nil || completed.Build == nil || *completed.Build != 124 {
+		t.Fatal("new candidate did not follow the retained candidate", completed, err)
+	}
+	if !slices.Contains(managedServiceCalls(m, "unregister"), "resources") {
+		t.Fatal("the registration awaiting approval was not retired", m.calls)
 	}
 }
 

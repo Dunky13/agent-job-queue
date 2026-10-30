@@ -359,7 +359,7 @@ func TestManagedAutomaticRelocationWaitsThroughFinalCallerReadback(t *testing.T)
 	}
 }
 
-func TestManagedRecordedPendingDrainsAndResumesApprovalBeforeRelocation(t *testing.T) {
+func TestManagedRecordedPendingDrainsBeforeRelocationWithoutWaitingForLoginApproval(t *testing.T) {
 	m, old := managedRelocationFixture(t, true)
 	i := m.installer
 	m.tasks["7"] = Object{"id": 7, "status": Object{"Running": Object{}}}
@@ -371,18 +371,11 @@ func TestManagedRecordedPendingDrainsAndResumesApprovalBeforeRelocation(t *testi
 		}
 		return m.snapshot(), nil
 	}
-	m.approval = "resources"
-	approvalReads := 0
+	// The login item only decides whether the app opens at login. Its pending
+	// approval must not hold relocation once the old jobs have drained.
+	m.approval = "login"
 	original := i.command
 	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" && args[3] == "resources" && m.statuses["resources"] == "requiresApproval" {
-			approvalReads++
-			if approvalReads == 3 {
-				m.approval = ""
-				m.statuses["resources"] = "enabled"
-				m.loaded["io.went.agent-resources"] = true
-			}
-		}
 		if len(args) == 4 && args[1] == "--service-management" && args[2] != "status" && len(m.tasks) != 0 {
 			t.Fatal("pending recovery changed a service before the old jobs drained")
 		}
@@ -391,10 +384,13 @@ func TestManagedRecordedPendingDrainsAndResumesApprovalBeforeRelocation(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	if err := i.repairAndExecute(ctx); err != nil {
-		t.Fatal("automatic recovery failed to resume the recorded candidate after drain and approval", err)
+		t.Fatal("automatic recovery failed to resume the recorded candidate after drain", err)
 	}
-	if approvalReads < 3 {
-		t.Fatal("fixture did not exercise an approval pause")
+	if reads < 3 {
+		t.Fatal("fixture did not exercise a drain pause")
+	}
+	if m.statuses["login"] != "requiresApproval" {
+		t.Fatal("login registration was not left pending for the user", m.statuses)
 	}
 	if _, err := os.Stat(old); err != nil {
 		t.Fatal("completed relocation removed the old app", err)

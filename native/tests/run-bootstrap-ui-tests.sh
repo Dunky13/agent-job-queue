@@ -31,7 +31,7 @@ PLIST
 sed '/^@main$/d' "$root/native/AgentQueue.swift" > "$temporary/AgentQueue.swift"
 xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -framework SwiftUI -framework AppKit -framework ServiceManagement \
   "$root/native/QueueBrand.swift" "$temporary/AgentQueue.swift" "$root/native/AgentIntegration.swift" "$root/native/AgentUpdates.swift" \
-  "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/AgentServices.swift" \
+  "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/AgentServices.swift" "$root/native/AgentSupervisor.swift" \
   "$root/native/tests/BootstrapFixtures.swift" "$root/native/tests/BootstrapUITests.swift" -o "$app/Contents/MacOS/BootstrapUITests"
 if [[ "${1:-}" == "--build-only" ]]; then exit 0; fi
 if [[ $# -ne 0 ]]; then echo "Unknown bootstrap UI fixture argument" >&2; exit 2; fi

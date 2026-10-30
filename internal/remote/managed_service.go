@@ -43,48 +43,35 @@ func (c *controller) managedServiceState(action string) (string, error) {
 	return status.Status, nil
 }
 
+// The menu bar app supervises `agent-remote serve` as its child process, so a
+// managed install never registers a Service Management job for phone access.
+// Starting only records the user's choice (enable has already written it); the
+// app launches the service once this command returns. Stopping retires a
+// registration left by an earlier version, which owns no process of its own;
+// stopOwnedService then stops the supervisor by PID and birth identity.
 func (c *controller) managedServiceAction(action string) error {
 	if action != "start" && action != "stop" {
 		return errors.New("Unsupported managed phone service action")
+	}
+	if action == "start" {
+		return nil
 	}
 	state, err := c.managedServiceState("status")
 	if err != nil {
 		return err
 	}
-	if action == "stop" {
-		if state == "notRegistered" {
-			return nil
-		}
-		if state == "notFound" {
-			return c.managedServiceAbsent()
-		}
-		state, err = c.managedServiceState("unregister")
-		if err != nil {
-			return err
-		}
-		if state != "notRegistered" {
-			return errors.New("Phone service removal did not finish; review Login Items in System Settings")
-		}
+	if state == "notRegistered" {
 		return nil
 	}
-	if state == "requiresApproval" {
-		return errors.New("Allow Agent Queue's background services in Login Items settings before enabling phone access")
+	if state == "notFound" {
+		return c.managedServiceAbsent()
 	}
-	if state == "enabled" {
-		return nil
-	}
-	if state != "notRegistered" && state != "notFound" {
-		return errors.New("The installed phone service definition is unavailable")
-	}
-	state, err = c.managedServiceState("register")
+	state, err = c.managedServiceState("unregister")
 	if err != nil {
 		return err
 	}
-	if state == "requiresApproval" {
-		return errors.New("Allow Agent Queue's background services in Login Items settings before enabling phone access")
-	}
-	if state != "enabled" {
-		return errors.New("Phone service registration did not finish")
+	if state != "notRegistered" {
+		return errors.New("Phone service removal did not finish; review Login Items in System Settings")
 	}
 	return nil
 }

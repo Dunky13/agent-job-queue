@@ -45,7 +45,7 @@ PLIST
 sed '/^@main$/d' "$root/native/AgentQueue.swift" > "$temporary/AgentQueue.swift"
 xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -target "$(uname -m)-apple-macos15.0" -framework SwiftUI -framework AppKit -framework ServiceManagement \
   "$root/native/QueueBrand.swift" "$temporary/AgentQueue.swift" "$root/native/AgentIntegration.swift" "$root/native/AgentUpdates.swift" \
-  "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/AgentServices.swift" "$root/native/tests/MenuBarUITests.swift" -o "$fixture_binary"
+  "$root/native/AgentLearning.swift" "$root/native/AgentBootstrap.swift" "$root/native/AgentServices.swift" "$root/native/AgentSupervisor.swift" "$root/native/tests/MenuBarUITests.swift" -o "$fixture_binary"
 rm -f -- "$report"
 # Direct launch keeps process ownership and existing terminal event permissions
 # with this runner. The fixture never asks for additional input permissions.

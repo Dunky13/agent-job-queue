@@ -759,6 +759,13 @@ func (c *controller) serviceAction(action string) error {
 	return err
 }
 
+// A managed install returns at once: the menu bar app starts the service after
+// this command exits, so there is nothing to wait for. An unmanaged install
+// starts its own LaunchAgent and confirms that it became ready.
+func (c *controller) waitsForServiceStart() bool {
+	return !c.p.testing && c.p.managedApp == ""
+}
+
 func (c *controller) enable() error {
 	if c.p.managedCandidate != "" && c.p.managedApp == "" {
 		return errors.New("Complete Agent Queue installation before enabling phone access")
@@ -771,13 +778,6 @@ func (c *controller) enable() error {
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("Cannot verify completed installation before enabling phone access: %w", err)
 			}
-		}
-		state, err := c.managedServiceState("status")
-		if err != nil {
-			return err
-		}
-		if state == "requiresApproval" {
-			return errors.New("Allow Agent Queue's background services in Login Items settings before enabling phone access")
 		}
 	}
 	if err := c.p.prepare(); err != nil {
@@ -808,7 +808,7 @@ func (c *controller) enable() error {
 	if err := c.serviceFn("start"); err != nil {
 		return err
 	}
-	if !c.p.testing {
+	if c.waitsForServiceStart() {
 		deadline := time.Now().Add(15 * time.Second)
 		for !c.isRunning() && time.Now().Before(deadline) && c.ctx.Err() == nil {
 			time.Sleep(150 * time.Millisecond)
