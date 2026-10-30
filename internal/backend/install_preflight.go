@@ -380,11 +380,18 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 	if err := install.validatePayload(); err != nil {
 		var pending *installPendingError
 		if errors.As(err, &pending) {
-			actions := []string{"reveal"}
+			actions := []string{"download-release", "reveal"}
 			if _, recoveryErr := install.pendingInstallation(ctx); recoveryErr == nil {
 				actions = append([]string{installFinishPending}, actions...)
 			}
-			report.add("pending-installation", "Finish the previous installation", err.Error(), filepath.Join(install.root, "install-in-progress.json"), actions...)
+			index := report.add("pending-installation", "Finish the previous installation", err.Error(), filepath.Join(install.root, "install-in-progress.json"), actions...)
+			if index >= 0 {
+				for n := range report.Issues[index].Actions {
+					if report.Issues[index].Actions[n].ID == "download-release" {
+						report.Issues[index].Actions[n].Title = "Open release history"
+					}
+				}
+			}
 			return report
 		}
 		actions := []string{"download-release", "reveal"}

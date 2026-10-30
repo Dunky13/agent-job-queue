@@ -9,14 +9,14 @@ struct BootstrapFixture: Sendable {
     let identity: Data
 
     init(parent: URL, location: String = "Applications", tracked: Bool = true,
-         setupMode: Bool = true, managed: Bool = false) throws {
+         setupMode: Bool = true, managed: Bool = false, arguments: [String] = []) throws {
         directory = try Self.canonicalDirectory(parent).appendingPathComponent(UUID().uuidString)
         let home = directory.appendingPathComponent("home")
         let applications = directory.appendingPathComponent("Applications")
         let appParent = location == "home" ? home.appendingPathComponent("Applications") : directory.appendingPathComponent(location)
         let app = appParent.appendingPathComponent("Agent Queue.app")
         environment = QueueBootstrapEnvironment(app: app, resources: app.appendingPathComponent("Contents/Resources"),
-            home: home, systemApplications: applications, setupAllowed: setupMode)
+            home: home, arguments: arguments, systemApplications: applications, setupAllowed: setupMode)
         identity = try JSONEncoder().encode(BootstrapFixtureIdentity(version: "1.2.3", commit: tracked ? String(repeating: "a", count: 40) : nil,
             build: tracked ? 42 : nil))
         let binaries = managed ? app.appendingPathComponent("Contents/MacOS") : environment.source.appendingPathComponent("bin")
@@ -99,16 +99,20 @@ private struct BootstrapFixtureInstallation: Encodable {
 
 actor BootstrapInstallerProgressFixture {
     let fixture: BootstrapFixture
+    let report: QueueBootstrapReport
     private(set) var installations = 0
     private var held: CheckedContinuation<Void, Never>?
 
-    init(_ fixture: BootstrapFixture) { self.fixture = fixture }
+    init(_ fixture: BootstrapFixture, report: QueueBootstrapReport = .clear) {
+        self.fixture = fixture
+        self.report = report
+    }
 
     func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) async throws -> Data {
         if request.arguments.suffix(2) == ["--preflight", "--json"] {
-            return try JSONEncoder().encode(QueueBootstrapReport.clear)
+            return try JSONEncoder().encode(report)
         }
-        guard request.arguments == ["install", "--app-bundle", fixture.environment.app.path] else {
+        guard request.arguments == ["install", "--app-bundle", fixture.environment.app.path] + (fixture.environment.arguments.contains("--setup") ? [] : ["--repair-and-continue"]) else {
             throw ClientError.message("Diagnostic setup used an unexpected request.")
         }
         installations += 1
@@ -141,7 +145,7 @@ actor BootstrapApprovalRetryFixture {
             let status = installations == 1 && approvalReads <= 2 ? "requiresApproval" : "enabled"
             return try JSONEncoder().encode(BootstrapFixtureServiceStatus(service: service, status: status))
         }
-        guard request.arguments == ["install", "--app-bundle", fixture.environment.app.path] else {
+        guard request.arguments == ["install", "--app-bundle", fixture.environment.app.path, "--repair-and-continue"] else {
             throw ClientError.message("Setup used an unexpected request.")
         }
         installations += 1
@@ -221,7 +225,7 @@ actor BootstrapExecutorFixture {
             }
             throw ClientError.message("Fixture service could not start. Correct the issue, then Retry.")
         }
-        if phoneAccessBlocker && !request.arguments.contains("--disable-phone-access") {
+        if phoneAccessBlocker && !request.arguments.contains("--disable-phone-access") && !request.arguments.contains("--repair-and-continue") {
             throw ClientError.message("Fixture recovery did not request disabling phone access.")
         }
         try fixture.install()
@@ -257,6 +261,35 @@ actor BootstrapCountingExecutorFixture {
     func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) -> Data {
         calls += 1
         return Data()
+    }
+}
+
+actor BootstrapAutomaticSetupFixture {
+    let fixture: BootstrapFixture
+    let report: QueueBootstrapReport
+    private var status: String
+    private(set) var requests: [QueueBootstrapRequest] = []
+
+    init(_ fixture: BootstrapFixture, report: QueueBootstrapReport = .clear, status: String = "enabled") {
+        self.fixture = fixture
+        self.report = report
+        self.status = status
+    }
+
+    func execute(_ request: QueueBootstrapRequest) throws -> Data {
+        requests.append(request)
+        if request.arguments.suffix(2) == ["--preflight", "--json"] {
+            return try JSONEncoder().encode(report)
+        }
+        if request.arguments.prefix(2) == ["--service-management", "status"], let service = request.arguments.last {
+            return try JSONEncoder().encode(BootstrapFixtureServiceStatus(service: service, status: status))
+        }
+        guard request.arguments == ["install", "--app-bundle", fixture.environment.app.path, "--repair-and-continue"] else {
+            throw ClientError.message("Automatic setup did not use the backend's verified repair contract")
+        }
+        try fixture.installManaged()
+        status = "enabled"
+        return Data("Verified setup complete".utf8)
     }
 }
 
@@ -336,4 +369,26 @@ actor BootstrapRawPreflightFixture {
         calls += 1
         return data
     }
+}
+
+// Models an already accepted finite mutation: cancellation must wait for its
+// response, rather than abandoning it or starting a competing retry.
+actor BootstrapQuitMutationFixture {
+    let fixture: BootstrapFixture
+    private var held: CheckedContinuation<Void, Never>?
+    private(set) var completed = false
+    var isHeld: Bool { held != nil }
+    init(_ fixture: BootstrapFixture) { self.fixture = fixture }
+    func execute(_ request: QueueBootstrapRequest, output: @escaping @Sendable (Data) -> Void) async throws -> Data {
+        if request.arguments.suffix(2) == ["--preflight", "--json"] {
+            return try JSONEncoder().encode(QueueBootstrapReport.clear)
+        }
+        guard request.arguments.last == "--repair-and-continue" else { throw ClientError.message("Unexpected quit fixture mutation") }
+        output(Data("Preparing private fixture services…".utf8))
+        await withCheckedContinuation { held = $0 }
+        try fixture.install()
+        completed = true
+        return Data("Accepted mutation completed".utf8)
+    }
+    func release() { held?.resume(); held = nil }
 }

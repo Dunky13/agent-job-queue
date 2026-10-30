@@ -8,14 +8,17 @@ import ServiceManagement
 // or establish readiness; those still require native status and install readback.
 enum QueueSetupProgress {
     static let approvalMarker = "AGENT_QUEUE_SETUP_STATE:requires-approval"
+    static let waitingMarker = "AGENT_QUEUE_SETUP_STATE:waiting"
+    static let installingMarker = "AGENT_QUEUE_SETUP_STATE:installing"
 
-    static func parse(_ text: String) -> (output: String, requiresServiceApproval: Bool) {
+    static func parse(_ text: String) -> (output: String, requiresServiceApproval: Bool, isWaiting: Bool) {
         let lines = text.components(separatedBy: .newlines)
-        let waiting = lines.contains(approvalMarker)
+        let markers = [approvalMarker, waitingMarker, installingMarker]
+        let state = lines.last(where: { markers.contains($0) })
         let visible = lines.filter { line in
-            line != approvalMarker && !(line.hasPrefix("AGENT_QUEUE_") && approvalMarker.hasPrefix(line))
+            !markers.contains(line) && !(line.hasPrefix("AGENT_QUEUE_") && markers.contains(where: { $0.hasPrefix(line) }))
         }
-        return (visible.joined(separator: "\n"), waiting)
+        return (visible.joined(separator: "\n"), state == approvalMarker, state == approvalMarker || state == waitingMarker)
     }
 }
 

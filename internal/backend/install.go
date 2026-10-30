@@ -30,6 +30,8 @@ type installer struct {
 	home, payload, root, state, config, launch, app, path string
 	identity                                              BuildInfo
 	pendingIdentity                                       *BuildInfo
+	pendingBundle                                         *managedBundleIdentity
+	setupStop                                             <-chan struct{}
 	serviceSlot                                           string
 	testing                                               bool
 	appBundle                                             bool
@@ -376,7 +378,7 @@ func installReadInfo(filename string) (BuildInfo, error) {
 
 // A downloaded payload replaces the recorded installation, including shared
 // Applications and renamed bundles. An explicit app-bundle target stays explicit
-// so the managed plan can refuse a mismatch rather than redirecting the caller.
+// so an ownership-checked relocation never redirects the caller to the old app.
 func (install *installer) resolvePayloadApp() error {
 	if install.appBundle {
 		return nil
@@ -615,6 +617,11 @@ func (install *installer) validatePayload() error {
 		pending, err := installReadInfo(filepath.Join(install.root, "install-in-progress.json"))
 		if err != nil || !pending.Equal(*install.pendingIdentity) {
 			return errors.New("The pending installation changed; recovery stopped")
+		}
+	}
+	if install.pendingBundle != nil {
+		if err := managedRequireBundle(install.app, *install.pendingBundle); err != nil {
+			return err
 		}
 	}
 	install.identity = identity
@@ -2205,6 +2212,21 @@ func InstallMain(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if options.repairAndContinue {
+		requests := make(chan os.Signal, 1)
+		signal.Notify(requests, syscall.SIGUSR1)
+		defer signal.Stop(requests)
+		requested, done := make(chan struct{}), make(chan struct{})
+		defer close(done)
+		go func() {
+			select {
+			case <-requests:
+				close(requested)
+			case <-done:
+			}
+		}()
+		install.setupStop = requested
+	}
 	if !options.repairAndContinue {
 		bounded, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()

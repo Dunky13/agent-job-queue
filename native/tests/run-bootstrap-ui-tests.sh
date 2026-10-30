@@ -2,8 +2,8 @@
 # Usage: bash native/tests/run-bootstrap-ui-tests.sh OUTPUT_DIRECTORY [--build-only]
 # Run through the shared heavy queue. Uses AppKit's own events and rendering;
 # needs a logged-in graphical macOS session, but no Accessibility permission.
-# Output: recovery verification.json, three PNGs and a standalone index.html with
-# embedded screenshots; generic-retry/ retains the same checks for other errors.
+# Output: per-scenario verification.json, cached private AppKit PNGs and a
+# standalone index.html. Ordinary startup never requires a setup window.
 # Bundle, home, state and preference fixtures are temporary/private.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -37,57 +37,48 @@ if [[ "${1:-}" == "--build-only" ]]; then exit 0; fi
 if [[ $# -ne 0 ]]; then echo "Unknown bootstrap UI fixture argument" >&2; exit 2; fi
 HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
-    --open-window --temporary "$temporary" --output "$output"
+    --temporary "$temporary" --output "$output"
 [[ "$(plutil -extract passed raw -o - "$output/verification.json")" == "true" ]]
 mkdir -p -- "$output/generic-retry"
 HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
-    --open-window --temporary "$temporary" --output "$output/generic-retry" --generic-retry
+    --temporary "$temporary" --output "$output/generic-retry" --generic-retry
 [[ "$(plutil -extract passed raw -o - "$output/generic-retry/verification.json")" == "true" ]]
 mkdir -p -- "$output/preflight-summary"
 HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
-    --open-window --temporary "$temporary" --output "$output/preflight-summary" --preflight-summary
+    --temporary "$temporary" --output "$output/preflight-summary" --preflight-summary --open-window
 [[ "$(plutil -extract passed raw -o - "$output/preflight-summary/verification.json")" == "true" ]]
 mkdir -p -- "$output/approved-repair"
 HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
-    --open-window --temporary "$temporary" --output "$output/approved-repair" --approved-repair
+    --temporary "$temporary" --output "$output/approved-repair" --approved-repair --open-window
 [[ "$(plutil -extract passed raw -o - "$output/approved-repair/verification.json")" == "true" ]]
 mkdir -p -- "$output/drag-and-drop"
 HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
-    --open-window --temporary "$temporary" --output "$output/drag-and-drop" --drag-and-drop
+    --temporary "$temporary" --output "$output/drag-and-drop" --drag-and-drop
 [[ "$(plutil -extract passed raw -o - "$output/drag-and-drop/verification.json")" == "true" ]]
-{
-  printf '# Bootstrap fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
-  cat "$output/verification.json"
-  printf '\n```\n\n'
-  for picture in 02-disable-phone-access 03-normal-fixture-startup; do
-    printf '![%s](%s.png)\n\n' "$picture" "$picture"
-  done
-} > "$output/verification.md"
-{
-  printf '# Generic retry fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
-  cat "$output/generic-retry/verification.json"
-  printf '\n```\n\n'
-  for picture in 02-failure-retry 03-normal-fixture-startup; do
-    printf '![%s](%s.png)\n\n' "$picture" "$picture"
-  done
-} > "$output/generic-retry/verification.md"
-{
-  printf '# Preflight summary fixture verification\n\nProduction setup window, injected executor, disposable home and simulated queue.\n\n```json\n'
-  cat "$output/preflight-summary/verification.json"
-  printf '\n```\n\n'
-  for picture in 01-preflight-summary 01-service-files-restored 02-waiting 03-wait-stopped 04-normal-fixture-startup; do
-    printf '![%s](%s.png)\n\n' "$picture" "$picture"
-  done
-} > "$output/preflight-summary/verification.md"
-{
-  printf '# Approved automatic repair verification\n\nProduction approval dialog and setup flow, disposable home and simulated queue.\n\n```json\n'
-  cat "$output/approved-repair/verification.json"
-  printf '\n```\n\n'
-  for picture in 01-repair-approval 02-approved-waiting 03-repairs-complete-waiting 04-approved-startup; do
-    printf '![%s](%s.png)\n\n' "$picture" "$picture"
-  done
-} > "$output/approved-repair/verification.md"
+mkdir -p -- "$output/silent-recovery"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --temporary "$temporary" --output "$output/silent-recovery" --silent-recovery
+[[ "$(plutil -extract passed raw -o - "$output/silent-recovery/verification.json")" == "true" ]]
+mkdir -p -- "$output/cancellable-wait"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --temporary "$temporary" --output "$output/cancellable-wait" --cancellable-wait
+[[ "$(plutil -extract passed raw -o - "$output/cancellable-wait/verification.json")" == "true" ]]
+
+for scenario in quit-mutation unknown-requirement; do
+  mkdir -p -- "$output/$scenario"
+  HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+    "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+      --temporary "$temporary" --output "$output/$scenario" "--$scenario"
+  [[ "$(plutil -extract passed raw -o - "$output/$scenario/verification.json")" == "true" ]]
+done
+mkdir -p -- "$output/direct-quit-wait"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --temporary "$temporary" --output "$output/direct-quit-wait" --cancellable-wait --direct-quit
+[[ "$(plutil -extract passed raw -o - "$output/direct-quit-wait/verification.json")" == "true" ]]

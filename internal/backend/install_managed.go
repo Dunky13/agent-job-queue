@@ -32,6 +32,7 @@ type managedPlan struct {
 	python, pueue, remote bool
 	remoteCleanup         bool
 	live                  *managedLiveUpgrade
+	relocation            *managedRelocation
 }
 
 func (install *installer) managedStatus(ctx context.Context, app, service string) (string, error) {
@@ -383,14 +384,10 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	}
 	if p.previous != nil {
 		if p.previous.App != install.app {
-			if exists, err := updateExists(p.previous.App); err != nil {
+			p.relocation, err = install.planManagedRelocation(ctx, p.previous)
+			if err != nil {
 				return nil, err
-			} else if !exists {
-				// The recorded app is gone, so its own helpers cannot unregister.
-				domain := install.domain()
-				return nil, fmt.Errorf("Agent Queue was installed at %s and its background services are still loaded from there. Stop them with: launchctl bootout %s/io.went.agent-heavy; launchctl bootout %s/io.went.agent-resources; launchctl bootout %s/io.went.agent-remote. Then open Agent Queue again", p.previous.App, domain, domain, domain)
 			}
-			return nil, fmt.Errorf("Agent Queue is already installed at %s; that location changed. Quit Agent Queue and drag this copy over that one, or move that copy to the Trash, then open Agent Queue again", p.previous.App)
 		}
 		if err := appservices.ValidateApp(install.home, p.previous.App); err != nil {
 			return nil, err
@@ -473,7 +470,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 			}
 			// A pending retry can have registered the bundle before metadata was
 			// published. The signed target plus exact loaded argv establishes ownership.
-			if err := install.managedLoaded(output, label, install.app); err != nil {
+			if err := install.managedLoaded(output, label, p.serviceApp(install.app)); err != nil {
 				return nil, err
 			}
 			if p.previous == nil {
@@ -485,7 +482,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	}
 	// Inspect registrations even for a first install: a Finder-copied bundle may
 	// already own services. Status is read-only; denied approval is never retried.
-	statusApp := install.app
+	statusApp := p.serviceApp(install.app)
 	if !install.appBundle {
 		if exists, err := updateExists(install.app); err != nil {
 			return nil, err
@@ -565,7 +562,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	} else {
 		p.loaded["io.went.agent-remote"] = loaded
 		if loaded && p.previous != nil && !legacyRemote {
-			if err := install.managedLoaded(output, "io.went.agent-remote", install.app); err != nil {
+			if err := install.managedLoaded(output, "io.went.agent-remote", p.serviceApp(install.app)); err != nil {
 				return nil, err
 			}
 		}
@@ -650,7 +647,7 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 		label = "io.went.agent-remote"
 	}
 	definition := filepath.Join(filepath.Dir(filepath.Dir(executable)), "Library/LaunchAgents", label+".plist")
-	identified, bundled, running := false, false, false
+	identified, bundled, running, definitionPath := false, false, false, false
 	pid := 0
 	arguments := []string{}
 	inArguments := false
@@ -672,8 +669,20 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 			}
 		case strings.HasPrefix(trimmed, "path = "):
 			paths++
-			if trimmed != "path = "+definition {
-				return false
+			if trimmed == "path = "+definition {
+				definitionPath = true
+			} else {
+				// macOS can describe a Service Management submission instead
+				// of its plist path. This descriptor grants no custody: only a
+				// live PID's kernel-recorded executable can bind it below.
+				value, found := strings.CutPrefix(trimmed, "path = (submitted by smd.")
+				if !found || !strings.HasSuffix(value, ")") {
+					return false
+				}
+				submitter, err := strconv.Atoi(strings.TrimSuffix(value, ")"))
+				if err != nil || submitter <= 1 {
+					return false
+				}
 			}
 		case trimmed == "arguments = {":
 			blocks++
@@ -703,7 +712,7 @@ func managedLoadedBundleProgram(raw []byte, executable, helper, command string) 
 		return false
 	}
 	if pids == 0 {
-		return !running && (programs == 1 || paths == 1)
+		return !running && (programs == 1 || definitionPath)
 	}
 	if pid <= 1 {
 		return false
@@ -1409,6 +1418,9 @@ func managedReadiness(raw []byte) error {
 // quiesceManaged runs with install.lock, scheduling.lock and remote control.lock
 // held. It never publishes a bundle, rewrites wrappers or registers services.
 func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) error {
+	if err := install.requireManagedRelocation(ctx, p.relocation); err != nil {
+		return err
+	}
 	if p.live != nil {
 		if p.live.adopted {
 			return nil
@@ -1419,13 +1431,16 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 	}
 	for _, service := range []string{"resources", "remote", "queue", "login"} {
 		if p.statuses[service] == "enabled" || install.unregisterServices && p.statuses[service] == "requiresApproval" {
+			if err := install.requireManagedRelocation(ctx, p.relocation); err != nil {
+				return err
+			}
 			if label := map[string]string{"queue": "io.went.agent-heavy", "resources": "io.went.agent-resources", "remote": "io.went.agent-remote"}[service]; label != "" {
 				output, loaded, err := install.inspectService(ctx, label)
 				if err != nil {
 					return err
 				}
 				if loaded {
-					if err := install.managedLoaded(output, label, install.app); err != nil {
+					if err := install.managedLoaded(output, label, p.serviceApp(install.app)); err != nil {
 						return err
 					}
 				}
@@ -1435,7 +1450,7 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 					return err
 				}
 			}
-			if err := install.managedAction(ctx, install.app, "unregister", service); err != nil {
+			if err := install.managedAction(ctx, p.serviceApp(install.app), "unregister", service); err != nil {
 				return err
 			}
 		}
@@ -1589,6 +1604,9 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		if err := install.managedBackupLegacyDefinitions(p); err != nil {
 			return err
 		}
+	}
+	if err := install.cleanupRelocationRuntimes(ctx, p.relocation); err != nil {
+		return err
 	}
 	raw, err := json.MarshalIndent(install.identity, "", "  ")
 	if err != nil {
@@ -1935,7 +1953,7 @@ func (install *installer) preflightManaged(ctx context.Context, report installPr
 		source = filepath.Join(install.payload, "Agent Queue.app")
 	}
 	if err := install.managedVerify(ctx, source); err != nil {
-		report.add("payload-invalid", "Review the signed application package", err.Error(), source, "reveal")
+		report.add("payload-invalid", "Review the signed application package", err.Error(), source, "download-release", "reveal")
 		return report
 	}
 	if missing, err := install.missingServiceDefinitions(ctx); err == nil && len(missing) > 0 {
@@ -1972,7 +1990,7 @@ func (install *installer) preflightManaged(ctx context.Context, report installPr
 				}
 			}
 		default:
-			report.add("managed-setup-blocked", "Review managed service setup", err.Error(), install.app, "reveal", "wait")
+			report.add("managed-setup-blocked", "Review managed service setup", err.Error(), install.app, "download-release", "reveal", "wait")
 		}
 	}
 	return report

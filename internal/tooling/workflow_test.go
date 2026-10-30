@@ -13,6 +13,7 @@ import (
 func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 	type validationStep struct {
 		Run             string `yaml:"run"`
+		Uses            string `yaml:"uses"`
 		If              string `yaml:"if"`
 		ContinueOnError bool   `yaml:"continue-on-error"`
 	}
@@ -62,7 +63,13 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 		}
 		found := false
 		for _, step := range job.Steps {
-			if step.ContinueOnError || step.If != "" {
+			// Evidence upload must run after a failed graphical fixture. Only
+			// this pinned, non-validation action may have a condition; every
+			// actual validation step remains unconditional and failure-fatal.
+			retainsFailedFixture := name == "native-tests" &&
+				step.Uses == "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9" &&
+				step.Run == "" && step.If == "${{ !cancelled() && steps.bootstrap-ui.outcome != 'skipped' }}"
+			if step.ContinueOnError || (step.If != "" && !retainsFailedFixture) {
 				t.Fatalf("%s may skip or ignore a validation failure", name)
 			}
 			found = found || strings.TrimSpace(step.Run) == command

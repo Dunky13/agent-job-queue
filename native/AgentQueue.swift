@@ -208,6 +208,7 @@ private final class QueueReadCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
     func cancel() { lock.withLock { cancelled = true } }
+    var isCancelled: Bool { lock.withLock { cancelled } }
     func check() throws { if lock.withLock({ cancelled }) { throw CancellationError() } }
 }
 
@@ -223,12 +224,14 @@ enum QueueClient {
     static func run(_ arguments: [String], controller: Controller = .heavy, input: Data? = nil,
                     budget: Budget = .normal, transport: Transport? = nil,
                     onOutput: (@Sendable (Data) -> Void)? = nil) async throws -> Data {
-        // Only known, discardable reads observe task cancellation. Accepted changes
-        // keep their original response/deadline and are never retried or rolled back.
+        // Known reads are discardable. Automatic setup can stop only while its
+        // controller reports a wait; its pending identity and custody survive.
+        // Other accepted changes retain their original response and deadline.
+        let automaticSetup = input == nil && controller == .heavy && budget == .setup && isAutomaticSetup(arguments)
         let discardable = input == nil && (arguments.first == "status" ||
             (controller == .heavy && arguments.first == "profiles" &&
                 ["list", "show"].contains(arguments.dropFirst().first ?? "")) ||
-            (controller == .heavy && (isSetupPreflight(arguments) || isNativeServiceStatus(arguments))))
+            (controller == .heavy && (isSetupPreflight(arguments) || isNativeServiceStatus(arguments)))) || automaticSetup
         let cancellation = discardable ? QueueReadCancellation() : nil
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -250,6 +253,12 @@ enum QueueClient {
             ["--app-bundle", "--payload"].contains(arguments[1]) &&
             arguments[2].hasPrefix("/") && !arguments[2].contains("\0") &&
             Array(arguments.suffix(2)) == ["--preflight", "--json"]
+    }
+
+    private static func isAutomaticSetup(_ arguments: [String]) -> Bool {
+        arguments.count == 4 && arguments[0] == "install" &&
+            ["--app-bundle", "--payload"].contains(arguments[1]) &&
+            arguments[2].hasPrefix("/") && !arguments[2].contains("\0") && arguments[3] == "--repair-and-continue"
     }
 
     private static func isNativeServiceStatus(_ arguments: [String]) -> Bool {
@@ -340,10 +349,23 @@ enum QueueClient {
         var response = Data()
         let captureLimit = budget == .setup ? 32_768 : 2_097_152
         var lastOutputDelivery = 0.0
+        var pendingOutputDelivery = false
         var buffer = [UInt8](repeating: 0, count: 16_384)
         var observedChildExit = false
+        let automaticSetup = controller == .heavy && budget == .setup && isAutomaticSetup(arguments)
+        var setupIsWaiting = false
+        var requestedSetupStop = false
         while true {
-            try cancellation?.check()
+            // Progress can lag a mutation. The backend, rather than this cached
+            // display state, decides when a stop request is safe to honor.
+            if automaticSetup {
+                if !requestedSetupStop, cancellation?.isCancelled == true, process.isRunning {
+                    guard kill(process.processIdentifier, SIGUSR1) == 0 || errno == ESRCH else {
+                        throw ClientError.message("Could not ask setup to stop waiting. Its installation evidence is preserved.")
+                    }
+                    requestedSetupStop = true
+                }
+            } else { try cancellation?.check() }
             if ProcessInfo.processInfo.systemUptime >= deadline {
                 if budget == .setup {
                     throw ClientError.message("Setup did not finish within \(Int(timeout)) seconds. Quit and reopen Agent Queue, or retry setup.\n" + String(decoding: response.suffix(8_000), as: UTF8.self))
@@ -363,13 +385,20 @@ enum QueueClient {
                     throw ClientError.message("The queue response exceeds the 2 MB display limit.")
                 }
                 response.append(contentsOf: buffer.prefix(count))
-                if response.count > captureLimit { response.removeFirst(response.count - captureLimit) }
-                if let onOutput, ProcessInfo.processInfo.systemUptime - lastOutputDelivery >= 0.1 {
-                    onOutput(response)
-                    lastOutputDelivery = ProcessInfo.processInfo.systemUptime
+                if automaticSetup {
+                    setupIsWaiting = QueueSetupProgress.parse(String(decoding: response, as: UTF8.self)).isWaiting
                 }
+                if response.count > captureLimit { response.removeFirst(response.count - captureLimit) }
+                pendingOutputDelivery = true
             } else if count < 0 && readError != EAGAIN && readError != EINTR {
                 throw ClientError.message("Could not read the private controller response.")
+            }
+            // Flush the last throttled update even when the child then waits
+            // silently for jobs or approval and emits no additional bytes.
+            if pendingOutputDelivery, let onOutput, ProcessInfo.processInfo.systemUptime - lastOutputDelivery >= 0.1 {
+                onOutput(response)
+                lastOutputDelivery = ProcessInfo.processInfo.systemUptime
+                pendingOutputDelivery = false
             }
             if !inputClosed, let input, let inputPipe {
                 let written = input.withUnsafeBytes { bytes in
@@ -409,7 +438,7 @@ enum QueueClient {
                 Thread.sleep(forTimeInterval: 0.01)
             }
         }
-        try cancellation?.check()
+        if !automaticSetup || setupIsWaiting { try cancellation?.check() }
         onOutput?(response)
         guard process.terminationStatus == 0 else {
             if arguments.first == "profiles", let failure = try? JSONDecoder().decode(QueueControllerFailure.self, from: response) {
@@ -976,6 +1005,115 @@ struct QueueStatusPresentation {
     }
 }
 
+// Owns only startup presentation. It never initializes AppRuntime or exposes
+// queue commands until the bootstrap controller has verified readiness.
+@MainActor
+final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let menu = NSMenu(title: "Agent Queue")
+    private let model: QueueBootstrapModel
+    private var observation: AnyCancellable?
+    private var ownsStatusItem = true
+    private(set) var isTornDown = false
+    private let status = NSMenuItem(title: "Preparing Agent Queue…", action: nil, keyEquivalent: "")
+    private let detail = NSMenuItem()
+    private var detailText: String?
+    private let settings = NSMenuItem(title: "Open Login Items Settings…", action: #selector(openSettings), keyEquivalent: "")
+    private let retry = NSMenuItem(title: "Retry", action: #selector(retryStartup), keyEquivalent: "")
+    private let applications = NSMenuItem(title: "Open Applications", action: #selector(openApplications), keyEquivalent: "")
+    private let download = NSMenuItem(title: "Download Agent Queue…", action: #selector(downloadRelease), keyEquivalent: "")
+
+    init(model: QueueBootstrapModel) {
+        self.model = model
+        super.init()
+        menu.autoenablesItems = false
+        menu.delegate = self
+        status.isEnabled = false
+        menu.addItem(status)
+        menu.addItem(detail)
+        menu.addItem(.separator())
+        for item in [settings, retry, applications, download] {
+            item.target = self
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit Agent Queue", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quit)
+        if let button = statusItem.button {
+            button.image = NSImage(systemSymbolName: QueueBrand.symbolName, accessibilityDescription: nil)
+            button.image?.isTemplate = true
+            button.imagePosition = .imageLeading
+            button.setAccessibilityIdentifier("agent-queue-status-item")
+        }
+        statusItem.menu = menu
+        // @Published sends before changing the value. Render on the next main
+        // actor turn so phase, output and the final approval hint agree.
+        observation = model.objectWillChange.sink { [weak self] _ in
+            Task { @MainActor [weak self] in self?.update() }
+        }
+        update()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) { update() }
+
+    func update() {
+        guard !isTornDown else { return }
+        let blocked = !model.isRunning && model.phase != .complete && model.phase != .idle
+        status.title = model.requiresServiceApproval ? "Allow Agent Queue in Login Items Settings" : model.message
+        let summary = "Agent Queue, " + status.title
+        statusItem.button?.title = blocked || model.requiresServiceApproval ? "!" : ""
+        statusItem.button?.toolTip = summary
+        statusItem.button?.setAccessibilityLabel(summary)
+        // Keep the controller's bounded diagnostic readable from the menu,
+        // including unknown failures. Scroll long output without opening a window.
+        let text = ([model.output] + model.issues.map { $0.title + "\n" + $0.detail })
+            .filter { !$0.isEmpty }.joined(separator: "\n\n")
+        detail.isHidden = text.isEmpty
+        if detailText != text {
+            detailText = text
+            let label = NSTextField(wrappingLabelWithString: text)
+            label.font = .menuFont(ofSize: NSFont.smallSystemFontSize)
+            label.textColor = .secondaryLabelColor
+            label.frame.size.width = 340
+            let height = max(24, label.sizeThatFits(NSSize(width: 340, height: CGFloat.greatestFiniteMagnitude)).height)
+            label.frame = NSRect(x: 12, y: 8, width: 340, height: height)
+            let content = NSView(frame: NSRect(x: 0, y: 0, width: 364, height: height + 16))
+            content.addSubview(label)
+            let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 364, height: min(240, height + 16)))
+            scroll.drawsBackground = false
+            scroll.hasVerticalScroller = height + 16 > 240
+            scroll.documentView = content
+            detail.view = scroll
+        }
+        settings.isHidden = !model.requiresServiceApproval
+        retry.isHidden = !blocked || !model.allowsInstallation
+        applications.isHidden = !model.issues.contains { $0.actions.contains { $0.id == "move-app" } }
+        download.isHidden = !blocked
+        retry.isEnabled = !model.isRunning
+    }
+
+    @objc private func openSettings() { model.showLoginItems() }
+    @objc private func retryStartup() { model.start() }
+    @objc private func openApplications() { model.showApplications() }
+    @objc private func downloadRelease() { model.downloadRelease() }
+
+    func transferStatusItem() -> NSStatusItem {
+        ownsStatusItem = false
+        tearDown()
+        return statusItem
+    }
+
+    func tearDown() {
+        guard !isTornDown else { return }
+        isTornDown = true
+        observation = nil
+        menu.cancelTracking()
+        menu.delegate = nil
+        statusItem.menu = nil
+        if ownsStatusItem { NSStatusBar.system.removeStatusItem(statusItem) }
+    }
+}
+
 @MainActor
 final class QueueMenuBarController: NSObject, NSPopoverDelegate {
     let statusItem: NSStatusItem
@@ -993,8 +1131,8 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
     private var registeredVisibleSurface = false
     private let perform: @MainActor (QueueAppAction) -> Void
 
-    init(store: QueueStore, perform: @escaping @MainActor (QueueAppAction) -> Void = AppRuntime.perform) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    init(store: QueueStore, statusItem: NSStatusItem? = nil, perform: @escaping @MainActor (QueueAppAction) -> Void = AppRuntime.perform) {
+        self.statusItem = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.store = store
         self.perform = perform
         super.init()
@@ -1004,7 +1142,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
         popover.delegate = self
         popover.contentSize = NSSize(width: 500, height: 650)
         popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, tracksVisibility: false))
-        if let button = statusItem.button {
+        if let button = self.statusItem.button {
             button.image = NSImage(systemSymbolName: QueueBrand.symbolName, accessibilityDescription: nil)
             button.image?.isTemplate = true
             button.imagePosition = .imageLeading
@@ -1777,17 +1915,23 @@ struct JobDetail: View {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var bootstrap: QueueBootstrapModel?
     private(set) var setupWindow: NSWindow?
+    private(set) var startupMenuBarController: QueueStartupMenuBarController?
+    private var terminationPending = false
     private var normalLaunchStarted = false
     private var bootstrapEnvironment: QueueBootstrapEnvironment?
     private var bootstrapExecutor: QueueBootstrapModel.Executor = QueueBootstrapModel.runInstaller
+    private var replyToTermination: @MainActor () -> Void = { NSApp.reply(toApplicationShouldTerminate: true) }
 
     override init() { super.init() }
 
     // The separate graphical fixture supplies a private bundle/home and an inert
     // executor. Normal launch still follows the production path with --fixture.
-    init(environment: QueueBootstrapEnvironment, executor: @escaping QueueBootstrapModel.Executor) {
+    init(environment: QueueBootstrapEnvironment,
+         terminationReply: @escaping @MainActor () -> Void = { NSApp.reply(toApplicationShouldTerminate: true) },
+         executor: @escaping QueueBootstrapModel.Executor) {
         bootstrapEnvironment = environment
         bootstrapExecutor = executor
+        replyToTermination = terminationReply
         super.init()
     }
 
@@ -1802,14 +1946,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.finishLaunching()
         }
         self.bootstrap = bootstrap
-        // Inspection never initializes AppRuntime or reads queue state. The setup
-        // menu exposes only Quit until the running payload has been installed.
-        bootstrap.onSetupRequired = { [weak self] in self?.showSetupWindow() }
+        // Present the menu before inspection starts, without touching queue state.
+        startupMenuBarController = QueueStartupMenuBarController(model: bootstrap)
+        let main = NSMenu()
+        let application = NSMenuItem()
+        let menu = NSMenu(title: "Agent Queue")
+        menu.addItem(withTitle: "Quit Agent Queue", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        application.submenu = menu
+        main.addItem(application)
+        NSApp.mainMenu = main
+        bootstrap.onSetupRequired = { [weak self] in
+            if environment.arguments.contains("--setup") { self?.showSetupWindow() }
+        }
         bootstrap.start()
     }
 
     private func showSetupWindow() {
-        guard setupWindow == nil, let bootstrap else { return }
+        guard (bootstrapEnvironment ?? .current()).arguments.contains("--setup"),
+              setupWindow == nil, let bootstrap else { return }
         let main = NSMenu()
         let application = NSMenuItem()
         let menu = NSMenu(title: "Agent Queue")
@@ -1832,7 +1986,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !normalLaunchStarted else { return }
         normalLaunchStarted = true
         NSApp.mainMenu = makeMainMenu()
-        AppRuntime.menuBarController = QueueMenuBarController(store: AppRuntime.store)
+        let statusItem = startupMenuBarController?.transferStatusItem()
+        startupMenuBarController = nil
+        AppRuntime.menuBarController = QueueMenuBarController(store: AppRuntime.store, statusItem: statusItem)
         AppRuntime.store.start()
         let arguments = CommandLine.arguments
         if let index = arguments.firstIndex(of: "--snapshot"), arguments.indices.contains(index + 1) {
@@ -1968,20 +2124,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        startupMenuBarController?.tearDown()
+        startupMenuBarController = nil
         AppRuntime.menuBarController?.tearDown()
         AppRuntime.menuBarController = nil
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard bootstrap?.isRunning == true else { return .terminateNow }
-        // Silent setup has no window; explain why quitting or logout waits.
+        guard let bootstrap, bootstrap.isRunning else { return .terminateNow }
+        if terminationPending { return .terminateLater }
+        if let stopped = bootstrap.stopForTermination() {
+            terminationPending = true
+            Task { @MainActor in
+                await stopped.value
+                self.replyToTermination()
+            }
+            return .terminateLater
+        }
+        // Explicit diagnostic mutations retain their existing guard.
         showSetupWindow()
         return .terminateCancel
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard let bootstrap, bootstrap.phase != .complete, bootstrap.phase != .idle else { return true }
-        showSetupWindow()
+        guard let bootstrap, bootstrap.phase != .complete else { return true }
+        if (bootstrapEnvironment ?? .current()).arguments.contains("--setup") { showSetupWindow() }
         return false
     }
 
