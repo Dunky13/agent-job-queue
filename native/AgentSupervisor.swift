@@ -339,7 +339,8 @@ final class QueueHelperSupervisor {
     private let spawner: QueueHelper.Spawner
     private let slots: [Name: Slot]
     private var isShutDown = false
-    private let lifeline: QueueHelper.Lifeline?
+    private var lifeline: QueueHelper.Lifeline?
+    private let makeLifeline: () -> QueueHelper.Lifeline?
     private let settingsDirectory: URL
     private let settingsDebounce: Duration
     private var settingsSource: (any DispatchSourceFileSystemObject)?
@@ -352,13 +353,15 @@ final class QueueHelperSupervisor {
     init(app: URL, stateDirectory: URL = QueueHelper.defaultStateDirectory,
          environment: [String: String] = ProcessInfo.processInfo.environment, throttle: Duration = .seconds(10),
          probe: QueueHelper.Probe? = nil, settingsDirectory: URL? = nil, settingsDebounce: Duration = .seconds(1),
+         makeLifeline: @escaping () -> QueueHelper.Lifeline? = QueueHelper.Lifeline.make,
          spawner: @escaping QueueHelper.Spawner = QueueHelper.spawn) {
         let scrubbed = QueueHelper.childEnvironment(from: environment)
         let home = scrubbed["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
         self.settingsDirectory = settingsDirectory
             ?? URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".config/agent-heavy", isDirectory: true)
         self.settingsDebounce = settingsDebounce
-        lifeline = QueueHelper.Lifeline.make()
+        self.makeLifeline = makeLifeline
+        lifeline = makeLifeline()
         self.app = app
         self.stateDirectory = stateDirectory
         self.environment = scrubbed
@@ -377,8 +380,7 @@ final class QueueHelperSupervisor {
     }
 
     /// What the app runs after setup: everything, and a watch on the phone access settings.
-    /// `agent-remote serve` exits 0 at once when phone access is off, which the restart
-    /// policy treats as "not wanted", so starting it is always safe.
+    /// `agent-remote serve` exits 0 at once when phone access is off, so starting it is always safe.
     func startAll() {
         start()
         start(.remote)
@@ -482,12 +484,19 @@ final class QueueHelperSupervisor {
 
     private func launch(_ slot: Slot) {
         slot.lastStart = .now
+        // Without the pipe these own-session children would survive an app crash.
+        // Retry allocation with the normal launch throttle instead of spawning them.
+        if lifeline == nil { lifeline = makeLifeline() }
+        guard let descriptor = lifeline?.readEnd else {
+            finish(slot, .launchFailed(EIO))
+            return
+        }
         slot.generation += 1
         let generation = slot.generation
         let launch = QueueHelper.Launch(
             name: slot.name, executable: app.appendingPathComponent("Contents/MacOS/\(slot.name.executable)"),
-            arguments: slot.name.arguments, environment: helperEnvironment(lifeline: lifeline?.readEnd),
-            log: stateDirectory.appendingPathComponent(slot.name.logPath), lifeline: lifeline?.readEnd)
+            arguments: slot.name.arguments, environment: helperEnvironment(),
+            log: stateDirectory.appendingPathComponent(slot.name.logPath), lifeline: descriptor)
         do {
             let child = try spawner(launch) { [weak self] exit in
                 Task { @MainActor in self?.exited(slot, generation: generation, exit) }
@@ -500,8 +509,7 @@ final class QueueHelperSupervisor {
         }
     }
 
-    private func helperEnvironment(lifeline: Int32?) -> [String: String] {
-        guard lifeline != nil else { return environment }
+    private func helperEnvironment() -> [String: String] {
         return environment.merging([QueueHelper.lifelineVariable: String(QueueHelper.lifelineDescriptor)]) { _, new in new }
     }
 
@@ -518,9 +526,10 @@ final class QueueHelperSupervisor {
             onChange?()
             return
         }
-        // A clean exit from the phone service means phone access is off. The queue and the
-        // scheduler restart after any exit while the app runs, even an external SIGTERM.
-        if slot.name == .remote && exit.isSuccess {
+        // Reconfiguration writes enabled settings before stopping the old phone service.
+        // Its clean exit can arrive after the settings debounce, so reconcile the latest
+        // choice here too. The queue and scheduler restart after every exit.
+        if slot.name == .remote && exit.isSuccess && !remoteSettingsEnabled() {
             slot.wanted = false
             setPhase(slot, .stopped)
             onChange?()

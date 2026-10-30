@@ -261,7 +261,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		return nil
 	}
 	if !p.loaded["io.went.agent-heavy"] {
-		return install.managedOfflineDrain(ctx)
+		return install.managedOfflineDrainHolding(ctx, p, "queue-daemon.lock", "resource-controller.lock")
 	}
 	snapshot, err := install.managedSnapshot(ctx)
 	if err != nil {
@@ -272,7 +272,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		// queue store, and app-bundle setup quiesces it and repeats the
 		// complete offline drain before any mutation.
 		if busy, lockErr := installInspectLock(install.state, "queue-daemon.lock"); install.appBundle && lockErr == nil && !busy && exists {
-			return install.managedOfflineDrainHolding(ctx, "queue-daemon.lock")
+			return install.managedOfflineDrainHolding(ctx, p, "queue-daemon.lock")
 		}
 		return fmt.Errorf("Cannot verify the installed queue is drained; no service was changed: %w", err)
 	}
@@ -308,17 +308,18 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 // Inspect a stopped queue using private copies. SQLite may create sidecars even
 // in read-only mode, so never open the user's live database during preflight.
 func (install *installer) managedOfflineDrain(ctx context.Context) error {
-	return install.managedOfflineDrainHolding(ctx, "queue-daemon.lock", "resource-controller.lock")
+	return install.managedOfflineDrainHolding(ctx, nil, "queue-daemon.lock", "resource-controller.lock")
 }
 
 // Each named lifetime lock must be free; its owner could still change the store.
 // Payload setup requires the stopped store to be drained. A supervised app
-// bundle never does: the app stops its daemon when it quits, so an upgrade
-// always finds a stopped store, and only the app can start the daemon whose
+// bundle recovering at the same location does not: the app stops its daemon
+// when it quits, and only the app can start the daemon whose
 // dirty-restart recovery pauses and re-adopts unfinished jobs. A drain wait
 // could therefore never end. Only a running launchd daemon, which unregistering
 // would disconnect from its callers, is waited for (see managedDrain).
-func (install *installer) managedOfflineDrainHolding(ctx context.Context, locks ...string) error {
+// Removal and relocation always retain the full drain and attempt checks.
+func (install *installer) managedOfflineDrainHolding(ctx context.Context, p *managedPlan, locks ...string) error {
 	for _, name := range locks {
 		busy, err := installInspectLock(install.state, name)
 		if err != nil {
@@ -362,10 +363,10 @@ func (install *installer) managedOfflineDrainHolding(ctx context.Context, locks 
 	if version != 1 && version != 2 {
 		return errors.New("Unsupported stopped queue schema")
 	}
-	// install.appBundle is the supervised path: both callers reach here only
-	// with no live handover (managedDrain returns early for a resumed one, and
-	// quiesceManaged validates it instead), so appBundle implies p.live == nil.
-	if install.appBundle {
+	// Only recovery at the same app location can preserve unfinished work for
+	// the supervised daemon to reconcile. Removal and relocation retire custody
+	// that its original callers and workers may still need.
+	if p != nil && install.managedSupervised(p) && !install.unregisterServices && !install.prepareReplacement && p.relocation == nil {
 		return install.requireLegacyCleanup()
 	}
 	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM queue_jobs WHERE phase != 'done'").Scan(&unfinished); err != nil {
@@ -1492,7 +1493,7 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 			if err := install.validateManagedLive(ctx, p.live); err != nil {
 				return err
 			}
-		} else if err := install.managedOfflineDrain(ctx); err != nil {
+		} else if err := install.managedOfflineDrainHolding(ctx, p, "queue-daemon.lock", "resource-controller.lock"); err != nil {
 			return err
 		}
 	}

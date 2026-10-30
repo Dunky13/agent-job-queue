@@ -425,6 +425,30 @@ func TestManagedAppBundleStoppedDaemonWithUnfinishedJobsCompletes(t *testing.T) 
 	}
 }
 
+func TestManagedAppBundleRemovalRequiresStoppedQueueDrained(t *testing.T) {
+	for _, phase := range []string{"queued", "starting", "running", "outcome"} {
+		t.Run(phase, func(t *testing.T) {
+			m := managedAppBundleFixture(t)
+			managedSetupNotices(m)
+			if err := m.run(t); err != nil {
+				t.Fatal(err)
+			}
+			i := m.installer
+			managedSeedUnfinishedQueue(t, i, phase)
+			managedRemovalTarget(i)
+			before := installTreeWitness(t, i.home)
+			m.calls = nil
+			if err := m.run(t); err == nil || !strings.Contains(err.Error(), "drained queue") {
+				t.Fatalf("removal accepted unfinished %s work: %v", phase, err)
+			}
+			if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
+				t.Fatal("refused removal changed installation or queue custody")
+			}
+			managedRequireNoServiceMutation(t, m.calls)
+		})
+	}
+}
+
 func TestManagedAppBundleCrashLoopingRegistrationWithUnfinishedJobsCompletes(t *testing.T) {
 	m := managedTestFixture(t)
 	if err := m.run(t); err != nil {

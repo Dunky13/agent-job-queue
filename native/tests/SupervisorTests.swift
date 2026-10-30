@@ -322,6 +322,25 @@ struct SupervisorTests {
             await supervisor.stopAll(grace: .seconds(1))
         }
 
+        // Lifeline exhaustion must never leave an unsupervised child behind.
+        try await scenario { f in
+            let spawner = FakeSpawner()
+            var canCreateLifeline = false
+            let supervisor = Supervisor(app: f.app, stateDirectory: f.state, environment: f.environment,
+                                        throttle: f.throttle, probe: { false },
+                                        makeLifeline: { canCreateLifeline ? Helper.Lifeline.make() : nil },
+                                        spawner: spawner.spawner)
+            supervisor.start(.resources)
+            _ = await eventually { supervisor.state(.resources).lastExit != nil || spawner.count(.resources) > 0 }
+            try check(spawner.count(.resources) == 0 && supervisor.state(.resources).lastExit == .launchFailed(EIO),
+                      "a missing lifeline records a launch failure without spawning a helper")
+            canCreateLifeline = true
+            _ = await eventually { spawner.count(.resources) == 1 }
+            try check(spawner.launches(.resources).first?.launch.lifeline != nil,
+                      "lifeline creation is retried before a helper can start")
+            await supervisor.stopAll(grace: .seconds(1))
+        }
+
         // Remote: on demand, stoppable, clean exit disables it.
         try await scenario { f in
             let spawner = FakeSpawner()
@@ -381,21 +400,26 @@ struct SupervisorTests {
             await sleep(0.5)
             try check(spawner.count(.remote) == 2, "a running phone service is not started twice")
             spawner.finish(.remote, .code(0))
+            _ = await eventually { spawner.count(.remote) == 3 }
+            try check(spawner.count(.remote) == 3, "enabled phone access restarts after reconfiguration outlasts the settings debounce")
+            try write(#"{"enabled": false}"#)
+            spawner.finish(.remote, .code(0))
             _ = await eventually { supervisor.state(.remote).phase == .stopped }
             try FileManager.default.removeItem(at: directory)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try write(#"{"enabled": true}"#)
-            _ = await eventually { spawner.count(.remote) == 3 }
-            try check(spawner.count(.remote) == 3, "a replaced settings directory is watched again")
+            _ = await eventually { spawner.count(.remote) == 4 }
+            try check(spawner.count(.remote) == 4, "a replaced settings directory is watched again")
+            try write(#"{"enabled": false}"#)
             spawner.finish(.remote, .code(0))
             _ = await eventually { supervisor.state(.remote).phase == .stopped }
             try write("{not json")
             await sleep(0.5)
-            try check(spawner.count(.remote) == 3, "unreadable settings count as off")
+            try check(spawner.count(.remote) == 4, "unreadable settings count as off")
             await supervisor.stopAll(grace: .seconds(1))
             try write(#"{"enabled": true}"#)
             await sleep(0.5)
-            try check(spawner.count(.remote) == 3, "nothing is watched or started after stopAll")
+            try check(spawner.count(.remote) == 4, "nothing is watched or started after stopAll")
         }
         try await scenario { f in
             let spawner = FakeSpawner()

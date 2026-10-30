@@ -143,6 +143,29 @@ func TestManagedRelocationWaitsWithoutChangingRunningJobs(t *testing.T) {
 	}
 }
 
+func TestManagedRelocationRequiresStoppedQueueDrained(t *testing.T) {
+	for _, phase := range []string{"queued", "starting", "running", "outcome"} {
+		t.Run(phase, func(t *testing.T) {
+			m, _ := managedRelocationFixture(t, false)
+			i := m.installer
+			for _, service := range []string{"queue", "resources", "remote"} {
+				m.statuses[service] = "notRegistered"
+			}
+			clear(m.loaded)
+			managedSeedUnfinishedQueue(t, i, phase)
+			before := installTreeWitness(t, i.home)
+			m.calls = nil
+			if err := m.run(t); err == nil || !strings.Contains(err.Error(), "drained queue") {
+				t.Fatalf("relocation accepted unfinished %s work: %v", phase, err)
+			}
+			if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
+				t.Fatal("refused relocation changed installation or queue custody")
+			}
+			managedRequireNoServiceMutation(t, m.calls)
+		})
+	}
+}
+
 func TestManagedRecordedPendingRefusesChangedOrUnsafeApp(t *testing.T) {
 	for _, scenario := range []string{"missing", "changed-build", "substituted-inode", "unsafe-path", "unsafe-permissions", "bad-signature", "unowned-backup", "unrelated-loaded-service"} {
 		t.Run(scenario, func(t *testing.T) {
