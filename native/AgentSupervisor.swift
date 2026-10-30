@@ -45,6 +45,58 @@ enum QueueHelper {
         let arguments: [String]
         let environment: [String: String]
         let log: URL?
+        /// Read end of the app's lifeline pipe, handed to the child as descriptor 3. Nil for short-lived helpers.
+        var lifeline: Int32?
+    }
+
+    /// The child's end of the lifeline is always this descriptor, announced by `lifelineVariable`.
+    static let lifelineDescriptor: Int32 = 3
+    static let lifelineVariable = "AGENT_QUEUE_LIFELINE"
+
+    /// A pipe the app keeps the write end of for its whole life. Supervised helpers receive the
+    /// read end and exit when it reaches end-of-file, which happens when the app exits for any
+    /// reason, including a crash or force quit, because the kernel then closes the write end.
+    /// Both ends are close-on-exec and above descriptor 9, so nothing but an explicit spawn
+    /// file action ever hands them to another process.
+    final class Lifeline: @unchecked Sendable {
+        private let lock = NSLock()
+        private var read: Int32
+        private var write: Int32
+
+        private init(read: Int32, write: Int32) {
+            self.read = read
+            self.write = write
+        }
+
+        static func make() -> Lifeline? {
+            var ends: [Int32] = [-1, -1]
+            guard pipe(&ends) == 0 else { return nil }
+            defer { ends.forEach { close($0) } }
+            let read = fcntl(ends[0], F_DUPFD_CLOEXEC, 10)
+            guard read >= 0 else { return nil }
+            let write = fcntl(ends[1], F_DUPFD_CLOEXEC, 10)
+            guard write >= 0 else {
+                close(read)
+                return nil
+            }
+            return Lifeline(read: read, write: write)
+        }
+
+        /// The descriptor to duplicate into a child, or nil once released.
+        var readEnd: Int32? { lock.withLock { read >= 0 ? read : nil } }
+        var isReleased: Bool { lock.withLock { write < 0 } }
+
+        /// Closes the write end so every child sees end-of-file. Safe to call repeatedly.
+        func release() {
+            lock.withLock {
+                if write >= 0 { close(write) }
+                if read >= 0 { close(read) }
+                write = -1
+                read = -1
+            }
+        }
+
+        deinit { release() }
     }
 
     /// `signal` only ever reaches a process that has not been reaped, so a recycled
@@ -140,7 +192,7 @@ enum QueueHelper {
     }
 
     /// Own session so group signals sent to the app never reach the helper; every
-    /// descriptor except 0-2 is closed in the child. Each child is reaped by pid
+    /// descriptor except 0-2 (and the lifeline, as 3, when given) is closed in the child. Each child is reaped by pid
     /// only, never with waitpid(-1), so other children in the app are untouched.
     static func spawn(_ launch: Launch, onExit: @escaping @Sendable (Exit) -> Void) throws -> Child {
         var output = launch.log.flatMap { openLog($0) } ?? -1
@@ -168,6 +220,11 @@ enum QueueHelper {
         if result == 0 { result = posix_spawnattr_setsigmask(&attributes, &none) }
         if result == 0 { result = posix_spawnattr_setsigdefault(&attributes, &everything) }
         if result == 0 { result = fdActions(&actions, output: output) }
+        // Last, so a log descriptor that happens to be 3 is already duplicated onto 1 and 2.
+        if result == 0, let lifeline = launch.lifeline {
+            result = lifeline == lifelineDescriptor ? EINVAL
+                : posix_spawn_file_actions_adddup2(&actions, lifeline, lifelineDescriptor)
+        }
         guard result == 0 else { throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EINVAL) }
 
         let arguments = [launch.name.executable] + launch.arguments
@@ -240,7 +297,9 @@ enum QueueHelper {
 
 /// Starts and supervises the queue daemon, resource scheduler and optional remote
 /// service as children of the menu bar app, replacing their launchd agents. They
-/// stop with the app. Restart rules mirror the retired launchd plists.
+/// stop with the app, including when it crashes or is force quit, through the
+/// lifeline pipe. Restart rules mirror the retired launchd plists, except that the
+/// queue daemon also restarts after a clean exit while the app runs.
 @MainActor
 final class QueueHelperSupervisor {
     typealias Name = QueueHelper.Name
@@ -280,13 +339,26 @@ final class QueueHelperSupervisor {
     private let spawner: QueueHelper.Spawner
     private let slots: [Name: Slot]
     private var isShutDown = false
+    private let lifeline: QueueHelper.Lifeline?
+    private let settingsDirectory: URL
+    private let settingsDebounce: Duration
+    private var settingsSource: (any DispatchSourceFileSystemObject)?
+    private var settingsWatchesTarget = false
+    private var settingsDebouncing: Task<Void, Never>?
+    private var isWatchingSettings = false
     /// Called after any process state change.
     var onChange: (@MainActor () -> Void)?
 
     init(app: URL, stateDirectory: URL = QueueHelper.defaultStateDirectory,
          environment: [String: String] = ProcessInfo.processInfo.environment, throttle: Duration = .seconds(10),
-         probe: QueueHelper.Probe? = nil, spawner: @escaping QueueHelper.Spawner = QueueHelper.spawn) {
+         probe: QueueHelper.Probe? = nil, settingsDirectory: URL? = nil, settingsDebounce: Duration = .seconds(1),
+         spawner: @escaping QueueHelper.Spawner = QueueHelper.spawn) {
         let scrubbed = QueueHelper.childEnvironment(from: environment)
+        let home = scrubbed["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
+        self.settingsDirectory = settingsDirectory
+            ?? URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".config/agent-heavy", isDirectory: true)
+        self.settingsDebounce = settingsDebounce
+        lifeline = QueueHelper.Lifeline.make()
         self.app = app
         self.stateDirectory = stateDirectory
         self.environment = scrubbed
@@ -302,6 +374,15 @@ final class QueueHelperSupervisor {
     func start() {
         start(.queue)
         start(.resources)
+    }
+
+    /// What the app runs after setup: everything, and a watch on the phone access settings.
+    /// `agent-remote serve` exits 0 at once when phone access is off, which the restart
+    /// policy treats as "not wanted", so starting it is always safe.
+    func startAll() {
+        start()
+        start(.remote)
+        watchRemoteSettings()
     }
 
     func start(_ name: Name) {
@@ -326,13 +407,14 @@ final class QueueHelperSupervisor {
     /// Adopted daemons are not ours and are left running.
     func stopAll(grace: Duration = .seconds(8)) async {
         isShutDown = true
+        stopWatchingSettings()
         let all = Array(slots.values)
         for slot in all {
             slot.wanted = false
             slot.stopRequested = true
             cancelPending(slot)
         }
-        await terminate(all, grace: grace)
+        await terminate(all, grace: grace, releasingLifeline: true)
         for slot in all where slot.child == nil { setPhase(slot, .stopped) }
     }
 
@@ -340,12 +422,14 @@ final class QueueHelperSupervisor {
     /// alive without waiting, and never restart anything afterwards.
     func terminateRemaining() {
         isShutDown = true
+        stopWatchingSettings()
         for slot in slots.values {
             slot.wanted = false
             slot.stopRequested = true
             cancelPending(slot)
             slot.child?.signal(SIGTERM)
         }
+        lifeline?.release()
     }
 
     /// True once some daemon answers the probe, so the menu need not flash an error at launch.
@@ -402,8 +486,8 @@ final class QueueHelperSupervisor {
         let generation = slot.generation
         let launch = QueueHelper.Launch(
             name: slot.name, executable: app.appendingPathComponent("Contents/MacOS/\(slot.name.executable)"),
-            arguments: slot.name.arguments, environment: environment,
-            log: stateDirectory.appendingPathComponent(slot.name.logPath))
+            arguments: slot.name.arguments, environment: helperEnvironment(lifeline: lifeline?.readEnd),
+            log: stateDirectory.appendingPathComponent(slot.name.logPath), lifeline: lifeline?.readEnd)
         do {
             let child = try spawner(launch) { [weak self] exit in
                 Task { @MainActor in self?.exited(slot, generation: generation, exit) }
@@ -414,6 +498,11 @@ final class QueueHelperSupervisor {
             let code = Int32((error as? POSIXError)?.errorCode ?? Int(EIO))
             finish(slot, .launchFailed(code))
         }
+    }
+
+    private func helperEnvironment(lifeline: Int32?) -> [String: String] {
+        guard lifeline != nil else { return environment }
+        return environment.merging([QueueHelper.lifelineVariable: String(QueueHelper.lifelineDescriptor)]) { _, new in new }
     }
 
     private func exited(_ slot: Slot, generation: Int, _ exit: Exit) {
@@ -429,8 +518,9 @@ final class QueueHelperSupervisor {
             onChange?()
             return
         }
-        // Queue and remote treat a clean exit as an intentional stop; the scheduler never stops.
-        if slot.name != .resources && exit.isSuccess {
+        // A clean exit from the phone service means phone access is off. The queue and the
+        // scheduler restart after any exit while the app runs, even an external SIGTERM.
+        if slot.name == .remote && exit.isSuccess {
             slot.wanted = false
             setPhase(slot, .stopped)
             onChange?()
@@ -441,8 +531,10 @@ final class QueueHelperSupervisor {
         }
     }
 
-    private func terminate(_ targets: [Slot], grace: Duration) async {
+    private func terminate(_ targets: [Slot], grace: Duration, releasingLifeline: Bool = false) async {
         for slot in targets { slot.child?.signal(SIGTERM) }
+        // Belt and braces: children that miss the signal still exit on end-of-file.
+        if releasingLifeline { lifeline?.release() }
         await waitUntilGone(targets, within: grace)
         for slot in targets { slot.child?.signal(SIGKILL) }
         await waitUntilGone(targets, within: .seconds(2))
@@ -453,5 +545,81 @@ final class QueueHelperSupervisor {
         while targets.contains(where: { $0.child != nil }), ContinuousClock.now < deadline {
             try? await Task.sleep(for: .milliseconds(10))
         }
+    }
+
+    // MARK: Phone access settings
+
+    private var settingsFile: URL { settingsDirectory.appendingPathComponent("remote.json") }
+
+    /// `agent-remote enable` run in a terminal only writes remote.json, so watch its
+    /// directory and start the service when it appears or changes. Creates nothing: when
+    /// the directory is missing, the nearest existing ancestor is watched until it exists.
+    func watchRemoteSettings() {
+        guard !isShutDown, !isWatchingSettings else { return }
+        isWatchingSettings = true
+        armSettingsWatch()
+    }
+
+    private func stopWatchingSettings() {
+        isWatchingSettings = false
+        settingsDebouncing?.cancel()
+        settingsDebouncing = nil
+        settingsSource?.cancel()
+        settingsSource = nil
+    }
+
+    /// Opens the settings directory, or its nearest existing ancestor, for events only.
+    private func armSettingsWatch() {
+        settingsSource?.cancel()
+        settingsSource = nil
+        var directory = settingsDirectory
+        while true {
+            let descriptor = open(directory.path, O_EVTONLY | O_DIRECTORY | O_CLOEXEC)
+            if descriptor >= 0 {
+                let source = DispatchSource.makeFileSystemObjectSource(
+                    fileDescriptor: descriptor, eventMask: [.write, .delete, .rename, .revoke], queue: .main)
+                source.setEventHandler { [weak self] in
+                    Task { @MainActor in self?.settingsChanged() }
+                }
+                source.setCancelHandler { close(descriptor) }
+                source.resume()
+                settingsSource = source
+                settingsWatchesTarget = directory.path == settingsDirectory.path
+                return
+            }
+            let parent = directory.deletingLastPathComponent()
+            guard parent.path != directory.path else { break }
+            directory = parent
+        }
+        settingsWatchesTarget = false
+    }
+
+    private func settingsChanged() {
+        guard isWatchingSettings, !isShutDown else { return }
+        settingsDebouncing?.cancel()
+        settingsDebouncing = Task { [weak self, settingsDebounce] in
+            try? await Task.sleep(for: settingsDebounce)
+            guard !Task.isCancelled, let self else { return }
+            self.settingsSettled()
+        }
+    }
+
+    private func settingsSettled() {
+        settingsDebouncing = nil
+        guard isWatchingSettings, !isShutDown else { return }
+        // The directory may have been replaced or created since the source was opened.
+        armSettingsWatch()
+        guard settingsWatchesTarget, state(.remote).phase == .stopped, remoteSettingsEnabled() else { return }
+        start(.remote)
+    }
+
+    /// Whether remote.json asks for phone access. Anything unreadable counts as off, since
+    /// the service would only exit again at once.
+    private func remoteSettingsEnabled() -> Bool {
+        var info = stat()
+        guard lstat(settingsFile.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, info.st_size <= 1 << 20,
+              let data = try? Data(contentsOf: settingsFile),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return object["enabled"] as? Bool == true
     }
 }

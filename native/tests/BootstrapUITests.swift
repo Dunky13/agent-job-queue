@@ -144,11 +144,16 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Preparation in progress shows only the plain icon and a neutral line: no setup wording, output or recovery items.
-    private func checkNeutralStartup(_ startup: QueueStartupMenuBarController, _ name: String) async throws {
-        try await waitUntil("the neutral startup menu") { startup.menu.items.first?.title == "Starting…" && startup.menu.items[1].isHidden }
+    /// The wait for running jobs (a migration from an older version) adds one reason line and Stop waiting.
+    private func checkNeutralStartup(_ startup: QueueStartupMenuBarController, _ name: String, waiting: Bool = false) async throws {
+        let line = waiting ? QueueStartupMenuBarController.waitingLine : "Starting…"
+        try await waitUntil("the neutral startup menu") { startup.menu.items.first?.title == line && startup.menu.items[1].isHidden }
+        let stop = startup.menu.items.first { $0.title == "Stop waiting" }
         try check(startup.statusItem.button?.title == "" && startup.menu.items.dropFirst(2).filter {
             ["Retry", "Open Applications", "Download Agent Queue…"].contains($0.title)
-        }.allSatisfy(\.isHidden) && NSApp.windows.allSatisfy { !$0.isVisible || $0 === startup.statusItem.button?.window }, name)
+        }.allSatisfy(\.isHidden) && NSApp.windows.allSatisfy { !$0.isVisible || $0 === startup.statusItem.button?.window }
+            && (stop.map { $0.isHidden != waiting && $0.isEnabled == waiting } ?? false)
+            && !line.localizedCaseInsensitiveContains("setup"), name)
     }
 
     private func checkStartup(_ delegate: AppDelegate) throws -> QueueStartupMenuBarController {
@@ -433,10 +438,16 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         guard let model = delegate.bootstrap else { throw ClientError.message("Automatic wait did not start") }
         try check(model.canStopWaiting && delegate.setupWindow == nil && AppRuntime.menuBarController == nil,
             "Automatic drain waits stay in the menu without starting an unready runtime")
-        try await checkNeutralStartup(startup, "Waiting for existing jobs stays neutral in the startup menu")
+        try await checkNeutralStartup(startup, "Waiting for existing jobs names its reason neutrally and offers Stop waiting, with no window", waiting: true)
         try snapshotStartup(startup, name: "01-waiting")
         let directQuit = CommandLine.arguments.contains("--direct-quit")
-        let stopping = directQuit ? nil : model.cancelWaiting()
+        let stopping: Task<Void, Never>?
+        if directQuit { stopping = nil }
+        else if let item = startup.menu.items.first(where: { $0.title == "Stop waiting" }) {
+            // The production menu action, as a click would invoke it.
+            startup.menu.performActionForItem(at: startup.menu.index(of: item))
+            stopping = model.cancelWaiting()
+        } else { throw ClientError.message("Stop waiting missing from the startup menu") }
         if !directQuit {
             try check(model.phase == .stopping && model.start() == nil,
                 "Stop waiting blocks retry while its controller is still stopping")
@@ -483,7 +494,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let executor = BootstrapAutomaticSetupFixture(fixture)
         let fake = BootstrapFakeSpawner()
         let helpers = QueueHelperSupervisor(app: fixture.environment.app, stateDirectory: temporary.appendingPathComponent("state"),
-            environment: [:], probe: { false }, spawner: fake.spawner)
+            environment: [:], probe: { false }, settingsDirectory: temporary.appendingPathComponent("settings"), spawner: fake.spawner)
         var replies = 0
         let delegate = AppDelegate(environment: fixture.environment, terminationReply: { replies += 1 }, supervisor: helpers) { request, _ in
             try await executor.execute(request)
@@ -492,21 +503,23 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         delegate.applicationDidFinishLaunching(notification)
         _ = try checkStartup(delegate)
         try await waitUntil { delegate.bootstrap?.phase == .complete }
-        try await waitUntil { Set(fake.launched) == [.queue, .resources] }
-        try check(delegate.supervisor === helpers && AppRuntime.remoteStore.supervisor === helpers && fake.launched.count == 2,
-            "A completed managed launch starts the queue and resources helpers, and no phone service until enabled")
+        try await waitUntil { Set(fake.launched) == [.queue, .resources, .remote] }
+        try check(delegate.supervisor === helpers && AppRuntime.remoteStore.supervisor === helpers && fake.launched.count == 3,
+            "A completed managed launch starts the queue, resources and phone helpers without consulting any status")
         try check(delegate.applicationShouldTerminate(NSApp) == .terminateLater && replies == 0,
             "Quit with supervised children defers termination")
-        try await waitUntil { fake.signals(.queue) == [SIGTERM] && fake.signals(.resources) == [SIGTERM] }
+        try await waitUntil { fake.signals(.queue) == [SIGTERM] && fake.signals(.resources) == [SIGTERM] && fake.signals(.remote) == [SIGTERM] }
         try check(delegate.applicationShouldTerminate(NSApp) == .terminateLater && replies == 0 && delegate.setupWindow == nil,
             "Repeated Quit waits for the same children and replies once")
         fake.releaseExits()
         try await waitUntil { replies == 1 }
-        try check(replies == 1 && fake.launched.count == 2 && fake.signals(.queue) == [SIGTERM] && fake.signals(.resources) == [SIGTERM] &&
+        try check(replies == 1 && fake.launched.count == 3 && fake.signals(.queue) == [SIGTERM] && fake.signals(.resources) == [SIGTERM]
+            && fake.signals(.remote) == [SIGTERM] &&
             QueueHelper.Name.allCases.allSatisfy { helpers.state($0).phase == .stopped },
             "Termination replies only after every child stopped, without SIGKILL or restarts")
         delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
-        try check(fake.signals(.queue) == [SIGTERM] && fake.signals(.resources) == [SIGTERM] && AppRuntime.menuBarController == nil,
+        try check(fake.signals(.queue) == [SIGTERM] && fake.signals(.resources) == [SIGTERM] && fake.signals(.remote) == [SIGTERM]
+            && AppRuntime.menuBarController == nil,
             "The final exit hook adds no signals once the children are gone")
         production = nil
     }

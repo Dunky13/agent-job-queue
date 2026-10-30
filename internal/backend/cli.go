@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/Dunky13/agent-job-queue/internal/lifeline"
 )
 
 const usage = `Usage: agent-heavy <command>
@@ -31,6 +33,8 @@ Commands receive stdin EOF. Supply input as argv or an explicit file.
 `
 
 func Main(args []string) int {
+	// First, before anything can spawn a process: see internal/lifeline.
+	lifeline.Adopt(len(args) > 0 && (args[0] == "daemon" || args[0] == "scheduler"))
 	syscall.Umask(0o077)
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" {
 		fmt.Print(usage)

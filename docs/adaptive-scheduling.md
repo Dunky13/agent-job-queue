@@ -14,7 +14,7 @@ These identities are statistical grouping keys, not reproducible-build or whole-
 
 ## Observation and learning
 
-The resource controller is a separate per-user login service. The Go queue daemon owns jobs, independent of the caller and UI. Native Darwin counters provide host CPU intervals, available memory, pressure, swap rates and disk space. Each job's verified process group is sampled for simultaneous physical footprint and observed cumulative CPU and I/O counters. PID birth identities and repeated membership checks prevent attributing a reused process group to an older job. No new privileged service or Python runtime dependency is needed.
+The resource controller is a separate process (agent-heavy scheduler) that the menu bar app starts and supervises, always restarting it when it exits. The Go queue daemon, also supervised by the app, owns jobs independently of the caller. Native Darwin counters provide host CPU intervals, available memory, pressure, swap rates and disk space. Each job's verified process group is sampled for simultaneous physical footprint and observed cumulative CPU and I/O counters. PID birth identities and repeated membership checks prevent attributing a reused process group to an older job. No new privileged service or Python runtime dependency is needed.
 
 CPU-seconds describe total observed computation, while CPU core demand and peak memory inform overlap. Summing simultaneous worker footprints avoids adding unrelated lifetime peaks. Workers born and exited entirely between samples, or peaks entirely between samples, remain invisible; observed totals are lower bounds. Completeness means the required sampled intervals were available, not kernel-enforced lifetime accounting.
 
@@ -38,7 +38,7 @@ Unfamiliar jobs run alone until comparable successful evidence accumulates. Reso
 
 Missing or stale resource telemetry holds new adaptive starts. The UI preserves monitoring failure separately from queue connectivity, and Fixed and Learn only remain selectable. Returning to Fixed returns managed jobs to fixed scheduling and preserves an intentionally paused queue. Existing force-start, cancellation, legacy-owner exclusion and daemon crash ownership rules remain in force. Suspending a process would not reclaim its memory, so adaptive admission does not use suspension as recovery.
 
-The app ships the resource modules and a separate bundle-owned resource-controller login service without replacing or restarting a running queue daemon. Local development can run the controller against a deliberately isolated queue with agent-heavy scheduler; production setup registers and starts it independently. Do not point test controllers at the operator's real queue.
+The app ships the resource modules and a separate bundled resource-controller helper without replacing or restarting a running queue daemon. Local development can run the controller against a deliberately isolated queue with agent-heavy scheduler; in production the app starts it independently of the daemon. Do not point test controllers at the operator's real queue.
 
 ## Validation
 

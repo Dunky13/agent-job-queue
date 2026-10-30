@@ -34,7 +34,7 @@ assembled around it, so the app itself is the notarized unit and the DMG is an
 additional container that receives its own ticket. Notarization has two stages,
 `app` then `dmg`:
 
-1. Sign the two Go helpers in the app's `Contents/MacOS`, then sign the app. Managed service definitions remain in the app's `Contents/Library/LaunchAgents` and use `BundleProgram`. Submit the app as a ZIP (`ditto -c -k --sequesterRsrc --keepParent`).
+1. Sign the two Go helpers in the app's `Contents/MacOS`, then sign the app. The agent definitions remain in the app's `Contents/Library/LaunchAgents` and use `BundleProgram` so upgrades can unregister registrations from earlier versions; the app itself no longer registers them. Submit the app as a ZIP (`ditto -c -k --sequesterRsrc --keepParent`).
 2. Require acceptance, fetch the log, then staple and validate the app.
 3. Recreate the distribution ZIP from the stapled app. It contains only `Agent Queue.app` at its top level.
 4. Package the stapled app and an `Applications` symlink in the DMG, sign the DMG, notarize it, and staple it.
@@ -58,7 +58,7 @@ first launch of the complete installed product remains a separate test.
 These requirements come from Apple's
 [custom notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
-The app carries support metadata and documents without duplicate helper binaries; its only executables are the helpers in `Contents/MacOS`. Opening the app from `/Applications` or `~/Applications` runs setup (`agent-heavy install --app-bundle`) from inside the bundle. Setup registers the bundle-owned services, writes the CLI wrappers to `~/.local/bin` and never modifies the installed bundle or copies executables out of it. Helpers are signed before sealing the app. The ZIP and the DMG deliver the same stapled app, preserving signatures, tickets and quarantine. Homebrew delivers the app through a plain `app` cask; nothing runs at install time and the first launch completes setup.
+The app carries support metadata and documents without duplicate helper binaries; its only executables are the helpers in `Contents/MacOS`. Opening the app from `/Applications` or `~/Applications` runs setup (`agent-heavy install --app-bundle`) from inside the bundle. Setup writes the CLI wrappers to `~/.local/bin`, migrates state, unregisters queue, resource and phone-access registrations left by older versions, and never modifies the installed bundle or copies executables out of it. The app then runs the helpers in `Contents/MacOS` as its own child processes and registers only its login item. Helpers are signed before sealing the app. The ZIP and the DMG deliver the same stapled app, preserving signatures, tickets and quarantine. Homebrew delivers the app through a plain `app` cask; nothing runs at install time and the first launch completes setup.
 
 The app is stapled only after its notarization is accepted, and no signed
 resource file changes afterward. Verification copies the app with

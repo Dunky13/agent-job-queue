@@ -32,15 +32,15 @@ Screenshots use sample jobs. The Mac image uses the app's safe preview mode.
 3. Open the DMG and drag **Agent Queue** onto **Applications**. To install for your account only, drop it in `~/Applications` instead.
 4. Open Agent Queue from Applications. It sets itself up silently and appears in the menu bar.
 
-The app is self-contained: the menu app, the `agent-heavy` and `agent-remote` command-line tools, the queue daemon, the resource controller and the HTTPS runtime all live inside `Agent Queue.app`. There is no installer and nothing is copied out of the bundle. On first launch the app registers its own bundled background services with macOS Service Management, creates its private data directories and adds `agent-heavy` and `agent-remote` wrappers to `~/.local/bin`. Xcode, Go, Python, Pueue and Caddy are not required, and setup never uses `sudo`.
+The app is self-contained: the menu app, the `agent-heavy` and `agent-remote` command-line tools, the queue daemon, the resource controller and the HTTPS runtime all live inside `Agent Queue.app`. There is no installer and nothing is copied out of the bundle. On first launch the app creates its private data directories and adds `agent-heavy` and `agent-remote` wrappers to `~/.local/bin`. On every launch it then runs the queue itself: it starts and supervises the queue daemon, the resource controller and, when phone access is on, the phone-access service as its own child processes. Only the app's login item (open at login) is registered with macOS Service Management. Xcode, Go, Python, Pueue and Caddy are not required, and setup never uses `sudo`.
 
-Opening the app immediately adds its menu-bar icon and prepares services automatically in the background, on both first launch and upgrades. There is no setup wizard or progress window. macOS may show a "Background Items Added" notification or require approval in **System Settings > General > Login Items**. The menu shows status, a Settings shortcut when approval is needed, and diagnostics with Retry if preparation fails. Setup resumes automatically after approval. Only the explicit `--setup` diagnostic mode opens a recovery window.
+Opening the app immediately adds its menu-bar icon, which shows "Starting…" while setup finishes in the background and the queue comes up, on both first launch and upgrades. There is no setup wizard or progress window. Setup wording, diagnostics and **Retry** appear in the menu only if something actually fails. macOS may show a "Background Items Added" notification for the login item; approving it in **System Settings > General > Login Items** only decides whether Agent Queue opens at login and never delays the queue. Setup also unregisters any queue, resource or phone-access background services that older versions registered with macOS, including ones stuck waiting for approval. Only the explicit `--setup` diagnostic mode opens a recovery window.
 
 To upgrade, quit Agent Queue, drag the new version over the old one and choose **Replace**, then open it. Queue history, settings, credentials and certificates are kept. If jobs are queued or running, setup either hands them over to the new version or waits for them to finish; see [upgrade recovery](docs/upgrade-recovery.md).
 
 If you move the app between `/Applications` and `~/Applications`, delete or replace the old copy first. Setup refuses to adopt a second copy while the recorded one still exists.
 
-To remove Agent Queue, finish queued and running jobs, stop its services, then move the app to the Trash:
+To remove Agent Queue, finish queued and running jobs, then run this command (it quits the app, which stops its queue processes, and removes its login item) and move the app to the Trash:
 
 ```sh
 agent-heavy install --app-bundle "/Applications/Agent Queue.app" --unregister-services
@@ -54,11 +54,11 @@ Use the app's actual location if it differs. Private data under `~/.local/share/
 brew install --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
-The cask places `Agent Queue.app` in Applications and nothing else; open it to use the menu bar while services prepare automatically. `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` replaces the app, and the next launch immediately shows the menu bar and completes the upgrade in the background. Homebrew verifies the download's SHA-256 and keeps quarantine so macOS assesses the notarized app. Maintainer setup is documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
+The cask places `Agent Queue.app` in Applications and nothing else; open it to use the menu bar while setup finishes automatically. `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` replaces the app, and the next launch immediately shows the menu bar and completes the upgrade in the background. Homebrew verifies the download's SHA-256 and keeps quarantine so macOS assesses the notarized app. Maintainer setup is documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
 
 ### Signing, Gatekeeper and endpoint security
 
-Releases from the distribution workflow are Developer ID signed, notarized and stapled (app and DMG). Quarantine is never removed. Because setup only registers services that ship inside the signed app, endpoint security tools see a notarized app from Applications managing its own login items, not a separate process copying executables. See [Apple signing and notarization](docs/apple-signing.md) for verification details.
+Releases from the distribution workflow are Developer ID signed, notarized and stapled (app and DMG). Quarantine is never removed. Because the app runs only helpers that ship inside the signed app, as its own child processes, and registers only its own login item, endpoint security tools see a notarized app from Applications, not a separate process copying executables. See [Apple signing and notarization](docs/apple-signing.md) for verification details.
 
 If macOS blocks a downloaded build you trust, open **System Settings > Privacy & Security**, choose **Open Anyway** next to **Agent Queue**, and confirm. Do not clear quarantine to work around a failed verification of a release advertised as notarized. See [Apple's opening instructions](https://support.apple.com/102445).
 
@@ -126,13 +126,13 @@ Use the same shared queue across repositories and worktrees. Keep each tool's
 internal worker count conservative. Run small focused checks directly.
 ```
 
-The Go queue daemon owns submitted jobs independently of the calling terminal and menu app. Closing the UI does not stop jobs. Abruptly losing a submitter leaves its accepted job visible until it finishes or is explicitly cancelled.
+The Go queue daemon owns submitted jobs independently of the calling terminal. The menu bar app starts and supervises the daemon, so the queue is available while the app is running; without it, `agent-heavy` reports that the queue daemon is unavailable instead of running the command directly. Closing the window does not stop jobs. Quitting the app stops the daemon, but running job processes keep running (see below). Abruptly losing a submitter leaves its accepted job visible until it finishes or is explicitly cancelled.
 
 ## View and manage jobs
 
 The menu-bar app provides project and branch labels, queue positions, elapsed time, results, job details, and bounded log tails. Background checks leave unchanged content in place. Details and confirmations stay within the queue panel.
 
-Click the menu-bar icon to open the queue popover. Right-click or Control-click it for **Open window**, learned workloads, About and updates, agent integration, remote access settings, and Quit. Double-click the icon to open or focus the main queue window. The same settings remain available in the popover's gear menu.
+Click the menu-bar icon to open the queue popover. Right-click or Control-click it for **Open window**, learned workloads, About and updates, agent integration, remote access settings, and Quit. Quit stops the queue: the app sends its queue daemon, resource controller and phone-access service SIGTERM, then SIGKILL to any that do not exit within a grace period. Running job processes are not stopped. If jobs were active, the queue comes back paused when you next open the app, as after any unclean daemon restart. Double-click the icon to open or focus the main queue window. The same settings remain available in the popover's gear menu.
 
 Use the app or CLI to change future scheduling:
 
@@ -165,7 +165,7 @@ A **lease** holds a lane slot without a command, for multi-step work such as dri
 
 ## Learn job costs and schedule by available resources
 
-The installer also starts an independent resource controller. It samples host CPU, memory pressure, available memory, swap activity and disk capacity, and measures the owned workers of running jobs. Job details show predicted memory and CPU demand, observed memory peaks, CPU-seconds, sample counts and confidence. Monitoring keeps working when the menu app or submitting terminal closes.
+The app also starts and supervises a resource controller (`agent-heavy scheduler`), restarting it whenever it exits. It samples host CPU, memory pressure, available memory, swap activity and disk capacity, and measures the owned workers of running jobs. Job details show predicted memory and CPU demand, observed memory peaks, CPU-seconds, sample counts and confidence. Monitoring keeps working when the queue window or the submitting terminal closes, and runs for as long as the app does.
 
 The default **Fixed** mode preserves the existing parallel limit while collecting history. **Learn only** makes shadow admission decisions without controlling starts. **Adaptive** holds waiting jobs until predicted CPU and memory demand fit the current headroom, within the same operator-set parallel limit. Choose the mode in the menu app or dashboard, or use:
 
@@ -203,7 +203,7 @@ The settings window displays the HTTPS address and certificate sharing controls:
 
 The dashboard shows the queue, details and logs, and supports reordering, concurrency changes, starting, and cancelling jobs. Connection failures preserve the last data and disable mutations until a successful refresh. No router forwarding or public hosting is configured.
 
-Caddy's Go modules provide HTTPS and Basic authentication inside the remote server process. Only a bcrypt hash is stored. Gorilla CSRF protects mutations, and the Go HTTP server serves a private Unix-socket interface with a fixed queue-control allowlist. Existing passwords and certificate trust survive the embedded gateway upgrade. Disabling access stops only the remote service. Quitting the menu app leaves an enabled remote service running independently. A failed stop remains visible as **Needs attention**.
+Caddy's Go modules provide HTTPS and Basic authentication inside the remote server process. Only a bcrypt hash is stored. Gorilla CSRF protects mutations, and the Go HTTP server serves a private Unix-socket interface with a fixed queue-control allowlist. Existing passwords and certificate trust survive the embedded gateway upgrade. The menu bar app runs the remote service as its own child process, so phone access is reachable only while the app is running. The app starts it at launch while access is enabled and restarts it after a failure; `agent-remote enable` only records the choice: the app starts the service when you enable access in its settings, and at its next launch. Disabling access stops only the remote service. Quitting the app stops it, and it starts again at the next launch. A failed stop remains visible as **Needs attention**.
 
 Remote authentication admission defaults to two concurrent checks, four requests per second per socket-peer IP, a burst of 64, and at most 1,024 peer entries expiring after 600 idle seconds. Cached dashboard polls count toward the rate. A bounded queue of at most `burst` requests accommodates initial asset requests; excess work receives HTTP 429 with `Retry-After`. Forwarded headers cannot choose the rate-limit identity. The existing bcrypt cost, Caddy cache, TLS, and CSRF protections remain in place.
 
@@ -232,13 +232,14 @@ The installation uses these intentional per-user locations:
 | Installation markers (`installation.json`, `build-info.json`), no binaries | `~/.local/share/agent-heavy/` |
 | Private configuration | `~/.config/agent-heavy/` |
 | Private jobs, receipts, logs and daemon state | `~/.local/state/agent-heavy/` |
-| Login services | Bundle-owned, registered with Service Management from `Agent Queue.app/Contents/Library/LaunchAgents/io.went.agent-*.plist` |
+| Queue processes | Children of the menu bar app (`agent-heavy daemon`, `agent-heavy scheduler`, and `agent-remote serve` when phone access is on), logging to `daemon.log`, `resources.log` and `remote/service.log` under `~/.local/state/agent-heavy/`, each bounded to 1 MiB when the process starts |
+| Login item | The app's own login item, registered with Service Management (open at login) |
 
-No executables are copied out of the app bundle, and new installs write nothing to `~/Library/LaunchAgents`. When migrating from an earlier installer-based install, setup can retire and back up legacy `io.went.agent-*.plist` definitions found there.
+No executables are copied out of the app bundle, and new installs write nothing to `~/Library/LaunchAgents`. When migrating from an earlier installer-based install, setup can retire and back up legacy `io.went.agent-*.plist` definitions found there. Setup also unregisters queue, resource and phone-access registrations from earlier app versions; `Agent Queue.app/Contents/Library/LaunchAgents` still holds their definitions in the bundle so that upgrades can do this.
 
-The dedicated Go daemon uses a private Unix socket and a durable SQLite database. The queue fails closed when its daemon, state, or process ownership cannot be verified. Do not clear a lock or kill a process to bypass an unknown owner.
+The dedicated Go daemon uses a private Unix socket and a durable SQLite database. The app restarts it after a failure, adopts a daemon that is already running instead of starting a second one, and the daemon's own lifetime locks refuse duplicate instances. Restart policy: the daemon and the phone-access service restart after a failure and stay stopped after a clean exit, the resource controller always restarts, and a restart waits until 10 seconds after the previous start. The queue fails closed when its daemon, state, or process ownership cannot be verified. Do not clear a lock or kill a process to bypass an unknown owner.
 
-After an unclean daemon restart, automatic scheduling remains paused while owned workers and their outcomes are reconciled. Inspect `agent-heavy status`, then use `agent-heavy resume` to resume the queue. `agent-heavy pause` holds future automatic starts without stopping active jobs. An uncertain command attempt is never automatically replayed.
+After an unclean daemon restart, including quitting the app while jobs are active, automatic scheduling remains paused while owned workers and their outcomes are reconciled. Inspect `agent-heavy status`, then use `agent-heavy resume` to resume the queue. `agent-heavy pause` holds future automatic starts without stopping active jobs. An uncertain command attempt is never automatically replayed.
 
 `agent-remote status --json` reports the remote service. `agent-remote disable` stops it. Passwords are passed privately through the native settings form, not command-line arguments.
 

@@ -257,7 +257,7 @@ struct QueueUpdatesSettings: View {
                         Label(message, systemImage: store.running.metadataError == nil ? "info.circle" : "exclamationmark.triangle")
                             .font(.callout).foregroundStyle(store.running.metadataError == nil ? Color.secondary : Color.orange)
                     }
-                    Text("Updates download a verified copy of the new app into your Downloads folder and show it in Finder. Quit Agent Queue, drag the new copy into Applications and choose Replace. Opening it finishes the update, and existing jobs finish before background services are updated.")
+                    Text("Updates download a verified copy of the new app into your Downloads folder and show it in Finder. Quit Agent Queue, drag the new copy into Applications and choose Replace. Opening it finishes the update. Jobs still running when you quit keep running, and the queue reopens paused.")
                         .font(.caption).foregroundStyle(.secondary)
                     if let error = store.error {
                         Label(error, systemImage: "exclamationmark.triangle").font(.callout)

@@ -125,11 +125,18 @@ n=$(cat "$d/leak" 2>/dev/null)
 if [ -n "$n" ]; then
   if ( : >&"$n" ) 2>/dev/null; then echo leaked; else echo clean; fi > "$d/$1.fd"
 fi
+if [ -e "$d/fds" ]; then
+  # Descriptors above 2 other than the shell's own script descriptor (255).
+  /usr/sbin/lsof -a -p "$$" -d 3-1000 -Ff 2>/dev/null | /usr/bin/grep '^f[0-9]' | /usr/bin/tr -d f | /usr/bin/grep -vx 255 | /usr/bin/tr '\\n' ' ' > "$d/$1.fds.tmp"
+  echo "done" >> "$d/$1.fds.tmp"
+  mv "$d/$1.fds.tmp" "$d/$1.fds"
+fi
 echo "hello from $1"
 case "$(cat "$d/$1.mode" 2>/dev/null)" in
   exit0) exit 0 ;;
   exit3) exit 3 ;;
   selfkill) kill -9 $$ ;;
+  lifeline) trap '' TERM; echo ready > "$d/$1.ready"; cat <&3 > /dev/null; echo eof > "$d/$1.eof"; exit 0 ;;
   ignoreterm) trap '' TERM; echo ready > "$d/$1.ready"; while :; do /bin/sleep 0.05; done ;;
   *) exec /bin/sleep 600 ;;
 esac
@@ -170,12 +177,13 @@ private final class Fixture {
     }
 
     func real(probe: Helper.Probe? = { false }) -> Supervisor {
-        Supervisor(app: app, stateDirectory: state, environment: environment, throttle: throttle, probe: probe)
+        Supervisor(app: app, stateDirectory: state, environment: environment, throttle: throttle, probe: probe,
+                   settingsDebounce: .milliseconds(100))
     }
 
     func fake(_ spawner: FakeSpawner, probe: @escaping Helper.Probe = { false }) -> Supervisor {
         Supervisor(app: app, stateDirectory: state, environment: environment, throttle: throttle, probe: probe,
-                   spawner: spawner.spawner)
+                   settingsDebounce: .milliseconds(100), spawner: spawner.spawner)
     }
 }
 
@@ -225,8 +233,14 @@ struct SupervisorTests {
             try check(queue.log == f.state.appendingPathComponent("daemon.log")
                       && resources.log == f.state.appendingPathComponent("resources.log"), "log files live in the state directory")
             try check(queue.environment["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin" && queue.environment["FOO"] == nil
-                      && !queue.environment.keys.contains { $0.hasPrefix("AGENT_") } && queue.environment["HOME"] == f.root.path,
-                      "launch environment is scrubbed")
+                      && queue.environment.keys.filter { $0.hasPrefix("AGENT_") } == ["AGENT_QUEUE_LIFELINE"]
+                      && queue.environment["HOME"] == f.root.path,
+                      "launch environment is scrubbed apart from the lifeline variable")
+            let lifelineDescriptors = spawner.launches.compactMap(\.launch.lifeline)
+            try check(queue.environment["AGENT_QUEUE_LIFELINE"] == "3" && resources.environment["AGENT_QUEUE_LIFELINE"] == "3"
+                      && lifelineDescriptors.count == 2 && lifelineDescriptors[0] == lifelineDescriptors[1] && lifelineDescriptors[0] >= 10
+                      && fcntl(lifelineDescriptors[0], F_GETFD) & FD_CLOEXEC != 0,
+                      "children share one close-on-exec lifeline read end, announced as descriptor 3")
             supervisor.start(.remote)
             _ = await eventually { spawner.count(.remote) == 1 }
             let remote = spawner.launches(.remote)[0].launch
@@ -234,6 +248,7 @@ struct SupervisorTests {
                       && remote.log == f.state.appendingPathComponent("remote/service.log"), "remote runs agent-remote serve on demand")
             try check(supervisor.state(.queue).phase == .running(pid: 70_001), "state exposes the running pid")
             await supervisor.stopAll(grace: .seconds(1))
+            try check(fcntl(lifelineDescriptors[0], F_GETFD) == -1, "stopAll closes the lifeline")
         }
 
         // Restart policy.
@@ -246,21 +261,26 @@ struct SupervisorTests {
             _ = await eventually { spawner.launches.count == 2 }
             spawner.finish(.queue, .code(0))
             _ = await eventually { supervisor.state(.queue).lastExit == .code(0) }
-            await sleep(0.8)
-            try check(spawner.count(.queue) == 1 && supervisor.state(.queue).phase == .stopped, "queue exit 0 is an intentional stop")
-            try check(changes > 0, "state changes are announced")
-            supervisor.start()
+            try check(supervisor.state(.queue).phase == .waiting, "queue exit 0 waits out the throttle")
             _ = await eventually { spawner.count(.queue) == 2 }
-            try check(spawner.count(.queue) == 2 && spawner.count(.resources) == 1, "start brings an intentionally stopped queue back")
+            try check(spawner.count(.queue) == 2 && spawner.count(.resources) == 1 && supervisor.state(.queue).lastExit == .code(0),
+                      "queue restarts after exit 0, such as an external SIGTERM")
+            try check(changes > 0, "state changes are announced")
+            spawner.finish(.queue, .signal(SIGTERM))
+            _ = await eventually { spawner.count(.queue) == 3 }
+            try check(spawner.count(.queue) == 3, "queue restarts after an external SIGTERM")
+            supervisor.start()
+            await sleep(0.1)
+            try check(spawner.count(.queue) == 3, "start does not duplicate a running queue")
 
             spawner.finish(.queue, .code(1))
             await sleep(0.1)
-            try check(spawner.count(.queue) == 2 && supervisor.state(.queue).phase == .waiting, "non-zero exit waits out the throttle")
-            _ = await eventually { spawner.count(.queue) == 3 }
-            try check(spawner.count(.queue) == 3, "queue restarts after a non-zero exit")
-            spawner.finish(.queue, .signal(SIGSEGV))
+            try check(spawner.count(.queue) == 3 && supervisor.state(.queue).phase == .waiting, "non-zero exit waits out the throttle")
             _ = await eventually { spawner.count(.queue) == 4 }
-            try check(spawner.count(.queue) == 4 && supervisor.state(.queue).lastExit == .signal(SIGSEGV), "queue restarts after signal death")
+            try check(spawner.count(.queue) == 4, "queue restarts after a non-zero exit")
+            spawner.finish(.queue, .signal(SIGSEGV))
+            _ = await eventually { spawner.count(.queue) == 5 }
+            try check(spawner.count(.queue) == 5 && supervisor.state(.queue).lastExit == .signal(SIGSEGV), "queue restarts after signal death")
 
             spawner.finish(.resources, .code(0))
             _ = await eventually { spawner.count(.resources) == 2 }
@@ -328,6 +348,66 @@ struct SupervisorTests {
             _ = await eventually { spawner.count(.remote) == 4 }
             try check(spawner.count(.remote) == 4, "remote can be started after stop")
             await supervisor.stopAll(grace: .seconds(1))
+        }
+
+        // startAll and the phone access settings watch.
+        try await scenario { f in
+            let spawner = FakeSpawner()
+            let supervisor = f.fake(spawner)
+            supervisor.startAll()
+            _ = await eventually { spawner.launches.count == 3 }
+            try check(spawner.count(.queue) == 1 && spawner.count(.resources) == 1 && spawner.count(.remote) == 1,
+                      "startAll starts the phone service without consulting any status")
+            spawner.finish(.remote, .code(0))
+            _ = await eventually { supervisor.state(.remote).phase == .stopped }
+            let config = f.root.appendingPathComponent(".config")
+            let directory = config.appendingPathComponent("agent-heavy")
+            let settings = directory.appendingPathComponent("remote.json")
+            func write(_ text: String) throws { try text.write(to: settings, atomically: true, encoding: .utf8) }
+            await sleep(0.3)
+            try check(!FileManager.default.fileExists(atPath: config.path) && spawner.count(.remote) == 1,
+                      "watching creates no directories")
+            try FileManager.default.createDirectory(at: config, withIntermediateDirectories: true)
+            await sleep(0.4)
+            try check(spawner.count(.remote) == 1, "an unrelated parent change starts nothing")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try write(#"{"enabled": false}"#)
+            await sleep(0.5)
+            try check(spawner.count(.remote) == 1, "settings that leave phone access off start nothing")
+            try write(#"{"enabled": true, "port": 8743}"#)
+            _ = await eventually { spawner.count(.remote) == 2 }
+            try check(spawner.count(.remote) == 2, "a terminal enable starts the phone service while the app runs")
+            try write(#"{"enabled": true, "port": 8744}"#)
+            await sleep(0.5)
+            try check(spawner.count(.remote) == 2, "a running phone service is not started twice")
+            spawner.finish(.remote, .code(0))
+            _ = await eventually { supervisor.state(.remote).phase == .stopped }
+            try FileManager.default.removeItem(at: directory)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try write(#"{"enabled": true}"#)
+            _ = await eventually { spawner.count(.remote) == 3 }
+            try check(spawner.count(.remote) == 3, "a replaced settings directory is watched again")
+            spawner.finish(.remote, .code(0))
+            _ = await eventually { supervisor.state(.remote).phase == .stopped }
+            try write("{not json")
+            await sleep(0.5)
+            try check(spawner.count(.remote) == 3, "unreadable settings count as off")
+            await supervisor.stopAll(grace: .seconds(1))
+            try write(#"{"enabled": true}"#)
+            await sleep(0.5)
+            try check(spawner.count(.remote) == 3, "nothing is watched or started after stopAll")
+        }
+        try await scenario { f in
+            let spawner = FakeSpawner()
+            let supervisor = f.fake(spawner)
+            supervisor.start()
+            supervisor.terminateRemaining()
+            supervisor.watchRemoteSettings()
+            let directory = f.root.appendingPathComponent(".config/agent-heavy")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try #"{"enabled": true}"#.write(to: directory.appendingPathComponent("remote.json"), atomically: true, encoding: .utf8)
+            await sleep(0.5)
+            try check(spawner.count(.remote) == 0, "terminateRemaining ends the watch for good")
         }
 
         // Adopt-if-running.
@@ -417,19 +497,26 @@ struct SupervisorTests {
 
         // Real posix_spawn path with fake helper scripts.
         try await scenario { f in
-            let leaked = open("/dev/null", O_RDONLY)
+            // Above 3, which a child legitimately has open as its lifeline.
+            let plain = open("/dev/null", O_RDONLY)
+            let leaked = fcntl(plain, F_DUPFD, 20)
+            close(plain)
             defer { close(leaked) }
             try String(leaked).write(to: f.file("leak"), atomically: true, encoding: .utf8)
             let supervisor = f.real()
             supervisor.start()
-            _ = await eventually { f.runs("daemon").count == 1 && f.runs("scheduler").count == 1 && !text(f.file("daemon.fd")).isEmpty }
+            _ = await eventually {
+                f.runs("daemon").count == 1 && f.runs("scheduler").count == 1 && !text(f.file("daemon.fd")).isEmpty
+                    && !text(f.state.appendingPathComponent("daemon.log")).isEmpty && !text(f.state.appendingPathComponent("resources.log")).isEmpty
+            }
             guard case .running(let pid) = supervisor.state(.queue).phase else { throw TestFailure(message: "queue is running") }
             try check(Int32(f.runs("daemon")[0]) == pid, "state reports the real child pid")
             try check(text(f.file("daemon.args")).hasSuffix("agent-heavy daemon\n") && text(f.file("scheduler.args")).hasSuffix("agent-heavy scheduler\n"),
                       "helpers receive their subcommand")
             let environment = Set(text(f.file("daemon.env")).split(separator: "\n").map(String.init))
-            try check(!environment.contains { $0.hasPrefix("AGENT_") } && !environment.contains("FOO=bar") && environment.contains("PATH=/usr/bin:/bin:/usr/sbin:/sbin"),
-                      "real child has no AGENT_ variables and a fixed PATH")
+            try check(environment.filter { $0.hasPrefix("AGENT_") } == ["AGENT_QUEUE_LIFELINE=3"] && !environment.contains("FOO=bar")
+                      && environment.contains("PATH=/usr/bin:/bin:/usr/sbin:/sbin"),
+                      "real child has only the lifeline AGENT_ variable and a fixed PATH")
             try check(environment.contains("HOME=\(f.root.path)") && environment.contains("USER=tester") && environment.contains("LOGNAME=tester")
                       && environment.contains("TMPDIR=/tmp/") && environment.contains("LANG=C"), "real child keeps the launchd-style variables")
             try check(getsid(pid) != getsid(0) && getsid(pid) == pid && getpgid(pid) == pid, "child runs in its own session")
@@ -453,7 +540,7 @@ struct SupervisorTests {
             supervisor.start()
             supervisor.start(.remote)
             _ = await eventually { f.runs("scheduler").count >= 2 && f.runs("serve").count >= 2 }
-            try check(f.runs("daemon").count == 1 && supervisor.state(.queue).lastExit == .code(0), "real queue exit 0 is not restarted")
+            try check(f.runs("daemon").count >= 2 && supervisor.state(.queue).lastExit == .code(0), "real queue restarts after exit 0")
             try check(f.runs("scheduler").count >= 2, "real scheduler restarts after exit 0")
             try check(supervisor.state(.remote).lastExit == .code(3) && f.runs("serve").count >= 2, "real remote restarts after exit 3")
             f.setMode("serve", "exit0")
@@ -462,9 +549,9 @@ struct SupervisorTests {
             await sleep(0.9)
             try check(supervisor.state(.remote).phase == .stopped && f.runs("serve").count <= before + 1, "real remote exit 0 is not restarted")
             f.setMode("daemon", "selfkill")
-            supervisor.start(.queue)
-            _ = await eventually { f.runs("daemon").count >= 3 }
-            try check(supervisor.state(.queue).lastExit == .signal(SIGKILL) && f.runs("daemon").count >= 3, "real signal death restarts the queue")
+            let daemonRuns = f.runs("daemon").count
+            _ = await eventually { supervisor.state(.queue).lastExit == .signal(SIGKILL) && f.runs("daemon").count > daemonRuns }
+            try check(supervisor.state(.queue).lastExit == .signal(SIGKILL) && f.runs("daemon").count > daemonRuns, "real signal death restarts the queue")
             await supervisor.stopAll(grace: .seconds(2))
         }
         try await scenario { f in
@@ -492,6 +579,65 @@ struct SupervisorTests {
             _ = await eventually { f.runs("scheduler").count == 1 }
             guard case .running(let pid) = supervisor.state(.resources).phase else { throw TestFailure(message: "scheduler is running") }
             try check(getpgid(pid) != getpgid(0), "child is outside the app's process group")
+            await supervisor.stopAll(grace: .seconds(2))
+        }
+
+        // Lifeline: the child's only extra descriptor is fd 3, and it ends when the app's end closes.
+        try await scenario { f in
+            try "1".write(to: f.file("fds"), atomically: true, encoding: .utf8)
+            f.setMode("daemon", "lifeline")
+            f.setMode("scheduler", "lifeline")
+            let supervisor = f.real()
+            supervisor.start()
+            _ = await eventually {
+                !text(f.file("daemon.ready")).isEmpty && !text(f.file("scheduler.ready")).isEmpty
+                    && !text(f.file("daemon.fds")).isEmpty && !text(f.file("scheduler.fds")).isEmpty
+            }
+            let environment = Set(text(f.file("daemon.env")).split(separator: "\n").map(String.init))
+            try check(environment.contains("AGENT_QUEUE_LIFELINE=3"), "the child is told its lifeline is descriptor 3")
+            try check(text(f.file("daemon.fds")) == "3 done\n"
+                      && text(f.file("scheduler.fds")) == "3 done\n",
+                      "descriptor 3 is the only extra descriptor, and it is open")
+            await sleep(0.4)
+            try check(!FileManager.default.fileExists(atPath: f.file("daemon.eof").path)
+                      && !FileManager.default.fileExists(atPath: f.file("scheduler.eof").path), "no end-of-file while the app holds its end")
+            await supervisor.stopAll(grace: .seconds(3))
+            try check(supervisor.state(.queue).lastExit == .code(0) && supervisor.state(.resources).lastExit == .code(0)
+                      && FileManager.default.fileExists(atPath: f.file("daemon.eof").path)
+                      && FileManager.default.fileExists(atPath: f.file("scheduler.eof").path),
+                      "children that ignore SIGTERM still exit cleanly on end-of-file when the write end closes")
+        }
+        try await scenario { f in
+            f.setMode("daemon", "lifeline")
+            var supervisor: Supervisor? = f.real()
+            supervisor?.start(.queue)
+            _ = await eventually { !text(f.file("daemon.ready")).isEmpty }
+            await sleep(0.3)
+            try check(!FileManager.default.fileExists(atPath: f.file("daemon.eof").path), "a live supervisor keeps the child waiting")
+            supervisor = nil
+            _ = await eventually { FileManager.default.fileExists(atPath: f.file("daemon.eof").path) }
+            try check(FileManager.default.fileExists(atPath: f.file("daemon.eof").path),
+                      "a supervisor that goes away without any stopAll still ends its children")
+        }
+        try await scenario { f in
+            // Short-lived children of the app, such as the CLI, must not inherit either end.
+            try "1".write(to: f.file("fds"), atomically: true, encoding: .utf8)
+            f.setMode("daemon", "lifeline")
+            let supervisor = f.real()
+            supervisor.start(.queue)
+            _ = await eventually { !text(f.file("daemon.ready")).isEmpty }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.arguments = ["-c", "/usr/sbin/lsof -a -p $$ -d 3-1000 -Ff 2>/dev/null | /usr/bin/grep -vx f255; echo done"]
+            let output = Pipe()
+            process.standardOutput = output
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            try check(String(decoding: data, as: UTF8.self) == "done\n", "a Foundation Process child inherits neither end of the lifeline")
+            let status = await Helper.run(f.file("agent-heavy"), arguments: ["status"], environment: Helper.childEnvironment(from: f.environment),
+                                          timeout: .seconds(3))
+            try check(status == .code(1) && text(f.file("status.code")).isEmpty, "the status probe runs without a lifeline")
             await supervisor.stopAll(grace: .seconds(2))
         }
 

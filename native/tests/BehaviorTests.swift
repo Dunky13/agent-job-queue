@@ -167,7 +167,7 @@ struct BehaviorTests {
         try check(QueueAppAction.allCases == [.openWindow] + QueueAppAction.settings + [.quit],
                   "Context menu and footer share all application actions in order")
         try check(QueueAppAction.settings.map(\.title) == ["Learned workloads…", "About and updates…", "Agent integration…", "Remote access settings…"]
-            && QueueAppAction.quitExplanation == "Quitting stops the queue. Running jobs keep running.",
+            && QueueAppAction.quitExplanation == "Quitting stops the queue. Running jobs continue; the queue reopens paused if any were active.",
                   "Application actions retain existing settings and the quit explanation")
         let summary = QueueSummary(status: "running", limit: 1, running: 2, waiting: 3, legacyOccupied: false)
         let snapshot = QueueSnapshot(updatedAt: "fixture", queue: summary, jobs: [])

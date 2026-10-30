@@ -2,6 +2,8 @@ package backend
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -329,6 +331,210 @@ func TestManagedAppBundlePreflightAcceptsLoadedCrashLoopingRegistration(t *testi
 	}
 	if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
 		t.Fatal("preflight changed the installation")
+	}
+	managedRequireNoServiceMutation(t, m.calls)
+}
+
+// The app stops the daemon when it quits, so an upgrade sees a stopped store
+// that may still hold unfinished jobs. Nothing can drain it before the app
+// restarts the daemon, whose dirty-restart recovery owns those rows.
+func managedSeedUnfinishedQueue(t *testing.T, i *installer, phases ...string) string {
+	t.Helper()
+	if err := os.MkdirAll(i.state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := openQueueStore(i.state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, phase := range phases {
+		if _, err := store.db.Exec("INSERT INTO queue_jobs(id,token,task,phase) VALUES(?,?,'{}',?)", 41+index, fmt.Sprintf("fixture-%d", index), phase); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.close()
+	return QueueDatabasePath(i.state)
+}
+
+func managedQueueRows(t *testing.T, i *installer) string {
+	t.Helper()
+	store, err := openQueueStore(i.state, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	rows, err := store.db.Query("SELECT id, token, task, phase FROM queue_jobs ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out strings.Builder
+	for rows.Next() {
+		var id int
+		var token, task, phase string
+		if err := rows.Scan(&id, &token, &task, &phase); err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&out, "%d|%s|%s|%s\n", id, token, task, phase)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out.String()
+}
+
+func managedRequireSetupComplete(t *testing.T, i *installer) {
+	t.Helper()
+	for _, name := range []string{"build-info.json"} {
+		if _, err := installReadInfo(filepath.Join(i.root, name)); err != nil {
+			t.Fatal("setup did not publish its build identity", err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(i.root, "installation.json")); err != nil {
+		t.Fatal("setup did not record the installation", err)
+	}
+	if _, err := os.Lstat(filepath.Join(i.root, "install-in-progress.json")); !os.IsNotExist(err) {
+		t.Fatalf("setup left its pending marker: %v", err)
+	}
+}
+
+func TestManagedAppBundleStoppedDaemonWithUnfinishedJobsCompletes(t *testing.T) {
+	for _, phase := range []string{"queued", "starting", "running", "outcome"} {
+		t.Run(phase, func(t *testing.T) {
+			m := managedAppBundleFixture(t)
+			managedSetupNotices(m)
+			i := m.installer
+			managedSeedUnfinishedQueue(t, i, phase, "done")
+			before := managedQueueRows(t, i)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if report := i.preflight(ctx); len(report.Issues) != 0 {
+				t.Fatalf("a stopped daemon with unfinished jobs blocked setup: %+v", report.Issues)
+			}
+			if err := i.repairAndExecute(ctx); err != nil {
+				t.Fatal("a stopped daemon with unfinished jobs blocked the upgrade", err)
+			}
+			managedRequireSetupComplete(t, i)
+			if after := managedQueueRows(t, i); after != before {
+				t.Fatalf("setup changed the queue rows:\nbefore %q\nafter  %q", before, after)
+			}
+			if got := managedServiceCalls(m, "register"); !slices.Equal(got, []string{"login"}) {
+				t.Fatalf("registered %v, want only the login item", got)
+			}
+		})
+	}
+}
+
+func TestManagedAppBundleCrashLoopingRegistrationWithUnfinishedJobsCompletes(t *testing.T) {
+	m := managedTestFixture(t)
+	if err := m.run(t); err != nil {
+		t.Fatal(err)
+	}
+	managedSetupNotices(m)
+	i := m.installer
+	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
+	managedSeedUnfinishedQueue(t, i, "running")
+	before := managedQueueRows(t, i)
+	// Launchd keeps the registration but never runs it, so it answers nothing.
+	m.statuses["queue"] = "enabled"
+	m.loaded["io.went.agent-heavy"] = true
+	original := i.command
+	i.command = func(ctx context.Context, args []string) ([]byte, error) {
+		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && args[2] == i.domain()+"/io.went.agent-heavy" && m.loaded["io.went.agent-heavy"] {
+			m.calls = append(m.calls, slices.Clone(args))
+			return managedCrashLoopOutput(i.domain()), nil
+		}
+		return original(ctx, args)
+	}
+	i.queueSnapshot = func(context.Context) (Object, error) { return nil, errors.New("queue daemon unavailable") }
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if report := i.preflight(ctx); len(report.Issues) != 0 {
+		t.Fatalf("a crash-looping registration with unfinished jobs blocked setup: %+v", report.Issues)
+	}
+	if err := i.repairAndExecute(ctx); err != nil {
+		t.Fatal("a crash-looping registration with unfinished jobs blocked the upgrade", err)
+	}
+	managedRequireSetupComplete(t, i)
+	if after := managedQueueRows(t, i); after != before {
+		t.Fatalf("setup changed the queue rows:\nbefore %q\nafter  %q", before, after)
+	}
+	if m.loaded["io.went.agent-heavy"] || m.statuses["queue"] != "notRegistered" {
+		t.Fatal("the stale registration remained", m.statuses)
+	}
+}
+
+func TestManagedAppBundleStoppedDaemonStillGuardsStoreAndLocks(t *testing.T) {
+	t.Run("unsupported schema", func(t *testing.T) {
+		m := managedAppBundleFixture(t)
+		i := m.installer
+		path := managedSeedUnfinishedQueue(t, i, "running")
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = db.Exec("PRAGMA user_version = 9")
+		db.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		before := installTreeWitness(t, i.home)
+		if err := m.run(t); err == nil || !strings.Contains(err.Error(), "Unsupported stopped queue schema") {
+			t.Fatal("a downgrade past the stopped store schema was accepted", err)
+		}
+		if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
+			t.Fatal("refusal changed the installation")
+		}
+		managedRequireNoServiceMutation(t, m.calls)
+	})
+	t.Run("lifetime lock held", func(t *testing.T) {
+		m := managedAppBundleFixture(t)
+		i := m.installer
+		managedSeedUnfinishedQueue(t, i, "running")
+		held, err := installLock(i.state, "queue-daemon.lock")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer held.Close()
+		if err := m.run(t); err == nil {
+			t.Fatal("a daemon holding its lifetime lock was bypassed")
+		}
+		managedRequireNoServiceMutation(t, m.calls)
+	})
+}
+
+func TestManagedAppBundleLiveAnsweringDaemonWithRunningJobsStillWaits(t *testing.T) {
+	m := managedTestFixture(t)
+	if err := m.run(t); err != nil {
+		t.Fatal(err)
+	}
+	i := m.installer
+	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
+	// A launchd daemon from an older version is registered, loaded and answering.
+	m.statuses["queue"] = "enabled"
+	m.loaded["io.went.agent-heavy"] = true
+	m.tasks["41"] = Object{"id": 41, "status": Object{"Running": Object{}}}
+	before := installTreeWitness(t, i.home)
+	m.calls = nil
+	var drain *installDrainPendingError
+	if _, err := i.planManaged(context.Background()); !errors.As(err, &drain) {
+		t.Fatal("an answering daemon with a running job did not produce the drain wait", err)
+	}
+	report := i.preflight(context.Background())
+	waiting := false
+	for _, issue := range report.Issues {
+		if issue.ID == "managed-jobs" {
+			waiting = true
+		}
+		if issue.ID == "managed-setup-blocked" {
+			t.Fatalf("a running job blocked setup instead of waiting: %+v", issue)
+		}
+	}
+	if !waiting {
+		t.Fatalf("no managed-jobs wait: %+v", report.Issues)
+	}
+	if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
+		t.Fatal("waiting changed the installation")
 	}
 	managedRequireNoServiceMutation(t, m.calls)
 }

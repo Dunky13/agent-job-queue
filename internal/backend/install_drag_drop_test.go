@@ -257,8 +257,14 @@ func TestManagedAppBundlePlanningReadsStoppedStoreWhenDaemonIsUnreachable(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The app stopped its daemon when it quit, and only the app can restart it
+	// to recover these jobs, so the supervised path never waits for a drain.
+	if _, err := i.planManaged(ctx); err != nil {
+		t.Fatal("an unfinished stopped job blocked supervised planning", err)
+	}
+	i.appBundle, i.payload = false, filepath.Join(filepath.Dir(i.payload), "unused")
 	if _, err := i.planManaged(ctx); err == nil {
-		t.Fatal("an unfinished stopped job was accepted")
+		t.Fatal("payload setup accepted an unfinished stopped job")
 	}
 }
 

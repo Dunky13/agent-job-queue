@@ -220,6 +220,71 @@ func TestManagedPhoneEnableIgnoresApprovalAndReturnsWithoutWaiting(t *testing.T)
 	}
 }
 
+// A terminal user who runs enable on a managed install must learn that the
+// app, not this command, starts phone access. Only the text of the existing
+// "error" field changes: the keys and every other value stay as they were.
+func TestManagedPhoneEnableExplainsThatTheAppStartsIt(t *testing.T) {
+	c := fixtureManagedController(t)
+	c.bootFn = func() (string, error) { return "fixture-boot", nil }
+	settings := testSettings()
+	settings.Enabled = false
+	if err := writePrivate(c.p.config, settings); err != nil {
+		t.Fatal(err)
+	}
+	c.managedCommand = func(args []string) ([]byte, error) {
+		return json.Marshal(appservices.Status{SchemaVersion: 1, Service: "remote", Status: "notRegistered"})
+	}
+	if err := c.enable(); err != nil {
+		t.Fatal(err)
+	}
+	status, err := c.status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status["error"] != remoteNotRunning {
+		t.Fatalf("status of a stopped service changed: %v", status["error"])
+	}
+	c.explainManagedEnable(status)
+	if !strings.Contains(fmt.Sprint(status["error"]), "starts when Agent Queue is running") {
+		t.Fatalf("enable did not explain who starts phone access: %v", status["error"])
+	}
+	var before, after map[string]any
+	explained, _ := json.Marshal(status)
+	if err := json.Unmarshal(plain, &before); err != nil || json.Unmarshal(explained, &after) != nil {
+		t.Fatal("status is not JSON", err)
+	}
+	if len(before) != len(after) {
+		t.Fatalf("enable output keys changed: %v vs %v", before, after)
+	}
+	for key, value := range before {
+		if _, ok := after[key]; !ok {
+			t.Fatalf("enable output lost %s", key)
+		}
+		if key != "error" && fmt.Sprint(after[key]) != fmt.Sprint(value) {
+			t.Fatalf("enable output changed %s: %v vs %v", key, value, after[key])
+		}
+	}
+	// A running service, an unrelated failure and an unmanaged install are left alone.
+	for name, change := range map[string]func(*controller, map[string]any){
+		"running":   func(_ *controller, s map[string]any) { s["running"] = true; s["error"] = nil },
+		"failure":   func(_ *controller, s map[string]any) { s["error"] = "Gateway could not start" },
+		"unmanaged": func(c *controller, s map[string]any) { c.p.managedApp = "" },
+	} {
+		c.p.managedApp = filepath.Join(c.p.home, "Applications/Agent Queue.app")
+		other := map[string]any{"running": false, "error": remoteNotRunning}
+		change(c, other)
+		want := fmt.Sprint(other["error"])
+		c.explainManagedEnable(other)
+		if fmt.Sprint(other["error"]) != want {
+			t.Fatalf("%s: enable rewrote %q", name, want)
+		}
+	}
+}
+
 func TestManagedPhoneStartNeverRegisters(t *testing.T) {
 	for _, state := range []string{"notRegistered", "notFound", "requiresApproval", "enabled"} {
 		t.Run(state, func(t *testing.T) {

@@ -312,6 +312,12 @@ func (install *installer) managedOfflineDrain(ctx context.Context) error {
 }
 
 // Each named lifetime lock must be free; its owner could still change the store.
+// Payload setup requires the stopped store to be drained. A supervised app
+// bundle never does: the app stops its daemon when it quits, so an upgrade
+// always finds a stopped store, and only the app can start the daemon whose
+// dirty-restart recovery pauses and re-adopts unfinished jobs. A drain wait
+// could therefore never end. Only a running launchd daemon, which unregistering
+// would disconnect from its callers, is waited for (see managedDrain).
 func (install *installer) managedOfflineDrainHolding(ctx context.Context, locks ...string) error {
 	for _, name := range locks {
 		busy, err := installInspectLock(install.state, name)
@@ -355,6 +361,12 @@ func (install *installer) managedOfflineDrainHolding(ctx context.Context, locks 
 	}
 	if version != 1 && version != 2 {
 		return errors.New("Unsupported stopped queue schema")
+	}
+	// install.appBundle is the supervised path: both callers reach here only
+	// with no live handover (managedDrain returns early for a resumed one, and
+	// quiesceManaged validates it instead), so appBundle implies p.live == nil.
+	if install.appBundle {
+		return install.requireLegacyCleanup()
 	}
 	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM queue_jobs WHERE phase != 'done'").Scan(&unfinished); err != nil {
 		return err

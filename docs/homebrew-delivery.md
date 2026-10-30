@@ -20,9 +20,9 @@ A tap that still holds metadata for a release built with the earlier installer w
 
 The cask is a plain app cask. Its only artifacts are `app "Agent Queue.app"`, which Homebrew installs into `/Applications`, and `uninstall quit: "io.went.agent-queue"`. Nothing runs at `brew install` or `brew upgrade`: there is no installer script, flight step, binary link or setup command. The cask keeps quarantine so macOS assesses the notarized app.
 
-The first launch completes setup. Opening the app from Applications registers its bundle-owned services with Service Management and writes the `agent-heavy` and `agent-remote` wrappers to `~/.local/bin`. A later `brew upgrade` replaces the app, and the next launch completes the upgrade. Normal app launch only reads installation and authorization state until setup runs; it never deletes executable code.
+The first launch completes setup. Opening the app from Applications writes the `agent-heavy` and `agent-remote` wrappers to `~/.local/bin`, migrates state and unregisters any queue, resource or phone-access services that older versions registered. The app then starts and supervises its own queue processes; only its login item is registered with Service Management. A later `brew upgrade` replaces the app, and the next launch completes the upgrade. Normal app launch only reads installation and authorization state until setup runs; it never deletes executable code.
 
-Homebrew uninstall asks a running app to quit, then removes the app. Services, jobs, history and credentials are removed only by the app's ownership-checked service-removal command, which the cask caveats name and which must run before deleting the app:
+Homebrew uninstall asks a running app to quit, which stops its queue processes while running job processes continue, then removes the app. Services, jobs, history and credentials are removed only by the app's ownership-checked service-removal command, which the cask caveats name and which must run before deleting the app:
 
 ```sh
 ~/.local/bin/agent-heavy install --app-bundle "/Applications/Agent Queue.app" --unregister-services
@@ -34,7 +34,7 @@ Compatible managed upgrades keep running and queued jobs across service replacem
 
 Whole previous signed app generations remain visible under `~/Applications/Agent Queue Runtimes`, bound to exact filesystem and attempt identities. Only a later setup operation can reclaim them after verifying terminal attempts and dead original callers and owned workers.
 
-macOS background-service approval remains an operating-system decision. While approval is pending, automatic setup reads status without re-registering denied services and continues after approval. Setup cannot bypass this approval or endpoint-protection policy. Unsafe ownership, malformed retained configuration and uncertain job attempts are not guessed or discarded. Deliberately held jobs remain held and can require an operator decision when drain is required. Local fixtures do not establish native Service Management worker survival, Apple acceptance or SentinelOne acceptance.
+macOS Login Items approval remains an operating-system decision, but it now concerns only the app's login item (opening at login) and never blocks setup or the queue, because the queue processes are the app's own children rather than registered background services. Setup also retires registrations from older versions that are still awaiting approval. Setup cannot bypass this approval or endpoint-protection policy. Unsafe ownership, malformed retained configuration and uncertain job attempts are not guessed or discarded. Deliberately held jobs remain held and can require an operator decision when drain is required. Local fixtures do not establish native Service Management worker survival, Apple acceptance or SentinelOne acceptance.
 
 ### Upgrading from the installer cask
 

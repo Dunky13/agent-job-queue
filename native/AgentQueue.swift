@@ -957,7 +957,7 @@ enum QueueAppAction: Int, CaseIterable, Identifiable {
     case openWindow, learnedWorkloads, updates, integration, remoteAccess, quit
     var id: Int { rawValue }
     static let settings: [Self] = [.learnedWorkloads, .updates, .integration, .remoteAccess]
-    static let quitExplanation = "Quitting stops the queue. Running jobs keep running."
+    static let quitExplanation = "Quitting stops the queue. Running jobs continue; the queue reopens paused if any were active."
 
     var title: String {
         switch self {
@@ -1022,6 +1022,7 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
     private let status = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: "")
     private let detail = NSMenuItem()
     private var detailText: String?
+    private let stopWaiting = NSMenuItem(title: "Stop waiting", action: #selector(stopWaitingForJobs), keyEquivalent: "")
     private let retry = NSMenuItem(title: "Retry", action: #selector(retryStartup), keyEquivalent: "")
     private let applications = NSMenuItem(title: "Open Applications", action: #selector(openApplications), keyEquivalent: "")
     private let download = NSMenuItem(title: "Download Agent Queue…", action: #selector(downloadRelease), keyEquivalent: "")
@@ -1035,7 +1036,7 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(status)
         menu.addItem(detail)
         menu.addItem(.separator())
-        for item in [retry, applications, download] {
+        for item in [stopWaiting, retry, applications, download] {
             item.target = self
             menu.addItem(item)
         }
@@ -1059,12 +1060,16 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) { update() }
 
+    static let waitingLine = "Finishing running jobs before completing the update…"
+
     func update() {
         guard !isTornDown else { return }
         let blocked = !model.isRunning && model.phase != .complete && model.phase != .idle
         // A successful launch is one step for the user: setup wording and diagnostics
-        // appear only once preparation has actually failed.
-        status.title = blocked ? model.message : "Starting…"
+        // appear only once preparation has actually failed. The one exception is the
+        // wait for running jobs, which names its reason in neutral words and can be stopped.
+        let waiting = model.phase == .waiting
+        status.title = blocked ? model.message : waiting ? Self.waitingLine : "Starting…"
         let summary = "Agent Queue, " + status.title
         statusItem.button?.title = blocked ? "!" : ""
         statusItem.button?.toolTip = summary
@@ -1090,12 +1095,15 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
             scroll.documentView = content
             detail.view = scroll
         }
+        stopWaiting.isHidden = !(waiting && model.canStopWaiting)
+        stopWaiting.isEnabled = !stopWaiting.isHidden
         retry.isHidden = !blocked || !model.allowsInstallation
         applications.isHidden = !model.issues.contains { $0.actions.contains { $0.id == "move-app" } }
         download.isHidden = !blocked
         retry.isEnabled = !model.isRunning
     }
 
+    @objc private func stopWaitingForJobs() { model.cancelWaiting() }
     @objc private func retryStartup() { model.start() }
     @objc private func openApplications() { model.showApplications() }
     @objc private func downloadRelease() { model.downloadRelease() }
@@ -2139,16 +2147,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startHelpers(_ helpers: QueueHelperSupervisor) {
         supervisor = helpers
         AppRuntime.remoteStore.supervisor = helpers
-        helpers.start()
+        // The phone service is always started: it exits at once while phone access is off.
+        helpers.startAll()
         helperStartup = Task { @MainActor in
             // Let the daemon come up first so the menu does not flash "Queue unavailable".
             _ = await helpers.waitUntilQueueReachable(timeout: .seconds(5))
             guard !Task.isCancelled else { return }
             AppRuntime.store.start()
             if CommandLine.arguments.contains("--open-window") { AppRuntime.showWindow() }
-            await AppRuntime.remoteStore.refresh()
-            guard !Task.isCancelled, AppRuntime.remoteStore.status?.enabled == true else { return }
-            helpers.start(.remote)
         }
     }
 
