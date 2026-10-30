@@ -2,6 +2,24 @@ import AppKit
 import Foundation
 import SwiftUI
 
+// A queued layout event reproduces the status item's asynchronous AppKit reflow
+// without moving the system pointer or changing any production controller.
+@MainActor
+final class BootstrapFixtureApplication: NSApplication {
+    var pendingStatusLayout: (() -> Void)?
+    private(set) var statusLayoutUpdates = 0
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .applicationDefined, event.subtype.rawValue == 71, let update = pendingStatusLayout {
+            pendingStatusLayout = nil
+            update()
+            statusLayoutUpdates += 1
+        } else {
+            super.sendEvent(event)
+        }
+    }
+}
+
 // A distinct process with a disposable HOME drives the real delegate and window.
 // Setup is an injected closure; normal startup uses --fixture throughout.
 @MainActor
@@ -189,15 +207,38 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         }
         let point = button.convert(NSPoint(x: button.bounds.midX, y: button.bounds.midY), to: nil)
         let now = ProcessInfo.processInfo.systemUptime
-        for (index, type) in [NSEvent.EventType.leftMouseDown, .leftMouseUp].enumerated() {
-            guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
-                timestamp: now + Double(index) * 0.001, windowNumber: window.windowNumber,
-                context: nil, eventNumber: index, clickCount: 1, pressure: index == 0 ? 1 : 0) else {
-                throw ClientError.message("Cannot create transferred status-button event")
+        let originalFrame = button.frame
+        defer { button.frame = originalFrame }
+        if CommandLine.arguments.contains("--pending-status-layout") {
+            guard let app = NSApp as? BootstrapFixtureApplication,
+                  let layout = NSEvent.otherEvent(with: .applicationDefined, location: .zero, modifierFlags: [],
+                    timestamp: now, windowNumber: window.windowNumber, context: nil, subtype: 71, data1: 0, data2: 0) else {
+                throw ClientError.message("Cannot prepare pending status-layout fixture")
             }
-            NSApp.postEvent(event, atStart: false)
+            app.pendingStatusLayout = { button.frame.origin.x += button.frame.width }
+            NSApp.postEvent(layout, atStart: false)
         }
+        guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
+                timestamp: now, windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: 1, pressure: 1),
+              let up = NSEvent.mouseEvent(with: .leftMouseUp, location: point, modifierFlags: [],
+                timestamp: now, windowNumber: window.windowNumber, context: nil,
+                eventNumber: 1, clickCount: 1, pressure: 0) else {
+            throw ClientError.message("Cannot create transferred status-button event")
+        }
+        // Deliver against the geometry just validated. Posting both events at
+        // the tail lets pending layout move the button before mouse-down runs.
+        // AppKit's native mouse tracking consumes the paired mouse-up first.
+        NSApp.postEvent(up, atStart: true)
+        window.sendEvent(down)
         try await waitUntil("the transferred status item's queue popover") { controller.popover.isShown }
+        if CommandLine.arguments.contains("--pending-status-layout") {
+            try await waitUntil("the queued status-layout update") {
+                (NSApp as? BootstrapFixtureApplication)?.statusLayoutUpdates == 1
+            }
+            button.frame = originalFrame
+            try check(controller.popover.isShown, "A pending status layout cannot steal the fixture's native click")
+        }
         try check(controller.popover.contentViewController != nil, "Retained menu item opens the normal usable queue popover")
         if let window = controller.popover.contentViewController?.view.window { try snapshot(window, name: "03-ready-popover") }
         controller.closePopover()
@@ -629,7 +670,7 @@ struct BootstrapUITests {
               let tempIndex = arguments.firstIndex(of: "--temporary"), arguments.indices.contains(tempIndex + 1) else {
             throw ClientError.message("Run native/tests/run-bootstrap-ui-tests.sh OUTPUT_DIRECTORY")
         }
-        let app = NSApplication.shared
+        let app = BootstrapFixtureApplication.shared
         app.setActivationPolicy(.accessory)
         let delegate = BootstrapUIFixtureDelegate(output: URL(fileURLWithPath: arguments[outputIndex + 1]),
             temporary: URL(fileURLWithPath: arguments[tempIndex + 1]))

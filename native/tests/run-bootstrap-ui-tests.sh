@@ -64,6 +64,11 @@ HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
     --temporary "$temporary" --output "$output/silent-recovery" --silent-recovery
 [[ "$(plutil -extract passed raw -o - "$output/silent-recovery/verification.json")" == "true" ]]
+mkdir -p -- "$output/status-layout"
+HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
+  "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \
+    --temporary "$temporary" --output "$output/status-layout" --silent-recovery --pending-status-layout
+[[ "$(plutil -extract passed raw -o - "$output/status-layout/verification.json")" == "true" ]]
 mkdir -p -- "$output/cancellable-wait"
 HOME="$temporary/home" CFFIXED_USER_HOME="$temporary/home" \
   "$app/Contents/MacOS/BootstrapUITests" --fixture "$root/native/tests/fixtures/queue.json" \

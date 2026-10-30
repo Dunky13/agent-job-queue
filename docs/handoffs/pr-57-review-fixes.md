@@ -149,6 +149,36 @@ fresh-head CI remain separate gates. Screenshot files remain outside Git.
 
 ## Hosted and platform evidence
 
+### Startup graphical CI follow-up
+
+On `38fd1cada2ad3df33d1130f0def153096bc6c4f1`, both architectures passed
+the native controller and Resume graphical tests and published their Resume
+screenshots. The ARM native job subsequently failed the existing drag-and-drop
+startup fixture: setup completed, but its synthetic status-item click did not
+produce the expected popover. Intel passed that complete job.
+
+Twenty focused ordinary local runs passed. A controlled queued status-button
+layout change then reproduced the same timeout: both mouse events were posted
+behind the layout event, so their recorded coordinates missed the button and
+never invoked its action. This demonstrates a fixture defect that can explain
+the hosted symptom; the hosted log alone does not establish the exact event
+ordering on that runner.
+
+The fixture now delivers mouse-down synchronously through the actual status
+window and puts its matching mouse-up first in AppKit's tracking queue. It still
+exercises the native button target/action and requires the real queue popover.
+A required queued-layout scenario also confirms that the delayed layout event
+actually executes and the popover remains open. Its private application subclass
+and frame changes exist only in the fixture executable. Production behavior,
+deadlines and required checks are unchanged. The full twelve-scenario graphical
+startup suite passes locally, including drag-and-drop and the new regression.
+Restoring only the old event delivery in a disposable copy makes the new
+regression fail with the original popover timeout. ShellCheck, shell syntax and
+the public-source boundary check pass. Independent Standards and Spec reviews
+found no actionable findings in the two-file repair diff against `38fd1ca`,
+SHA-256 `b74d794c63bd32af91baed2b0d987e1898402e0d18e8449f93b2312e2afa068d`.
+Fresh-head hosted CI remains required after this fixture repair.
+
 The original head's Intel core job was cancelled at its existing 20-minute job
 budget. Go setup consumed over 11 minutes before the test step began. This was
 not a reported test assertion failure. Updated-head CI remains a separate gate;
