@@ -166,7 +166,7 @@ Every consumer is updated together: Swift decoders and fixtures (`native/tests/f
 - Held leases count in `queue.running` and queued leases in `queue.waiting`.
 - `lanes` entries add `removed: true` for a removed lane that still has work. `plugins` entries add `warning`, which reports skipped hooks and dropped hook events.
 - Status from a daemon without lane support has no `lanes` or `plugins`; `agent-heavy status --json` then reports the default lane alone.
-- The live handover payload is unchanged (protocol 1). Instead, unfinished lane work or any queued or held lease makes live upgrade ineligible, so setup waits for that work to finish or be released, as a drained upgrade does.
+- The live handover payload is unchanged (protocol 1). Setup no longer starts a live handover, so it waits for unfinished lane work and queued or held leases to finish or be released, as for any other job.
 
 ## Hooks (Contract)
 
@@ -193,5 +193,5 @@ Hooks are code execution from a configuration directory, so they follow the repo
 
 ## Compatibility
 
-- No queue database schema change is required: lane, kind and lease fields live in the existing task JSON. If a change to the live handover protocol is unavoidable, bump it, keep old callers working through the existing drained-upgrade fallback, and document it in `docs/upgrade-recovery.md`.
+- No queue database schema change is required: lane, kind and lease fields live in the existing task JSON. The live handover protocol is frozen: it only finishes journals older releases left behind (see `docs/upgrade-recovery.md`).
 - A daemon without plugin support ignores nothing: callers passing `--lane` to an older daemon must get a clear "this queue does not support lanes; update Agent Queue" error, never a silent run in the default lane.

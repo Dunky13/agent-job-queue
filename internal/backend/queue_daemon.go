@@ -369,7 +369,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	if e := queuePrivateFiles(d.store.path); e != nil {
 		return nil, e
 	}
-	if op == "handover-status" || op == "prepare-handover" || op == "commit-handover" || op == "cancel-handover" {
+	if op == "prepare-handover" || op == "commit-handover" || op == "cancel-handover" {
 		return d.handoverControl(op, p)
 	}
 	if d.handover != nil && op != "snapshot" && op != "lease-status" {

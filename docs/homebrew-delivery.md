@@ -30,7 +30,7 @@ Homebrew uninstall asks a running app to quit, which stops its queue processes w
 
 No destructive `zap` action is supplied. Private history, configuration and credentials remain retained.
 
-Compatible managed upgrades keep running and queued jobs across service replacement when the installed daemon, target and every outstanding caller support handover protocol 1 and queue schema 2. Original callers keep their outcomes and exit statuses, pause and parallel-limit settings survive, and no attempt is replayed. New mutations can be briefly rejected before acceptance during the swap. Legacy releases or callers need one drained upgrade; unsupported versions or schemas retain the drain path, and uncertain attempts or ownership fail closed. Removal and external app-replacement preparation still require drain.
+Setup waits for a running queue daemon's active and queued jobs before replacing it, and never starts a live handover; it only finishes one an older release left behind, on the exact build that began it. Original callers keep their outcomes and exit statuses, and no attempt is replayed. Uncertain attempts or ownership fail closed. Removal and external app-replacement preparation still require drain.
 
 Whole previous signed app generations remain visible under `~/Applications/Agent Queue Runtimes`, bound to exact filesystem and attempt identities. Only a later setup operation can reclaim them after verifying terminal attempts and dead original callers and owned workers.
 

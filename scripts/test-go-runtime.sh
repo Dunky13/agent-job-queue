@@ -18,7 +18,7 @@ module=github.com/Dunky13/agent-job-queue
 tooling="$module/internal/tooling"
 https="$module/internal/remote"
 backend="$module/internal/backend"
-installer_test=TestInstallerManagedLiveUpgradeRetainsRunningAttempts
+installer_test=TestInstallerManagedLiveResumeRetainsRunningAttempts
 installer_pattern="^${installer_test}$"
 summary_detail='^([0-9]+([.][0-9]+)?s([[:space:]]+\(cached\))?|\(cached\))$'
 runtime=()
@@ -101,7 +101,7 @@ if [[ "$scope" == core || "$scope" == core-1 || "$scope" == core-2 ]]; then
     go test -p 2 -parallel 2 -race "$backend" -skip "$installer_pattern" -timeout 12m
   else
     # Enumerate before selecting so every ordinary test, example and fuzz seed
-    # runs exactly once. The live-upgrade test retains its independent job.
+    # runs exactly once. The live-resume test retains its independent job.
     inventory=$(go test -race -p 2 ./internal/backend -list .)
     tests=()
     listed_tests=()

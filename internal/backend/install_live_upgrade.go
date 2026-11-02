@@ -12,6 +12,8 @@ import (
 	"time"
 )
 
+// Setup no longer starts a live handover; it waits for active jobs instead. This
+// journal exists only so one an older release left behind can still finish.
 // Installer custody is separate from the daemon's one-use leadership receipt.
 // Retain the original active attempts even after the new daemon adopts them, so
 // a retry can finish publication without stopping that daemon a second time.
@@ -22,7 +24,6 @@ type managedLiveUpgrade struct {
 	Token         string                     `json:"token"`
 	TargetSHA256  string                     `json:"targetSHA256"`
 	Attempts      []runtimeGenerationAttempt `json:"attempts"`
-	prepared      bool
 	released      bool
 	adopted       bool
 }
@@ -49,32 +50,17 @@ func (install *installer) liveControl(ctx context.Context, operation string, pay
 	return install.liveGate(ctx).QueueControl(operation, payload)
 }
 
-func (install *installer) liveTarget(ctx context.Context) (string, bool) {
+func (install *installer) liveTargetDigest() (string, error) {
 	app := install.app
 	if !install.appBundle {
 		app = filepath.Join(install.payload, "Agent Queue.app")
 	}
-	helper := filepath.Join(app, "Contents/MacOS/agent-heavy")
-	output, err := install.run(ctx, helper, "handover-capabilities", "--json")
+	raw, err := installReadPayload(app, filepath.Join(app, "Contents/MacOS/agent-heavy"), updateMaxArchive, true)
 	if err != nil {
-		return "", false
-	}
-	value, err := decodeObject(output)
-	if err != nil || len(value) != 3 {
-		return "", false
-	}
-	schema, _ := integer(value["schemaVersion"])
-	protocol, _ := integer(value["protocol"])
-	database, _ := integer(value["queueSchema"])
-	if schema != 1 || protocol != 1 || database != 2 {
-		return "", false
-	}
-	raw, err := installReadPayload(app, helper, updateMaxArchive, true)
-	if err != nil {
-		return "", false
+		return "", err
 	}
 	digest := sha256.Sum256(raw)
-	return hex.EncodeToString(digest[:]), true
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func liveAllowed(install *installer, plan *managedPlan) bool {
@@ -189,8 +175,8 @@ func (install *installer) resumeManagedLive(ctx context.Context, plan *managedPl
 		}
 		return nil, errors.New("Another live candidate is pending; preserve its journal and finish that exact installation")
 	}
-	target, supported := install.liveTarget(ctx)
-	if !supported || target != live.TargetSHA256 {
+	target, err := install.liveTargetDigest()
+	if err != nil || target != live.TargetSHA256 {
 		return nil, errors.New("The retained live-upgrade target changed")
 	}
 	receipt, err := install.liveReceipt(live)
@@ -202,12 +188,11 @@ func (install *installer) resumeManagedLive(ctx context.Context, plan *managedPl
 	}
 	switch text(receipt["phase"]) {
 	case "prepared", "committed":
-		live.prepared = true
 	case "released":
 		if err := install.validateManagedLive(ctx, live); err != nil {
 			return nil, err
 		}
-		live.prepared, live.released = true, true
+		live.released = true
 	case "consumed":
 		if err := validateConsumedQueueHandover(install.liveGate(ctx), live.Token, live.TargetSHA256); err != nil {
 			return nil, err
@@ -233,7 +218,7 @@ func (install *installer) resumeManagedLive(ctx context.Context, plan *managedPl
 		if _, err := install.managedSnapshot(ctx); err != nil {
 			return nil, err
 		}
-		live.prepared, live.released, live.adopted = true, true, true
+		live.released, live.adopted = true, true
 	case "cancelled", "expired":
 		return nil, nil
 	default:
@@ -242,73 +227,19 @@ func (install *installer) resumeManagedLive(ctx context.Context, plan *managedPl
 	return live, nil
 }
 
-func (install *installer) planManagedLive(ctx context.Context, plan *managedPlan) (*managedLiveUpgrade, error) {
-	if live, err := install.resumeManagedLive(ctx, plan); err != nil || live != nil {
-		return live, err
-	}
-	if !liveAllowed(install, plan) || install.appBundle || !plan.loaded["io.went.agent-heavy"] {
-		return nil, nil
-	}
-	target, supported := install.liveTarget(ctx)
-	if !supported {
-		return nil, nil
-	}
-	status, err := install.liveControl(ctx, "handover-status", nil)
-	if err != nil {
-		return nil, nil
-	} // Older daemons retain the fully drained path.
-	schema, _ := integer(status["schemaVersion"])
-	protocol, _ := integer(status["protocol"])
-	database, _ := integer(status["queueSchema"])
-	if schema != 1 || protocol != 1 || database != 2 || !boolean(status["eligible"]) {
-		return nil, nil
-	}
-	attempts, err := liveAttempts(status)
-	if err != nil {
-		return nil, err
-	}
-	if len(attempts) == 0 {
-		return nil, nil
-	}
-	return &managedLiveUpgrade{SchemaVersion: 1, App: install.app, Target: install.identity, Token: token(), TargetSHA256: target, Attempts: attempts}, nil
-}
-
-func (install *installer) beginManagedLive(ctx context.Context, live *managedLiveUpgrade) error {
+// confirmManagedLive reasserts a journal's token with the daemon that accepted
+// it. The daemon's answer is authoritative: the journal is written before the
+// daemon prepares, so its attempts can be out of date after an interruption.
+func (install *installer) confirmManagedLive(ctx context.Context, live *managedLiveUpgrade) error {
 	if live.released || live.adopted {
 		return nil
 	}
-	if previous, raw, err := install.readLiveJournal(); err != nil {
-		return err
-	} else if previous != nil && previous.Token != live.Token {
-		completed, err := installReadInfo(filepath.Join(install.root, "build-info.json"))
-		finished := err == nil && completed.Equal(previous.Target)
-		if previous.Target.Equal(live.Target) && !finished {
-			receipt, receiptErr := install.liveReceipt(previous)
-			if !errors.Is(receiptErr, os.ErrNotExist) && (receiptErr != nil || receipt["phase"] != "cancelled" && receipt["phase"] != "expired") {
-				return errors.New("The previous live handover must be cancelled or expired before a new token is prepared")
-			}
-		} else if !finished {
-			return errors.New("Another live-upgrade journal must be reconciled before replacement")
-		}
-		if err := install.managedRemoveFile(install.liveJournalPath(), raw); err != nil {
-			return err
-		}
-	}
-	raw, err := json.Marshal(live)
+	receipt, err := install.liveReceipt(live)
 	if err != nil {
 		return err
 	}
-	if err := installAtomic(install.liveJournalPath(), append(raw, '\n'), 0600); err != nil {
-		return err
-	}
-	if live.prepared {
-		receipt, err := install.liveReceipt(live)
-		if err != nil {
-			return err
-		}
-		if text(receipt["phase"]) == "committed" || text(receipt["phase"]) == "released" {
-			return nil
-		}
+	if text(receipt["phase"]) == "committed" || text(receipt["phase"]) == "released" {
+		return nil
 	}
 	status, err := install.liveControl(ctx, "prepare-handover", Object{"token": live.Token, "targetSHA256": live.TargetSHA256})
 	if err != nil {
@@ -321,8 +252,8 @@ func (install *installer) beginManagedLive(ctx context.Context, live *managedLiv
 	if err != nil {
 		return err
 	}
-	live.Attempts, live.prepared = attempts, true
-	raw, err = json.Marshal(live)
+	live.Attempts = attempts
+	raw, err := json.Marshal(live)
 	if err != nil {
 		return err
 	}
@@ -396,6 +327,21 @@ func (install *installer) finishManagedLive(live *managedLiveUpgrade) error {
 	}
 	if current == nil || current.Token != live.Token {
 		return errors.New("Live-upgrade journal changed before completion")
+	}
+	return install.managedRemoveFile(install.liveJournalPath(), raw)
+}
+
+// Starting a handover used to discard a journal its finished installation left
+// behind. Unremoved, it reads as pending once a later build completes, and every
+// upgrade after that refuses. Callers must have ruled out a resumable journal.
+func (install *installer) retireFinishedLive() error {
+	live, raw, err := install.readLiveJournal()
+	if err != nil || live == nil {
+		return err
+	}
+	completed, err := installReadInfo(filepath.Join(install.root, "build-info.json"))
+	if err != nil || !completed.Equal(live.Target) {
+		return nil
 	}
 	return install.managedRemoveFile(install.liveJournalPath(), raw)
 }
