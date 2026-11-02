@@ -7,18 +7,17 @@ import (
 	"github.com/Dunky13/agent-job-queue/internal/census"
 )
 
-func TestCensusCallersKeepTheirEstablishedMessages(t *testing.T) {
+func TestCensusWordingsKeepTheirEstablishedMessages(t *testing.T) {
 	observer := census.Observer{PID: 999, PGID: 900}
 	const observerRow = "999 900 501 S Mon Nov 2 18:22:25 2026\n"
 	listings := []struct {
 		output string
 		kind   error
-		pick   func(census.Wording) string
 	}{
-		{observerRow + "invalid\n", census.ErrTruncated, func(w census.Wording) string { return w.Truncated }},
-		{observerRow + "abc 900 501 S Mon Nov 2 18:22:25 2026\n", census.ErrInvalid, func(w census.Wording) string { return w.Invalid }},
-		{observerRow + observerRow, census.ErrAmbiguous, func(w census.Wording) string { return w.Ambiguous }},
-		{"101 400 501 S Mon Nov 2 18:22:25 2026\n", census.ErrIncomplete, func(w census.Wording) string { return w.Incomplete }},
+		{observerRow + "invalid\n", census.ErrTruncated},
+		{observerRow + "abc 900 501 S Mon Nov 2 18:22:25 2026\n", census.ErrInvalid},
+		{observerRow + observerRow, census.ErrAmbiguous},
+		{"101 400 501 S Mon Nov 2 18:22:25 2026\n", census.ErrIncomplete},
 	}
 	for _, site := range []struct {
 		name    string
@@ -48,6 +47,12 @@ func TestCensusCallersKeepTheirEstablishedMessages(t *testing.T) {
 			}
 			if got := site.wording.Of(err).Error(); got != site.want[i] {
 				t.Errorf("%s reports %q for %v, want %q", site.name, got, listing.kind, site.want[i])
+			}
+			if site.name == "resource census" {
+				// The one site that takes text can be checked through its caller.
+				if _, err := parseResourceProcessListing(listing.output, 400, observer); err == nil || err.Error() != site.want[i] {
+					t.Errorf("parseResourceProcessListing reports %v for %v, want %q", err, listing.kind, site.want[i])
+				}
 			}
 		}
 	}

@@ -23,7 +23,7 @@ Negative UIDs stay valid because macOS can print `nobody` as -2. `Table.Identify
 | `leaseProcessSnapshot` | observer group, zombie observer, full `lstart` |
 | remote `processBirth` | everything, see below |
 
-Existing error text at each site is unchanged. `census.Wording` maps rejections back to it. New rejection kinds at the two `ownership.go` sites use new messages with the same `; shared slot retained` suffix. A search found no code or test matching on any of these strings.
+Existing error text at each site is unchanged. `census.Wording` maps rejections back to it. New rejection kinds at the two `ownership.go` sites use new messages with the same `; shared slot retained` suffix. A search found no code matching on any of these strings.
 
 ## Fail-closed trace
 
@@ -95,6 +95,10 @@ Independent review of `b0553ef` found no blocking defect. Its findings are fixed
 - `processBirth` now treats any nonzero `ps` exit as a failed listing. With the observer listed, `ps` exits 0 whether or not the target exists, so a nonzero exit with a usable row can no longer read as an exited process.
 - A record holding a PID macOS could never assign reads as exited, because macOS `ps -p` refuses the whole command above 99999. It would otherwise wedge `reconcileChildren` on a corrupt record.
 - The `leaseProcess` and `queueHandoverProcess` aliases, used only by tests, are gone.
-- Each caller's census wording is named, and `TestCensusCallersKeepTheirEstablishedMessages` asserts the preserved text at every site.
+- Each caller's census wording is named, and `TestCensusWordingsKeepTheirEstablishedMessages` pins the text of each named wording. It reaches a real caller only for the resource census, the one site that takes text; a swapped wording at the four `identityCensus` sites would not fail it, and those messages have no other reader.
 
 Still open: the `TestRealDaemonCancellationRemovesDescendants` race and `execution.go:596` dropping the real exit code on a rejected census. Both predate this PR. The review judged the census adds no new outcome to the race and is unlikely to explain most of the 4 of 260 versus 1 of 390 gap, without ruling out a small timing contribution.
+
+Validation of these follow-ups was narrow: `TestProcessBirth*`, the wording test, lease owner, handover caller and resource census tests, plus `./internal/census`, `go vet` and the Linux build. The evidence section above describes the earlier candidate; hosted CI is the full check on the final head.
+
+Known and left alone: on Linux, a corrupt record with a PID procps refuses (for example 2147483648) stops `reconcileChildren`, as it has since this PR began. No Linux build runs the controller: only `queue-preview` and `queue-tool` are built for Linux.

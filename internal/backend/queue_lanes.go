@@ -271,8 +271,6 @@ type leaseProcesses struct {
 	Processes census.Table
 }
 
-// leaseProcessSnapshot reads the complete process table once so that a missing
-// PID can be told apart from a failed listing; failures keep leases held.
 var leaseOwnerCensusWording = census.Wording{
 	Truncated:  "Incomplete lease owner process listing",
 	Invalid:    "Invalid lease owner process listing",
@@ -280,6 +278,8 @@ var leaseOwnerCensusWording = census.Wording{
 	Incomplete: "Incomplete lease owner process listing",
 }
 
+// leaseProcessSnapshot reads the complete process table once so that a missing
+// PID can be told apart from a failed listing; failures keep leases held.
 func leaseProcessSnapshot(boot string) (leaseProcesses, error) {
 	result := leaseProcesses{Boot: boot, Processes: census.Table{}}
 	processes, err := identityCensus(leaseOwnerCensusWording)

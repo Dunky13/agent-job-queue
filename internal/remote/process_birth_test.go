@@ -59,9 +59,13 @@ func TestProcessBirthReadsAnImpossiblePidAsExited(t *testing.T) {
 	if err != nil || birth != "" {
 		t.Fatalf("impossible pid = %q, %v, want exited", birth, err)
 	}
-	// The real ps must still accept the largest PID, or the limit is wrong.
+	// The real ps pins the constant from both sides: it accepts the largest PID
+	// and refuses the next one, so a changed limit fails here first.
 	if birth, err := c.processBirth(darwinMaxPID); err != nil || birth != "" {
 		t.Fatalf("largest pid = %q, %v, want exited", birth, err)
+	}
+	if err := exec.Command("/bin/ps", "-p", strconv.Itoa(darwinMaxPID+1)+","+strconv.Itoa(os.Getpid()), "-o", "pid=").Run(); err == nil {
+		t.Fatalf("ps accepted pid %d, so darwinMaxPID is out of date", darwinMaxPID+1)
 	}
 }
 

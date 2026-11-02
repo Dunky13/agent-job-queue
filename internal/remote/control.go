@@ -399,7 +399,7 @@ func (c *controller) allowedHosts() ([]string, error) {
 	return hosts, nil
 }
 
-// darwinMaxPID is the largest PID macOS assigns and its ps accepts.
+// darwinMaxPID is the largest PID macOS ps accepts; the kernel assigns less.
 const darwinMaxPID = 99999
 
 func (c *controller) processBirth(pid int) (string, error) {
