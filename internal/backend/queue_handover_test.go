@@ -879,8 +879,8 @@ func TestQueueHandoverConsumedReceiptDoesNotCaptureLaterJobs(t *testing.T) {
 		}
 	}
 	// A committed receipt a crash left behind must not capture later jobs either.
-	// The probe fails this test if custody is consulted, so its daemon's state never
-	// comes into it.
+	// Without the check, this expired fixture fails on its expiry; with a live
+	// expiry and a dead daemon it would report a crash before release.
 	committed := *receipt
 	committed.Phase, committed.Consumer = "committed", nil
 	if err := writeQueueHandoverReceipt(g, &committed); err != nil {

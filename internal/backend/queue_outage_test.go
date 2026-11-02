@@ -408,6 +408,39 @@ func TestFollowSaysHeldInterruptWasNotConfirmedAtBound(t *testing.T) {
 	}
 }
 
+func TestFollowSaysAnAcknowledgedCancelWasAcknowledgedAtBound(t *testing.T) {
+	fastOutage(t, 25*time.Millisecond)
+	g := testGate(t)
+	scriptSnapshots(t, g, []step{{task: running()}, {task: running()}, {task: running()}, {fail: true}}, func(string) (Object, error) { return Object{}, nil })
+	read := captureStreams(t)
+	code, err := followWithToken(g, 7, signals(1), "")
+	read()
+	if code != 125 || err == nil || !strings.Contains(err.Error(), "after the daemon acknowledged the cancellation") || strings.Contains(err.Error(), "could not be confirmed;") {
+		t.Fatal("an acknowledged cancel was reported as unconfirmed", code, err)
+	}
+	if !strings.Contains(err.Error(), "may still be running") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
+		t.Fatal("the message lost its inspect hint", err)
+	}
+}
+
+func TestFollowSaysAnAcknowledgedCancelWasAcknowledgedOnSecondInterrupt(t *testing.T) {
+	fastOutage(t, time.Minute)
+	g := testGate(t)
+	interrupts := signals(1)
+	scriptSnapshots(t, g, []step{{task: running()}, {task: running()}, {task: running()}, {fail: true}}, func(operation string) (Object, error) {
+		if operation == "cancel" {
+			interrupts <- syscall.SIGINT // after the drain at the start of the cancellation
+		}
+		return Object{}, nil
+	})
+	read := captureStreams(t)
+	code, err := followWithToken(g, 7, interrupts, "")
+	read()
+	if code != 125 || err == nil || !strings.Contains(err.Error(), "Interrupted again while the queue daemon was not answering; the cancellation was acknowledged") {
+		t.Fatal("an acknowledged cancel was reported as unconfirmed", code, err)
+	}
+}
+
 // With no cancel acknowledged, a job seen finished reports its own result.
 func TestFollowReportsAFinishedJobsResultOverAHeldInterrupt(t *testing.T) {
 	fastOutage(t, time.Minute)

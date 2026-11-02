@@ -172,6 +172,12 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		}
 		return 125, fmt.Errorf("%s: %w", message, cause)
 	}
+	interruptedAgain := func(context string) string {
+		if cancelSentAt.IsZero() {
+			return "Interrupted again" + context + "; the cancellation could not be confirmed"
+		}
+		return "Interrupted again" + context + "; the cancellation was acknowledged but the job's exit could not be confirmed"
+	}
 	// wait spends one backoff step of the outage budget, or ends the run.
 	wait := func(cause error) (ended bool, code int, err error) {
 		var unconfirmed *cancelUnconfirmedError
@@ -192,11 +198,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		select {
 		case sig := <-signals:
 			if pendingSignal != nil {
-				message := "Interrupted again while the queue daemon was not answering; the cancellation could not be confirmed"
-				if !cancelSentAt.IsZero() {
-					message = "Interrupted again while the queue daemon was not answering; the cancellation was acknowledged but the job's exit could not be confirmed"
-				}
-				code, err = end(message, cause)
+				code, err = end(interruptedAgain(" while the queue daemon was not answering"), cause)
 				return true, code, err
 			}
 			pendingSignal = sig
@@ -324,7 +326,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		select {
 		case sig := <-signals:
 			if pendingSignal != nil {
-				return end("Interrupted again; the cancellation could not be confirmed", nil)
+				return end(interruptedAgain(""), nil)
 			}
 			// Delivered at the next poll, which also sees a result that arrived first.
 			pendingSignal = sig

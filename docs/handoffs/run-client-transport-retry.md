@@ -31,7 +31,7 @@ Non-transport errors fail at once as before. `queueHandoverFollowTask` is consul
 
 - The custody follow-wait stays unbounded by the outage budget: while an authenticated handover explains the loss, the client keeps waiting as before (`outage.reset()`), because the spec preserves that path.
 - A worker waiting for the shared slot exits 125 on a transport failure outside handover custody (`execution.go`, worker wait; `queue_handover_test.go` `missing-custody` requires it). Resubmitting is safe.
-- A follower of a job that WAS in custody still uses custody checks against a stale consumed receipt (`queue_handover.go`), including a dead consumer. No non-test code removes `run/handover.json`.
+- A follower of a job that WAS in custody still uses custody checks against a stale receipt (`queue_handover.go`): a dead consumer on a consumed one, and "crashed before releasing" or "custody expired" on a committed one, each on its first lost reply. No non-test code removes `run/handover.json`.
 - Between `ListenUnix` and `Chmod` the socket has mode 0700 (`queue_daemon.go:244-250`), so a retrying client can land in that window and exit 125. The socket check must not be relaxed.
 - `lane acquire` retries submission immediately, so a refused socket exhausts its two retries at once.
 - Why the daemon becomes slow under memory pressure.
