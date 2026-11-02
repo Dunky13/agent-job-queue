@@ -163,10 +163,18 @@ with a read-only history request before signing or recording submission intent.
 History contents, JWTs, private keys and S3 credentials are never printed.
 
 CI builds `queue-tool` before loading credentials and passes its absolute
-executable path in `QUEUE_NOTARY_TOOL`. Direct API-key authentication in the
-resumable engine requires that binary and a team key with an issuer ID. There
-is no native-client fallback. Local Keychain-profile commands and one-shot
-packaging retain their existing `notarytool` path.
+executable path in `QUEUE_NOTARY_TOOL`. The resumable engine requires that
+binary for every operation on existing state, because `queue-tool notarize
+record` alone parses, validates and advances stage records. Direct API-key
+authentication also requires a team key with an issuer ID. There is no
+native-client fallback. Local Keychain-profile commands keep their existing
+`notarytool` upload path, and one-shot packaging needs no state or client.
+
+Each job that reads stage records builds the tool from its own checkout:
+`notarize` on macOS and `publish` on Linux. The tool never crosses jobs or
+architectures as an artifact. The recovery observer has no Go toolchain, so its
+`recovery.json` checks stay in `jq`, and a test keeps them aligned with the record
+module.
 The REST engine accepts bare-second timeout values such as `300` and explicit
 `s`, `m` or `h` units, with a maximum of 24 hours. It validates this budget before
 signing or creating a submission. The CI job's outer budget still applies.

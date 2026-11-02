@@ -33,9 +33,8 @@ fi
 record="$state/stages/$stage.json"
 phase=prepared submission='' hash='' reason=none
 if [[ -f $record ]]; then
-  phase=$(jq -er '.phase' "$record")
-  submission=$(jq -r '.submission_id' "$record")
-  hash=$(jq -er '.archive_sha256' "$record")
+  fields=$("$QUEUE_NOTARY_TOOL" notarize record get --record "$record" --field phase,submission_id,archive_sha256)
+  IFS=, read -r phase submission hash <<< "$fields"
   if [[ $phase == submitted && -f $state/receipts/$stage.status.json ]] &&
     jq -e --arg id "$submission" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" '
       .id == $id and .status == "In Progress" and .error == "timeout" and

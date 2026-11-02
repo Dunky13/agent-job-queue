@@ -319,9 +319,12 @@ jobs:
         with:
           name: ${{ needs.notarize.outputs.artifact_name }}
           path: dist
+      - name: Build the stage record validator from this automation commit
+        run: go build -p 2 -trimpath -o "$RUNNER_TEMP/queue-notary-tool" ./cmd/queue-tool
       - name: Publish immutable main build
         env:
           GH_TOKEN: ${{ github.token }}
+          QUEUE_NOTARY_TOOL: ${{ runner.temp }}/queue-notary-tool
         run: scripts/distribution-publish.sh dist
 
   homebrew-sync:
