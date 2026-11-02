@@ -1,68 +1,216 @@
 {
-  "updatedAt": "2026-10-18T10:00:00Z",
-  "queue": {
-    "status": "running",
-    "limit": 1,
-    "running": 1,
-    "waiting": 1,
-    "legacyOccupied": false
-  },
   "jobs": [
     {
-      "id": 1,
-      "state": "queued",
-      "title": "Fixture validation",
-      "project": "Example",
       "branch": "main",
+      "canCancel": true,
+      "canReorder": false,
+      "canStart": false,
       "directory": "/example/project",
       "executable": "python3",
-      "priority": 0,
-      "queuePosition": 1,
-      "submittedAt": "2026-10-18T10:00:00Z",
-      "startedAt": null,
-      "finishedAt": null,
       "exitCode": null,
-      "logPath": "",
-      "canReorder": true,
-      "canCancel": true,
-      "phase": "Queued",
+      "finishedAt": null,
+      "id": 1,
+      "kind": "command",
       "lane": "default",
-      "kind": "command"
+      "logPath": "/example/state/logs/1.log",
+      "phase": "Running",
+      "priority": 0,
+      "project": "Example",
+      "queuePosition": null,
+      "resources": {
+        "decision": null,
+        "learning": {
+          "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "label": "Browser tests",
+          "reason": "Operator shared these job families"
+        },
+        "observed": {
+          "complete": false,
+          "cpuCores": 1.5,
+          "cpuSeconds": 20,
+          "durationSeconds": 15,
+          "memoryBytes": 1073741824,
+          "peakMemoryBytes": 1610612736,
+          "samples": 5
+        },
+        "prediction": {
+          "confidence": "low",
+          "cpuCores": 2,
+          "durationSeconds": 60,
+          "familySamples": 3,
+          "memoryBytes": 2147483648,
+          "samples": 3,
+          "source": "family"
+        }
+      },
+      "startedAt": "2026-10-18T21:07:00.000001+02:00",
+      "state": "running",
+      "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+      "title": "Fixture validation"
     },
     {
-      "id": 2,
-      "state": "running",
-      "title": "Fixture validation",
-      "project": "Example",
+      "branch": "",
+      "canCancel": true,
+      "canReorder": false,
+      "canStart": false,
+      "directory": "",
+      "executable": "",
+      "exitCode": null,
+      "expiresAt": null,
+      "finishedAt": null,
+      "grantedAt": "2026-10-29T09:59:01Z",
+      "id": 4,
+      "kind": "lease",
+      "label": "QA session",
+      "lane": "qa",
+      "logPath": "",
+      "meta": {
+        "ticket": "WM-123"
+      },
+      "ownerAlive": true,
+      "ownerPid": 4242,
+      "phase": "Held",
+      "position": null,
+      "priority": 0,
+      "project": "",
+      "queuePosition": null,
+      "queuedAt": "2026-10-29T09:59:00Z",
+      "reason": null,
+      "renewedAt": null,
+      "startedAt": "2026-10-29T09:59:01Z",
+      "state": "held",
+      "submittedAt": "2026-10-29T09:59:00Z",
+      "title": "QA session"
+    },
+    {
       "branch": "main",
+      "canCancel": true,
+      "canReorder": true,
+      "canStart": true,
       "directory": "/example/project",
       "executable": "python3",
-      "priority": 0,
-      "queuePosition": null,
-      "submittedAt": "2026-10-18T10:00:00Z",
-      "startedAt": null,
-      "finishedAt": null,
       "exitCode": null,
-      "logPath": "",
-      "canReorder": false,
-      "canCancel": true,
-      "phase": "Running",
+      "finishedAt": null,
+      "id": 2,
+      "kind": "command",
       "lane": "default",
-      "kind": "command"
+      "logPath": "/example/state/logs/2.log",
+      "phase": "Waiting for memory headroom",
+      "priority": 0,
+      "project": "Example",
+      "queuePosition": 1,
+      "resources": {
+        "decision": {
+          "allowed": false,
+          "reason": "Waiting for memory headroom"
+        },
+        "observed": null,
+        "prediction": {
+          "confidence": "low",
+          "cpuCores": 2,
+          "durationSeconds": 60,
+          "familySamples": 3,
+          "memoryBytes": 2147483648,
+          "samples": 3,
+          "source": "family"
+        }
+      },
+      "startedAt": null,
+      "state": "queued",
+      "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+      "title": "Fixture validation"
+    },
+    {
+      "branch": "",
+      "canCancel": false,
+      "canReorder": false,
+      "canStart": false,
+      "directory": "/example/project",
+      "executable": "",
+      "exitCode": 7,
+      "finishedAt": "2026-10-18T21:09:00Z",
+      "id": 3,
+      "kind": "command",
+      "lane": "default",
+      "logPath": "/example/state/logs/3.log",
+      "phase": "Done",
+      "priority": 0,
+      "project": "project",
+      "queuePosition": null,
+      "startedAt": "2026-10-18T21:08:00Z",
+      "state": "done",
+      "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+      "title": "Validation batch"
     }
   ],
   "lanes": [
     {
-      "name": "default",
-      "label": "Default",
-      "plugin": null,
       "concurrency": 1,
-      "priority": 0,
-      "sharesLimit": true,
-      "running": 1,
+      "held": 1,
+      "label": "QA",
+      "name": "qa",
+      "plugin": "qa-plugin",
+      "priority": 50,
+      "running": 0,
+      "sharesLimit": false,
+      "waiting": 0
+    },
+    {
+      "concurrency": 1,
       "held": 0,
+      "label": "Default",
+      "name": "default",
+      "plugin": null,
+      "priority": 0,
+      "running": 1,
+      "sharesLimit": true,
       "waiting": 1
     }
   ],
-  "plugins": []
+  "plugins": [
+    {
+      "error": null,
+      "lanes": [
+        "qa"
+      ],
+      "loaded": true,
+      "name": "qa-plugin",
+      "warning": null
+    },
+    {
+      "error": "Invalid plugin.json: unknown field \"concurency\"",
+      "lanes": [],
+      "loaded": false,
+      "name": "broken",
+      "warning": null
+    }
+  ],
+  "queue": {
+    "legacyOccupied": false,
+    "limit": 1,
+    "running": 2,
+    "status": "running",
+    "waiting": 1
+  },
+  "scheduler": {
+    "available": true,
+    "host": {
+      "availableMemoryBytes": 4294967296,
+      "complete": false,
+      "cpuBusyCores": 2.5,
+      "cpuCores": 8,
+      "diskFreeBytes": 21474836480,
+      "machine": "arm64",
+      "memoryPressure": "warning",
+      "sampledAt": 1792404000,
+      "swapInBytesPerSecond": 0,
+      "swapOutBytesPerSecond": 0,
+      "swapUsedBytes": 1073741824,
+      "totalMemoryBytes": 17179869184
+    },
+    "mode": "adaptive",
+    "reason": "Fixture resource controller",
+    "updatedAt": "2026-10-19T10:00:00Z"
+  },
+  "updatedAt": "2026-10-18T19:44:39.127731+00:00"
 }

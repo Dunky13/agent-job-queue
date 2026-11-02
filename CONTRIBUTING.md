@@ -39,6 +39,8 @@ scripts/test-installer.sh "dist/Agent-Queue-$(cat VERSION)-universal.zip"
 bash scripts/test-dmg.sh "dist/Agent-Queue-$(cat VERSION)-universal.dmg"
 ```
 
+`TestStatusContractGolden` fails when the status fixtures shared by the Swift, dashboard and browser tests are stale. After an intended change to the [status contract](docs/plugins.md#status-json-contract), regenerate them with `go test -p 2 ./internal/backend -run '^TestStatusContractGolden$' -update`.
+
 Apply the shared queue policy to broad tests, builds, analyzers, browser suites, and installers. Keep the Go package and test worker limits at two unless explicitly authorized otherwise. Do not nest queue wrappers. Persistent preview servers stay outside the queue.
 
 Core and HTTPS acceptance tests launch temporary private daemons, directories, child processes, ports, and test credentials. They remove inherited queue overrides before creating their fixture. Browser tests use simulated jobs through the actual Go HTTP interface. Installer and agent integration tests use isolated user directories. They must never operate on the installed queue or real agent instructions. The installer artifact test installs the actual packaged Go binaries into a temporary home and exercises their private queue and scheduler. It also runs the actual outer managed installer, setup and removal with a parent-owned native lifecycle fixture; a private HOME alone cannot isolate real Service Management.

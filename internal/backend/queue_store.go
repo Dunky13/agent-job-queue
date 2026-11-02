@@ -386,7 +386,7 @@ func (s *queueStore) importLegacy() error {
 }
 
 func legacyQueueSettings(snapshot Object) (int, string, error) {
-	group := obj(obj(snapshot["groups"])["default"])
+	group := defaultGroup(snapshot)
 	if group == nil {
 		return 0, "", errors.New("Legacy import is missing default queue settings")
 	}

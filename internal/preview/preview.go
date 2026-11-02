@@ -3,6 +3,7 @@
 package preview
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Dunky13/agent-job-queue/internal/remote"
+	"github.com/Dunky13/agent-job-queue/internal/wire"
 )
 
 type fakeQueue struct {
@@ -32,10 +34,11 @@ type fakeQueue struct {
 	events          [][]string
 	offline         bool
 	limit           int
-	scheduler       map[string]any
+	scheduler       *wire.Scheduler
+	snapshot        *wire.Snapshot
 	profileRevision int
 	profiles        map[string]map[string]any
-	jobs            []map[string]any
+	jobs            []wire.Job
 }
 
 func clone[T any](value T) T {
@@ -54,23 +57,24 @@ func (q *fakeQueue) reset() error {
 	q.offline = false
 	q.limit = 1
 	q.scheduler = nil
+	q.snapshot = nil
 	q.profileRevision = 4
 	q.profiles = learningProfiles()
 	q.jobs = nil
 	for index, title := range []string{"Build app", "Run browser tests", "Typecheck client"} {
 		id, state := index+101, "queued"
-		var position any = index
-		var started any
+		position := new(index)
+		var started *string
 		if index == 0 {
 			state = "running"
 			position = nil
-			started = "2026-01-01T10:01:00+00:00"
+			started = new("2026-01-01T10:01:00+00:00")
 		}
 		log := filepath.Join(q.root, strconv.Itoa(id)+".log")
 		if err := os.WriteFile(log, []byte("Starting "+title+"\nPassed fixture step\n"), 0600); err != nil {
 			return err
 		}
-		q.jobs = append(q.jobs, map[string]any{"id": id, "state": state, "title": title, "project": "example-project", "branch": "feature/queue", "directory": "/example/project", "executable": "fixture-command", "priority": 0, "queuePosition": position, "submittedAt": "2026-01-01T10:00:00+00:00", "startedAt": started, "finishedAt": nil, "exitCode": nil, "logPath": log, "canReorder": state == "queued", "canStart": state == "queued", "canCancel": true, "phase": strings.ToUpper(state[:1]) + state[1:]})
+		q.jobs = append(q.jobs, wire.Job{ID: id, State: state, Title: title, Project: "example-project", Branch: "feature/queue", Directory: "/example/project", Executable: "fixture-command", QueuePosition: position, SubmittedAt: new("2026-01-01T10:00:00+00:00"), StartedAt: started, LogPath: log, CanReorder: state == "queued", CanStart: state == "queued", CanCancel: true, Phase: strings.ToUpper(state[:1]) + state[1:]})
 	}
 	return nil
 }
@@ -387,20 +391,19 @@ func (q *fakeQueue) run(_ context.Context, arguments []string, input []byte) (ma
 		return q.profilesCall(arguments, input)
 	}
 	if slices.Equal(arguments, []string{"status", "--json"}) {
+		if q.snapshot != nil {
+			return statusObject(*q.snapshot)
+		}
 		running, waiting := 0, 0
 		for _, job := range q.jobs {
-			if job["state"] == "running" {
+			if job.State == "running" {
 				running++
 			}
-			if job["state"] == "queued" {
+			if job.State == "queued" {
 				waiting++
 			}
 		}
-		value := map[string]any{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": map[string]any{"status": "running", "limit": q.limit, "running": running, "waiting": waiting, "legacyOccupied": false}, "jobs": clone(q.jobs)}
-		if q.scheduler != nil {
-			value["scheduler"] = clone(q.scheduler)
-		}
-		return value, nil
+		return statusObject(wire.Snapshot{UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano), Queue: wire.Queue{Status: "running", Limit: &q.limit, Running: running, Waiting: waiting}, Jobs: q.jobs, Scheduler: q.scheduler})
 	}
 	q.events = append(q.events, append([]string(nil), arguments...))
 	switch arguments[0] {
@@ -410,56 +413,75 @@ func (q *fakeQueue) run(_ context.Context, arguments []string, input []byte) (ma
 		if q.scheduler == nil {
 			return nil, errors.New("Resource sampler unavailable")
 		}
-		if available, _ := q.scheduler["available"].(bool); arguments[1] == "adaptive" && !available {
+		if arguments[1] == "adaptive" && !q.scheduler.Available {
 			return nil, errors.New("Resource sampler unavailable")
 		}
-		q.scheduler["mode"] = arguments[1]
+		q.scheduler.Mode = arguments[1]
 	default:
 		id, err := strconv.Atoi(arguments[1])
 		if err != nil {
 			return nil, err
 		}
-		index := slices.IndexFunc(q.jobs, func(job map[string]any) bool { return job["id"] == id })
+		index := slices.IndexFunc(q.jobs, func(job wire.Job) bool { return job.ID == id })
 		if index < 0 {
 			return nil, errors.New("Fixture job no longer exists")
 		}
-		job := q.jobs[index]
+		job := &q.jobs[index]
 		switch arguments[0] {
 		case "start":
-			job["state"] = "running"
-			job["phase"] = "Running"
-			job["queuePosition"] = nil
-			job["canStart"] = false
-			job["canReorder"] = false
-			job["startedAt"] = "2026-01-01T10:02:00+00:00"
+			job.State = "running"
+			job.Phase = "Running"
+			job.QueuePosition = nil
+			job.CanStart = false
+			job.CanReorder = false
+			job.StartedAt = new("2026-01-01T10:02:00+00:00")
 		case "cancel":
-			job["state"] = "cancelled"
-			job["phase"] = "Cancelled"
-			job["queuePosition"] = nil
-			job["canStart"] = false
-			job["canCancel"] = false
-			job["canReorder"] = false
+			job.State = "cancelled"
+			job.Phase = "Cancelled"
+			job.QueuePosition = nil
+			job.CanStart = false
+			job.CanCancel = false
+			job.CanReorder = false
 		case "next", "last":
-			waiting := make([]map[string]any, 0)
+			waiting := make([]*wire.Job, 0)
 			if arguments[0] == "next" {
 				waiting = append(waiting, job)
 			}
-			for other, candidate := range q.jobs {
-				if other != index && candidate["state"] == "queued" {
-					waiting = append(waiting, candidate)
+			for other := range q.jobs {
+				if other != index && q.jobs[other].State == "queued" {
+					waiting = append(waiting, &q.jobs[other])
 				}
 			}
 			if arguments[0] == "last" {
 				waiting = append(waiting, job)
 			}
 			for position, candidate := range waiting {
-				candidate["queuePosition"] = position + 1
+				candidate.QueuePosition = new(position + 1)
 			}
 		default:
 			return nil, errors.New("Unknown fixture queue action")
 		}
 	}
 	return map[string]any{"ok": true}, nil
+}
+
+// statusObject gives the controller interface the same plain JSON values a real
+// controller's output decodes into.
+func statusObject(snapshot wire.Snapshot) (map[string]any, error) {
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	var value map[string]any
+	return value, json.Unmarshal(data, &value)
+}
+
+// fixtureValue rejects a field the wire contract does not declare, so a mistyped
+// browser fixture fails instead of silently dropping data.
+func fixtureValue(data []byte, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(target)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -492,7 +514,7 @@ func (q *fakeQueue) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "Invalid fixture state"})
 		return
 	}
-	fields := []string{"profileFloors", "profileRevision", "profileCount", "profileMemberCount", "profiles", "offline", "title", "scheduler", "resources"}
+	fields := []string{"profileFloors", "profileRevision", "profileCount", "profileMemberCount", "profiles", "offline", "title", "scheduler", "resources", "snapshot"}
 	for key := range values {
 		if !slices.Contains(fields, key) {
 			writeJSON(w, 400, map[string]any{"error": "Unknown fixture state field"})
@@ -596,19 +618,31 @@ func (q *fakeQueue) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			var title string
 			err = json.Unmarshal(value, &title)
 			if err == nil {
-				q.jobs[1]["title"] = title
+				q.jobs[1].Title = title
 			}
 		case "scheduler":
-			var scheduler map[string]any
-			err = json.Unmarshal(value, &scheduler)
+			var scheduler *wire.Scheduler
+			err = fixtureValue(value, &scheduler)
 			if err == nil {
 				q.scheduler = scheduler
 			}
 		case "resources":
-			var resources map[string]any
-			err = json.Unmarshal(value, &resources)
+			var resources *wire.Resources
+			err = fixtureValue(value, &resources)
 			if err == nil {
-				q.jobs[1]["resources"] = resources
+				q.jobs[1].Resources = resources
+			}
+		case "snapshot":
+			var snapshot *wire.Snapshot
+			err = fixtureValue(value, &snapshot)
+			if err == nil && snapshot != nil {
+				// The test-mode log endpoint trusts this path, so a fixture must never choose it.
+				for index := range snapshot.Jobs {
+					snapshot.Jobs[index].LogPath = filepath.Join(q.root, strconv.Itoa(snapshot.Jobs[index].ID)+".log")
+				}
+			}
+			if err == nil {
+				q.snapshot = snapshot
 			}
 		default:
 			err = errors.New("Unknown fixture state field")
@@ -625,16 +659,15 @@ func (q *fakeQueue) screenshotData() error {
 	now := time.Now().UTC().Truncate(time.Minute)
 	examples := [][3]string{{"Build desktop app", "desktop-app", "feat/menu-bar"}, {"Run browser tests", "web-dashboard", "fix/queue-refresh"}, {"Typecheck API", "api-service", "feat/job-controls"}}
 	for index, example := range examples {
-		job := q.jobs[index]
-		job["title"] = example[0]
-		job["project"] = example[1]
-		job["branch"] = example[2]
-		job["submittedAt"] = now.Add(-time.Duration(5-index) * time.Minute).Format(time.RFC3339)
+		job := &q.jobs[index]
+		job.Title = example[0]
+		job.Project = example[1]
+		job.Branch = example[2]
+		job.SubmittedAt = new(now.Add(-time.Duration(5-index) * time.Minute).Format(time.RFC3339))
 		if index == 0 {
-			job["startedAt"] = now.Add(-2 * time.Minute).Format(time.RFC3339)
+			job.StartedAt = new(now.Add(-2 * time.Minute).Format(time.RFC3339))
 		}
-		log, _ := job["logPath"].(string)
-		if err := os.WriteFile(log, []byte("Starting "+example[0]+"\nExample validation step passed\n"), 0600); err != nil {
+		if err := os.WriteFile(job.LogPath, []byte("Starting "+example[0]+"\nExample validation step passed\n"), 0600); err != nil {
 			return err
 		}
 	}

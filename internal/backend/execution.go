@@ -559,7 +559,7 @@ func RunInLane(g *Gate, argv []string, label, lane string) (code int, err error)
 	if err != nil {
 		return 125, err
 	}
-	group := obj(obj(snapshot["groups"])["default"])
+	group := defaultGroup(snapshot)
 	limit, ok := integer(group["parallel_tasks"])
 	if !ok {
 		return 125, errors.New("Invalid parallel limit")

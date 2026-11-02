@@ -254,7 +254,7 @@ func LeaseCapacity(g *Gate) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	limit, ok := integer(obj(obj(snapshot["groups"])["default"])["parallel_tasks"])
+	limit, ok := integer(defaultGroup(snapshot)["parallel_tasks"])
 	if !ok {
 		return 0, errors.New("Invalid parallel limit")
 	}

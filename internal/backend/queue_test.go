@@ -449,18 +449,16 @@ func TestStatusOrderRetentionAndSecretExclusion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobs := list(data["jobs"])
+	jobs := data.Jobs
 	if len(jobs) != 33 {
 		t.Fatal("retention", len(jobs))
 	}
 	for i, id := range []int{50, 52, 51, 44} {
-		actual, _ := integer(obj(jobs[i])["id"])
-		if actual != id {
-			t.Fatalf("order %d: %d", i, actual)
+		if jobs[i].ID != id {
+			t.Fatalf("order %d: %d", i, jobs[i].ID)
 		}
 	}
-	position, _ := integer(obj(jobs[1])["queuePosition"])
-	if position != 1 {
+	if position := jobs[1].QueuePosition; position == nil || *position != 1 {
 		t.Fatal("queue position", position)
 	}
 	body, _ := json.Marshal(data)

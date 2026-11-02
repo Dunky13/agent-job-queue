@@ -4,13 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dunky13/agent-job-queue/internal/wire"
 )
 
 func TestPreviewQueueAndProfileScenarios(t *testing.T) {
@@ -27,7 +33,7 @@ func TestPreviewQueueAndProfileScenarios(t *testing.T) {
 		t.Fatal(err)
 	}
 	queue, _ := object(snapshot["queue"])
-	if queue["running"] != 2 {
+	if queue["running"] != float64(2) {
 		t.Fatal(snapshot)
 	}
 	id := strings.Repeat("a", 64)
@@ -155,16 +161,66 @@ func TestPreviewRejectsPublicAndWildcardBindings(t *testing.T) {
 	}
 }
 
+func TestPreviewServesAndResetsAContractSnapshot(t *testing.T) {
+	q := &fakeQueue{root: t.TempDir()}
+	if err := q.reset(); err != nil {
+		t.Fatal(err)
+	}
+	golden, err := os.ReadFile("../../native/tests/fixtures/queue.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func(body string) int {
+		response := httptest.NewRecorder()
+		q.ServeHTTP(response, httptest.NewRequest("POST", "/__fixture/state", strings.NewReader(body)))
+		return response.Code
+	}
+	if code := post(`{"snapshot":` + string(golden) + `}`); code != 200 {
+		t.Fatal(code)
+	}
+	served, err := q.run(context.Background(), []string{"status", "--json"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expected map[string]any
+	if err := json.Unmarshal(golden, &expected); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range expected["jobs"].([]any) {
+		job, _ := object(raw)
+		job["logPath"] = filepath.Join(q.root, fmt.Sprint(job["id"])+".log")
+	}
+	if !reflect.DeepEqual(served, expected) {
+		t.Fatalf("served %v, want %v", served, expected)
+	}
+	for _, chosen := range []string{"/etc/passwd", "../../secret"} {
+		if code := post(`{"snapshot":{"jobs":[{"id":7,"logPath":"` + chosen + `"}]}}`); code != 200 {
+			t.Fatal(code)
+		}
+		if path := q.snapshot.Jobs[0].LogPath; path != filepath.Join(q.root, "7.log") {
+			t.Fatalf("a fixture chose log path %q", path)
+		}
+	}
+	for _, invalid := range []string{`{"snapshot":{"undeclared":true}}`, `{"scheduler":{"undeclared":true}}`, `{"resources":{"undeclared":true}}`} {
+		if code := post(invalid); code != 400 {
+			t.Fatalf("%s: %d", invalid, code)
+		}
+	}
+	if err := q.reset(); err != nil || q.snapshot != nil {
+		t.Fatal("reset kept the contract snapshot", err)
+	}
+}
+
 func TestPreviewStateReplacesProfilesAndSchedulerRatherThanMerging(t *testing.T) {
 	q := &fakeQueue{root: t.TempDir()}
 	if err := q.reset(); err != nil {
 		t.Fatal(err)
 	}
-	q.scheduler = map[string]any{"mode": "fixed", "old": "must be removed"}
+	q.scheduler = &wire.Scheduler{Mode: "fixed", Reason: "must be removed"}
 	request := httptest.NewRequest("POST", "/__fixture/state", strings.NewReader(`{"profiles":{},"scheduler":{"mode":"adaptive"}}`))
 	response := httptest.NewRecorder()
 	q.ServeHTTP(response, request)
-	if response.Code != 200 || len(q.profiles) != 0 || q.scheduler["mode"] != "adaptive" || q.scheduler["old"] != nil {
+	if response.Code != 200 || len(q.profiles) != 0 || q.scheduler.Mode != "adaptive" || q.scheduler.Reason != "" {
 		t.Fatal("fixture state retained replaced entries", response.Code, q.profiles, q.scheduler)
 	}
 	result, err := q.run(context.Background(), []string{"profiles", "list", "--offset", "0", "--limit", "100", "--query", "", "--json"}, nil)

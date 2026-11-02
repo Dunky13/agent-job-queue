@@ -574,15 +574,15 @@ func TestStatusWithoutLanesReportsDefaultLaneOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lanes := data["lanes"].([]Object)
-	if len(lanes) != 1 || lanes[0]["name"] != defaultLaneName || lanes[0]["waiting"] != 1 || lanes[0]["plugin"] != nil || len(data["plugins"].([]Object)) != 0 {
-		t.Fatalf("lanes for a daemon without lanes: %v %v", lanes, data["plugins"])
+	lanes := data.Lanes
+	if len(lanes) != 1 || lanes[0].Name != defaultLaneName || lanes[0].Waiting != 1 || lanes[0].Plugin != nil || len(data.Plugins) != 0 {
+		t.Fatalf("lanes for a daemon without lanes: %v %v", lanes, data.Plugins)
 	}
-	job := data["jobs"].([]Object)[0]
-	if job["lane"] != defaultLaneName || job["kind"] != "command" || job["queuePosition"] != 1 {
+	job := data.Jobs[0]
+	if job.Lane != defaultLaneName || job.Kind != "command" || job.QueuePosition == nil || *job.QueuePosition != 1 {
 		t.Fatalf("default job fields: %v", job)
 	}
-	if _, ok := job["position"]; ok {
+	if job.Lease != nil {
 		t.Fatal("ordinary jobs gained a lease position")
 	}
 }
