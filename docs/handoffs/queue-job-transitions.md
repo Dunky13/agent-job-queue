@@ -52,14 +52,59 @@ Raw SQL that only simulated a transition now uses store calls in `queue_store_ed
 
 ## Evidence
 
-Validation evidence is listed in the pull request description for the reviewed head. The temporary mutants that removed each guard and agreement check all failed the tests, and were reverted.
+All code results are for code commit `79060b5`. Later commits on this branch change only this file.
+
+**`bash scripts/validate.sh` did not pass locally.** Queue job 2743 exited 1 with load around 13, so it does not count as a pass:
+
+- `internal/backend` and `internal/tooling` each hit the 12-minute test timeout. The backend alarm fired 13 seconds into an unrelated installer test.
+- Three `internal/remote` tests failed and `TestAppleSigningCleansUpAfterSignals` failed.
+- No test from this change failed, and the log has no `DATA RACE`.
+- `set -e` stopped the batch before its web, browser, native, app, installer and DMG steps.
+
+**The same scope, split into the repository's CI partitions (queue job 2765), found one more failure and the `https` failure again:**
+
+| Step | Result |
+| --- | --- |
+| `test-go-runtime.sh core-1` | pass, 728s |
+| `test-go-runtime.sh core-2` | pass, 733s |
+| `test-go-runtime.sh installer` | pass, 489s |
+| `test-go-runtime.sh https` | **fail**, the same three `internal/remote` tests |
+| `test-go-tooling.sh 1` and `2` | pass, 706s and 658s |
+| `packaging/homebrew`, Go build and both Linux builds | pass |
+| `npm run test:web` and `test:browser` | pass |
+| `test-native.sh` | **fail**, exit 133 in `TransportTests` |
+| `build-app.sh`, `test-installer.sh` and `test-dmg.sh` | pass |
+
+The batch's scope matches `validate.sh` after its lint and vulnerability steps, which passed in job 2743.
+
+**Why the two local failures do not come from this change:**
+
+- `internal/remote` does not import `internal/backend`, and neither it nor `go.mod` changed. Its three tests pass when run alone with `-race`, in 114s at load around 7. As part of the whole package, `remote configure` is killed at its 35-second limit.
+- `native/` and `scripts/` did not change. The failing `TransportTests` assertion requires a read to finish within 0.5 seconds of wall-clock time. It is the last line of `test-native.sh`, and a direct run of that binary passed 5 of 5 times with all 58 checks, at load around 10.
+
+A baseline run of `validate.sh` on main was not taken. A retest of the full native script (job 2784) was cancelled while still queued.
+
+**Hosted CI:** all 20 checks pass on `79060b5`, including `ci-required`, the Apple Silicon and Intel partitions, and native tests. `Lint` and the Apple Silicon `https` job first failed with `The job was not acquired by Runner of type hosted` and passed when rerun.
+
+**Other checks:**
+
+- `go test -p 2 -parallel 2 ./internal/backend -run 'TestRealDaemon|Handover|TestQueue|TestLease|TestLane|TestRuntimeGeneration|Drained|TestLegacy' -count=1` passed.
+- Eight temporary mutants that removed a guard or check, or moved a side effect, each failed the tests and were reverted. They covered the kind check, both agreement checks, the launch error, the affected-row check, the cleanup tolerance, enqueue ordering and the illegal-edge check.
+- A ninth mutant that wrote before rejecting an edge also failed the tests, and was reverted.
+- The new tests add about 11 seconds to the backend suite.
 
 ## Remaining work
 
-Independent Standards and Spec review of the draft pull request comes next. There is no follow-up in this change. A later refactor could move the `queue_settings` writes behind the store.
+Independent Standards and Spec review of the draft pull request comes next. These are findings outside this change, and neither is fixed here:
+
+- `validate.sh` runs the whole backend under one 12-minute limit, but its three CI partitions took 1,713 seconds of test time here, and about 15 minutes on hosted Apple Silicon. That limit may not hold on main either, and no baseline was run to confirm it.
+- The 0.5-second assertion in `native/tests/TransportTests.swift` can fail on a loaded host, and it did once here. Swift is out of scope for this change.
+
+A later refactor could move the `queue_settings` writes behind the store.
 
 ## Next steps
 
 1. Review the draft pull request against this handoff.
-2. Fix findings at their root and re-run the validation listed in the pull request.
-3. Ask the owner to mark it ready and merge it. It is not merged or marked ready.
+2. Fix findings at their root and re-run the validation above.
+3. Decide whether the `validate.sh` limit and the transport assertion need their own fixes.
+4. Ask the owner to mark it ready and merge it. It is not merged or marked ready.
