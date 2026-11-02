@@ -358,7 +358,7 @@ func TestQueueHandoverWorkerRetriesSchedulingSnapshotAfterCapacity(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			job := edgeInsertJob(t, store, "running")
+			job := edgeInsertJob(t, store, "starting")
 			job.task["handoverProtocol"] = 1
 			job.task["handoverCaller"] = identity
 			members, err := ProcessGroupMembers(identity.PGID)
@@ -366,15 +366,10 @@ func TestQueueHandoverWorkerRetriesSchedulingSnapshotAfterCapacity(t *testing.T)
 				t.Fatal(err)
 			}
 			job.worker = Object{"pid": identity.PID, "pgid": identity.PGID, "boot_uuid": identity.BootUUID, "members": members}
-			task, err := queueJSON(job.task)
-			if err != nil {
+			if err := store.saveTask(job); err != nil {
 				t.Fatal(err)
 			}
-			worker, err := queueJSON(job.worker)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := store.db.Exec("UPDATE queue_jobs SET task=?,worker=? WHERE id=?", task, worker, job.id); err != nil {
+			if err := store.claimWorker(job.id, job.token, job.attempt, job.worker); err != nil {
 				t.Fatal(err)
 			}
 			receipt.Attempts = []queueHandoverAttempt{{ID: job.id, Token: job.token, Attempt: job.attempt, Phase: "running", Worker: job.worker, Caller: &identity}}
@@ -463,14 +458,8 @@ func TestQueueHandoverFollowerObservesReleaseBeforeDaemonExit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			job := edgeInsertJob(t, store, "queued")
-			job.task["status"] = Object{"Queued": Object{}}
-			job.task["handoverProtocol"], job.task["handoverCaller"] = 1, caller
-			data, err := queueJSON(job.task)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := store.db.Exec("UPDATE queue_jobs SET task=?,attempt='' WHERE id=?", data, job.id); err != nil {
+			job := queueJob{id: 7, token: strings.Repeat("a", 32), task: Object{"token": strings.Repeat("a", 32), "priority": 0, "status": Object{"Queued": Object{}}, "handoverProtocol": 1, "handoverCaller": caller}}
+			if err := store.enqueue(job.id, job.token, job.task, nil); err != nil {
 				t.Fatal(err)
 			}
 			receipt.Phase = "committed"

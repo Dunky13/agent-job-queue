@@ -337,7 +337,7 @@ func (install *installer) managedOfflineDrainHolding(ctx context.Context, p *man
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-	var version, unfinished int
+	var version int
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
@@ -350,18 +350,11 @@ func (install *installer) managedOfflineDrainHolding(ctx context.Context, p *man
 	if p != nil && install.managedSupervised(p) && !install.unregisterServices && !install.prepareReplacement && p.relocation == nil {
 		return install.requireLegacyCleanup()
 	}
-	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM queue_jobs WHERE phase != 'done'").Scan(&unfinished); err != nil {
-		return err
-	}
-	if unfinished != 0 {
-		return errors.New("Managed setup requires a drained queue; stopped queue has unfinished jobs or attempts")
-	}
-	store := &queueStore{db: db, path: filepath.Join(temporary, "queue.sqlite3")}
-	snapshot, err := store.snapshot()
+	tasks, err := stoppedQueueTasks(ctx, db, filepath.Join(temporary, "queue.sqlite3"))
 	if err != nil {
 		return err
 	}
-	if err := installRequireDrained(obj(snapshot["tasks"])); err != nil {
+	if err := installRequireDrained(tasks); err != nil {
 		return err
 	}
 	return install.requireLegacyCleanup()

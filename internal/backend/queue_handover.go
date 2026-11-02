@@ -418,22 +418,21 @@ func queueHandoverAttempts(store *queueStore) ([]queueHandoverAttempt, error) {
 }
 
 func validateQueueHandoverJobState(job queueJob) error {
-	name, details, err := TaskStatus(job.task)
-	if err != nil {
+	if _, _, err := TaskStatus(job.task); err != nil {
 		return err
 	}
+	agrees := queueJobAgreement(job) == nil
 	switch job.phase {
 	case "queued":
-		if job.attempt != "" || job.worker != nil || name != "Queued" && name != "Stashed" {
+		if job.attempt != "" || job.worker != nil || !agrees {
 			return errors.New("Queued handover state is inconsistent")
 		}
 	case "running":
-		if !validToken(job.attempt) || job.worker == nil || name != "Running" && name != "Paused" {
+		if !validToken(job.attempt) || job.worker == nil || !agrees {
 			return errors.New("Running handover state is inconsistent")
 		}
 	case "outcome", "done":
-		code, err := ResultCode(details["result"])
-		if name != "Done" || err != nil || !job.outcome.Valid || int64(code) != job.outcome.Int64 {
+		if !job.outcome.Valid || !agrees {
 			return errors.New("Completed handover state is inconsistent")
 		}
 	default:
