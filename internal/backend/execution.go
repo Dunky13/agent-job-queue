@@ -56,7 +56,6 @@ var queueCleanupWindow = 12 * time.Second
 func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
 	deadline := time.Now().Add(queueCleanupWindow)
 	waitingForHandover := false
-	outage := newQueueOutage(id, os.Stderr)
 	for {
 		receipt, err := g.Receipt(id)
 		if err != nil {
@@ -73,25 +72,20 @@ func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
 					return handoverError
 				}
 				if allowed {
-					outage.reset()
 					waitingForHandover = true
 					deadline = time.Now().Add(400 * time.Millisecond)
 					continue
 				}
-				// The job already finished; a slow daemon must not turn that into
-				// a failed cleanup while the daemon can still complete it.
-				if outage.lose() {
-					deadline = time.Now().Add(outage.delay())
-					continue
-				}
-				return fmt.Errorf("Job %d finished but cleanup did not complete; the queue daemon has not responded for %s, so its shared slot stays retained until the daemon returns (inspect the job with: agent-heavy logs %d): %w", id, outage.elapsed(), id, rpcError)
-			} else if rpcError == nil && (outage.recover() || waitingForHandover) {
+				// The job's result is already known to the caller, which decides
+				// what to report; this only says why cleanup is unconfirmed.
+				return fmt.Errorf("Job %d finished but its cleanup could not be confirmed, so its shared slot may stay retained until the queue daemon answers (inspect the job with: agent-heavy logs %d): %w", id, id, rpcError)
+			} else if rpcError == nil && waitingForHandover {
 				waitingForHandover = false
 				deadline = time.Now().Add(queueCleanupWindow)
 				continue
 			}
-			// A daemon that answers yet leaves the receipt behind is an anomaly, not an
-			// outage: the slot really is retained, so this stays a failure.
+			// A daemon that answers yet leaves the receipt behind is an anomaly, not
+			// an outage: the slot really is retained, so this stays a failure.
 			return fmt.Errorf("Job %d finished but cleanup did not complete; shared slot retained%s", id, causeSuffix(rpcError))
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -100,27 +94,67 @@ func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
 func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
 	return followWithToken(g, id, signals, "")
 }
+
+// followWithToken is the only place that rides out a queue outage. A single
+// outage budget covers every step of one run: reading the job, delivering a held
+// interrupt and the cancellation it triggers. An iteration without a transport
+// failure anywhere is the only recovery, so alternating failures cannot restart
+// the clock.
 func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken string) (int, error) {
 	offset := int64(0)
 	notice := time.Now()
 	path := g.LogPath(id)
 	var pendingSignal os.Signal
+	pauseShown, pauseCheckLost := false, false
 	outage := newQueueOutage(id, os.Stderr)
-	// A job whose daemon is gone for good may still have finished; report that
-	// result when the store proves it, and otherwise name how to inspect the job.
-	endOutage := func(cause error) (int, error) {
+	// A finished job's own result always wins: say so if an interrupt was held.
+	cancelTried := false
+	finished := func(code int) (int, error) {
+		switch {
+		case pendingSignal != nil && cancelTried:
+			fmt.Fprintf(os.Stderr, "agent-heavy: job %d finished with exit status %d while its cancellation was being confirmed\n", id, code)
+		case pendingSignal != nil:
+			fmt.Fprintf(os.Stderr, "agent-heavy: job %d had already finished, so the interrupt did nothing\n", id)
+		}
+		return code, nil
+	}
+	// end reports an outage that cannot be waited out. The store may still prove
+	// the job finished; otherwise the job may still be running.
+	end := func(prefix string, cause error) (int, error) {
 		if code, ok := queueStoredOutcome(g, id, expectedToken); ok {
 			if _, err := Drain(path, offset); err != nil {
 				return 125, err
 			}
-			fmt.Fprintf(os.Stderr, "agent-heavy: queue daemon unreachable for %s; job %d finished with exit status %d (read from the queue store); its cleanup completes when the daemon returns\n", outage.elapsed(), id, code)
-			return code, nil
+			fmt.Fprintf(os.Stderr, "agent-heavy: queue daemon not answering; job %d finished with exit status %d (read from the queue store); its cleanup completes when the daemon answers\n", id, code)
+			return finished(code)
 		}
-		detail := ""
-		if pendingSignal != nil {
-			detail = "; your interrupt was not delivered, so the job was not cancelled"
+		message := fmt.Sprintf("%s; job %d may still be running; inspect it with: agent-heavy logs %d", prefix, id, id)
+		if cause == nil {
+			return 125, errors.New(message)
 		}
-		return 125, fmt.Errorf("Lost contact with the queue daemon for %s; job %d may still be running%s; inspect it with: agent-heavy logs %d: %w", outage.elapsed(), id, detail, id, cause)
+		return 125, fmt.Errorf("%s: %w", message, cause)
+	}
+	// wait spends one backoff step of the outage budget, or ends the run.
+	wait := func(cause error) (ended bool, code int, err error) {
+		if !outage.lose(cause) {
+			prefix := fmt.Sprintf("Lost contact with the queue daemon for %s", outage.elapsed())
+			if pendingSignal != nil {
+				prefix += " and the cancellation requested by your interrupt could not be confirmed"
+			}
+			code, err = end(prefix, cause)
+			return true, code, err
+		}
+		select {
+		case sig := <-signals:
+			if pendingSignal != nil {
+				code, err = end("Interrupted again while the queue daemon was not answering; the cancellation could not be confirmed", cause)
+				return true, code, err
+			}
+			pendingSignal = sig
+			fmt.Fprintf(os.Stderr, "agent-heavy: interrupt received; cancelling job %d once the queue daemon answers (interrupt again to stop waiting)\n", id)
+		case <-time.After(outage.delay()):
+		}
+		return false, 0, nil
 	}
 	for {
 		var err error
@@ -139,21 +173,8 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 				task, err = retained, nil
 				outage.reset()
 			} else {
-				// The job was submitted and keeps its place in the daemon; only
-				// this client lost sight of it. Keep following, within the bound.
-				if !outage.lose() {
-					return endOutage(err)
-				}
-				select {
-				case sig := <-signals:
-					// Nothing can be cancelled while the daemon is unreachable. The first
-					// interrupt is held for when it returns; a second ends the wait.
-					if pendingSignal != nil {
-						return 125, fmt.Errorf("Interrupted while the queue daemon was unreachable; the cancellation was not delivered and job %d may still be running; inspect it with: agent-heavy logs %d: %w", id, id, err)
-					}
-					pendingSignal = sig
-					fmt.Fprintf(os.Stderr, "agent-heavy: interrupt received; job %d will be cancelled when the queue daemon responds (interrupt again to stop waiting)\n", id)
-				case <-time.After(outage.delay()):
+				if ended, code, err := wait(err); ended {
+					return code, err
 				}
 				continue
 			}
@@ -161,7 +182,6 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		if err != nil {
 			return 125, err
 		}
-		recovered := rpcAvailable && outage.recover()
 		if expectedToken == "" {
 			expectedToken = text(task["token"])
 		} else if got := text(task["token"]); task != nil && got != "" && got != expectedToken {
@@ -169,17 +189,53 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			// job under this ID is not ours to report or cancel.
 			return 125, fmt.Errorf("Job %d is no longer the command this client submitted; its result was not used", id)
 		}
-		if pendingSignal != nil && rpcAvailable {
-			if err := cancelWithSignals(g, id, signals); err == nil {
-				return 128 + int(pendingSignal.(syscall.Signal)), nil
-			} else if !errors.Is(err, errQueueHandoverBusy) {
-				return 125, err
-			}
-		}
 		name, details, err := TaskStatus(task)
 		if err != nil {
 			return 125, err
 		}
+		if name == "Done" {
+			if rpcAvailable {
+				outage.recover() // a finished job needs no mutation, so this read is recovery
+			}
+			offset, err = Drain(path, offset)
+			if err != nil {
+				return 125, err
+			}
+			code, err := ResultCode(details["result"])
+			if err != nil {
+				return 125, err
+			}
+			if err = waitCleanupWithToken(g, id, expectedToken); err != nil {
+				if !errors.Is(err, errQueueTransportUnavailable) {
+					return 125, err
+				}
+				// Only the daemon's silence blocks cleanup; the result is known.
+				fmt.Fprintln(os.Stderr, "agent-heavy:", err)
+			}
+			_, err = Drain(path, offset)
+			if err != nil {
+				return 125, err
+			}
+			return finished(code)
+		}
+		if pendingSignal != nil && rpcAvailable {
+			ownResult, err := cancelJob(g, id, expectedToken)
+			cancelTried = ownResult == nil // a finished job needed no cancellation
+			switch {
+			case err == nil && ownResult != nil:
+				return finished(*ownResult)
+			case err == nil:
+				return 128 + int(pendingSignal.(syscall.Signal)), nil
+			case errors.Is(err, errQueueTransportUnavailable):
+				if ended, code, err := wait(err); ended {
+					return code, err
+				}
+				continue
+			case !errors.Is(err, errQueueHandoverBusy):
+				return 125, err
+			}
+		}
+		recovered := rpcAvailable && outage.recover()
 		if name == "Missing" {
 			cancelled, err := ReadPrivate(filepath.Join(g.Cancelled, strconv.Itoa(id)+".json"))
 			if err != nil {
@@ -193,7 +249,6 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 				if !errors.Is(err, errQueueTransportUnavailable) {
 					return 125, err
 				}
-				// Only the daemon's absence blocks cleanup; the result is known.
 				fmt.Fprintln(os.Stderr, "agent-heavy:", err)
 			}
 			_, err = Drain(path, offset)
@@ -202,30 +257,13 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			}
 			return code, nil
 		}
-		if name == "Done" && pendingSignal == nil {
-			offset, err = Drain(path, offset)
-			if err != nil {
-				return 125, err
-			}
-			code, err := ResultCode(details["result"])
-			if err != nil {
-				return 125, err
-			}
-			if err = waitCleanupWithToken(g, id, expectedToken); err != nil {
-				if !errors.Is(err, errQueueTransportUnavailable) {
-					return 125, err
-				}
-				// Only the daemon's absence blocks cleanup; the job's own result is
-				// known and must not be replaced by a failure status.
-				fmt.Fprintln(os.Stderr, "agent-heavy:", err)
-			}
-			_, err = Drain(path, offset)
-			return code, err
+		tick := time.Since(notice) >= 15*time.Second
+		if name == "Queued" && !pauseShown && outage.lostOnce && (recovered || tick || pauseCheckLost) {
+			var answered bool
+			pauseShown, answered = announcePausedQueue(g, id)
+			pauseCheckLost = !answered
 		}
-		if recovered && name == "Queued" {
-			announcePausedQueue(g, id)
-		}
-		if time.Since(notice) >= 15*time.Second {
+		if tick {
 			receipt, err := g.Receipt(id)
 			if err != nil {
 				return 125, err
@@ -239,18 +277,11 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		}
 		select {
 		case sig := <-signals:
-			if !rpcAvailable {
-				pendingSignal = sig
-				continue
+			if pendingSignal != nil {
+				return end("Interrupted again; the cancellation could not be confirmed", nil)
 			}
-			if err := cancelWithSignals(g, id, signals); err != nil {
-				if errors.Is(err, errQueueHandoverBusy) {
-					pendingSignal = sig
-					continue
-				}
-				return 125, err
-			}
-			return 128 + int(sig.(syscall.Signal)), nil
+			// Delivered at the next poll, which also sees a result that arrived first.
+			pendingSignal = sig
 		case <-time.After(400 * time.Millisecond):
 		}
 	}
@@ -259,123 +290,132 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 // queueCancelGrace is how long a cancelled job may take to stop before it is killed.
 var queueCancelGrace = 3 * time.Second
 
-// announcePausedQueue explains a job that stays queued after the daemon came
-// back: a restart after an unclean stop pauses the queue until an operator acts.
-func announcePausedQueue(g *Gate, id int) {
+// announcePausedQueue says what is known when a job waits behind a paused
+// queue, without guessing why it is paused. It reports whether it said so and
+// whether the daemon answered; the caller retries a check that was lost.
+func announcePausedQueue(g *Gate, id int) (shown, answered bool) {
 	snapshot, err := g.Snapshot()
-	if err == nil && obj(obj(snapshot["groups"])["default"])["status"] == "Paused" {
-		fmt.Fprintf(os.Stderr, "agent-heavy: the queue is paused (a daemon restart after an unclean stop pauses it); job %d will not start until you run: agent-heavy resume\n", id)
+	if err != nil {
+		return false, false
 	}
+	if obj(obj(snapshot["groups"])["default"])["status"] != "Paused" {
+		return false, true
+	}
+	fmt.Fprintf(os.Stderr, "agent-heavy: the queue is paused; job %d will not start until the queue is resumed\n", id)
+	return true, true
 }
 
-func Cancel(g *Gate, id int) error { return cancelWithSignals(g, id, nil) }
+func causeSuffix(err error) string {
+	if err == nil {
+		return ""
+	}
+	return ": " + err.Error()
+}
 
-// cancelWithSignals also stops waiting out a daemon outage when the caller is
-// interrupted; a nil channel never fires.
-func cancelWithSignals(g *Gate, id int, signals <-chan os.Signal) error {
+// Cancel does not retry through a daemon outage: a standalone caller learns at
+// once that the cancellation could not be confirmed. A waiting client retries it.
+func Cancel(g *Gate, id int) error {
+	_, err := cancelJob(g, id, "")
+	return err
+}
+
+// cancelUnconfirmed names what is not known when the daemon went silent: the
+// request may or may not have taken effect.
+func cancelUnconfirmed(id int, err error) error {
+	if !errors.Is(err, errQueueTransportUnavailable) {
+		return err
+	}
+	return fmt.Errorf("Cancellation of job %d could not be confirmed; the job may still be running; inspect it with: agent-heavy logs %d: %w", id, id, err)
+}
+
+// cancelJob cancels job id. A job whose token differs from the first one seen
+// (or from expectedToken) is refused before any mutation. When the job had
+// already finished before any cancellation was attempted, its own exit status is
+// returned so the caller can report it.
+func cancelJob(g *Gate, id int, expectedToken string) (*int, error) {
 	if id < 0 {
-		return errors.New("Task ID must be nonnegative")
+		return nil, errors.New("Task ID must be nonnegative")
 	}
 	if err := g.Prepare(); err != nil {
-		return err
+		return nil, err
 	}
 	path := filepath.Join(g.Cancelled, strconv.Itoa(id)+".json")
 	if err := WritePrivate(path, Object{"task_id": id, "exit_code": 130}); err != nil {
-		return err
+		return nil, err
 	}
 	deadline := time.Now().Add(12 * time.Second)
 	var cancelSent time.Time
-	outage := newQueueOutage(id, os.Stderr)
-	// A transport failure does not say whether the cancellation took effect. Retry
-	// within the outage bound, without charging the lost time to the deadline.
-	transient := func(err error, started time.Time) error {
-		if !errors.Is(err, errQueueTransportUnavailable) {
-			return err
-		}
-		if !outage.lose() {
-			return fmt.Errorf("Cancellation of job %d was not delivered: the queue daemon has been unreachable for %s; the job may still be running; inspect it with: agent-heavy logs %d: %w", id, outage.elapsed(), id, err)
-		}
-		select {
-		case <-signals:
-			return fmt.Errorf("Interrupted while the queue daemon was unreachable; the cancellation of job %d was not delivered and it may still be running; inspect it with: agent-heavy logs %d: %w", id, id, err)
-		case <-time.After(outage.delay()):
-		}
-		deadline = deadline.Add(time.Since(started))
-		return nil
-	}
+	attempted := false
 	for time.Now().Before(deadline) {
-		started := time.Now()
 		task, err := g.Task(id)
 		if err != nil {
-			if err = transient(err, started); err != nil {
-				return err
+			return nil, cancelUnconfirmed(id, err)
+		}
+		if got := text(task["token"]); task != nil && got != "" {
+			if expectedToken == "" {
+				expectedToken = got
+			} else if got != expectedToken {
+				return nil, fmt.Errorf("Job %d is no longer the job this cancellation targeted; nothing further was cancelled", id)
 			}
-			continue
 		}
 		name, details, err := TaskStatus(task)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		// A read alone does not end an outage: a daemon that answers snapshots but
-		// loses mutations must still reach the bound. Only a delivered mutation, or
-		// a terminal state that needs none, counts as recovery.
 		switch name {
 		case "Done":
-			outage.recover()
 			code, err := ResultCode(details["result"])
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if err = WritePrivate(path, Object{"task_id": id, "exit_code": code}); err != nil {
-				return err
+				return nil, err
 			}
-			return WaitCleanup(g, id)
+			err = WaitCleanup(g, id)
+			if err == nil && !attempted {
+				return &code, nil
+			}
+			return nil, err
 		case "Missing":
-			outage.recover()
 			receipt, err := g.Receipt(id)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if receipt != nil {
 				payload, err := g.PayloadPath(text(receipt["token"]))
 				if err != nil {
-					return err
+					return nil, err
 				}
 				if err = removeMissing(payload); err != nil {
-					return err
+					return nil, err
 				}
 				if receipt["pgid"] == nil {
 					if err = removeMissing(g.ReceiptPath(id)); err != nil {
-						return err
+						return nil, err
 					}
 				}
 			}
-			return WaitCleanup(g, id)
+			return nil, WaitCleanup(g, id)
 		case "Queued", "Stashed", "Running", "Paused":
-			// SIGKILL only follows a delivered cancel that outlived the grace period;
-			// a lost response is no evidence that the job was ever asked to stop.
+			// SIGKILL only follows a cancel the daemon acknowledged and that outlived
+			// the grace period; a lost reply is no evidence the job was told to stop.
 			op := "cancel"
 			if !cancelSent.IsZero() && time.Since(cancelSent) > queueCancelGrace {
 				op = "kill"
 			}
-			_, err = g.QueueControl(op, Object{"id": id})
-			if err != nil {
-				if err = transient(err, started); err != nil {
-					return err
-				}
-				continue
+			attempted = true
+			if _, err = g.QueueControl(op, Object{"id": id}); err != nil {
+				return nil, cancelUnconfirmed(id, err)
 			}
-			outage.recover()
 			if op == "cancel" && cancelSent.IsZero() {
 				cancelSent = time.Now()
 			}
-
 		default:
-			return fmt.Errorf("Job %d has unexpected state %s; inspect the queue before recovery", id, name)
+			return nil, fmt.Errorf("Job %d has unexpected state %s; inspect the queue before recovery", id, name)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return fmt.Errorf("Cancellation of job %d did not finish; its exclusion lock is retained", id)
+	return nil, fmt.Errorf("Cancellation of job %d did not finish; its exclusion lock is retained", id)
 }
 func RejectPipedInput() error {
 	fd := int(os.Stdin.Fd())
@@ -742,11 +782,4 @@ func executeWithAttempt(g *Gate, value, attempt string) (int, error) {
 		return 125, err
 	}
 	return code, nil
-}
-
-func causeSuffix(err error) string {
-	if err == nil {
-		return ""
-	}
-	return ": " + err.Error()
 }

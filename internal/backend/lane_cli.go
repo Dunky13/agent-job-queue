@@ -380,6 +380,10 @@ func laneWait(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupt
 		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 		defer signal.Stop(signals)
 	}
+	return laneWaitSignals(g, id, timeout, out, interrupted, signals)
+}
+
+func laneWaitSignals(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupted func() error, signals <-chan os.Signal) int {
 	var deadline <-chan time.Time
 	if timeout != nil {
 		timer := time.NewTimer(*timeout)
@@ -404,7 +408,7 @@ func laneWait(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupt
 				return out.failure(laneExitRefused, fmt.Errorf("Lease %d is %s (%s)", id, text(lease["state"]), text(lease["reason"])), lease)
 			}
 		case errors.Is(err, errQueueTransportUnavailable) || errors.Is(err, errQueueHandoverBusy):
-			if !outage.lose() {
+			if !outage.lose(err) {
 				return out.failure(laneExitRefused, fmt.Errorf("Lost contact with the queue daemon for %s; lease %d may still be queued: %w", outage.elapsed(), id, err), Object{"id": id})
 			}
 			pause = outage.delay()

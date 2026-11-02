@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -30,15 +31,21 @@ var queueOutageBackoff = func(n int) time.Duration {
 }
 
 // queueOutage tracks one continuous loss of the queue daemon for a waiting
-// command and prints one notice on first loss and one on recovery.
+// command. Its only definition of recovery is an iteration without a transport
+// failure anywhere. Notices are rate limited so a flapping daemon stays quiet.
 type queueOutage struct {
 	id        int
 	noun      string
 	out       io.Writer
 	since     time.Time
+	noticed   time.Time
 	failures  int
 	announced bool
+	lostOnce  bool
 }
+
+// queueOutageNoticeGap is the quiet period after a notice pair.
+const queueOutageNoticeGap = 30 * time.Second
 
 func newQueueOutage(id int, out io.Writer) *queueOutage {
 	return &queueOutage{id: id, noun: "job", out: out}
@@ -46,13 +53,18 @@ func newQueueOutage(id int, out io.Writer) *queueOutage {
 
 // lose records a transport failure and reports whether the caller may keep
 // waiting, that is whether the outage is still within the bound.
-func (o *queueOutage) lose() bool {
+func (o *queueOutage) lose(cause error) bool {
 	if o.since.IsZero() {
 		o.since = time.Now()
 	}
-	if !o.announced {
-		o.announced = true
-		fmt.Fprintf(o.out, "agent-heavy: queue daemon not responding; still waiting for %s %d (this does not cancel it)\n", o.noun, o.id)
+	o.lostOnce = true
+	if !o.announced && (o.noticed.IsZero() || time.Since(o.noticed) >= queueOutageNoticeGap) {
+		o.announced, o.noticed = true, time.Now()
+		what := "queue daemon not responding"
+		if errors.Is(cause, errQueueHandoverBusy) {
+			what = "queue handover in progress"
+		}
+		fmt.Fprintf(o.out, "agent-heavy: %s; still waiting for %s %d\n", what, o.noun, o.id)
 	}
 	o.failures++
 	return time.Since(o.since) <= queueOutageBound
@@ -70,8 +82,8 @@ func (o *queueOutage) recover() bool {
 	was := !o.since.IsZero() || o.announced
 	o.reset()
 	if o.announced {
-		o.announced = false
-		fmt.Fprintf(o.out, "agent-heavy: queue daemon responding again (%s %d)\n", o.noun, o.id)
+		o.announced, o.noticed = false, time.Now()
+		fmt.Fprintf(o.out, "agent-heavy: queue answering again (%s %d)\n", o.noun, o.id)
 	}
 	return was
 }

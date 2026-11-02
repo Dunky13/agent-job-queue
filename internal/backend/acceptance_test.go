@@ -515,13 +515,13 @@ func TestRealDaemonCrashRetainsOwnershipAndPausesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The waiter must say why its job is not starting before an operator acts.
-	fixtureUntil(t, 20*time.Second, func() bool { return strings.Contains(second.errors.String(), "agent-heavy resume") })
+	fixtureUntil(t, 20*time.Second, func() bool { return strings.Contains(second.errors.String(), "the queue is paused") })
 	if err = Cancel(f.gate, secondID); err != nil {
 		t.Fatal(err)
 	}
 	second.wait(t, 130)
 	notices := second.errors.String()
-	if !strings.Contains(notices, "queue daemon not responding") || !strings.Contains(notices, "queue daemon responding again") || strings.Count(notices, "the queue is paused") != 1 {
+	if !strings.Contains(notices, "queue daemon not responding") || !strings.Contains(notices, "queue answering again") || strings.Count(notices, "the queue is paused") != 1 {
 		t.Fatalf("outage or pause was not announced once: %q", notices)
 	}
 	select {

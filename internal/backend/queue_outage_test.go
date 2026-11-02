@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -55,8 +54,19 @@ func transportTimeout(t *testing.T) error {
 	return err
 }
 
+func jobToken(n int) string { return fmt.Sprintf("%032x", n) }
+
+func taskWithToken(token, status string, details Object) Object {
+	return Object{"token": token, "status": Object{status: details}}
+}
+
 func taskWith(status string, details Object) Object {
-	return Object{"token": fmt.Sprintf("%032x", 8), "status": Object{status: details}}
+	return taskWithToken(jobToken(8), status, details)
+}
+
+func running() Object { return taskWith("Running", Object{}) }
+func done(result any) Object {
+	return taskWith("Done", Object{"result": result})
 }
 
 func writeJobLog(t *testing.T, g *Gate, id int, content string) {
@@ -70,20 +80,65 @@ func writeJobLog(t *testing.T, g *Gate, id int, content string) {
 	}
 }
 
+// step is one scripted snapshot answer: a lost reply, or the job's state.
+type step struct {
+	task  Object
+	fail  bool
+	pause bool // report the default group as paused
+}
+
+// scriptSnapshots answers each snapshot with the next step (the last repeats).
+// Mutations go to mutate, or fail the test when it is nil.
+func scriptSnapshots(t *testing.T, g *Gate, steps []step, mutate func(string) (Object, error)) *[]string {
+	t.Helper()
+	operations := &[]string{}
+	n := 0
+	g.queueControl = func(operation string, _ Object) (Object, error) {
+		*operations = append(*operations, operation)
+		if operation != "snapshot" {
+			if mutate == nil {
+				t.Errorf("unexpected operation %s", operation)
+				return nil, errors.New("unexpected operation")
+			}
+			return mutate(operation)
+		}
+		current := steps[min(n, len(steps)-1)]
+		n++
+		if current.fail {
+			return nil, transportTimeout(t)
+		}
+		snapshot := testSnapshot(Object{"7": current.task})
+		if current.pause {
+			snapshot["groups"] = Object{"default": Object{"status": "Paused", "parallel_tasks": 1}}
+		}
+		return snapshot, nil
+	}
+	return operations
+}
+
+func signals(n int) chan os.Signal {
+	c := make(chan os.Signal, 8)
+	for i := 0; i < n; i++ {
+		c <- syscall.SIGINT
+	}
+	return c
+}
+
+func mutations(operations []string) []string {
+	out := []string{}
+	for _, operation := range operations {
+		if operation != "snapshot" {
+			out = append(out, operation)
+		}
+	}
+	return out
+}
+
 func TestFollowRidesOutTransientQueueTransportFailure(t *testing.T) {
 	fastOutage(t, time.Minute)
 	g := testGate(t)
 	writeJobLog(t, g, 7, "job output\n")
-	failures := 3
-	snapshots := 0
-	g.queueControl = func(operation string, _ Object) (Object, error) {
-		snapshots++
-		if failures > 0 {
-			failures--
-			return nil, transportTimeout(t)
-		}
-		return testSnapshot(Object{"7": taskWith("Done", Object{"result": Object{"Failed": 41}})}), nil
-	}
+	scriptSnapshots(t, g, []step{{fail: true}, {fail: true}, {fail: true}, {task: done(Object{"Failed": 41})}}, nil)
 	read := captureStreams(t)
 	code, err := followWithToken(g, 7, make(chan os.Signal), "")
 	stdout, stderr := read()
@@ -93,11 +148,8 @@ func TestFollowRidesOutTransientQueueTransportFailure(t *testing.T) {
 	if stdout != "job output\n" {
 		t.Fatalf("job output not delivered: %q", stdout)
 	}
-	if strings.Count(stderr, "not responding") != 1 || strings.Count(stderr, "responding again") != 1 {
+	if strings.Count(stderr, "not responding") != 1 || strings.Count(stderr, "answering again") != 1 {
 		t.Fatalf("expected one loss and one recovery notice: %q", stderr)
-	}
-	if snapshots < 4 {
-		t.Fatal("follow did not retry", snapshots)
 	}
 }
 
@@ -119,7 +171,7 @@ func TestFollowEndsVisiblyWhenDaemonStaysUnreachable(t *testing.T) {
 	if !errors.Is(err, errQueueTransportUnavailable) {
 		t.Fatal("cause was hidden", err)
 	}
-	if strings.Count(stderr, "not responding") != 1 || strings.Contains(stderr, "responding again") {
+	if strings.Count(stderr, "not responding") != 1 || strings.Contains(stderr, "answering again") {
 		t.Fatalf("unexpected notices: %q", stderr)
 	}
 }
@@ -141,99 +193,86 @@ func TestFollowStillFailsAtOnceOnNonTransportError(t *testing.T) {
 	}
 }
 
-func TestWaitCleanupRidesOutTransientQueueTransportFailure(t *testing.T) {
+func TestFollowRefusesAnotherJobUnderTheSameID(t *testing.T) {
 	fastOutage(t, time.Minute)
 	g := testGate(t)
-	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": fmt.Sprintf("%032x", 8)})
-	failures := 2
-	g.queueControl = func(string, Object) (Object, error) {
-		if failures > 0 {
-			failures--
-			return nil, transportTimeout(t)
-		}
-		// The recovered daemon completes the cleanup it had not finished.
-		_ = os.Remove(g.ReceiptPath(7))
-		return testSnapshot(Object{}), nil
-	}
+	other := taskWithToken(jobToken(99), "Done", Object{"result": "Success"})
+	g.queueControl = func(string, Object) (Object, error) { return testSnapshot(Object{"7": other}), nil }
 	read := captureStreams(t)
-	err := WaitCleanup(g, 7)
-	_, stderr := read()
-	if err != nil {
-		t.Fatal("transient outage failed a finished job's cleanup", err)
-	}
-	if strings.Count(stderr, "not responding") != 1 || strings.Count(stderr, "responding again") != 1 {
-		t.Fatalf("expected one loss and one recovery notice: %q", stderr)
-	}
-}
-
-func TestWaitCleanupEndsVisiblyWhenDaemonStaysUnreachable(t *testing.T) {
-	fastOutage(t, 25*time.Millisecond)
-	g := testGate(t)
-	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": fmt.Sprintf("%032x", 8)})
-	g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
-	read := captureStreams(t)
-	err := WaitCleanup(g, 7)
+	code, err := followWithToken(g, 7, make(chan os.Signal), jobToken(8))
 	read()
-	if err == nil || !strings.Contains(err.Error(), "Job 7 finished but cleanup did not complete") || !errors.Is(err, errQueueTransportUnavailable) {
-		t.Fatal("sustained outage was not reported", err)
+	if code != 125 || err == nil || !strings.Contains(err.Error(), "no longer the command this client submitted") {
+		t.Fatal("another job's result was used", code, err)
 	}
 }
 
-func TestCancelRidesOutTransientQueueTransportFailure(t *testing.T) {
+// A replaced row discovered after a lost read must stop the held cancellation
+// before it sends anything.
+func TestFollowDoesNotCancelAReplacedJobAfterALostRead(t *testing.T) {
 	fastOutage(t, time.Minute)
 	g := testGate(t)
-	var operations []string
-	failCancel := true
-	g.queueControl = func(operation string, _ Object) (Object, error) {
-		operations = append(operations, operation)
-		switch operation {
-		case "snapshot":
-			if len(operations) == 1 { // the first look is lost to a timeout
-				return nil, transportTimeout(t)
-			}
-			if failCancel {
-				return testSnapshot(Object{"7": taskWith("Running", Object{})}), nil
-			}
-			return testSnapshot(Object{"7": taskWith("Done", Object{"result": "Killed"})}), nil
-		case "cancel":
-			if failCancel {
-				failCancel = false
-				return nil, transportTimeout(t)
-			}
-			return Object{}, nil
-		}
-		t.Fatalf("unexpected operation %s", operation)
-		return nil, nil
-	}
+	replaced := taskWithToken(jobToken(99), "Running", Object{})
+	operations := scriptSnapshots(t, g, []step{{task: running()}, {fail: true}, {task: replaced}}, nil)
 	read := captureStreams(t)
-	err := Cancel(g, 7)
-	_, stderr := read()
-	if err != nil {
-		t.Fatal("transient outage failed the cancellation", err, operations)
-	}
-	// The lost read and the lost mutation are one continuous outage.
-	if strings.Count(stderr, "not responding") != 1 || strings.Count(stderr, "responding again") != 1 {
-		t.Fatalf("expected one loss and one recovery notice: %q", stderr)
-	}
-	if strings.Join(operations, ",") != "snapshot,snapshot,cancel,snapshot" {
-		t.Fatal("cancel was not retried after the lost response", operations)
+	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	read()
+	if code != 125 || err == nil || !strings.Contains(err.Error(), "no longer the command this client submitted") || len(mutations(*operations)) != 0 {
+		t.Fatal("a different job was cancelled or reported", code, err, *operations)
 	}
 }
 
-func TestCancelEndsVisiblyWhenDaemonStaysUnreachable(t *testing.T) {
-	fastOutage(t, 25*time.Millisecond)
+func TestCancelRefusesAJobReplacedBetweenReads(t *testing.T) {
 	g := testGate(t)
-	g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
+	replaced := taskWithToken(jobToken(99), "Running", Object{})
+	operations := scriptSnapshots(t, g, []step{{task: running()}, {task: replaced}}, func(string) (Object, error) { return Object{}, nil })
 	read := captureStreams(t)
-	err := Cancel(g, 7)
+	err := Cancel(g, 7) // no token supplied: the first read fixes it
 	read()
-	if err == nil || !strings.Contains(err.Error(), "may still be running") || !strings.Contains(err.Error(), "agent-heavy logs 7") || !errors.Is(err, errQueueTransportUnavailable) {
-		t.Fatal("sustained outage was not reported", err)
+	if err == nil || !strings.Contains(err.Error(), "no longer the job this cancellation targeted") {
+		t.Fatal("replaced job was cancelled", err)
+	}
+	if strings.Join(*operations, ",") != "snapshot,cancel,snapshot" {
+		t.Fatal("unexpected operations", *operations)
+	}
+}
+
+func TestCancelRefusesAMismatchedExpectedTokenBeforeAnyMutation(t *testing.T) {
+	g := testGate(t)
+	operations := scriptSnapshots(t, g, []step{{task: taskWithToken(jobToken(99), "Running", Object{})}}, nil)
+	read := captureStreams(t)
+	_, err := cancelJob(g, 7, jobToken(8))
+	read()
+	if err == nil || len(mutations(*operations)) != 0 {
+		t.Fatal("a different job was cancelled", err, *operations)
+	}
+}
+
+func TestCancelReportsAnUnconfirmedCancellationAtOnce(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		steps []step
+		want  string
+	}{
+		{"lost read", []step{{fail: true}}, "snapshot"},
+		{"lost mutation", []step{{task: running()}}, "snapshot,cancel"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			g := testGate(t)
+			operations := scriptSnapshots(t, g, test.steps, func(string) (Object, error) { return nil, transportTimeout(t) })
+			read := captureStreams(t)
+			err := Cancel(g, 7)
+			_, stderr := read()
+			if err == nil || !strings.Contains(err.Error(), "could not be confirmed") || !strings.Contains(err.Error(), "agent-heavy logs 7") || !errors.Is(err, errQueueTransportUnavailable) {
+				t.Fatal("unconfirmed cancellation was not reported", err)
+			}
+			if strings.Contains(err.Error(), "not delivered") || strings.Join(*operations, ",") != test.want || stderr != "" {
+				t.Fatalf("unexpected claim, retry or notice: %v %v %q", err, *operations, stderr)
+			}
+		})
 	}
 }
 
 func TestCancelStillFailsAtOnceOnNonTransportError(t *testing.T) {
-	fastOutage(t, time.Minute)
 	g := testGate(t)
 	boom := errors.New("Queue returned an invalid task")
 	calls := 0
@@ -246,90 +285,23 @@ func TestCancelStillFailsAtOnceOnNonTransportError(t *testing.T) {
 	}
 }
 
-func TestLaneWaitRidesOutTransientQueueTransportFailure(t *testing.T) {
-	fastOutage(t, time.Minute)
-	g := testGate(t)
-	failures := 2
-	g.queueControl = func(operation string, _ Object) (Object, error) {
-		if failures > 0 {
-			failures--
-			return nil, transportTimeout(t)
-		}
-		return Object{"id": 5, "state": "held", "lane": "build"}, nil
-	}
-	var stdout, stderr bytes.Buffer
-	if code := laneWait(g, 5, nil, laneOutput{stdout: &stdout, stderr: &stderr}, nil); code != 0 {
-		t.Fatal("transient outage ended the lane wait", code, stderr.String())
-	}
-	if strings.Count(stderr.String(), "still waiting for lease 5") != 1 || strings.Count(stderr.String(), "responding again (lease 5)") != 1 || !strings.Contains(stdout.String(), "lease 5 held") {
-		t.Fatalf("unexpected output: %q %q", stdout.String(), stderr.String())
-	}
-}
-
-func TestLaneWaitEndsVisiblyWhenDaemonStaysUnreachable(t *testing.T) {
-	fastOutage(t, 25*time.Millisecond)
-	g := testGate(t)
-	g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
-	var stdout, stderr bytes.Buffer
-	code := laneWait(g, 5, nil, laneOutput{stdout: io.Discard, stderr: &stderr}, nil)
-	if code != laneExitRefused || !strings.Contains(stderr.String(), "lease 5 may still be queued") {
-		t.Fatal("sustained outage was not reported", code, stdout.String(), stderr.String())
-	}
-}
-
-func signals(n int) chan os.Signal {
-	c := make(chan os.Signal, 8)
-	for i := 0; i < n; i++ {
-		c <- syscall.SIGINT
-	}
-	return c
-}
-
-func TestCancelEndsAtBoundWhenOnlyMutationsFail(t *testing.T) {
-	fastOutage(t, 25*time.Millisecond)
-	g := testGate(t)
-	calls := 0
-	g.queueControl = func(operation string, _ Object) (Object, error) {
-		calls++
-		if operation == "snapshot" {
-			return testSnapshot(Object{"7": taskWith("Running", Object{})}), nil
-		}
-		return nil, transportTimeout(t)
-	}
-	read := captureStreams(t)
-	start := time.Now()
-	err := Cancel(g, 7)
-	_, stderr := read()
-	if err == nil || !strings.Contains(err.Error(), "was not delivered") || !strings.Contains(err.Error(), "agent-heavy logs 7") || !errors.Is(err, errQueueTransportUnavailable) {
-		t.Fatal("failing mutations did not end at the bound", err)
-	}
-	if time.Since(start) > 5*time.Second || calls > 500 {
-		t.Fatal("cancellation kept retrying past its bound", time.Since(start), calls)
-	}
-	if strings.Count(stderr, "not responding") != 1 || strings.Contains(stderr, "responding again") {
-		t.Fatalf("one outage must give one loss notice: %q", stderr)
-	}
-}
-
 func TestCancelNeverKillsWithoutADeliveredCancel(t *testing.T) {
-	fastOutage(t, time.Minute)
 	oldGrace := queueCancelGrace
 	queueCancelGrace = 30 * time.Millisecond
 	t.Cleanup(func() { queueCancelGrace = oldGrace })
 	g := testGate(t)
+	killed, delivered := false, 0
 	var operations []string
-	delivered := 0
-	killed := false
 	g.queueControl = func(operation string, _ Object) (Object, error) {
 		operations = append(operations, operation)
 		switch operation {
 		case "snapshot":
 			if killed {
-				return testSnapshot(Object{"7": taskWith("Done", Object{"result": "Killed"})}), nil
+				return testSnapshot(Object{"7": done("Killed")}), nil
 			}
-			return testSnapshot(Object{"7": taskWith("Running", Object{})}), nil
+			return testSnapshot(Object{"7": running()}), nil
 		case "cancel":
-			if len(operations) == 2 { // a slow cancel outlives the whole grace period, then its reply is lost
+			if delivered == 0 && len(operations) == 2 { // a slow cancel whose reply is lost
 				time.Sleep(60 * time.Millisecond)
 				return nil, transportTimeout(t)
 			}
@@ -337,7 +309,7 @@ func TestCancelNeverKillsWithoutADeliveredCancel(t *testing.T) {
 			return Object{}, nil
 		case "kill":
 			if delivered == 0 {
-				t.Error("SIGKILL without evidence that the cancel was delivered", operations)
+				t.Error("SIGKILL without a delivered cancel", operations)
 			}
 			killed = true
 			return Object{}, nil
@@ -346,122 +318,130 @@ func TestCancelNeverKillsWithoutADeliveredCancel(t *testing.T) {
 		return nil, nil
 	}
 	read := captureStreams(t)
-	err := Cancel(g, 7)
-	read()
-	if err != nil {
+	defer read()
+	if err := Cancel(g, 7); err == nil {
+		t.Fatal("a lost reply must be reported, not turned into a kill")
+	}
+	if strings.Contains(strings.Join(operations, ","), "kill") {
+		t.Fatal("kill without evidence of delivery", operations)
+	}
+	if err := Cancel(g, 7); err != nil {
 		t.Fatal(err, operations)
 	}
-	first := strings.Index(strings.Join(operations, ","), "kill")
-	if first < 0 || !strings.Contains(strings.Join(operations, ",")[:first], "cancel,snapshot,cancel") {
+	if !strings.Contains(strings.Join(operations, ","), "cancel,snapshot,kill") {
 		t.Fatal("kill did not follow a delivered cancel and its grace period", operations)
+	}
+}
+
+func TestFollowHeldInterruptEndsAtTheOutageBoundWhenOnlyMutationsFail(t *testing.T) {
+	fastOutage(t, 25*time.Millisecond)
+	g := testGate(t)
+	operations := scriptSnapshots(t, g, []step{{task: running()}}, func(string) (Object, error) { return nil, transportTimeout(t) })
+	read := captureStreams(t)
+	start := time.Now()
+	code, err := followWithToken(g, 7, signals(1), "")
+	_, stderr := read()
+	if code != 125 || err == nil || !strings.Contains(err.Error(), "could not be confirmed") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
+		t.Fatal("failing mutations did not end at the bound", code, err)
+	}
+	if time.Since(start) > 5*time.Second || len(*operations) > 2000 {
+		t.Fatal("kept retrying past the bound", time.Since(start), len(*operations))
+	}
+	if strings.Count(stderr, "not responding") != 1 {
+		t.Fatalf("one outage must give one loss notice: %q", stderr)
 	}
 }
 
 func TestFollowSecondSignalDuringOutageEndsTheWait(t *testing.T) {
 	fastOutage(t, time.Minute)
 	g := testGate(t)
-	var mutations []string
+	var mutated []string
 	g.queueControl = func(operation string, _ Object) (Object, error) {
 		if operation != "snapshot" {
-			mutations = append(mutations, operation)
+			mutated = append(mutated, operation)
 		}
 		return nil, transportTimeout(t)
 	}
 	read := captureStreams(t)
 	code, err := followWithToken(g, 7, signals(2), "")
 	_, stderr := read()
-	if code != 125 || err == nil || !strings.Contains(err.Error(), "cancellation was not delivered") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
+	if code != 125 || err == nil || !strings.Contains(err.Error(), "could not be confirmed") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
 		t.Fatal("second interrupt did not end the wait", code, err)
 	}
-	if len(mutations) != 0 || strings.Count(stderr, "interrupt received") != 1 {
-		t.Fatalf("unexpected mutation or notice: %v %q", mutations, stderr)
+	if len(mutated) != 0 || strings.Count(stderr, "interrupt received") != 1 {
+		t.Fatalf("unexpected mutation or notice: %v %q", mutated, stderr)
 	}
 }
 
-func TestFollowSaysHeldInterruptWasNotDeliveredAtBound(t *testing.T) {
+func TestFollowSaysHeldInterruptWasNotConfirmedAtBound(t *testing.T) {
 	fastOutage(t, 25*time.Millisecond)
 	g := testGate(t)
 	g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
 	read := captureStreams(t)
 	code, err := followWithToken(g, 7, signals(1), "")
 	read()
-	if code != 125 || err == nil || !strings.Contains(err.Error(), "interrupt was not delivered") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
+	if code != 125 || err == nil || !strings.Contains(err.Error(), "cancellation requested by your interrupt could not be confirmed") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
 		t.Fatal("held interrupt was dropped silently", code, err)
 	}
 }
 
-func TestCancelOutageWaitIsInterruptible(t *testing.T) {
-	fastOutage(t, time.Minute)
-	queueOutageBackoff = func(int) time.Duration { return time.Hour }
-	g := testGate(t)
-	g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
-	read := captureStreams(t)
-	done := make(chan error, 1)
-	go func() { done <- cancelWithSignals(g, 7, signals(1)) }()
-	select {
-	case err := <-done:
-		read()
-		if err == nil || !strings.Contains(err.Error(), "was not delivered") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
-			t.Fatal("interrupt did not explain the undelivered cancel", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("interrupt did not end the backoff wait")
-	}
-}
-
-func TestFollowExplainsAPausedQueueAfterAnOutage(t *testing.T) {
+// A finished job's own result wins over a held interrupt.
+func TestFollowReportsAFinishedJobsResultOverAHeldInterrupt(t *testing.T) {
 	fastOutage(t, time.Minute)
 	g := testGate(t)
-	calls := 0
-	g.queueControl = func(string, Object) (Object, error) {
-		calls++
-		switch {
-		case calls <= 2:
-			return nil, transportTimeout(t)
-		case calls <= 4: // the poll and the pause check
-			snapshot := testSnapshot(Object{"7": taskWith("Queued", Object{})})
-			snapshot["groups"] = Object{"default": Object{"status": "Paused", "parallel_tasks": 1}}
-			return snapshot, nil
-		}
-		return testSnapshot(Object{"7": taskWith("Done", Object{"result": "Success"})}), nil
-	}
+	scriptSnapshots(t, g, []step{{task: running()}, {fail: true}, {task: done(Object{"Failed": 41})}}, nil)
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, make(chan os.Signal), "")
+	code, err := followWithToken(g, 7, signals(1), jobToken(8))
 	_, stderr := read()
-	if err != nil || code != 0 {
-		t.Fatal(code, err)
-	}
-	if strings.Count(stderr, "agent-heavy resume") != 1 || strings.Contains(stderr, "not affected") {
-		t.Fatalf("pause was not explained once: %q", stderr)
+	if code != 41 || err != nil || !strings.Contains(stderr, "had already finished, so the interrupt did nothing") {
+		t.Fatal("the finished job's result was replaced", code, err, stderr)
 	}
 }
 
-func TestFollowRefusesAnotherJobUnderTheSameID(t *testing.T) {
+// The cancellation's own cleanup hits an outage after the job ended with
+// Success: the client must report Success, not 125.
+func TestFollowKeepsTheResultWhenCleanupFailsDuringAHeldCancellation(t *testing.T) {
 	fastOutage(t, time.Minute)
 	g := testGate(t)
-	other := taskWith("Done", Object{"result": "Success"})
-	other["token"] = fmt.Sprintf("%032x", 99)
-	g.queueControl = func(string, Object) (Object, error) { return testSnapshot(Object{"7": other}), nil }
+	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
+	n := 0
+	g.queueControl = func(operation string, _ Object) (Object, error) {
+		if operation != "snapshot" {
+			return Object{}, nil
+		}
+		n++
+		switch {
+		case n == 2: // the interrupt is taken during this lost read
+			return nil, transportTimeout(t)
+		case n <= 4: // the log path, the follow read, then the cancellation's first read
+			return testSnapshot(Object{"7": running()}), nil
+		case n == 5: // the cancel took effect and the job finished
+			return testSnapshot(Object{"7": done("Success")}), nil
+		case n == 7:
+			return testSnapshot(Object{"7": done("Success")}), nil
+		}
+		return nil, transportTimeout(t) // cleanup cannot be confirmed
+	}
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, make(chan os.Signal), fmt.Sprintf("%032x", 8))
-	read()
-	if code != 125 || err == nil || !strings.Contains(err.Error(), "no longer the command this client submitted") {
-		t.Fatal("another job's result was used", code, err)
+	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	_, stderr := read()
+	if code != 0 || err != nil || !strings.Contains(stderr, "finished with exit status 0 while its cancellation was being confirmed") {
+		t.Fatal("a cleanup outage replaced the job's result", code, err, stderr)
 	}
 }
 
 func TestFollowReportsAFinishedJobFromTheStoreWhenDaemonStaysGone(t *testing.T) {
-	token := fmt.Sprintf("%032x", 8)
+	token := jobToken(8)
 	for _, test := range []struct {
 		name, phase, jobToken string
 		task                  Object
 		outcome               any
 		code                  int
 	}{
-		{"done", "done", token, taskWith("Done", Object{"result": Object{"Failed": 41}}), 41, 41},
-		{"outcome", "outcome", token, taskWith("Running", Object{}), 23, 23},
-		{"running", "running", token, taskWith("Running", Object{}), nil, -1},
-		{"other token", "done", fmt.Sprintf("%032x", 99), taskWith("Done", Object{"result": "Success"}), 0, -1},
+		{"done", "done", token, done(Object{"Failed": 41}), 41, 41},
+		{"outcome", "outcome", token, running(), 23, 23},
+		{"running", "running", token, running(), nil, -1},
+		{"other token", "done", jobToken(99), done("Success"), 0, -1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fastOutage(t, 25*time.Millisecond)
@@ -501,15 +481,8 @@ func TestFollowReportsAFinishedJobFromTheStoreWhenDaemonStaysGone(t *testing.T) 
 func TestFollowKeepsTheJobResultWhenOnlyCleanupLosesTheDaemon(t *testing.T) {
 	fastOutage(t, 25*time.Millisecond)
 	g := testGate(t)
-	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": fmt.Sprintf("%032x", 8)})
-	calls := 0
-	g.queueControl = func(string, Object) (Object, error) {
-		calls++
-		if calls <= 2 {
-			return testSnapshot(Object{"7": taskWith("Done", Object{"result": Object{"Failed": 41}})}), nil
-		}
-		return nil, transportTimeout(t)
-	}
+	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
+	scriptSnapshots(t, g, []step{{task: done(Object{"Failed": 41})}, {task: done(Object{"Failed": 41})}, {fail: true}}, nil)
 	read := captureStreams(t)
 	code, err := followWithToken(g, 7, make(chan os.Signal), "")
 	_, stderr := read()
@@ -518,17 +491,128 @@ func TestFollowKeepsTheJobResultWhenOnlyCleanupLosesTheDaemon(t *testing.T) {
 	}
 }
 
-func TestQueueOutageNoticesSurviveAHandoverReset(t *testing.T) {
+func TestWaitCleanupReportsUnconfirmedCleanupAfterOneProbe(t *testing.T) {
+	fastOutage(t, time.Minute)
+	g := testGate(t)
+	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
+	calls := 0
+	g.queueControl = func(string, Object) (Object, error) { calls++; return nil, transportTimeout(t) }
+	read := captureStreams(t)
+	err := WaitCleanup(g, 7)
+	_, stderr := read()
+	if err == nil || !errors.Is(err, errQueueTransportUnavailable) || !strings.Contains(err.Error(), "could not be confirmed") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
+		t.Fatal("unconfirmed cleanup was not reported", err)
+	}
+	if calls != 1 || stderr != "" {
+		t.Fatalf("cleanup retried or announced: calls=%d %q", calls, stderr)
+	}
+}
+
+// Cleanup has no retry state to restart: the first answered probe with the
+// receipt still present ends it, as before.
+func TestWaitCleanupEndsAtTheFirstAnsweredProbeWithTheReceiptStillPresent(t *testing.T) {
+	fastOutage(t, time.Minute)
+	g := testGate(t)
+	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
+	calls := 0
+	g.queueControl = func(string, Object) (Object, error) { calls++; return testSnapshot(Object{}), nil }
+	read := captureStreams(t)
+	err := WaitCleanup(g, 7)
+	read()
+	if err == nil || !strings.Contains(err.Error(), "cleanup did not complete") || calls != 1 {
+		t.Fatal("an answered probe did not end cleanup", err, calls)
+	}
+}
+
+func TestWaitCleanupStillFailsAtOnceOnNonTransportError(t *testing.T) {
+	fastOutage(t, time.Minute)
+	g := testGate(t)
+	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
+	calls := 0
+	g.queueControl = func(string, Object) (Object, error) { calls++; return nil, errors.New("boom") }
+	read := captureStreams(t)
+	err := WaitCleanup(g, 7)
+	_, stderr := read()
+	if err == nil || !strings.Contains(err.Error(), "cleanup did not complete") || calls != 1 || stderr != "" {
+		t.Fatal("non-transport error was retried or announced", err, calls, stderr)
+	}
+}
+
+func TestFollowExplainsAPausedQueueOnceAndWithoutGuessingWhy(t *testing.T) {
+	queued := taskWith("Queued", Object{})
+	for _, test := range []struct {
+		name  string
+		steps []step
+	}{
+		{"after one outage", []step{{fail: true}, {fail: true}, {task: queued, pause: true}, {task: queued, pause: true}, {task: done("Success")}}},
+		{"across flapping outages", []step{{fail: true}, {fail: true}, {task: queued, pause: true}, {task: queued, pause: true}, {fail: true}, {task: queued, pause: true}, {fail: true}, {task: queued, pause: true}, {task: done("Success")}}},
+		{"after a lost check", []step{{fail: true}, {fail: true}, {task: queued, pause: true}, {fail: true}, {task: queued, pause: true}, {task: queued, pause: true}, {task: done("Success")}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fastOutage(t, time.Minute)
+			g := testGate(t)
+			scriptSnapshots(t, g, test.steps, nil)
+			read := captureStreams(t)
+			code, err := followWithToken(g, 7, make(chan os.Signal), "")
+			_, stderr := read()
+			if err != nil || code != 0 {
+				t.Fatal(code, err)
+			}
+			if strings.Count(stderr, "the queue is paused; job 7 will not start until the queue is resumed") != 1 {
+				t.Fatalf("pause was not explained exactly once: %q", stderr)
+			}
+			for _, claim := range []string{"unclean", "restart", "not affected", "agent-heavy resume"} {
+				if strings.Contains(stderr, claim) {
+					t.Fatalf("notice claims %q: %q", claim, stderr)
+				}
+			}
+			if strings.Count(stderr, "not responding") != 1 {
+				t.Fatalf("notices were not kept concise: %q", stderr)
+			}
+		})
+	}
+}
+
+func TestFollowSaysNothingAboutAQueueThatIsNotPaused(t *testing.T) {
+	fastOutage(t, time.Minute)
+	g := testGate(t)
+	queued := taskWith("Queued", Object{})
+	scriptSnapshots(t, g, []step{{fail: true}, {fail: true}, {task: queued}, {task: queued}, {task: done("Success")}}, nil)
+	read := captureStreams(t)
+	code, err := followWithToken(g, 7, make(chan os.Signal), "")
+	_, stderr := read()
+	if err != nil || code != 0 || strings.Contains(stderr, "paused") {
+		t.Fatal(code, err, stderr)
+	}
+}
+
+func TestQueueOutageNoticesAreConciseAndSurviveAHandoverReset(t *testing.T) {
 	var out bytes.Buffer
 	o := newQueueOutage(3, &out)
-	o.lose()
+	o.lose(nil)
 	o.reset()
-	if !o.recover() || strings.Count(out.String(), "responding again") != 1 {
+	if !o.recover() || strings.Count(out.String(), "answering again") != 1 {
 		t.Fatal("recovery after a reset was silent", out.String())
 	}
-	o.lose()
+	for i := 0; i < 20; i++ { // flapping stays quiet
+		o.lose(nil)
+		o.recover()
+	}
+	if strings.Count(out.String(), "not responding") != 1 || strings.Count(out.String(), "answering again") != 1 {
+		t.Fatal("flapping produced a notice per blip", out.String())
+	}
+	o.noticed = time.Now().Add(-time.Hour)
+	o.lose(nil)
 	if strings.Count(out.String(), "not responding") != 2 {
-		t.Fatal("the next outage was not announced", out.String())
+		t.Fatal("a later outage was not announced", out.String())
+	}
+}
+
+func TestQueueOutageDoesNotClaimAnUnresponsiveDaemonDuringAHandover(t *testing.T) {
+	var out bytes.Buffer
+	newQueueOutage(3, &out).lose(errQueueHandoverBusy)
+	if strings.Contains(out.String(), "not responding") || !strings.Contains(out.String(), "handover in progress") {
+		t.Fatal(out.String())
 	}
 }
 
@@ -541,17 +625,43 @@ func TestOversizedQueueResponseIsNotATransportFailure(t *testing.T) {
 	}
 }
 
-func TestWaitCleanupStillFailsAtOnceOnNonTransportError(t *testing.T) {
+func TestQueueControlHonoursItsDeadlineBeforeLookingForTheSocket(t *testing.T) {
+	g := testGate(t)
+	g.ControlDeadline = time.Now().Add(-time.Second)
+	_, err := g.QueueControl("snapshot", nil)
+	if err == nil || !strings.Contains(err.Error(), "deadline expired") || errors.Is(err, errQueueTransportUnavailable) {
+		t.Fatal("an expired deadline was reported as a retryable outage", err)
+	}
+}
+
+func TestLaneWaitRidesOutTransientQueueTransportFailure(t *testing.T) {
 	fastOutage(t, time.Minute)
 	g := testGate(t)
-	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": fmt.Sprintf("%032x", 8)})
-	calls := 0
-	g.queueControl = func(string, Object) (Object, error) { calls++; return nil, errors.New("boom") }
-	read := captureStreams(t)
-	err := WaitCleanup(g, 7)
-	_, stderr := read()
-	if err == nil || !strings.Contains(err.Error(), "cleanup did not complete") || calls != 1 || stderr != "" {
-		t.Fatal("non-transport error was retried or announced", err, calls, stderr)
+	failures := 2
+	g.queueControl = func(operation string, _ Object) (Object, error) {
+		if failures > 0 {
+			failures--
+			return nil, transportTimeout(t)
+		}
+		return Object{"id": 5, "state": "held", "lane": "build"}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if code := laneWait(g, 5, nil, laneOutput{stdout: &stdout, stderr: &stderr}, nil); code != 0 {
+		t.Fatal("transient outage ended the lane wait", code, stderr.String())
+	}
+	if strings.Count(stderr.String(), "still waiting for lease 5") != 1 || strings.Count(stderr.String(), "answering again (lease 5)") != 1 || !strings.Contains(stdout.String(), "lease 5 held") {
+		t.Fatalf("unexpected output: %q %q", stdout.String(), stderr.String())
+	}
+}
+
+func TestLaneWaitEndsVisiblyWhenDaemonStaysUnreachable(t *testing.T) {
+	fastOutage(t, 25*time.Millisecond)
+	g := testGate(t)
+	g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
+	var stderr bytes.Buffer
+	code := laneWait(g, 5, nil, laneOutput{stdout: io.Discard, stderr: &stderr}, nil)
+	if code != laneExitRefused || !strings.Contains(stderr.String(), "lease 5 may still be queued") {
+		t.Fatal("sustained outage was not reported", code, stderr.String())
 	}
 }
 
@@ -576,24 +686,8 @@ func TestLaneWaitReportsWhetherTheWithdrawalWorked(t *testing.T) {
 			g := testGate(t)
 			g.queueControl = func(string, Object) (Object, error) { return Object{"id": 5, "state": "queued"}, nil }
 			var stdout, stderr bytes.Buffer
-			// The guard keeps an early signal from ending the test binary; the sender
-			// repeats until laneWait returns so a late registration still gets one.
-			guard := make(chan os.Signal, 64)
-			signal.Notify(guard, syscall.SIGINT)
-			defer signal.Stop(guard)
-			stop := make(chan struct{})
-			go func() {
-				for {
-					select {
-					case <-stop:
-						return
-					case <-time.After(50 * time.Millisecond):
-						_ = syscall.Kill(os.Getpid(), syscall.SIGINT)
-					}
-				}
-			}()
-			defer close(stop)
-			code := laneWait(g, 5, nil, laneOutput{stdout: &stdout, stderr: &stderr}, func() error { return test.release })
+			interrupt := signals(1) // a channel, not a process signal: nothing can end the test binary
+			code := laneWaitSignals(g, 5, nil, laneOutput{stdout: &stdout, stderr: &stderr}, func() error { return test.release }, interrupt)
 			if code != 130 || !strings.Contains(stderr.String(), test.want) {
 				t.Fatal(code, stderr.String())
 			}

@@ -2,38 +2,36 @@
 
 ## Result
 
-`agent-heavy run` no longer exits 125 when one queue call times out while it follows a submitted job. The job lives in the daemon and keeps running; only the client lost sight of it, and an agent reading 125 would conclude the job failed and may submit it again. The follow loop, the finished-job cleanup wait, cancellation and `agent-heavy lane wait` now keep trying through a transport failure (`errQueueTransportUnavailable`), print one stderr notice on loss and one on recovery, and keep draining the job log meanwhile.
+`agent-heavy run` no longer exits 125 when one queue call times out while it follows a submitted job. The job lives in the daemon and keeps running; only the client lost sight of it, and an agent reading 125 would conclude the job failed and may submit it again.
 
-## Bound
+## Design: one place retries
 
-A continuous outage may last `queueOutageWindow`, two minutes. A stopped daemon returns the same transport error. The menu bar app restarts it after at most a 10 second throttle (`AgentSupervisor.swift`), and startup adds the database open, so two minutes covers several restart attempts on a slow, swapping host. Backoff between attempts is 0.4 s doubling to 3 s. The bound, the backoff, the cleanup window and the cancel grace period are variables only so tests can shorten them.
+Retrying happens in exactly one place, the follow loop (`followWithToken`), plus `agent-heavy lane wait`. Everything else reports a lost call once and truthfully, and the follow loop decides what to do.
 
-When the bound passes, the client first reads the job's terminal outcome from the queue store, read-only (`queueReadHandoverStore`: no migration, no write, no daemon-held lock) and only for the exact submitted token. A finished job reports its real exit status. Otherwise the client exits 125 naming the job, saying it may still be running and pointing to `agent-heavy logs JOB_ID`. If the user interrupted, it also says the cancellation was not delivered.
-
-## Behavior in detail
-
-- **Cancel.** A read alone no longer ends an outage; only a delivered mutation or a terminal state does, so a daemon that answers snapshots but loses `cancel` and `kill` reaches the bound with one loss notice. `kill` is sent only after a `cancel` was acknowledged and the 3 second grace period passed, never because a reply was lost. The retry wait is interruptible.
-- **Interrupts.** The first interrupt during an outage is held and announced; a second ends the wait with the inspect message. The held interrupt cancels the job when the daemon answers.
-- **Paused queue.** An unclean daemon restart pauses the queue. When a client recovers and its job is still queued behind a paused queue, it prints one notice naming `agent-heavy resume`.
-- **Finished job, cleanup blocked.** If only the daemon's absence blocks cleanup, the job's real exit status is returned with the notice on stderr instead of 125. Other cleanup failures still return 125.
-- **Identity.** If the daemon reports a different token under the job ID, the client refuses to use or cancel it.
-- **Oversized reply.** A reply over 32 MiB fails once with a definite error instead of being retried as a lost connection.
-- **Lane wait.** Notices say "lease". An interrupt reports whether the withdrawal worked and how to inspect the lease.
+- **One definition of recovery:** an iteration with no transport failure anywhere (the read, the held-interrupt cancellation, and any cleanup it triggers). A read that answers while a `cancel` or `kill` is lost is not recovery, so a daemon that answers snapshots but loses mutations reaches the bound.
+- **One budget:** a continuous outage may last `queueOutageWindow`, two minutes, plus the one call in flight when it ends (a call times out after 15 s). The window covers the app's 10 second restart throttle (`AgentSupervisor.swift`) several times over plus startup on a slow host. Backoff is 0.4 s doubling to 3 s. A second interrupt is observed between calls, so it can take up to one call (15 s) to act.
+- **`Cancel` does not retry** (used by `agent-heavy cancel`, the signal path and installer preflight). It returns at once with `Cancellation of job N could not be confirmed; the job may still be running; inspect it with: agent-heavy logs N`, wrapping the real cause. It never claims "not delivered" or "unreachable", because a lost reply can hide a delivered signal and snapshots may be answering. A waiting client retries it within its own budget. Trade-off: a standalone `agent-heavy cancel` on a briefly slow daemon fails once instead of retrying; the operator re-runs it, which is safe because cancellation is idempotent. This removed the nested outage state, the deadline refund, the interruptible sleeps and the three-phase composition (measured earlier at about 3 times the bound).
+- **`WaitCleanup` does not retry** either. If the only problem is that the daemon does not answer the cleanup probe, it returns a transport error and the follow loop returns the job's real exit status with a stderr note. A daemon that answers but leaves the receipt behind is an anomaly, not an outage, and stays 125.
+- **Grace:** `kill` follows only a `cancel` the daemon acknowledged in the same call, after the 3 s grace. A lost reply never starts the clock.
+- **Identity:** the daemon's task token is checked on every read in the follow loop and in `Cancel` (standalone `Cancel` fixes the token on its first read), before any mutation.
+- **Real result wins:** a job observed `Done` is reported with its own exit status, with a note when an interrupt was held ("had already finished, so the interrupt did nothing", or "finished ... while its cancellation was being confirmed" if a cancel had been sent). At the bound, the client reads the terminal outcome from the queue store read-only (`queueReadHandoverStore`: `mode=ro`, no migration, no write, no daemon lock), only for the exact submitted token and only for `done` or `outcome` phases.
+- **Interrupts:** the first interrupt during an outage is held and announced; a second ends the wait with `... the cancellation could not be confirmed ... inspect it with: agent-heavy logs N`. At the bound the message says the cancellation requested by the interrupt could not be confirmed.
+- **Paused queue:** after a loss, a client whose job is queued checks the group once on recovery, again if that check was lost, and on the 15 s tick. It prints one notice per run, `the queue is paused; job N will not start until the queue is resumed`, with no cause and no command.
+- **Notices:** loss and recovery are printed at most once per 30 s, so a flapping daemon stays quiet. During a handover the notice says so instead of claiming the daemon is not responding.
+- **Also:** `QueueControl` honours `ControlDeadline` before looking for the socket (a missing socket no longer defeats the installer's 20 s deadline). A reply over 32 MiB fails once instead of being retried. `lane wait` says "lease" and reports whether the withdrawal on interrupt worked.
 
 ## Unchanged
 
-Non-transport errors fail at once as before. The handover path (`queueHandoverFollowTask`) is consulted first and still wins. Submission still reconciles by token with two immediate retries. The command is never run directly. The daemon and its 100 ms tick are untouched.
+Non-transport errors fail at once as before. The handover path (`queueHandoverFollowTask`) is consulted first. Submission still reconciles by token with two immediate retries. The command is never run directly. The daemon server code and its 100 ms tick are untouched.
 
-## Known gaps, out of scope here
+## Known gaps, out of scope
 
-- A worker waiting for the shared slot exits 125 on a transport failure outside handover custody, so the command never runs and the job records 125 (`execution.go`, worker wait; `queue_handover_test.go` `missing-custody` requires it). Resubmitting is safe.
-- A retained `consumed` handover receipt ends a client immediately (`queue_handover.go`). No non-test code removes `run/handover.json`; PR #63 or later handover work may affect it.
-- Between `ListenUnix` and `Chmod` in the daemon the socket has mode 0700, so a retrying client can land in that window and exit 125. The socket check must not be relaxed.
+- A worker waiting for the shared slot exits 125 on a transport failure outside handover custody (`execution.go:709`; `queue_handover_test.go` `missing-custody` requires it). Resubmitting is safe.
+- A retained `consumed` handover receipt ends a client immediately (`queue_handover.go:910-916`). No non-test code removes `run/handover.json`; PR #63 or later work may affect it.
+- Between `ListenUnix` and `Chmod` the socket has mode 0700 (`queue_daemon.go:244-250`), so a retrying client can land in that window and exit 125. The socket check must not be relaxed.
 - `lane acquire` retries submission immediately, so a refused socket exhausts its two retries at once.
 - Why the daemon becomes slow under memory pressure.
 
 ## Validation
 
-Locally, directly: focused `go test -p 2 -parallel 2 ./internal/backend` runs over the new tests, `TestResults`, `TestRealDaemon`, handover, lane, follow, cancel and queue tests, and `-race` over the new tests and the two adjusted real-daemon tests. The full package and other packages are left to hosted CI because of host memory pressure.
-
-Two real-daemon tests asserted the old behavior (client exits 125 when the daemon dies). They now assert that the client keeps waiting, announces the outage and the paused queue, and finishes with the real result.
+Locally, directly, with `-race` on the new tests; the full package is left to hosted CI because of host memory pressure. See the pull request for the exact commands and results.
