@@ -12,6 +12,11 @@ import (
 // through this file, so legal edges, matching writes and compare-and-swap guards
 // have one owner. The one other writer is importLegacy, which inserts drained
 // history. Reads never validate: snapshots must still show a corrupt row.
+//
+// The overwrite methods at the end of this file are the deliberate exception. A
+// corrupted row must never stop the queue, refuse startup or stall other jobs, so
+// the daemon settles one and logs it. Nothing else may call them, and every other
+// write refuses an illegal edge or a disagreeing row.
 
 var (
 	errQueueChanged           = errors.New("Queue job changed concurrently")
@@ -43,7 +48,7 @@ var (
 func queueJobAgreement(j queueJob) error {
 	name, details, e := TaskStatus(j.task)
 	if e != nil {
-		return e
+		return fmt.Errorf("%w: job %d is %s: %w", errQueueStateDisagreement, j.id, j.phase, e)
 	}
 	agrees := false
 	switch j.phase {
@@ -182,12 +187,18 @@ func (s *queueStore) setPaused(j queueJob, paused bool) error {
 	return s.saveTask(j)
 }
 
-// markCancelled records an operator's request. It writes a held row too, because
-// cancelling is the one way to settle one, and it leaves status alone.
+// markCancelled records an operator's request and leaves status alone.
 func (s *queueStore) markCancelled(j queueJob) error {
 	if j.phase == "done" {
 		return fmt.Errorf("%w: %s %d is done and cannot be cancelled", errQueueIllegalTransition, taskKind(j.task), j.id)
 	}
+	if e := queueJobAgreement(j); e != nil {
+		return e
+	}
+	return s.writeCancelled(j)
+}
+
+func (s *queueStore) writeCancelled(j queueJob) error {
 	j.task["cancelled"] = true
 	data, e := queueJSON(j.task)
 	if e != nil {
@@ -249,7 +260,7 @@ func (s *queueStore) recordOutcome(j queueJob, code int) error {
 func (s *queueStore) writeOutcome(j queueJob, code int) error {
 	_, details, e := TaskStatus(j.task)
 	if e != nil {
-		details = Object{} // Only a held row gets here with no readable status.
+		details = Object{} // Only an overwrite gets here with no readable status.
 	}
 	details["end"] = queueNow()
 	details["result"] = queueResult(code)
@@ -298,7 +309,7 @@ func (s *queueStore) endLease(j queueJob, at string) error {
 func (s *queueStore) writeLeaseEnd(j queueJob, at string) error {
 	_, details, e := TaskStatus(j.task)
 	if e != nil {
-		details = Object{} // Only a held row gets here with no readable status.
+		details = Object{} // Only an overwrite gets here with no readable status.
 	}
 	details["end"] = at
 	details["result"] = "Success"
@@ -312,36 +323,31 @@ func (s *queueStore) writeLeaseEnd(j queueJob, at string) error {
 	return s.swapJob(j, errQueueChanged, "UPDATE queue_jobs SET phase='done',task=?,outcome=0 WHERE id=? AND token=? AND phase=?", data, j.id, j.token, from)
 }
 
-// checkQueueHeld admits only a row the ordinary edges would refuse. Settling is
-// the operator's way out of a hold, and nothing else may use it.
-func checkQueueHeld(j queueJob, lease bool) error {
-	if taskIsLease(j.task) != lease || j.phase == "done" {
-		return fmt.Errorf("%w: %s %d in phase %s cannot be settled", errQueueIllegalTransition, taskKind(j.task), j.id, j.phase)
-	}
-	if queueJobAgreement(j) == nil {
-		return fmt.Errorf("%w: job %d is not held", errQueueIllegalTransition, j.id)
-	}
-	return nil
-}
+// The overwrite methods are the deliberate exception described above. Each keeps
+// the guards of the write it stands in for, and refuses a row its strict method
+// would accept, so it cannot become a way around the checks.
 
-// settleHeld gives a held command a result the store can stand behind, which the
-// caller may do only once no verified process remains. A row already at outcome
-// keeps its published exit status when it has one; cleanup then retires it.
-func (s *queueStore) settleHeld(j queueJob, code int) error {
-	if e := checkQueueHeld(j, false); e != nil {
-		return e
-	}
-	if j.phase == "outcome" && j.outcome.Valid {
-		code = int(j.outcome.Int64)
-	} else {
-		j.task["cancelled"] = true
+// overwriteOutcome settles a corrupted row, or a lease stranded at starting, which
+// no lifecycle edge covers. A healthy row and a published result are left alone.
+func (s *queueStore) overwriteOutcome(j queueJob, code int) error {
+	if j.phase == "done" || queueJobAgreement(j) == nil && !(taskIsLease(j.task) && j.phase == "starting") {
+		return fmt.Errorf("%w: %s %d in phase %s has no result to overwrite", errQueueIllegalTransition, taskKind(j.task), j.id, j.phase)
 	}
 	return s.writeOutcome(j, code)
 }
 
-func (s *queueStore) settleHeldLease(j queueJob, at string) error {
-	if e := checkQueueHeld(j, true); e != nil {
-		return e
+func (s *queueStore) overwriteLeaseEnd(j queueJob, at string) error {
+	if j.phase == "done" || !taskIsLease(j.task) || checkQueueEdge(j, true, "done") == nil {
+		return fmt.Errorf("%w: %s %d in phase %s has no lease end to overwrite", errQueueIllegalTransition, taskKind(j.task), j.id, j.phase)
 	}
 	return s.writeLeaseEnd(j, at)
+}
+
+// overwriteCancelled keeps an operator's request on a corrupted row, so the result
+// the daemon records once its process has gone still reads as cancelled.
+func (s *queueStore) overwriteCancelled(j queueJob) error {
+	if j.phase == "done" || queueJobAgreement(j) == nil {
+		return fmt.Errorf("%w: %s %d in phase %s has no cancel request to overwrite", errQueueIllegalTransition, taskKind(j.task), j.id, j.phase)
+	}
+	return s.writeCancelled(j)
 }

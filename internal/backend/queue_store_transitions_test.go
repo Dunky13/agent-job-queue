@@ -3,6 +3,7 @@ package backend
 import (
 	"errors"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -376,6 +377,9 @@ func TestQueueTransitionDisagreeingRowIsRefused(t *testing.T) {
 		{"outcome missing column", done, nil, transitionCommand, "outcome", func(s *queueStore, j queueJob) error { return s.retire(j) }},
 		{"outcome mismatched column", done, 8, transitionCommand, "outcome", func(s *queueStore, j queueJob) error { return s.retire(j) }},
 		{"outcome with unknown result", `{"status":{"Done":{"result":"Mystery"}}}`, 7, transitionCommand, "outcome", func(s *queueStore, j queueJob) error { return s.retire(j) }},
+		{"cancel request on running as Queued", `{"status":{"Queued":{}}}`, nil, transitionCommand, "running", func(s *queueStore, j queueJob) error { return s.markCancelled(j) }},
+		{"stash on queued as Running", `{"status":{"Running":{}}}`, nil, transitionCommand, "queued", func(s *queueStore, j queueJob) error { return s.setWaiting(j, true) }},
+		{"pause on running as Queued", `{"status":{"Queued":{}}}`, nil, transitionCommand, "running", func(s *queueStore, j queueJob) error { return s.setPaused(j, true) }},
 		{"queued lease as Running", `{"kind":"lease","status":{"Running":{}}}`, nil, transitionLease, "queued", func(s *queueStore, j queueJob) error { return s.grantLease(j, "2026-11-02T00:00:00Z") }},
 		{"held lease as Queued", `{"kind":"lease","status":{"Queued":{}}}`, nil, transitionLease, "running", func(s *queueStore, j queueJob) error { return s.endLease(j, "2026-11-02T00:00:00Z") }},
 	}
@@ -441,7 +445,8 @@ func TestQueueTransitionInvalidStatusKeepsItsError(t *testing.T) {
 	if _, err := s.db.Exec("UPDATE queue_jobs SET task='{}' WHERE id=1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.recordOutcome(transitionRow(t, s, 1), 125); err == nil || err.Error() != "Queue returned invalid task status" {
+	err := s.recordOutcome(transitionRow(t, s, 1), 125)
+	if !errors.Is(err, errQueueStateDisagreement) || !strings.Contains(err.Error(), "Queue returned invalid task status") {
 		t.Fatalf("error=%v", err)
 	}
 }

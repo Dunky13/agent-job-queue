@@ -234,18 +234,6 @@ func (d *queueDaemon) snapshot() (Object, error) {
 	}
 	snapshot["lanes"] = lanes
 	snapshot["plugins"] = plugins
-	// Omitted when empty, so a healthy queue's snapshot does not change.
-	problems := []Object{}
-	for _, j := range jobs {
-		if why := queueJobAgreement(j); why != nil {
-			problems = append(problems, Object{"id": j.id, "kind": "held", "message": why.Error()})
-		} else if message := d.errors[j.id]; message != "" {
-			problems = append(problems, Object{"id": j.id, "kind": "cleanup", "message": message})
-		}
-	}
-	if len(problems) != 0 {
-		snapshot["problems"] = problems
-	}
 	return snapshot, nil
 }
 
@@ -431,9 +419,20 @@ func (d *queueDaemon) acquireLease(p Object) (Object, error) {
 	d.emitTask("lease.queued", next, task, nil)
 	// Grant immediately when the lane has room, so --no-wait can report held.
 	if err = d.tick(); err != nil {
-		d.logLimited("tick", err.Error())
+		fmt.Fprintln(os.Stderr, "agent-heavy daemon:", err)
 	}
 	return d.leaseView(next)
+}
+
+// taskLeaseObject keeps a corrupted lease row with no lease object from panicking
+// the daemon on the lease fields written below.
+func taskLeaseObject(task Object) Object {
+	lease := obj(task["lease"])
+	if lease == nil {
+		lease = Object{}
+		task["lease"] = lease
+	}
+	return lease
 }
 
 func (d *queueDaemon) grantLease(j queueJob) error {
@@ -443,14 +442,18 @@ func (d *queueDaemon) grantLease(j queueJob) error {
 	if err := d.laneRoom(taskLane(j.task)); err != nil {
 		return err
 	}
-	lease := obj(j.task["lease"])
+	lease := taskLeaseObject(j.task)
 	now := d.stamp()
 	lease["state"] = "held"
 	lease["grantedAt"] = now
 	if ttl, _ := integer(lease["ttlSeconds"]); ttl > 0 {
 		lease["expiresAt"] = d.clock().Add(time.Duration(ttl) * time.Second).UTC().Format(time.RFC3339Nano)
 	}
-	if err := d.store.grantLease(j, now); err != nil {
+	err := d.store.grantLease(j, now)
+	if queueRowRefused(err) {
+		return errQueueChanged // The result main gives its guard on such a row.
+	}
+	if err != nil {
 		return err
 	}
 	d.emitTask("lease.granted", j.id, j.task, nil)
@@ -460,17 +463,7 @@ func (d *queueDaemon) grantLease(j queueJob) error {
 // endLease moves a lease straight to done: it has no process to clean up.
 // Held leases are released or expire; queued ones are dropped or expire.
 func (d *queueDaemon) endLease(j queueJob, reason string) error {
-	// Cancelling is the one reason that may settle a held lease; the store refuses
-	// the others. Read this first, while the row is as the caller found it.
-	end := d.store.endLease
-	if reason == "cancelled" && queueJobAgreement(j) != nil {
-		end = d.store.settleHeldLease
-	}
-	lease := obj(j.task["lease"])
-	if lease == nil {
-		lease = Object{}
-		j.task["lease"] = lease
-	}
+	lease := taskLeaseObject(j.task)
 	held := j.phase == "running"
 	state, event := "dropped", "lease.dropped"
 	switch {
@@ -488,7 +481,12 @@ func (d *queueDaemon) endLease(j queueJob, reason string) error {
 	if reason == "owner-exited" {
 		lease["ownerAlive"] = false
 	}
-	if err := end(j, now); err != nil {
+	err := d.store.endLease(j, now)
+	if queueRowRefused(err) {
+		d.reportRow(j)
+		err = d.store.overwriteLeaseEnd(j, now)
+	}
+	if err != nil {
 		return err
 	}
 	delete(d.ownerAlive, j.id)
@@ -602,10 +600,6 @@ func (d *queueDaemon) checkLeaseOwners() error {
 			return err
 		}
 		if !taskIsLease(j.task) || j.phase != "queued" && j.phase != "running" || !jsonEqual(obj(obj(j.task["lease"])["owner"]), owner) {
-			continue
-		}
-		if why := queueJobAgreement(j); why != nil {
-			d.holdRow(j, why)
 			continue
 		}
 		if err = d.endLease(j, "owner-exited"); err != nil && !errors.Is(err, errQueueChanged) {

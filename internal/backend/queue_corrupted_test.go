@@ -1,0 +1,733 @@
+package backend
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// Rows here are corrupted with raw SQL on purpose: no strict store method can
+// write them. The daemon settles such a row and logs it once.
+
+func corruptedDaemon(t *testing.T) (*queueDaemon, *queueStore, *laneClock, *bytes.Buffer) {
+	t.Helper()
+	d, clock := laneDaemon(t, 8, map[string]string{"qa": laneManifest("qa", `{"name":"qa","concurrency":4}`)})
+	output := &bytes.Buffer{}
+	d.logOutput = output
+	d.g.queueControl = func(op string, payload Object) (Object, error) {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.control(op, payload)
+	}
+	return d, d.store, clock, output
+}
+
+func corruptStatus(t *testing.T, s *queueStore, id int, status Object) queueJob {
+	t.Helper()
+	j := transitionRow(t, s, id)
+	j.task["status"] = status
+	data, err := queueJSON(j.task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.db.Exec("UPDATE queue_jobs SET task=? WHERE id=?", data, id); err != nil {
+		t.Fatal(err)
+	}
+	return transitionRow(t, s, id)
+}
+
+func corruptTask(t *testing.T, s *queueStore, id int, task string) queueJob {
+	t.Helper()
+	if _, err := s.db.Exec("UPDATE queue_jobs SET task=? WHERE id=?", task, id); err != nil {
+		t.Fatal(err)
+	}
+	return transitionRow(t, s, id)
+}
+
+// exitedWorker is the marker of a process group that has already gone.
+func exitedWorker(t *testing.T) Object {
+	t.Helper()
+	command := exec.Command("/usr/bin/true")
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Run(); err != nil {
+		t.Fatal(err)
+	}
+	boot, err := BootIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Object{"pgid": command.Process.Pid, "pid": command.Process.Pid, "boot_uuid": boot, "members": []Object{}}
+}
+
+// liveWorker runs a verified process group that ignores SIGINT, so only SIGKILL
+// ends it.
+func liveWorker(t *testing.T) (Object, int, <-chan struct{}) {
+	t.Helper()
+	ready := filepath.Join(t.TempDir(), "ready")
+	process := exec.Command("/bin/sh", "-c", `trap '' INT; touch "$1"; while :; do sleep 1; done`, "fixture", ready)
+	process.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := process.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pgid := process.Process.Pid
+	t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+	exited := make(chan struct{})
+	go func() { _ = process.Wait(); close(exited) }()
+	fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(ready); return err == nil })
+	boot, err := BootIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	members, err := ProcessGroupMembers(pgid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Object{"pgid": pgid, "pid": pgid, "boot_uuid": boot, "members": members}, pgid, exited
+}
+
+func runningWithWorker(t *testing.T, s *queueStore, id int, worker Object) queueJob {
+	t.Helper()
+	j := transitionCommand(t, s, id, "starting")
+	if err := s.claimWorker(j.id, j.token, j.attempt, worker); err != nil {
+		t.Fatal(err)
+	}
+	return transitionRow(t, s, id)
+}
+
+func corruptedTick(t *testing.T, d *queueDaemon) {
+	t.Helper()
+	d.mu.Lock()
+	err := d.tick()
+	d.mu.Unlock()
+	if err != nil {
+		t.Fatalf("a corrupted row stopped the tick: %v", err)
+	}
+	d.cleanup.Wait()
+}
+
+// tickingForClient keeps the daemon working while Cancel() polls it from outside.
+func tickingForClient(t *testing.T, d *queueDaemon) func() {
+	t.Helper()
+	stop, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(20 * time.Millisecond):
+				d.mu.Lock()
+				_ = d.tick()
+				d.mu.Unlock()
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-stopped
+		d.cleanup.Wait()
+	}
+}
+
+func cancelledExit(t *testing.T, d *queueDaemon, id int) int {
+	t.Helper()
+	raw, err := ReadPrivate(filepath.Join(d.g.Cancelled, fmt.Sprintf("%d.json", id)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, _ := integer(raw["exit_code"])
+	return code
+}
+
+// The reported reproduction: main settles all three rows, and so must this.
+func TestCorruptedRowScenarioSettlesAllThree(t *testing.T) {
+	d, s, _, _ := corruptedDaemon(t)
+	runningWithWorker(t, s, 1, exitedWorker(t))
+	corruptStatus(t, s, 1, Object{"Queued": Object{}})
+	transitionCommand(t, s, 2, "outcome")
+	lease := acquireTestLease(t, d, "qa", Object{"ttlSeconds": 60})
+	for range 3 {
+		corruptedTick(t, d)
+	}
+	first := transitionRow(t, s, 1)
+	if first.phase != "done" || first.outcome.Int64 != 125 {
+		t.Fatalf("corrupted row: %+v", first)
+	}
+	if err := queueJobAgreement(first); err != nil {
+		t.Fatal(err)
+	}
+	if j := transitionRow(t, s, 2); j.phase != "done" {
+		t.Fatalf("valid outcome: %+v", j)
+	}
+	requireLeaseState(t, d, lease, "held")
+}
+
+func TestCorruptedStartingRowsLetRecoverFinish(t *testing.T) {
+	d, s, _, _ := corruptedDaemon(t)
+	rows := []func(int){
+		func(id int) {
+			transitionCommand(t, s, id, "starting")
+			corruptStatus(t, s, id, Object{"Queued": Object{}})
+		},
+		func(id int) {
+			transitionCommand(t, s, id, "starting")
+			corruptStatus(t, s, id, Object{"Done": Object{"result": "Success"}})
+		},
+		func(id int) { transitionCommand(t, s, id, "starting"); corruptTask(t, s, id, "{}") },
+		func(id int) { transitionCommand(t, s, id, "starting") }, // Healthy, as a crash leaves it.
+	}
+	for id, row := range rows {
+		row(id)
+	}
+	for id, name := range map[int]string{4: "Running", 5: "Paused"} {
+		transitionLease(t, s, id, "queued")
+		corruptTask(t, s, id, fmt.Sprintf(`{"kind":"lease","lane":"qa","status":{%q:{}},"lease":{"state":"held"}}`, name))
+		if _, err := s.db.Exec("UPDATE queue_jobs SET phase='starting' WHERE id=?", id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.recover(); err != nil {
+		t.Fatalf("a corrupted row refused startup: %v", err)
+	}
+	for id := range 6 {
+		j := transitionRow(t, s, id)
+		if j.phase != "outcome" || !j.outcome.Valid || j.outcome.Int64 != 125 {
+			t.Fatalf("row %d was not recorded as main records it: %+v", id, j)
+		}
+		if err := queueJobAgreement(j); err != nil {
+			t.Fatalf("row %d: %v", id, err)
+		}
+	}
+}
+
+func TestCorruptedRowsDoNotDelayLeaseExpiry(t *testing.T) {
+	d, s, clock, _ := corruptedDaemon(t)
+	runningWithWorker(t, s, 0, exitedWorker(t))
+	corruptStatus(t, s, 0, Object{"Queued": Object{}})
+	transitionCommand(t, s, 1, "running") // Unverifiable, so it stays and must not stop the tick.
+	corruptStatus(t, s, 1, Object{"Queued": Object{}})
+	healthy := acquireTestLease(t, d, "qa", Object{"ttlSeconds": 60})
+	corrupted := acquireTestLease(t, d, "qa", Object{"ttlSeconds": 60})
+	id, _ := integer(corrupted["id"])
+	corruptStatus(t, s, id, Object{"Queued": Object{}})
+	clock.advance(61 * time.Second)
+	corruptedTick(t, d)
+	requireLeaseState(t, d, healthy, "expired")
+	requireLeaseState(t, d, corrupted, "expired")
+}
+
+// Tick and the client's Cancel both leave a verified live process alone until it
+// has really gone, and neither reports cancelled before then.
+func TestCorruptedRowWithLiveProcessIsNotSettledAway(t *testing.T) {
+	t.Run("tick", func(t *testing.T) {
+		d, s, _, _ := corruptedDaemon(t)
+		worker, pgid, _ := liveWorker(t)
+		runningWithWorker(t, s, 0, worker)
+		before := corruptStatus(t, s, 0, Object{"Queued": Object{}})
+		for range 3 {
+			corruptedTick(t, d)
+		}
+		requireRowUnchanged(t, s, before)
+		if err := syscall.Kill(-pgid, 0); err != nil {
+			t.Fatalf("tick touched a live process: %v", err)
+		}
+	})
+	t.Run("Cancel escalates and settles after exit", func(t *testing.T) {
+		d, s, _, _ := corruptedDaemon(t)
+		worker, pgid, exited := liveWorker(t)
+		j := runningWithWorker(t, s, 0, worker)
+		corruptStatus(t, s, 0, Object{"Queued": Object{}})
+		mustWrite(t, d.g.ReceiptPath(0), Object{"task_id": 0, "token": j.token})
+		stop := tickingForClient(t, d)
+		defer stop()
+		result := make(chan error, 1)
+		go func() { result <- Cancel(d.g, 0) }()
+		// SIGINT is ignored, so the row must still be running before the escalation.
+		time.Sleep(time.Second)
+		if current := transitionRow(t, s, 0); current.phase != "running" || !boolean(current.task["cancelled"]) {
+			t.Fatalf("settled while its process lived, or lost the request: %+v", current)
+		}
+		if err := syscall.Kill(-pgid, 0); err != nil {
+			t.Fatalf("process should ignore SIGINT: %v", err)
+		}
+		if err := <-result; err != nil {
+			t.Fatalf("Cancel: %v", err)
+		}
+		<-exited
+		current := transitionRow(t, s, 0)
+		if current.phase != "done" || current.outcome.Int64 != 130 || cancelledExit(t, d, 0) != 130 {
+			t.Fatalf("settled row: %+v", current)
+		}
+	})
+	t.Run("Cancel on a Done reading row reports no false cancel", func(t *testing.T) {
+		d, s, _, _ := corruptedDaemon(t)
+		worker, pgid, _ := liveWorker(t)
+		j := runningWithWorker(t, s, 0, worker)
+		before := corruptStatus(t, s, 0, Object{"Done": Object{"result": "Success"}})
+		mustWrite(t, d.g.ReceiptPath(0), Object{"task_id": 0, "token": j.token})
+		stop := tickingForClient(t, d)
+		defer stop()
+		if err := Cancel(d.g, 0); err == nil || !strings.Contains(err.Error(), "cleanup did not complete") {
+			t.Fatalf("a live process was reported cancelled: %v", err)
+		}
+		requireRowUnchanged(t, s, before)
+		if err := syscall.Kill(-pgid, 0); err != nil {
+			t.Fatalf("process was signalled: %v", err)
+		}
+	})
+}
+
+// pgid 1 fails identity verification. Nothing is signalled or settled, and the
+// row does not stop other jobs.
+func TestCorruptedRowWithUnverifiableWorker(t *testing.T) {
+	d, s, _, _ := corruptedDaemon(t)
+	transitionCommand(t, s, 0, "running")
+	before := corruptStatus(t, s, 0, Object{"Queued": Object{}})
+	transitionCommand(t, s, 1, "outcome")
+	for range 3 {
+		corruptedTick(t, d)
+	}
+	requireRowUnchanged(t, s, before)
+	if j := transitionRow(t, s, 1); j.phase != "done" {
+		t.Fatalf("a job behind the row stalled: %+v", j)
+	}
+	if err := Cancel(d.g, 0); err == nil || !strings.Contains(err.Error(), "Unsafe process group") {
+		t.Fatalf("Cancel reported success on an unverifiable worker: %v", err)
+	}
+	if j := transitionRow(t, s, 0); j.phase != "running" {
+		t.Fatalf("Cancel settled an unverifiable row: %+v", j)
+	}
+}
+
+func TestCorruptedRowWithoutWorkerSettles(t *testing.T) {
+	d, s, _, _ := corruptedDaemon(t)
+	runningWithWorker(t, s, 0, exitedWorker(t))
+	corruptStatus(t, s, 0, Object{"Queued": Object{}})
+	if _, err := s.db.Exec("UPDATE queue_jobs SET worker=NULL WHERE id=0"); err != nil {
+		t.Fatal(err)
+	}
+	corruptedTick(t, d)
+	if j := transitionRow(t, s, 0); j.phase != "outcome" || j.outcome.Int64 != 125 {
+		t.Fatalf("row: %+v", j)
+	}
+}
+
+func TestCorruptedRowsCancelThroughClient(t *testing.T) {
+	queued, running := Object{"Queued": Object{}}, Object{"Running": Object{}}
+	failed := Object{"Done": Object{"result": Object{"Failed": 7}}}
+	for _, test := range []struct {
+		name       string
+		setup      func(*testing.T, *queueStore) queueJob
+		code, file int
+	}{
+		{"queued reading Running", func(t *testing.T, s *queueStore) queueJob {
+			transitionCommand(t, s, 0, "queued")
+			return corruptStatus(t, s, 0, running)
+		}, 130, 130},
+		{"starting reading Queued", func(t *testing.T, s *queueStore) queueJob {
+			transitionCommand(t, s, 0, "starting")
+			return corruptStatus(t, s, 0, queued)
+		}, 130, 130},
+		{"running reading Queued", func(t *testing.T, s *queueStore) queueJob {
+			runningWithWorker(t, s, 0, exitedWorker(t))
+			return corruptStatus(t, s, 0, queued)
+		}, 130, 130},
+		{"running reading Done keeps main's reported code", func(t *testing.T, s *queueStore) queueJob {
+			runningWithWorker(t, s, 0, exitedWorker(t))
+			return corruptStatus(t, s, 0, failed)
+		}, 125, 7},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, s, _, _ := corruptedDaemon(t)
+			j := test.setup(t, s)
+			mustWrite(t, d.g.ReceiptPath(0), Object{"task_id": 0, "token": j.token})
+			stop := tickingForClient(t, d)
+			defer stop()
+			if err := Cancel(d.g, 0); err != nil {
+				t.Fatalf("Cancel: %v", err)
+			}
+			if receipt, err := d.g.Receipt(0); err != nil || receipt != nil {
+				t.Fatalf("Cancel returned before cleanup: %v %v", receipt, err)
+			}
+			current := transitionRow(t, s, 0)
+			if current.phase != "done" || current.outcome.Int64 != int64(test.code) || cancelledExit(t, d, 0) != test.file {
+				t.Fatalf("row %+v, cancelled file %d", current, cancelledExit(t, d, 0))
+			}
+			if err := queueJobAgreement(current); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name, phase string
+		status      Object
+	}{{"granted lease reading Queued", "running", queued}, {"queued lease reading Running", "queued", running}} {
+		t.Run(test.name, func(t *testing.T) {
+			d, s, _, _ := corruptedDaemon(t)
+			transitionLease(t, s, 0, test.phase)
+			corruptStatus(t, s, 0, test.status)
+			stop := tickingForClient(t, d)
+			defer stop()
+			if err := Cancel(d.g, 0); err != nil {
+				t.Fatalf("Cancel: %v", err)
+			}
+			current := transitionRow(t, s, 0)
+			if current.phase != "done" || current.outcome.Int64 != 0 {
+				t.Fatalf("lease row: %+v", current)
+			}
+		})
+	}
+}
+
+// Main panicked here, on an assignment into the missing lease object.
+func TestCorruptedLeaseWithoutLeaseObjectDoesNotPanic(t *testing.T) {
+	t.Run("granted", func(t *testing.T) {
+		d, s, _, _ := corruptedDaemon(t)
+		transitionLease(t, s, 0, "queued")
+		corruptTask(t, s, 0, `{"kind":"lease","lane":"qa","priority":0,"status":{"Queued":{}}}`)
+		corruptedTick(t, d)
+		if j := transitionRow(t, s, 0); j.phase != "running" {
+			t.Fatalf("row: %+v", j)
+		}
+	})
+	t.Run("cancelled", func(t *testing.T) {
+		d, s, _, _ := corruptedDaemon(t)
+		transitionLease(t, s, 0, "running")
+		corruptTask(t, s, 0, `{"kind":"lease","lane":"qa","status":{"Queued":{}}}`)
+		if err := Cancel(d.g, 0); err != nil {
+			t.Fatal(err)
+		}
+		if j := transitionRow(t, s, 0); j.phase != "done" {
+			t.Fatalf("row: %+v", j)
+		}
+	})
+}
+
+// Each row reports once per daemon run, and no row hides another.
+func TestCorruptedRowLogsOnce(t *testing.T) {
+	d, s, _, output := corruptedDaemon(t)
+	transitionCommand(t, s, 0, "running") // Unverifiable: seen on every tick.
+	corruptStatus(t, s, 0, Object{"Queued": Object{}})
+	transitionCommand(t, s, 1, "running")
+	corruptStatus(t, s, 1, Object{"Stashed": Object{}})
+	runningWithWorker(t, s, 2, exitedWorker(t))
+	corruptStatus(t, s, 2, Object{"Done": Object{"result": "Success"}})
+	for range 5 {
+		corruptedTick(t, d)
+	}
+	text := output.String()
+	for _, want := range []string{"corrupted job 0: phase running, status Queued", "corrupted job 1: phase running, status Stashed", "corrupted job 2: phase running, status Done"} {
+		if count := strings.Count(text, want); count != 1 {
+			t.Fatalf("%q appears %d times in %q", want, count, text)
+		}
+	}
+	if lines := strings.Count(text, "\n"); lines != 3 {
+		t.Fatalf("%d lines: %q", lines, text)
+	}
+	next := newQueueDaemon(d.g, s)
+	buffer := &bytes.Buffer{}
+	next.logOutput = buffer
+	next.mu.Lock()
+	err := next.tick()
+	next.mu.Unlock()
+	next.hooks.wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buffer.String(), "corrupted job 0:") {
+		t.Fatalf("a new daemon run should report again: %q", buffer.String())
+	}
+}
+
+func TestCorruptedQueuedRowWithUnreadableStatusSettles(t *testing.T) {
+	d, s, _, output := corruptedDaemon(t)
+	transitionCommand(t, s, 0, "queued")
+	corruptTask(t, s, 0, "{}")
+	transitionCommand(t, s, 1, "outcome")
+	corruptedTick(t, d)
+	if j := transitionRow(t, s, 0); j.phase != "outcome" || j.outcome.Int64 != 125 {
+		t.Fatalf("row: %+v", j)
+	}
+	if !strings.Contains(output.String(), "corrupted job 0: phase queued, status unreadable") {
+		t.Fatalf("log: %q", output.String())
+	}
+}
+
+// A corrupted outcome keeps the exit status it published, or records one.
+func TestCorruptedOutcomeRowRetires(t *testing.T) {
+	d, s, _, _ := corruptedDaemon(t)
+	transitionCommand(t, s, 0, "outcome")
+	corruptStatus(t, s, 0, Object{"Queued": Object{}})
+	transitionCommand(t, s, 1, "outcome")
+	corruptStatus(t, s, 1, Object{"Running": Object{}})
+	if _, err := s.db.Exec("UPDATE queue_jobs SET outcome=NULL WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	corruptedTick(t, d)
+	corruptedTick(t, d)
+	for id, code := range map[int]int64{0: 7, 1: 125} {
+		j := transitionRow(t, s, id)
+		if j.phase != "done" || !j.outcome.Valid || j.outcome.Int64 != code {
+			t.Fatalf("row %d: %+v", id, j)
+		}
+		if err := queueJobAgreement(j); err != nil {
+			t.Fatalf("row %d: %v", id, err)
+		}
+	}
+}
+
+// A grant or launch the store refuses gives callers the result main's guard gave,
+// which dispatch already moves past.
+func TestCorruptedRowsKeepMainsDispatchResults(t *testing.T) {
+	d, s, _, _ := corruptedDaemon(t)
+	transitionLease(t, s, 0, "queued")
+	if _, err := s.db.Exec("UPDATE queue_jobs SET phase='starting' WHERE id=0"); err != nil {
+		t.Fatal(err)
+	}
+	waiting := acquireTestLease(t, d, "qa", Object{"ttlSeconds": 60})
+	corruptedTick(t, d)
+	requireLeaseState(t, d, waiting, "held")
+	runningWithWorker(t, s, 10, exitedWorker(t))
+	transitionCommand(t, s, 11, "running")
+	before := corruptStatus(t, s, 11, Object{"Queued": Object{}})
+	if _, err := d.control("start", Object{"id": 11}); err == nil || err.Error() != "Job changed before launch" {
+		t.Fatalf("start on a running row: %v", err)
+	}
+	if _, err := d.control("hold", Object{"id": 11}); err != nil {
+		t.Fatalf("hold should stay a no-op: %v", err)
+	}
+	requireRowUnchanged(t, s, before)
+}
+
+// The settling methods cannot become a way around the strict ones.
+func TestQueueStoreOverwriteRefusesHealthyRowsAndKeepsGuards(t *testing.T) {
+	_, s := edgeQueueStore(t)
+	const at = "2026-11-02T00:00:00Z"
+	command := transitionCommand(t, s, 0, "running")
+	lease := transitionLease(t, s, 1, "running")
+	published := transitionCommand(t, s, 2, "outcome")
+	finished := transitionCommand(t, s, 3, "done")
+	for name, attempt := range map[string]error{
+		"outcome on a healthy command":  s.overwriteOutcome(command, 1),
+		"outcome on a healthy lease":    s.overwriteOutcome(lease, 1),
+		"outcome on a published result": s.overwriteOutcome(published, 1),
+		"outcome on a finished row":     s.overwriteOutcome(finished, 1),
+		"lease end on a healthy lease":  s.overwriteLeaseEnd(lease, at),
+		"lease end on a command":        s.overwriteLeaseEnd(command, at),
+		"cancel on a healthy command":   s.overwriteCancelled(command),
+		"cancel on a finished row":      s.overwriteCancelled(finished),
+	} {
+		if !errors.Is(attempt, errQueueIllegalTransition) {
+			t.Fatalf("%s: %v", name, attempt)
+		}
+	}
+	for _, row := range []queueJob{command, lease, published, finished} {
+		requireRowUnchanged(t, s, row)
+	}
+}
+
+func TestQueueStoreOverwriteKeepsStaleGuards(t *testing.T) {
+	_, s := edgeQueueStore(t)
+	transitionCommand(t, s, 0, "starting")
+	view := corruptStatus(t, s, 0, Object{"Queued": Object{}})
+	if err := s.overwriteOutcome(view, 125); err != nil {
+		t.Fatal(err)
+	}
+	settled := transitionRow(t, s, 0)
+	if err := s.overwriteOutcome(view, 130); !errors.Is(err, errQueueChanged) {
+		t.Fatalf("stale overwrite: %v", err)
+	}
+	if err := s.overwriteCancelled(view); !errors.Is(err, errQueueChanged) {
+		t.Fatalf("stale cancel: %v", err)
+	}
+	requireRowUnchanged(t, s, settled)
+	transitionLease(t, s, 1, "running")
+	lease := corruptStatus(t, s, 1, Object{"Queued": Object{}})
+	if err := s.overwriteLeaseEnd(lease, "2026-11-02T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.overwriteLeaseEnd(lease, "2026-11-02T01:00:00Z"); !errors.Is(err, errQueueChanged) {
+		t.Fatalf("stale lease end: %v", err)
+	}
+}
+
+// Ordinary rows keep their no-op and their refusals through the store's rule.
+func TestQueueControlHoldAndPauseKeepTheirBehaviour(t *testing.T) {
+	d, s, _, _ := corruptedDaemon(t)
+	queued := transitionCommand(t, s, 0, "queued")
+	for _, test := range []struct {
+		op, want string
+	}{{"hold", "Stashed"}, {"hold", "Stashed"}, {"enqueue", "Queued"}} {
+		if _, err := d.control(test.op, Object{"id": queued.id}); err != nil {
+			t.Fatal(err)
+		}
+		if got := transitionStatus(t, transitionRow(t, s, 0)); got != test.want {
+			t.Fatalf("%s left %s", test.op, got)
+		}
+	}
+	lease := transitionLease(t, s, 1, "queued")
+	claimed := transitionCommand(t, s, 2, "starting")
+	for _, row := range []queueJob{lease, claimed} {
+		for _, op := range []string{"hold", "enqueue"} {
+			if _, err := d.control(op, Object{"id": row.id}); err != nil {
+				t.Fatalf("%s on job %d was not a no-op: %v", op, row.id, err)
+			}
+			requireRowUnchanged(t, s, row)
+		}
+	}
+	if _, err := d.control("pause-job", Object{"id": lease.id}); err == nil || !strings.Contains(err.Error(), "A lease has no process") {
+		t.Fatalf("pause on a lease: %v", err)
+	}
+	if _, err := d.control("pause-job", Object{"id": queued.id}); err == nil || !strings.Contains(err.Error(), "Only active jobs") {
+		t.Fatalf("pause on a queued job: %v", err)
+	}
+	if _, err := d.control("pause-job", Object{"id": claimed.id}); err != nil {
+		t.Fatal(err)
+	}
+	if got := transitionStatus(t, transitionRow(t, s, 2)); got != "Paused" {
+		t.Fatalf("pause left %s", got)
+	}
+	if _, err := d.control("resume-job", Object{"id": claimed.id}); err != nil {
+		t.Fatal(err)
+	}
+	_, details, err := TaskStatus(transitionRow(t, s, 2).task)
+	if err != nil || details["start"] == nil {
+		t.Fatalf("resume lost the attempt's start: %v %v", details, err)
+	}
+}
+
+func TestQueueStoreStatusMethodsRefuseOutsideTheirPhases(t *testing.T) {
+	_, s := edgeQueueStore(t)
+	lease := transitionLease(t, s, 0, "queued")
+	if err := s.setWaiting(lease, true); !errors.Is(err, errQueueIllegalTransition) {
+		t.Fatalf("a lease was stashed: %v", err)
+	}
+	if err := s.setPaused(lease, true); !errors.Is(err, errQueueIllegalTransition) {
+		t.Fatalf("a lease was paused: %v", err)
+	}
+	starting := transitionCommand(t, s, 1, "starting")
+	if err := s.setWaiting(starting, true); !errors.Is(err, errQueueIllegalTransition) {
+		t.Fatalf("a claimed job was stashed: %v", err)
+	}
+	queued := transitionCommand(t, s, 2, "queued")
+	if err := s.setPaused(queued, true); !errors.Is(err, errQueueIllegalTransition) {
+		t.Fatalf("a queued job was paused: %v", err)
+	}
+	done := transitionCommand(t, s, 3, "done")
+	if err := s.markCancelled(done); !errors.Is(err, errQueueIllegalTransition) {
+		t.Fatalf("a done job was cancelled: %v", err)
+	}
+	for _, row := range []queueJob{lease, starting, queued, done} {
+		requireRowUnchanged(t, s, row)
+	}
+	stale := transitionRow(t, s, 2)
+	if err := s.recordOutcome(transitionRow(t, s, 2), 130); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.markCancelled(stale); !errors.Is(err, errQueueChanged) {
+		t.Fatalf("a stale cancel request: %v", err)
+	}
+}
+
+// Legacy history has no outcome column. It is terminal, and nothing touches it.
+func TestLegacyHistoryStaysUntouched(t *testing.T) {
+	d, s, _, output := corruptedDaemon(t)
+	mustWrite(t, filepath.Join(d.g.State, "legacy-queue-import.json"), Object{
+		"tasks":  Object{"4": Object{"priority": 0, "status": Object{"Done": Object{"result": Object{"Failed": 7}}}}},
+		"groups": Object{"default": Object{"parallel_tasks": 1, "status": "Running"}},
+	})
+	if err := s.importLegacy(); err != nil {
+		t.Fatal(err)
+	}
+	before := transitionRow(t, s, 4)
+	corruptedTick(t, d)
+	if _, err := d.control("cancel", Object{"id": 4}); err != nil {
+		t.Fatalf("cancelling finished history should stay a no-op: %v", err)
+	}
+	requireRowUnchanged(t, s, before)
+	if output.Len() != 0 {
+		t.Fatalf("legacy history was reported: %q", output.String())
+	}
+}
+
+// Captured from main at 7b4b27c on this same fixture, so a healthy snapshot stays
+// byte-identical.
+const healthySnapshotOnMain = `{"groups":{"default":{"dirty":0,"imported":0,"next_id":5,"parallel_tasks":8,"status":"Running"}},"lanes":{"default":{"concurrency":8,"held":0,"label":"Default","name":"default","plugin":null,"priority":0,"removed":false,"reservation":{"cpuPercent":0,"memoryMiB":0},"running":1,"sharesLimit":true,"ttlSeconds":0,"waiting":1},"qa":{"concurrency":4,"held":0,"label":"qa","name":"qa","plugin":"qa","priority":0,"removed":false,"reservation":{"cpuPercent":0,"memoryMiB":0},"running":0,"sharesLimit":true,"ttlSeconds":0,"waiting":1}},"plugins":[{"error":null,"lanes":["qa"],"loaded":true,"name":"qa","warning":null}],"tasks":{"1":{"priority":0,"status":{"Queued":{}},"token":"00000000000000000000000000000001"},"2":{"priority":0,"status":{"Running":{"start":"2026-11-02T00:00:00Z"}},"token":"00000000000000000000000000000002"},"3":{"priority":0,"status":{"Done":{"result":"Success"}}},"4":{"kind":"lease","lane":"qa","lease":{"state":"queued"},"priority":0,"status":{"Queued":{}}}}}`
+
+func TestHealthySnapshotIsByteIdenticalToMain(t *testing.T) {
+	d, s, _, _ := corruptedDaemon(t)
+	insert := func(id int, phase, attempt, task string, worker, outcome any) {
+		if _, err := s.db.Exec("INSERT INTO queue_jobs(id,token,task,attempt,phase,worker,outcome) VALUES(?,?,?,?,?,?,?)", id, fmt.Sprintf("%032d", id), task, attempt, phase, worker, outcome); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec("UPDATE queue_settings SET next_id=max(next_id,?) WHERE id=1", id+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert(1, "queued", "", fmt.Sprintf(`{"token":"%032d","priority":0,"status":{"Queued":{}}}`, 1), nil, nil)
+	insert(2, "running", fmt.Sprintf("%032d", 92), fmt.Sprintf(`{"token":"%032d","priority":0,"status":{"Running":{"start":"2026-11-02T00:00:00Z"}}}`, 2), `{"pgid":99999}`, nil)
+	insert(3, "done", fmt.Sprintf("%032d", 93), `{"status":{"Done":{"result":"Success"}},"priority":0}`, nil, 0)
+	insert(4, "queued", "", `{"kind":"lease","lane":"qa","priority":0,"status":{"Queued":{}},"lease":{"state":"queued"}}`, nil, nil)
+	snapshot, err := d.control("snapshot", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != healthySnapshotOnMain {
+		t.Fatalf("healthy snapshot changed:\n got %s\nwant %s", raw, healthySnapshotOnMain)
+	}
+}
+
+// A real daemon starts with corrupted rows, runs another job and keeps serving.
+func TestRealDaemonStartsWithCorruptedStartingRows(t *testing.T) {
+	f := daemonAcceptance(t)
+	if err := f.daemon.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.daemon.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := openQueueStore(f.gate.State, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+	for id, task := range map[int]string{
+		40: `{"priority":0,"status":{"Queued":{}}}`,
+		41: `{"priority":0,"status":{"Done":{"result":"Success"}}}`,
+		42: `{"kind":"lease","lane":"gone","status":{"Running":{}},"lease":{"state":"held"}}`,
+		43: `{"priority":0}`,
+	} {
+		if _, err = s.db.Exec("INSERT INTO queue_jobs(id,token,task,attempt,phase) VALUES(?,?,?,?,'starting')", id, strings.Repeat("c", 30)+fmt.Sprint(id), task, strings.Repeat("d", 32)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = s.db.Exec("UPDATE queue_settings SET next_id=44 WHERE id=1"); err != nil {
+		t.Fatal(err)
+	}
+	queueRestartFixture(t, f)
+	if output := f.launch("/bin/sh", "-c", "printf ran").wait(t, 0); output != "ran" {
+		t.Fatalf("another job did not run: %q", output)
+	}
+	for _, id := range []int{40, 41, 43} {
+		id := id
+		fixtureUntil(t, 8*time.Second, func() bool { return transitionRow(t, s, id).phase == "done" })
+		if j := transitionRow(t, s, id); j.outcome.Int64 != 125 {
+			t.Fatalf("row %d: %+v", id, j)
+		}
+	}
+	if j := transitionRow(t, s, 42); j.phase != "outcome" || j.outcome.Int64 != 125 {
+		t.Fatalf("lease row: %+v", j)
+	}
+}

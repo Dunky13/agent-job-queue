@@ -155,7 +155,7 @@ type queueDaemon struct {
 	finished     map[int]bool
 	boot         string
 	now          func() time.Time
-	logged       map[string]time.Time
+	reported     map[int]bool
 	logOutput    io.Writer
 }
 
@@ -357,10 +357,11 @@ func ServeQueue(g *Gate) error {
 			return nil
 		case <-ticker.C:
 			d.mu.Lock()
-			if e = d.tick(); e != nil {
-				d.logLimited("tick", e.Error())
-			}
+			e = d.tick()
 			d.mu.Unlock()
+			if e != nil {
+				fmt.Fprintln(os.Stderr, "agent-heavy daemon:", e)
+			}
 		}
 	}
 }
@@ -370,107 +371,61 @@ func (d *queueDaemon) recover() error {
 		return e
 	}
 	for _, j := range jobs {
-		if j.phase != "starting" {
-			continue
-		}
-		// One bad row must not take the socket away from every other job.
-		if why := queueJobAgreement(j); why != nil {
-			d.holdRow(j, why)
-			continue
-		}
-		if e = d.store.recordOutcome(j, 125); e != nil && !errors.Is(e, errQueueChanged) {
-			return e
+		if j.phase == "starting" {
+			if e = d.finish(j, 125); e != nil && !errors.Is(e, errQueueChanged) {
+				return e
+			}
 		}
 	}
 	return nil
 }
 
-const queueLogInterval = time.Minute
+// queueRowRefused reports a store refusal the daemon settles instead of failing:
+// a corrupted row must never stop the queue. Stale errors are not refusals.
+func queueRowRefused(e error) bool {
+	return errors.Is(e, errQueueStateDisagreement) || errors.Is(e, errQueueIllegalTransition)
+}
 
-// logLimited keeps a condition that repeats on every 100 ms tick to one line per
-// interval for each key.
-func (d *queueDaemon) logLimited(key, message string) {
-	now := d.clock()
-	if last, seen := d.logged[key]; seen && now.Sub(last) < queueLogInterval {
+// reportRow writes one line per row per daemon run. daemon.log is bounded only at
+// spawn, and tick repeats every 100 ms. The first report for a row stands.
+func (d *queueDaemon) reportRow(j queueJob) {
+	if d.reported[j.id] {
 		return
 	}
-	if d.logged == nil {
-		d.logged = map[string]time.Time{}
+	if d.reported == nil {
+		d.reported = map[int]bool{}
 	}
-	d.logged[key] = now
+	d.reported[j.id] = true
+	status := "unreadable"
+	if name, _, e := TaskStatus(j.task); e == nil {
+		status = name
+	}
 	var output io.Writer = os.Stderr
 	if d.logOutput != nil {
 		output = d.logOutput
 	}
-	fmt.Fprintln(output, "agent-heavy daemon:", message)
+	fmt.Fprintf(output, "agent-heavy daemon: corrupted job %d: phase %s, status %s; settling it once no owned process remains\n", j.id, j.phase, status)
 }
 
-// holdRow leaves a row whose phase and status disagree for an operator. It keeps
-// its slot and nothing else waits for it. The only way out here is a cancel the
-// operator already asked for, once its process has gone.
-func (d *queueDaemon) holdRow(j queueJob, why error) {
-	key := "job-" + strconv.Itoa(j.id)
-	d.logLimited(key, fmt.Sprintf("holding job %d, cancel or kill settles it: %v", j.id, why))
-	if !boolean(j.task["cancelled"]) || taskIsLease(j.task) {
-		return
+// finish records a command's result. A row the store refuses is settled and logged.
+func (d *queueDaemon) finish(j queueJob, code int) error {
+	e := d.store.recordOutcome(j, code)
+	if !queueRowRefused(e) {
+		return e
 	}
-	alive, e := d.heldProcess(j)
-	if e == nil && !alive {
-		if e = d.store.settleHeld(j, 130); errors.Is(e, errQueueChanged) {
-			e = nil
-		}
-	}
-	if e != nil {
-		d.logLimited(key+"-settle", fmt.Sprintf("cannot settle held job %d yet: %v", j.id, e))
-	}
+	d.reportRow(j)
+	return d.store.overwriteOutcome(j, code)
 }
 
-// heldProcess reports whether a held row still has a process that must stop
-// first. A starting row is fenced by its phase, and a row at outcome has published.
-// A running row with no worker recorded and no child has no process to find.
-func (d *queueDaemon) heldProcess(j queueJob) (bool, error) {
-	if j.phase != "running" {
-		return false, nil
+func (d *queueDaemon) markCancelled(j queueJob) error {
+	e := d.store.markCancelled(j)
+	if !errors.Is(e, errQueueStateDisagreement) {
+		return e
 	}
-	if d.children[j.id] != nil {
-		return true, nil
-	}
-	if j.worker == nil {
-		return false, nil
-	}
-	return VerifyGroupIdentity(j.worker)
+	d.reportRow(j)
+	return d.store.overwriteCancelled(j)
 }
 
-// controlHeld is the only control path for a held row. Cancel and kill settle it
-// or fail visibly; a process whose identity cannot be verified is never signalled.
-func (d *queueDaemon) controlHeld(op string, j queueJob, why error) (Object, error) {
-	if op != "cancel" && op != "kill" {
-		return nil, fmt.Errorf("Job %d is held and only cancel or kill can settle it: %w", j.id, why)
-	}
-	var e error
-	if taskIsLease(j.task) {
-		e = d.endLease(j, "cancelled")
-	} else {
-		var alive bool
-		if alive, e = d.heldProcess(j); e != nil {
-			return nil, fmt.Errorf("Held job %d was not signalled or settled because its process could not be verified: %w", j.id, e)
-		}
-		if !alive {
-			e = d.store.settleHeld(j, 130)
-		} else if e = d.store.markCancelled(j); e == nil {
-			// The next tick settles it once the process has gone.
-			if op == "kill" {
-				e = d.signal(j, syscall.SIGKILL)
-			} else if e = d.signal(j, syscall.SIGINT); e == nil {
-				e = d.signal(j, syscall.SIGCONT) // A stopped process cannot act on SIGINT.
-			}
-		}
-	}
-	if e != nil {
-		return nil, e
-	}
-	return d.snapshot()
-}
 func (d *queueDaemon) control(op string, p Object) (Object, error) {
 	for range 8 {
 		value, e := d.controlOnce(op, p)
@@ -574,12 +529,6 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	if e != nil {
 		return nil, e
 	}
-	// A done row keeps no slot, and legacy history has no outcome column.
-	if j.phase != "done" {
-		if why := queueJobAgreement(j); why != nil {
-			return d.controlHeld(op, j, why)
-		}
-	}
 	name, _, e := TaskStatus(j.task)
 	if e != nil {
 		return nil, e
@@ -600,7 +549,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		return d.snapshot()
 	case "hold", "enqueue":
 		// Holding or enqueueing anything that is not waiting has always done nothing.
-		if e = d.store.setWaiting(j, op == "hold"); errors.Is(e, errQueueIllegalTransition) {
+		if e = d.store.setWaiting(j, op == "hold"); queueRowRefused(e) {
 			e = nil
 		}
 	case "priority", "next", "last":
@@ -617,7 +566,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 			for _, candidate := range jobs {
 				state, _, e := TaskStatus(candidate.task)
 				if e != nil {
-					continue // A held row with no readable status is not waiting.
+					return nil, e
 				}
 				// Reordering stays within the item's own lane.
 				if (state == "Queued" || state == "Stashed") && taskLane(candidate.task) == taskLane(j.task) {
@@ -654,7 +603,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		}
 		if op == "kill" {
 			if name != "Done" {
-				if e = d.store.markCancelled(j); e == nil {
+				if e = d.markCancelled(j); e == nil {
 					e = d.signal(j, syscall.SIGKILL)
 				}
 			}
@@ -663,11 +612,11 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		if name == "Done" {
 			return j.task, nil
 		}
-		if e = d.store.markCancelled(j); e != nil {
+		if e = d.markCancelled(j); e != nil {
 			return nil, e
 		}
 		if j.phase == "queued" || j.phase == "starting" {
-			e = d.store.recordOutcome(j, 130)
+			e = d.finish(j, 130)
 		} else {
 			e = d.signal(j, syscall.SIGINT)
 			if name == "Paused" && e == nil {
@@ -794,27 +743,30 @@ func (d *queueDaemon) launch(j queueJob) error {
 		return e
 	}
 	j, e := d.store.claimAttempt(j)
+	if queueRowRefused(e) {
+		return errQueueLaunchChanged // The result main gives its guard on such a row.
+	}
 	if e != nil {
 		return e
 	}
 	path := text(j.task["logPath"])
 	fd, e := syscall.Open(path, syscall.O_CREAT|syscall.O_APPEND|syscall.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0600)
 	if e != nil {
-		return d.store.recordOutcome(j, 125)
+		return d.finish(j, 125)
 	}
 	log := os.NewFile(uintptr(fd), path)
 	defer log.Close()
 	info, e := log.Stat()
 	if e != nil {
-		return d.store.recordOutcome(j, 125)
+		return d.finish(j, 125)
 	}
 	logStat, validLog := info.Sys().(*syscall.Stat_t)
 	if !validLog || !fileOwned(info, true) || logStat.Nlink != 1 {
-		return d.store.recordOutcome(j, 125)
+		return d.finish(j, 125)
 	}
 	executable, e := os.Executable()
 	if e != nil {
-		return d.store.recordOutcome(j, 125)
+		return d.finish(j, 125)
 	}
 	cmd := exec.Command(executable, "execute-attempt", strconv.Itoa(j.id), j.token, j.attempt)
 	cmd.Env = envList(d.g.ControlEnv)
@@ -822,7 +774,7 @@ func (d *queueDaemon) launch(j queueJob) error {
 	cmd.Stdout = log
 	cmd.Stderr = log
 	if e = cmd.Start(); e != nil {
-		return d.store.recordOutcome(j, 125)
+		return d.finish(j, 125)
 	}
 	d.children[j.id] = cmd
 	d.emitTask("job.started", j.id, j.task, nil)
@@ -842,7 +794,7 @@ func (d *queueDaemon) launch(j queueJob) error {
 					code = exit.ExitCode()
 				}
 			}
-			_ = d.store.recordOutcome(current, code)
+			_ = d.finish(current, code)
 		}
 	}()
 	return nil
@@ -888,13 +840,6 @@ func (d *queueDaemon) tick() error {
 	waiting := []queueJob{}
 	now := d.clock()
 	for _, j := range jobs {
-		if why := queueJobAgreement(j); why != nil {
-			d.holdRow(j, why)
-			if j.phase != "queued" {
-				occupy(j)
-			}
-			continue
-		}
 		if taskIsLease(j.task) {
 			if leaseExpired(j.task, now) {
 				if e = d.endLease(j, "ttl"); e != nil && !errors.Is(e, errQueueChanged) {
@@ -917,11 +862,20 @@ func (d *queueDaemon) tick() error {
 				occupy(j)
 				continue
 			}
-			owned, e := VerifyGroupIdentity(j.worker)
-			if e != nil {
-				return e
+			// A corrupted row with no worker recorded has nothing to verify. One whose
+			// worker cannot be verified is neither settled nor allowed to stop the tick.
+			corrupted := queueJobAgreement(j) != nil
+			owned, unverified := false, error(nil)
+			if !corrupted || j.worker != nil {
+				owned, unverified = VerifyGroupIdentity(j.worker)
 			}
-			if owned {
+			if unverified != nil && !corrupted {
+				return unverified
+			}
+			if unverified != nil {
+				d.reportRow(j)
+			}
+			if owned || unverified != nil {
 				occupy(j)
 				continue
 			}
@@ -929,11 +883,24 @@ func (d *queueDaemon) tick() error {
 			if boolean(j.task["cancelled"]) {
 				code = 130
 			}
-			if e = d.store.recordOutcome(j, code); e != nil && !errors.Is(e, errQueueChanged) {
+			if e = d.finish(j, code); e != nil && !errors.Is(e, errQueueChanged) {
 				return e
 			}
 		case "outcome":
 			occupy(j)
+			// Its exit status stands if it has one. The next tick retires it as usual.
+			if queueJobAgreement(j) != nil {
+				code := 125
+				if j.outcome.Valid {
+					code = int(j.outcome.Int64)
+				} else if boolean(j.task["cancelled"]) {
+					code = 130
+				}
+				if e = d.finish(j, code); e != nil && !errors.Is(e, errQueueChanged) {
+					return e
+				}
+				continue
+			}
 			if !d.finished[j.id] {
 				if d.finished == nil {
 					d.finished = map[int]bool{}
@@ -970,7 +937,10 @@ func (d *queueDaemon) tick() error {
 		case "queued":
 			name, _, e := TaskStatus(j.task)
 			if e != nil {
-				return e
+				if e = d.finish(j, 125); e != nil && !errors.Is(e, errQueueChanged) {
+					return e
+				}
+				continue
 			}
 			if name == "Queued" {
 				waiting = append(waiting, j)

@@ -168,7 +168,7 @@ func (c *Controller) Tick() (Object, error) {
 		token     string
 		resources Object
 	}{}
-	snapshot, e := g.schedulingSnapshot()
+	snapshot, e := g.Snapshot()
 	if e != nil {
 		return nil, e
 	}
@@ -395,7 +395,7 @@ func (c *Controller) Tick() (Object, error) {
 			return nil, e
 		}
 	}
-	current, e := g.schedulingSnapshot()
+	current, e := g.Snapshot()
 	if e != nil {
 		return nil, e
 	}
@@ -825,7 +825,7 @@ func (c *Controller) admitLeasesWithoutHost() (Object, error) {
 	if e != nil {
 		return nil, e
 	}
-	current, e := g.schedulingSnapshot()
+	current, e := g.Snapshot()
 	if e != nil {
 		return nil, e
 	}

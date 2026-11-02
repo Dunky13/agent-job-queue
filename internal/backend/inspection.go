@@ -282,7 +282,6 @@ func StatusData(g *Gate) (Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	held := heldJobIDs(snapshot)
 	jobs := []Object{}
 	doneEntries := []Object{}
 	entries := []Object{}
@@ -297,9 +296,6 @@ func StatusData(g *Gate) (Object, error) {
 		}
 		name, details, err := TaskStatus(task)
 		if err != nil {
-			if held[id] {
-				continue // Its problem entry still reports it; other jobs stay visible.
-			}
 			return nil, err
 		}
 		entry := Object{"id": id, "task": task, "end": details["end"]}
@@ -328,11 +324,7 @@ func StatusData(g *Gate) (Object, error) {
 			return nil, err
 		}
 		if taskIsLease(task) {
-			job := leaseStatusJob(id, task, details, scheduling)
-			if held[id] {
-				markHeldStatusJob(job)
-			}
-			jobs = append(jobs, job)
+			jobs = append(jobs, leaseStatusJob(id, task, details, scheduling))
 			continue
 		}
 		state := strings.ToLower(name)
@@ -377,21 +369,16 @@ func StatusData(g *Gate) (Object, error) {
 		}
 		if name == "Done" {
 			code, err := ResultCode(details["result"])
-			if err != nil && !held[id] {
+			if err != nil {
 				return nil, err
 			}
-			if err == nil {
-				job["exitCode"] = code
-			}
+			job["exitCode"] = code
 		}
 		if resources != nil {
 			job["resources"] = resources
 		}
 		job["lane"] = taskLane(task)
 		job["kind"] = "command"
-		if held[id] {
-			markHeldStatusJob(job)
-		}
 		jobs = append(jobs, job)
 	}
 	active, waiting, done := []Object{}, []Object{}, []Object{}
@@ -454,29 +441,7 @@ func StatusData(g *Gate) (Object, error) {
 	if status == "" {
 		status = "unknown"
 	}
-	result := Object{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": Object{"status": status, "limit": group["parallel_tasks"], "running": len(active), "waiting": len(waiting), "legacyOccupied": LegacyOccupied(g)}, "jobs": all, "scheduler": scheduler, "lanes": statusLanes(snapshot, active, waiting), "plugins": statusPlugins(snapshot)}
-	if problems := list(snapshot["problems"]); len(problems) != 0 {
-		result["problems"] = problems
-	}
-	return result, nil
-}
-
-func heldJobIDs(snapshot Object) map[int]bool {
-	held := map[int]bool{}
-	for _, raw := range list(snapshot["problems"]) {
-		problem := obj(raw)
-		if id, ok := integer(problem["id"]); ok && problem["kind"] == "held" {
-			held[id] = true
-		}
-	}
-	return held
-}
-
-// markHeldStatusJob offers existing consumers only the action that can work. The
-// held state keeps it among active jobs instead of showing a queue position.
-func markHeldStatusJob(job Object) {
-	job["state"], job["phase"] = "held", "Held; cancel or kill settles it"
-	job["canCancel"], job["canStart"], job["canReorder"] = true, false, false
+	return Object{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": Object{"status": status, "limit": group["parallel_tasks"], "running": len(active), "waiting": len(waiting), "legacyOccupied": LegacyOccupied(g)}, "jobs": all, "scheduler": scheduler, "lanes": statusLanes(snapshot, active, waiting), "plugins": statusPlugins(snapshot)}, nil
 }
 
 // statusLanes lists every lane in priority order. A daemon that predates lanes

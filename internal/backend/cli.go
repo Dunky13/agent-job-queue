@@ -212,10 +212,6 @@ func dispatch(g *Gate, args []string) (int, error) {
 			}
 			fmt.Printf("  job %v: %s | %s | %s%s\n", job["id"], text(job["phase"]), text(job["title"]), context, suffix)
 		}
-		for _, raw := range list(data["problems"]) {
-			problem := obj(raw)
-			fmt.Printf("  problem with job %v (%s): %s\n", problem["id"], text(problem["kind"]), text(problem["message"]))
-		}
 		occupied := "no"
 		if boolean(queue["legacyOccupied"]) {
 			occupied = "yes"
