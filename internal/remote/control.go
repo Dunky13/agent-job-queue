@@ -399,14 +399,23 @@ func (c *controller) allowedHosts() ([]string, error) {
 	return hosts, nil
 }
 
+// darwinMaxPID is the largest PID macOS assigns and its ps accepts.
+const darwinMaxPID = 99999
+
 func (c *controller) processBirth(pid int) (string, error) {
 	if pid <= 1 {
 		return "", nil
 	}
+	// macOS ps refuses the whole command for a PID it could never assign, so a
+	// corrupt record must read as exited rather than as a failed listing.
+	if runtime.GOOS == "darwin" && pid > darwinMaxPID {
+		return "", nil
+	}
 	// Listing the observer as well tells a process that exited apart from a
-	// listing that failed: ps exits nonzero with no output for both otherwise.
+	// listing that failed: with it listed, ps exits 0 whether or not pid exists,
+	// so a nonzero exit is always a failed listing.
 	observer := census.Self()
-	output, err := c.command([]string{"/bin/ps", "-p", strconv.Itoa(pid) + "," + strconv.Itoa(observer.PID), "-o", census.Columns}, nil, 5*time.Second, false)
+	output, err := c.command([]string{"/bin/ps", "-p", strconv.Itoa(pid) + "," + strconv.Itoa(observer.PID), "-o", census.Columns}, nil, 5*time.Second, true)
 	if err != nil {
 		return "", err
 	}

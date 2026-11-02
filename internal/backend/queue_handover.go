@@ -157,10 +157,16 @@ func decodeQueueHandoverIdentity(value any) (*queueHandoverDaemon, error) {
 	return &identity, nil
 }
 
-type queueHandoverProcess = census.Process
 type queueHandoverProcesses struct {
 	Boot      string
 	Processes census.Table
+}
+
+var queueHandoverCensusWording = census.Wording{
+	Truncated:  "Incomplete handover process snapshot",
+	Invalid:    "Invalid handover process snapshot",
+	Ambiguous:  "Ambiguous handover process snapshot",
+	Incomplete: "Incomplete handover process snapshot",
 }
 
 func queueHandoverProcessSnapshot() (queueHandoverProcesses, error) {
@@ -170,12 +176,7 @@ func queueHandoverProcessSnapshot() (queueHandoverProcesses, error) {
 		return result, err
 	}
 	result.Boot = boot
-	processes, err := identityCensus(census.Wording{
-		Truncated:  "Incomplete handover process snapshot",
-		Invalid:    "Invalid handover process snapshot",
-		Ambiguous:  "Ambiguous handover process snapshot",
-		Incomplete: "Incomplete handover process snapshot",
-	})
+	processes, err := identityCensus(queueHandoverCensusWording)
 	if err != nil {
 		return result, err
 	}

@@ -87,3 +87,14 @@ go test -p 2 -parallel 2 ./internal/census
 go test -p 2 -parallel 2 ./internal/backend -run 'TestRealDaemon|Liveness|LeaseOwner'
 go test -p 2 -parallel 2 -race ./internal/remote
 ```
+
+## Review follow-up
+
+Independent review of `b0553ef` found no blocking defect. Its findings are fixed:
+
+- `processBirth` now treats any nonzero `ps` exit as a failed listing. With the observer listed, `ps` exits 0 whether or not the target exists, so a nonzero exit with a usable row can no longer read as an exited process.
+- A record holding a PID macOS could never assign reads as exited, because macOS `ps -p` refuses the whole command above 99999. It would otherwise wedge `reconcileChildren` on a corrupt record.
+- The `leaseProcess` and `queueHandoverProcess` aliases, used only by tests, are gone.
+- Each caller's census wording is named, and `TestCensusCallersKeepTheirEstablishedMessages` asserts the preserved text at every site.
+
+Still open: the `TestRealDaemonCancellationRemovesDescendants` race and `execution.go:596` dropping the real exit code on a rejected census. Both predate this PR. The review judged the census adds no new outcome to the race and is unlikely to explain most of the 4 of 260 versus 1 of 390 gap, without ruling out a small timing contribution.

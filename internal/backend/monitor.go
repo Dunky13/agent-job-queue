@@ -327,15 +327,18 @@ func resourceProcessListing(pgid int) ([]Object, error) {
 	}
 	return parseResourceProcessListing(output.String(), pgid, census.Self())
 }
+
+var resourceCensusWording = census.Wording{
+	Truncated:  "Process resource identity listing is invalid",
+	Invalid:    "Process resource identity listing is invalid",
+	Ambiguous:  "Process resource identity listing is inconsistent",
+	Incomplete: "Process resource identity listing is incomplete",
+}
+
 func parseResourceProcessListing(output string, pgid int, observer census.Observer) ([]Object, error) {
 	table, err := census.Parse(output, observer)
 	if err != nil {
-		return nil, census.Wording{
-			Truncated:  "Process resource identity listing is invalid",
-			Invalid:    "Process resource identity listing is invalid",
-			Ambiguous:  "Process resource identity listing is inconsistent",
-			Incomplete: "Process resource identity listing is incomplete",
-		}.Of(err)
+		return nil, resourceCensusWording.Of(err)
 	}
 	return groupMemberObjects(table, pgid), nil
 }

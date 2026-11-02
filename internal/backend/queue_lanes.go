@@ -266,7 +266,6 @@ func validLeaseMeta(raw any) (Object, error) {
 	return values, nil
 }
 
-type leaseProcess = census.Process
 type leaseProcesses struct {
 	Boot      string
 	Processes census.Table
@@ -274,14 +273,16 @@ type leaseProcesses struct {
 
 // leaseProcessSnapshot reads the complete process table once so that a missing
 // PID can be told apart from a failed listing; failures keep leases held.
+var leaseOwnerCensusWording = census.Wording{
+	Truncated:  "Incomplete lease owner process listing",
+	Invalid:    "Invalid lease owner process listing",
+	Ambiguous:  "Ambiguous lease owner process listing",
+	Incomplete: "Incomplete lease owner process listing",
+}
+
 func leaseProcessSnapshot(boot string) (leaseProcesses, error) {
 	result := leaseProcesses{Boot: boot, Processes: census.Table{}}
-	processes, err := identityCensus(census.Wording{
-		Truncated:  "Incomplete lease owner process listing",
-		Invalid:    "Invalid lease owner process listing",
-		Ambiguous:  "Ambiguous lease owner process listing",
-		Incomplete: "Incomplete lease owner process listing",
-	})
+	processes, err := identityCensus(leaseOwnerCensusWording)
 	if err != nil {
 		return result, err
 	}

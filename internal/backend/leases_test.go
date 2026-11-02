@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dunky13/agent-job-queue/internal/census"
 )
 
 type laneClock struct{ now time.Time }
@@ -275,12 +277,12 @@ func TestLeaseOwnerIdentityRejectsReusedPID(t *testing.T) {
 		}
 	}
 	zombie := processes
-	zombie.Processes = map[int]leaseProcess{os.Getpid(): {UID: self.UID, Birth: self.Birth, State: "Z"}}
+	zombie.Processes = census.Table{os.Getpid(): {UID: self.UID, Birth: self.Birth, State: "Z"}}
 	if zombie.alive(owner) {
 		t.Error("a zombie owner kept a lease alive")
 	}
 	foreign := processes
-	foreign.Processes = map[int]leaseProcess{os.Getpid(): {UID: self.UID + 1, Birth: self.Birth, State: "S"}}
+	foreign.Processes = census.Table{os.Getpid(): {UID: self.UID + 1, Birth: self.Birth, State: "S"}}
 	if foreign.alive(owner) {
 		t.Error("another user's process kept a lease alive")
 	}

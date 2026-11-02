@@ -70,13 +70,16 @@ func groupMemberObjects(table census.Table, pgid int) []Object {
 	}
 	return members
 }
+
+var processIdentityWording = census.Wording{
+	Truncated:  "Invalid process identity listing; shared slot retained",
+	Invalid:    "Invalid process identity listing; shared slot retained",
+	Ambiguous:  "Ambiguous process identity listing; shared slot retained",
+	Incomplete: "Incomplete process identity listing; shared slot retained",
+}
+
 func ProcessGroupMembers(pgid int) ([]Object, error) {
-	table, err := identityCensus(census.Wording{
-		Truncated:  "Invalid process identity listing; shared slot retained",
-		Invalid:    "Invalid process identity listing; shared slot retained",
-		Ambiguous:  "Ambiguous process identity listing; shared slot retained",
-		Incomplete: "Incomplete process identity listing; shared slot retained",
-	})
+	table, err := identityCensus(processIdentityWording)
 	if err != nil {
 		return nil, err
 	}
@@ -88,13 +91,15 @@ type groupState struct {
 	Birth, State string
 }
 
+var processStateWording = census.Wording{
+	Truncated:  "Invalid process state listing; shared slot retained",
+	Invalid:    "Invalid process state listing; shared slot retained",
+	Ambiguous:  "Ambiguous process state listing; shared slot retained",
+	Incomplete: "Incomplete process state listing; shared slot retained",
+}
+
 func processGroupStates(pgid int) ([]groupState, error) {
-	table, err := identityCensus(census.Wording{
-		Truncated:  "Invalid process state listing; shared slot retained",
-		Invalid:    "Invalid process state listing; shared slot retained",
-		Ambiguous:  "Ambiguous process state listing; shared slot retained",
-		Incomplete: "Incomplete process state listing; shared slot retained",
-	})
+	table, err := identityCensus(processStateWording)
 	if err != nil {
 		return nil, err
 	}

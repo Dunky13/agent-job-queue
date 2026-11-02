@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Dunky13/agent-job-queue/internal/census"
 )
 
 func handoverTarget(t *testing.T) string {
@@ -360,7 +362,7 @@ func TestRealDaemonHandoverProtocolRequiresVerifiedCaller(t *testing.T) {
 
 func TestQueueHandoverCallerMovedProcessGroupFailsClosed(t *testing.T) {
 	identity := queueHandoverDaemon{PID: 23, PGID: 24, Birth: "original process birth", BootUUID: "00000000-0000-0000-0000-000000000001"}
-	snapshot := queueHandoverProcesses{Boot: identity.BootUUID, Processes: map[int]queueHandoverProcess{identity.PID: {PGID: 25, Birth: identity.Birth, State: "S"}}}
+	snapshot := queueHandoverProcesses{Boot: identity.BootUUID, Processes: census.Table{identity.PID: {PGID: 25, Birth: identity.Birth, State: "S"}}}
 	if alive, err := snapshot.alive(identity); err == nil || alive {
 		t.Fatal("moved caller was classified dead", alive, err)
 	}

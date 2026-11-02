@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,6 +30,7 @@ func TestProcessBirthFailsClosedOnUntrustedListings(t *testing.T) {
 		{name: "absent", output: observerRow},
 		{name: "zombie", output: observerRow + targetRow("Z")},
 		{name: "failed listing", status: 1, fails: true},
+		{name: "nonzero exit with a usable row", output: observerRow, status: 1, fails: true},
 		{name: "no observer", output: targetRow("S"), fails: true},
 		{name: "observer in another group", output: fmt.Sprintf("%d %d 501 S Mon Nov  2 18:22:25 2026\n", self, group+1), fails: true},
 		{name: "zombie observer", output: fmt.Sprintf("%d %d 501 Z Mon Nov  2 18:22:25 2026\n", self, group), fails: true},
@@ -45,6 +47,21 @@ func TestProcessBirthFailsClosedOnUntrustedListings(t *testing.T) {
 				t.Fatalf("processBirth = %q, %v", birth, err)
 			}
 		})
+	}
+}
+
+func TestProcessBirthReadsAnImpossiblePidAsExited(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS ps limit")
+	}
+	c := &controller{ctx: context.Background()}
+	birth, err := c.processBirth(darwinMaxPID + 1)
+	if err != nil || birth != "" {
+		t.Fatalf("impossible pid = %q, %v, want exited", birth, err)
+	}
+	// The real ps must still accept the largest PID, or the limit is wrong.
+	if birth, err := c.processBirth(darwinMaxPID); err != nil || birth != "" {
+		t.Fatalf("largest pid = %q, %v, want exited", birth, err)
 	}
 }
 
