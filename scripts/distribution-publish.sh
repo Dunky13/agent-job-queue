@@ -80,7 +80,7 @@ jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$BUILD_SHA" --arg version "$ver
 index=0
 for stage in app dmg; do
   jq ".stages[$index]" "$candidate/apple-notarization.json" > "$temporary/stage.json"
-  "$QUEUE_NOTARY_TOOL" notarize record validate --record "$temporary/stage.json" --stage "$stage" ||
+  env -u GH_TOKEN "$QUEUE_NOTARY_TOOL" notarize record validate --record "$temporary/stage.json" --stage "$stage" ||
     fail 'Public Apple evidence does not bind Accepted stages to this source and final candidate.'
   index=$((index + 1))
 done

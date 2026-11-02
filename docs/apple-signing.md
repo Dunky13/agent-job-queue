@@ -175,6 +175,7 @@ Each job that reads stage records builds the tool from its own checkout:
 architectures as an artifact. The recovery observer has no Go toolchain, so its
 `recovery.json` checks stay in `jq`, and a test keeps them aligned with the record
 module.
+
 The REST engine accepts bare-second timeout values such as `300` and explicit
 `s`, `m` or `h` units, with a maximum of 24 hours. It validates this budget before
 signing or creating a submission. The CI job's outer budget still applies.

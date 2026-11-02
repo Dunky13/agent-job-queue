@@ -303,7 +303,12 @@ submit_stage() {
   fi
   submission=$(jq -er '.id | strings' "$response") || { rm -f "$response"; fail 'Upload returned no submission ID; manual reconciliation is required.'; }
   rm -f "$response"
-  stage_advance submitted --id "$submission" || fail 'Upload returned a malformed submission ID or it could not be recorded; manual reconciliation is required.'
+  if ! stage_advance submitted --id "$submission"; then
+    # A failed write must not lose the only evidence of Apple's ID, as on the REST
+    # path. Provider text that cannot be an ID is still never echoed.
+    [[ $submission =~ ^[A-Fa-f0-9-]+$ ]] || fail 'Upload returned a malformed submission ID; manual reconciliation is required.'
+    fail "Apple submission $submission could not be recorded; manual reconciliation is required, never resubmit."
+  fi
   printf 'Recorded Apple submission %s (%s).\n' "$submission" "$stage"
 }
 
@@ -447,8 +452,7 @@ export_assets() {
 }
 
 bind_origin() {
-  [[ -n ${BUILD_RUN_ID:-} && ${QUEUE_NOTARY_TOOL:-} == /* && -x ${QUEUE_NOTARY_TOOL:-} ]] ||
-    fail 'Original artifact binding requires verified build context and the prebuilt trusted verifier.'
+  [[ -n ${BUILD_RUN_ID:-} ]] || fail 'Original artifact binding requires verified build context.'
   "$QUEUE_NOTARY_TOOL" verify-checkpoint-origin --original "$original_archive" --initial "$state/initial.zip"
   if [[ $(json_field "$state/metadata.json" schema) == 1 ]]; then
     # Metadata upgrade follows exact original-byte/mode/resource verification.

@@ -21,7 +21,13 @@ The only legal steps are prepared, uploading, submitted, accepted, finished. Eve
 failure exits 1 with a fixed code and no path, so `set -e`, `pipefail` and the
 `|| fail` messages behave as before. Shell-driven writes now get the directory
 lock, fsync and atomic rename that only the Go path had, where the `jq` writers only
-renamed. Their bytes still match what those writers produced.
+renamed.
+
+Output matches the last shell writers (the expressions at `7b4b27c`) byte for byte,
+but this is not byte compatibility with every existing record. Real production
+records hold `prepared_attempt` before `prepared_run_id`, and a rewrite reverses
+those two keys. That is harmless because every consumer ignores key order, and
+`TestRecordRewriteOfAttemptFirstRecordChangesOnlyKeyOrder` proves nothing else changes.
 
 ## Where each step gets the tool
 
@@ -40,8 +46,10 @@ The tool is never downloaded, so no job depends on another job's architecture.
 `actions: write` and a 10 minute budget, so adding setup-go and a build there is a
 meaningful workflow change. It validates `recovery.json`, a separate 20-key
 document, and cross-checks retained stage files by equality. Its `jq` therefore
-still restates the phase list, the empty-ID rule and the UUID format.
-`TestRecoveryProjectionMatchesRecordRules` fails if those drift from the module.
+still restates the phase list, the empty-ID rule, the SHA-256 format and the UUID
+format. `TestRecoveryProjectionMatchesRecordRules` runs those rules through real `jq`
+and the module's `valid()` over the same records, and fails on a difference from
+either side.
 
 Other remaining record-adjacent `jq` binds documents to each other and is not
 record validation: `verify_publication`, the log and asset bindings in
@@ -52,12 +60,21 @@ record validation: `verify_publication`, the log and asset bindings in
 - `macos-resume.sh` now requires `QUEUE_NOTARY_TOOL` for every operation on
   existing state, including local Keychain-profile use. CI always sets it.
   One-shot `macos-signing.sh package` is unaffected.
-- The Go parser is stricter than `jq` in cases no writer produces: duplicate keys,
-  records over 16 KiB, and values with a trailing newline, which `jq`'s `$` accepted.
+- The Go parser is stricter than `jq`. Independent review compared them over 1,477
+  unique records: `jq` accepted 108 that Go rejected (trailing newline 38, duplicate
+  keys 20, over 16 KiB 20, multiple documents 20, BOM 10), and Go accepted nothing
+  `jq` rejected. No writer produces any of these. My earlier claim that every
+  disagreement was a trailing newline was wrong: my 835-record corpus did not
+  contain the other shapes.
 - `submit` previously accepted malformed-but-parseable records and then refused
   them. It now returns `invalid_record` for those. Both fail before any provider call.
 - `publish` now rejects unknown or missing keys in embedded stages. Its test
   fixture gained the two keys real records carry; no assertion was removed.
+- On the local `notarytool` path, a failed `submitted` write now prints Apple's ID in
+  the failure message, as the REST path does. Before this, the ID was on neither disk
+  nor in the message. This was a defect at `7b4b27c` too. Provider text that cannot
+  be an ID is still not echoed.
+- `queue-tool` validation in `distribution-publish.sh` runs without `GH_TOKEN`.
 - A killed write can now leave a `.notary-*` temporary file beside the record, not
   `<record>.new`. Neither is read back.
 - REST-written records are now indented like shell-written ones. Compact records
@@ -70,17 +87,24 @@ record validation: `verify_publication`, the log and asset bindings in
 ## Evidence
 
 All local results are from a host under sustained load with swap nearly exhausted.
+"Review repair" is the commit after `c38735c`.
 
 | Check | Candidate | Result |
 | --- | --- | --- |
-| `go test -race ./internal/notaryapi` inside validate job 2777 | Final code | PASS |
-| Focused non-race runs of `internal/tooling`: 139 of 176 top-level tests, covering resume, receipts, publication, checkpoint, signing and workflow | Final code | 137 PASS, 2 skipped (`TestNotarizedHomebrew*`, environment-gated) |
-| `scripts/lint.sh` | Final code | PASS |
-| Linux amd64 cross-build of `queue-tool` | Final code | PASS |
-| Old `jq` validator against Go across 835 mutated records | Before batched reads; validator unchanged since | 17 disagreements, all trailing-newline values |
-| `scripts/validate.sh`, job 2777 | Final code | FAIL, see below |
+| `go test ./internal/notaryapi` (non-race) | Review repair | PASS |
+| Narrow non-race `internal/tooling` runs: the new tests plus `TestDistributionPublish*`, `TestWorkflow*` and the main resume, upload and origin tests | Review repair | PASS |
+| `scripts/lint.sh` | Review repair | PASS |
+| Reviewer's mutations tried on the real files: `$GITHUB_ENV` export deleted, `publish` wrong path, Go accepts `uploading` with an ID, recover `def hash` at 40 characters | Review repair | All caught by their assertion |
+| Further mutations tried: Go hash pattern at 40, `env -u GH_TOKEN` removed, ID left out of the failure message | Review repair | All caught by their assertion |
+| `go test -race ./internal/notaryapi` inside validate job 2777 | `c38735c` | PASS |
+| Focused non-race runs of `internal/tooling`: 139 of 176 top-level tests, covering resume, receipts, publication, checkpoint, signing and workflow | `c38735c` | 137 PASS, 2 skipped (`TestNotarizedHomebrew*`, environment-gated) |
+| Linux amd64 cross-build of `queue-tool` | `c38735c` | PASS |
+| `scripts/validate.sh`, job 2777 | `c38735c` | FAIL, see below |
 | Tooling shard 1, job 2758 | Before batched reads | FAIL, 12 minute test timeout with no test failure |
 | Tooling shard 2, job 2759 | Before batched reads | Interrupted by my cancel |
+
+The review repair did not rerun `validate.sh` or either shard locally, by instruction,
+because of host memory pressure. Hosted CI covers them.
 
 Job 2777 stopped at `go test`, so its later steps never ran: web, browser and native
 tests, app build, installer and DMG checks. Its failures:
@@ -105,8 +129,11 @@ this against Apple, only from `main` after CI succeeds or by `workflow_dispatch`
 
 ## Next steps
 
-1. Check the hosted tooling shards on this PR, especially Intel timing.
-2. Run independent Standards and Spec review.
+1. Check the hosted tooling shards on this PR. Intel is the open risk: the 12 minute
+   limit applies to the test binary, recent main runs took 441 s and 451 s, and the
+   worst test step in 12 recent runs was 9:51. This head adds a few more resume tests.
+2. Independent review of `c38735c` found no blocking defect, and its findings are fixed
+   here. Re-review the repair commit.
 3. After merge, watch the first `Distribution` run through `notarize` and `publish`.
 4. Decide separately whether `distribution-recovery.yml` should build the tool, which
    would remove the remaining restated rules.

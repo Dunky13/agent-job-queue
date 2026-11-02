@@ -2,12 +2,16 @@ package notaryapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
-	"sort"
 	"strings"
 	"testing"
 
@@ -221,7 +225,7 @@ func TestRecordAdvanceCannotForgeOrReplaceEvidence(t *testing.T) {
 // records from before f892944 that have no prepared_run_id.
 func TestRecordCompatibilityWithRecordsAlreadyWritten(t *testing.T) {
 	paths, err := filepath.Glob("testdata/*.json")
-	if err != nil || len(paths) != 11 {
+	if err != nil || len(paths) != 12 {
 		t.Fatalf("compatibility fixtures: %v %v", paths, err)
 	}
 	next := map[string][]string{
@@ -272,6 +276,37 @@ func TestRecordCompatibilityWithRecordsAlreadyWritten(t *testing.T) {
 				t.Fatalf("writer added the optional key: %s", written)
 			}
 		})
+	}
+}
+
+// Real production records hold prepared_attempt first. A rewrite reorders the keys
+// and changes nothing else, and every consumer ignores key order.
+func TestRecordRewriteOfAttemptFirstRecordChangesOnlyKeyOrder(t *testing.T) {
+	data, err := os.ReadFile("testdata/indented-attempt-first-submitted.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run, attempt := bytes.Index(data, []byte("prepared_run_id")), bytes.Index(data, []byte("prepared_attempt")); run < 0 || attempt < 0 || attempt > run {
+		t.Fatalf("fixture lost the production shape: %s", data)
+	}
+	path := writeRecordFile(t, data)
+	if _, err := recordCommand("advance", "--record", path, "--to", "accepted"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want, got map[string]any
+	if err := json.Unmarshal(data, &want); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(after, &got); err != nil {
+		t.Fatal(err)
+	}
+	want["phase"] = "accepted"
+	if !reflect.DeepEqual(want, got) {
+		t.Fatalf("rewrite changed more than key order:\n%v\n%v", want, got)
 	}
 }
 
@@ -390,6 +425,9 @@ func TestRecordCreateIsPrivateValidatedAndNeverReplaces(t *testing.T) {
 			t.Fatalf("invalid %s was written", name)
 		}
 	}
+	// A failed existence check fails closed without claiming the record exists.
+	_, err = recordCommand("create", "--record", filepath.Join(dir, strings.Repeat("x", 300)), "--stage", "app", "--run", "9", "--attempt", "1", "--sha256", recordHash)
+	requireError(t, err, "invalid_record")
 	_, err = recordCommand("create", "--record", filepath.Join(dir, "norun.json"), "--stage", "app", "--attempt", "1", "--sha256", recordHash)
 	requireError(t, err, "invalid_arguments")
 }
@@ -425,6 +463,37 @@ func TestRecordWritesRespectTheDirectoryLockAndStayAtomic(t *testing.T) {
 	}
 }
 
+// An fsync failure after the rename reports failure with the ID already durable.
+func TestSubmitWriteFailureAfterRenameKeepsSubmissionAndRefusesAnother(t *testing.T) {
+	f := makeFixture(t)
+	posts := 0
+	c := f.client(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet {
+			return response(req, http.StatusOK, `{"data":[]}`), nil
+		}
+		posts++
+		return response(req, http.StatusOK, `{"data":{"id":"`+testID+`","attributes":{}}}`), nil
+	})
+	saves := 0
+	c.persist = func(dir *os.File, name string, data []byte) error {
+		saves++
+		if err := atomicWrite(dir, name, data); err != nil || saves != 2 {
+			return err
+		}
+		return errors.New("synthetic directory sync failure")
+	}
+	_, err := f.command(context.Background(), f.submitArgs(), c)
+	requireError(t, err, "record_persistence_failed")
+	if r := f.readRecord(t); r.Phase != "submitted" || r.SubmissionID != testID {
+		t.Fatalf("record: %+v", r)
+	}
+	_, err = f.command(context.Background(), f.submitArgs(), c)
+	requireError(t, err, "submission_refused")
+	if posts != 1 {
+		t.Fatalf("created %d submissions", posts)
+	}
+}
+
 func TestRecordCommandNeedsNoCredentialsAndHidesPaths(t *testing.T) {
 	path := writeRecordFile(t, []byte(`{}`))
 	var stdout bytes.Buffer
@@ -441,6 +510,59 @@ func TestRecordCommandNeedsNoCredentialsAndHidesPaths(t *testing.T) {
 	}
 }
 
+// recoveryProjectionDisagreements runs the rules distribution-recover.sh restates
+// through real jq and through valid over the same records. Values with a trailing
+// newline are left out: jq's $ accepts them and that difference is deliberate.
+func recoveryProjectionDisagreements(t *testing.T, script string, valid func(stageRecord) bool) []string {
+	t.Helper()
+	hash := regexp.MustCompile(`def hash: test\("[^"]+"\);`).FindString(script)
+	enum := regexp.MustCompile(`\(\.phase == "[a-z]+"( or \.phase == "[a-z]+")+\)`).FindString(script)
+	rule := regexp.MustCompile(`(?s)\(\.archive_sha256\|hash\) and \(if .*? end\)`).FindString(script)
+	if hash == "" || enum == "" || rule == "" {
+		t.Fatalf("recovery rules moved: hash=%q enum=%q rule=%q", hash, enum, rule)
+	}
+	phases := map[string]bool{phasePrepared: true, "rejected": true}
+	for phase := range previousPhase {
+		phases[phase] = true
+	}
+	for _, match := range regexp.MustCompile(`"([a-z]+)"`).FindAllStringSubmatch(enum, -1) {
+		phases[match[1]] = true
+	}
+	var records []stageRecord
+	for phase := range phases {
+		for _, id := range []string{"", recordID, strings.ToLower(recordID), "ABCDEF01-ABCD-ABCD-ABCD-ABCDEFABCDEF", recordID[:35], recordID + "0", strings.ReplaceAll(recordID, "-", "_")} {
+			for _, archive := range []string{recordHash, recordHash[:40], recordHash[:63], recordHash + "a", strings.ToUpper(recordHash), ""} {
+				record := stageRecord{Stage: "app", Phase: phase, PreparedAttempt: "1", ArchiveSHA256: archive, SubmissionID: id}
+				if phase == phaseFinished {
+					record.CompletedSHA256 = recordCompleted
+				}
+				records = append(records, record)
+			}
+		}
+	}
+	input, err := json.Marshal(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("jq", "-c", hash+" map("+enum+" and "+rule+")")
+	cmd.Stdin = bytes.NewReader(input)
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run recovery rules through jq: %v", err)
+	}
+	var accepted []bool
+	if err := json.Unmarshal(output, &accepted); err != nil || len(accepted) != len(records) {
+		t.Fatalf("jq output: %v: %s", err, output)
+	}
+	var disagreements []string
+	for i, record := range records {
+		if accepted[i] != valid(record) {
+			disagreements = append(disagreements, fmt.Sprintf("jq=%t %+v", accepted[i], record))
+		}
+	}
+	return disagreements
+}
+
 // shortcut: distribution-recovery.yml has no Go toolchain, so its recovery.json
 // jq restates these rules. This test catches drift; a Go step there would end it.
 func TestRecoveryProjectionMatchesRecordRules(t *testing.T) {
@@ -449,24 +571,55 @@ func TestRecoveryProjectionMatchesRecordRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := string(data)
-	line := regexp.MustCompile(`\(\.phase == "[a-z]+"( or \.phase == "[a-z]+")+\) and`).FindString(script)
-	var found []string
-	for _, match := range regexp.MustCompile(`"([a-z]+)"`).FindAllStringSubmatch(line, -1) {
-		found = append(found, match[1])
+	if found := recoveryProjectionDisagreements(t, script, stageRecord.valid); len(found) != 0 {
+		t.Fatalf("recovery and the record module disagree:\n%s", strings.Join(found, "\n"))
 	}
-	want := []string{phasePrepared}
-	for phase := range previousPhase {
-		want = append(want, phase)
+	// Each drift below must be seen, whichever side it starts on.
+	replace := func(old, new string) string {
+		t.Helper()
+		if !strings.Contains(script, old) {
+			t.Fatalf("mutation target moved: %s", old)
+		}
+		return strings.Replace(script, old, new, 1)
 	}
-	sort.Strings(found)
-	sort.Strings(want)
-	if strings.Join(found, " ") != strings.Join(want, " ") {
-		t.Fatalf("recovery phases %v differ from record phases %v", found, want)
-	}
-	if !strings.Contains(script, `if .phase == "prepared" or .phase == "uploading" then .submission_id == "" else`) {
-		t.Fatal("recovery no longer restates when a submission ID is absent")
-	}
-	if !strings.Contains(script, `"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$"`) || uuidPattern.String() != `^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$` {
-		t.Fatal("recovery and the record module disagree on the submission ID format")
+	for name, test := range map[string]struct {
+		script string
+		valid  func(stageRecord) bool
+	}{
+		"go accepts uploading with an id": {script, func(r stageRecord) bool {
+			if r.Phase == phaseUploading {
+				r.SubmissionID = ""
+			}
+			return r.valid()
+		}},
+		"go requires no id once submitted": {script, func(r stageRecord) bool {
+			if r.Phase == phaseSubmitted {
+				r.SubmissionID = recordID
+			}
+			return r.valid()
+		}},
+		"go accepts a short hash": {script, func(r stageRecord) bool {
+			if len(r.ArchiveSHA256) == 40 {
+				r.ArchiveSHA256 = recordHash
+			}
+			return r.valid()
+		}},
+		"go gains a phase": {script, func(r stageRecord) bool {
+			if r.Phase == "rejected" {
+				r.Phase = phaseSubmitted
+			}
+			return r.valid()
+		}},
+		"recovery hash is 40 characters":       {replace(`def hash: test("^[a-f0-9]{64}$");`, `def hash: test("^[a-f0-9]{40}$");`), stageRecord.valid},
+		"recovery hash accepts uppercase":      {replace(`def hash: test("^[a-f0-9]{64}$");`, `def hash: test("^[a-fA-F0-9]{64}$");`), stageRecord.valid},
+		"recovery allows uploading with an id": {replace(`if .phase == "prepared" or .phase == "uploading" then .submission_id == "" else`, `if .phase == "prepared" then .submission_id == "" else`), stageRecord.valid},
+		"recovery id format narrows":           {replace(`"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-`, `"^[a-f0-9]{8}-[a-fA-F0-9]{4}-`), stageRecord.valid},
+		"recovery drops a phase":               {replace(`.phase == "submitted" or .phase == "accepted"`, `.phase == "accepted"`), stageRecord.valid},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if len(recoveryProjectionDisagreements(t, test.script, test.valid)) == 0 {
+				t.Fatal("drift went unnoticed")
+			}
+		})
 	}
 }

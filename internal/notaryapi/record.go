@@ -14,8 +14,9 @@ import (
 )
 
 // stageRecord is the durable notarization state of one stage. Records written
-// by earlier runs omit prepared_run_id, and writers never add it to them. Field
-// order and indented output keep the serialization the shell writers produced.
+// by earlier runs omit prepared_run_id, and writers never add it to them. Output
+// follows the last shell writers. Older records can hold prepared_attempt first;
+// a rewrite reorders those keys, which is harmless because consumers ignore order.
 type stageRecord struct {
 	Stage           string `json:"stage"`
 	Phase           string `json:"phase"`
@@ -194,8 +195,12 @@ func createRecord(path string, record stageRecord) error {
 	defer unlock()
 	name := filepath.Base(path)
 	var info unix.Stat_t
-	if err = unix.Fstatat(int(dir.Fd()), name, &info, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+	err = unix.Fstatat(int(dir.Fd()), name, &info, unix.AT_SYMLINK_NOFOLLOW)
+	if err == nil {
 		return failure("record_exists")
+	}
+	if !errors.Is(err, unix.ENOENT) {
+		return failure("invalid_record")
 	}
 	return saveRecord(atomicWrite, dir, name, record)
 }
