@@ -362,16 +362,19 @@ func laneAcquire(g *Gate, snapshot Object, options laneOptions, out laneOutput) 
 	id, _ := integer(lease["id"])
 	// Interrupting a blocking acquire abandons the request it created; a
 	// bounded timeout keeps it queued instead.
-	release := func() {
-		release := Object{"id": id, "force": true}
-		_, _ = g.QueueControl("lease-release", release)
+	release := func() error {
+		_, err := g.QueueControl("lease-release", Object{"id": id, "force": true})
+		if errors.Is(err, errQueueLeaseGone) {
+			return nil // already withdrawn or finished: nothing is left queued
+		}
+		return err
 	}
 	return laneWait(g, id, options.timeout, out, release)
 }
 
 // laneWait polls the daemon in bounded steps; it never changes the lease, so a
 // caller can wait repeatedly without losing its queue position.
-func laneWait(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupted func()) int {
+func laneWait(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupted func() error) int {
 	signals := make(chan os.Signal, 2)
 	if interrupted != nil {
 		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -385,6 +388,7 @@ func laneWait(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupt
 	}
 	var last Object
 	outage := newQueueOutage(id, out.stderr)
+	outage.noun = "lease"
 	for {
 		pause := 250 * time.Millisecond
 		lease, err := g.QueueControl("lease-status", Object{"id": id})
@@ -414,7 +418,9 @@ func laneWait(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupt
 			}
 			return out.failure(laneExitTimedOut, fmt.Errorf("Lease %d is still queued; it keeps its position", id), last)
 		case <-signals:
-			interrupted()
+			if err := interrupted(); err != nil {
+				return out.failure(130, fmt.Errorf("Interrupted, but lease %d could not be withdrawn and may still be queued; inspect it with: agent-heavy lane status %d: %w", id, id, err), Object{"id": id})
+			}
 			return out.failure(130, fmt.Errorf("Interrupted; lease %d was withdrawn", id), Object{"id": id})
 		case <-time.After(pause):
 		}
