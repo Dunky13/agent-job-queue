@@ -53,6 +53,21 @@ func WaitCleanup(g *Gate, id int) error {
 // release its receipt before the daemon is probed.
 var queueCleanupWindow = 12 * time.Second
 
+// queueCleanupUnconfirmed says a finished job's cleanup is not confirmed. The
+// job's own result is known, so followers report it with this as a note.
+type queueCleanupUnconfirmed struct {
+	message string
+	cause   error
+}
+
+func (e *queueCleanupUnconfirmed) Error() string {
+	if e.cause == nil {
+		return e.message
+	}
+	return e.message + ": " + e.cause.Error()
+}
+func (e *queueCleanupUnconfirmed) Unwrap() error { return e.cause }
+
 func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
 	deadline := time.Now().Add(queueCleanupWindow)
 	waitingForHandover := false
@@ -78,14 +93,18 @@ func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
 				}
 				// The job's result is already known to the caller, which decides
 				// what to report; this only says why cleanup is unconfirmed.
-				return fmt.Errorf("Job %d finished but its cleanup could not be confirmed, so its shared slot may stay retained until the queue daemon answers (inspect the job with: agent-heavy logs %d): %w", id, id, rpcError)
+				return &queueCleanupUnconfirmed{fmt.Sprintf("Job %d finished but its cleanup could not be confirmed, so its shared slot may stay retained until the queue daemon answers (inspect the job with: agent-heavy logs %d)", id, id), rpcError}
 			} else if rpcError == nil && waitingForHandover {
 				waitingForHandover = false
 				deadline = time.Now().Add(queueCleanupWindow)
 				continue
 			}
-			// A daemon that answers yet leaves the receipt behind is an anomaly, not
-			// an outage: the slot really is retained, so this stays a failure.
+			if rpcError == nil {
+				// The daemon answers and keeps retrying cleanup, and the job holds its
+				// slot until it finishes. The job's result is known, so the caller reports
+				// it; a 125 here would add no safety.
+				return &queueCleanupUnconfirmed{fmt.Sprintf("Job %d finished but its cleanup is not confirmed: the queue daemon answers and still holds its receipt, so its shared slot stays retained until the daemon completes cleanup (inspect the job with: agent-heavy logs %d)", id, id), nil}
+			}
 			return fmt.Errorf("Job %d finished but cleanup did not complete; shared slot retained%s", id, causeSuffix(rpcError))
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -95,11 +114,15 @@ func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
 	return followWithToken(g, id, signals, "")
 }
 
-// followWithToken is the only place that rides out a queue outage. A single
-// outage budget covers every step of one run: reading the job, delivering a held
-// interrupt and the cancellation it triggers. An iteration without a transport
-// failure anywhere is the only recovery, so alternating failures cannot restart
-// the clock.
+// followWithToken is the only place that rides out a queue outage. One outage
+// budget covers every step of a continuous outage: reading the job, delivering a
+// held interrupt and the cancellation it triggers. The budget is per continuous
+// outage, not per run: an iteration without a transport failure anywhere is the
+// only recovery, so alternating failures cannot restart the clock. Its clock
+// starts when the first timed-out call returns, and calls already in flight (the
+// read, the cancellation's read and mutation, and a cleanup probe, up to 15
+// seconds each) finish after it passes, so a hung daemon ends the run in under
+// three minutes.
 func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken string) (int, error) {
 	offset := int64(0)
 	notice := time.Now()
@@ -107,16 +130,31 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 	var pendingSignal os.Signal
 	pauseShown, pauseCheckLost := false, false
 	outage := newQueueOutage(id, os.Stderr)
-	// A finished job's own result always wins: say so if an interrupt was held.
-	cancelTried := false
+	// cancelSentAt is the first cancel the daemon acknowledged in this run. After
+	// one, a held interrupt reports the interrupt status as it always has, so a
+	// network blip cannot decide the exit status. With none acknowledged, a job seen
+	// finished reports its own result.
+	var cancelSentAt time.Time
 	finished := func(code int) (int, error) {
 		switch {
-		case pendingSignal != nil && cancelTried:
-			fmt.Fprintf(os.Stderr, "agent-heavy: job %d finished with exit status %d while its cancellation was being confirmed\n", id, code)
-		case pendingSignal != nil:
-			fmt.Fprintf(os.Stderr, "agent-heavy: job %d had already finished, so the interrupt did nothing\n", id)
+		case pendingSignal == nil:
+			return code, nil
+		case !cancelSentAt.IsZero():
+			fmt.Fprintf(os.Stderr, "agent-heavy: job %d finished with exit status %d after its cancellation was acknowledged; reporting the interrupt status\n", id, code)
+			return 128 + int(pendingSignal.(syscall.Signal)), nil
 		}
+		fmt.Fprintf(os.Stderr, "agent-heavy: job %d finished with exit status %d; no cancellation was confirmed\n", id, code)
 		return code, nil
+	}
+	// cleanupNote reports a cleanup the daemon has not confirmed without hiding
+	// the job's known result; any other cleanup error is a failure.
+	cleanupNote := func(err error, code int) error {
+		var unconfirmed *queueCleanupUnconfirmed
+		if !errors.As(err, &unconfirmed) {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "agent-heavy: %v; the job's own exit status is %d\n", err, code)
+		return nil
 	}
 	// end reports an outage that cannot be waited out. The store may still prove
 	// the job finished; otherwise the job may still be running.
@@ -136,10 +174,14 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 	}
 	// wait spends one backoff step of the outage budget, or ends the run.
 	wait := func(cause error) (ended bool, code int, err error) {
+		var unconfirmed *cancelUnconfirmedError
+		if errors.As(cause, &unconfirmed) {
+			cause = unconfirmed.cause // the end message says it once
+		}
 		if !outage.lose(cause) {
 			prefix := fmt.Sprintf("Lost contact with the queue daemon for %s", outage.elapsed())
 			if pendingSignal != nil {
-				prefix += " and the cancellation requested by your interrupt could not be confirmed"
+				prefix = fmt.Sprintf("Queue calls kept failing for %s and the cancellation requested by your interrupt could not be confirmed", outage.elapsed())
 			}
 			code, err = end(prefix, cause)
 			return true, code, err
@@ -205,12 +247,8 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			if err != nil {
 				return 125, err
 			}
-			if err = waitCleanupWithToken(g, id, expectedToken); err != nil {
-				if !errors.Is(err, errQueueTransportUnavailable) {
-					return 125, err
-				}
-				// Only the daemon's silence blocks cleanup; the result is known.
-				fmt.Fprintln(os.Stderr, "agent-heavy:", err)
+			if err = cleanupNote(waitCleanupWithToken(g, id, expectedToken), code); err != nil {
+				return 125, err
 			}
 			_, err = Drain(path, offset)
 			if err != nil {
@@ -219,19 +257,23 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			return finished(code)
 		}
 		if pendingSignal != nil && rpcAvailable {
-			ownResult, err := cancelJob(g, id, expectedToken)
-			cancelTried = ownResult == nil // a finished job needed no cancellation
+			seen, err := cancelJob(g, id, expectedToken, &cancelSentAt)
 			switch {
-			case err == nil && ownResult != nil:
-				return finished(*ownResult)
+			case seen != nil:
+				if err = cleanupNote(err, *seen); err != nil {
+					return 125, err
+				}
+				return finished(*seen)
 			case err == nil:
 				return 128 + int(pendingSignal.(syscall.Signal)), nil
-			case errors.Is(err, errQueueTransportUnavailable):
+			case errors.Is(err, errQueueTransportUnavailable), errors.Is(err, errQueueHandoverBusy):
+				// A busy handover is bounded like an outage: alternating it with lost
+				// replies must not restart the clock.
 				if ended, code, err := wait(err); ended {
 					return code, err
 				}
 				continue
-			case !errors.Is(err, errQueueHandoverBusy):
+			default:
 				return 125, err
 			}
 		}
@@ -245,11 +287,8 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			if !ok || code < 0 || code > 255 {
 				return 125, errors.New("Invalid cancellation result")
 			}
-			if err = waitCleanupWithToken(g, id, expectedToken); err != nil {
-				if !errors.Is(err, errQueueTransportUnavailable) {
-					return 125, err
-				}
-				fmt.Fprintln(os.Stderr, "agent-heavy:", err)
+			if err = cleanupNote(waitCleanupWithToken(g, id, expectedToken), code); err != nil {
+				return 125, err
 			}
 			_, err = Drain(path, offset)
 			if err != nil {
@@ -315,37 +354,48 @@ func causeSuffix(err error) string {
 // Cancel does not retry through a daemon outage: a standalone caller learns at
 // once that the cancellation could not be confirmed. A waiting client retries it.
 func Cancel(g *Gate, id int) error {
-	_, err := cancelJob(g, id, "")
+	_, err := cancelJob(g, id, "", nil)
 	return err
 }
 
-// cancelUnconfirmed names what is not known when the daemon went silent: the
-// request may or may not have taken effect.
+// cancelUnconfirmedError names what is not known when the daemon went silent:
+// the request may or may not have taken effect.
+type cancelUnconfirmedError struct {
+	id    int
+	cause error
+}
+
+func (e *cancelUnconfirmedError) Error() string {
+	return fmt.Sprintf("Cancellation of job %d could not be confirmed; the job may still be running; inspect it with: agent-heavy logs %d: %v", e.id, e.id, e.cause)
+}
+func (e *cancelUnconfirmedError) Unwrap() error { return e.cause }
+
 func cancelUnconfirmed(id int, err error) error {
 	if !errors.Is(err, errQueueTransportUnavailable) {
 		return err
 	}
-	return fmt.Errorf("Cancellation of job %d could not be confirmed; the job may still be running; inspect it with: agent-heavy logs %d: %w", id, id, err)
+	return &cancelUnconfirmedError{id, err}
 }
 
 // cancelJob cancels job id. A job whose token differs from the first one seen
-// (or from expectedToken) is refused before any mutation. When the job had
-// already finished before any cancellation was attempted, its own exit status is
-// returned so the caller can report it.
-func cancelJob(g *Gate, id int, expectedToken string) (*int, error) {
+// (or from expectedToken) is refused before anything is written or sent. sentAt
+// carries the time of the first cancel the daemon acknowledged, across calls
+// when the caller supplies it, so a kill follows an acknowledged cancel and its
+// grace period even if reads were lost in between. When the job is seen
+// finished, its own exit status is returned beside any cleanup error.
+func cancelJob(g *Gate, id int, expectedToken string, sentAt *time.Time) (*int, error) {
 	if id < 0 {
 		return nil, errors.New("Task ID must be nonnegative")
 	}
 	if err := g.Prepare(); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(g.Cancelled, strconv.Itoa(id)+".json")
-	if err := WritePrivate(path, Object{"task_id": id, "exit_code": 130}); err != nil {
-		return nil, err
+	if sentAt == nil {
+		sentAt = new(time.Time)
 	}
+	path := filepath.Join(g.Cancelled, strconv.Itoa(id)+".json")
 	deadline := time.Now().Add(12 * time.Second)
-	var cancelSent time.Time
-	attempted := false
+	marked := false
 	for time.Now().Before(deadline) {
 		task, err := g.Task(id)
 		if err != nil {
@@ -357,6 +407,14 @@ func cancelJob(g *Gate, id int, expectedToken string) (*int, error) {
 			} else if got != expectedToken {
 				return nil, fmt.Errorf("Job %d is no longer the job this cancellation targeted; nothing further was cancelled", id)
 			}
+		}
+		// The local marker that stands for this cancellation is written only once
+		// the job is known to be the targeted one.
+		if !marked {
+			if err = WritePrivate(path, Object{"task_id": id, "exit_code": 130}); err != nil {
+				return nil, err
+			}
+			marked = true
 		}
 		name, details, err := TaskStatus(task)
 		if err != nil {
@@ -371,11 +429,7 @@ func cancelJob(g *Gate, id int, expectedToken string) (*int, error) {
 			if err = WritePrivate(path, Object{"task_id": id, "exit_code": code}); err != nil {
 				return nil, err
 			}
-			err = WaitCleanup(g, id)
-			if err == nil && !attempted {
-				return &code, nil
-			}
-			return nil, err
+			return &code, WaitCleanup(g, id)
 		case "Missing":
 			receipt, err := g.Receipt(id)
 			if err != nil {
@@ -400,15 +454,14 @@ func cancelJob(g *Gate, id int, expectedToken string) (*int, error) {
 			// SIGKILL only follows a cancel the daemon acknowledged and that outlived
 			// the grace period; a lost reply is no evidence the job was told to stop.
 			op := "cancel"
-			if !cancelSent.IsZero() && time.Since(cancelSent) > queueCancelGrace {
+			if !sentAt.IsZero() && time.Since(*sentAt) > queueCancelGrace {
 				op = "kill"
 			}
-			attempted = true
 			if _, err = g.QueueControl(op, Object{"id": id}); err != nil {
 				return nil, cancelUnconfirmed(id, err)
 			}
-			if op == "cancel" && cancelSent.IsZero() {
-				cancelSent = time.Now()
+			if op == "cancel" && sentAt.IsZero() {
+				*sentAt = time.Now()
 			}
 		default:
 			return nil, fmt.Errorf("Job %d has unexpected state %s; inspect the queue before recovery", id, name)

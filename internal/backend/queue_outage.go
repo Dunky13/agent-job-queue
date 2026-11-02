@@ -17,8 +17,7 @@ import (
 // The window is chosen from how a stopped daemon comes back: the menu bar app
 // restarts it after at most a 10 second throttle (AgentSupervisor.swift), and
 // startup adds the database open and recovery. Two minutes covers several
-// restart attempts with room for a slow, swapping host, while still ending well
-// before a caller's own watchdog would give up on a silent command.
+// restart attempts with room for a slow, swapping host.
 const queueOutageWindow = 2 * time.Minute
 
 // queueOutageBound is a variable only so tests can shorten it.

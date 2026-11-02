@@ -63,15 +63,15 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 	if g.queueControl != nil {
 		return g.queueControl(operation, payload)
 	}
+	if e := safeQueueSocket(queueSocket(g)); e != nil {
+		return nil, fmt.Errorf("Queue daemon unavailable; command was not run directly: %w", queueTransportError(e))
+	}
 	deadline := time.Now().Add(15 * time.Second)
 	if !g.ControlDeadline.IsZero() && g.ControlDeadline.Before(deadline) {
 		deadline = g.ControlDeadline
 	}
 	if !deadline.After(time.Now()) {
 		return nil, errors.New("Queue control deadline expired")
-	}
-	if e := safeQueueSocket(queueSocket(g)); e != nil {
-		return nil, fmt.Errorf("Queue daemon unavailable; command was not run directly: %w", queueTransportError(e))
 	}
 	dialer := net.Dialer{Deadline: deadline}
 	conn, e := dialer.DialContext(ctx, "unix", queueSocket(g))

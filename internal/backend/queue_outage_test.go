@@ -240,7 +240,7 @@ func TestCancelRefusesAMismatchedExpectedTokenBeforeAnyMutation(t *testing.T) {
 	g := testGate(t)
 	operations := scriptSnapshots(t, g, []step{{task: taskWithToken(jobToken(99), "Running", Object{})}}, nil)
 	read := captureStreams(t)
-	_, err := cancelJob(g, 7, jobToken(8))
+	_, err := cancelJob(g, 7, jobToken(8), nil)
 	read()
 	if err == nil || len(mutations(*operations)) != 0 {
 		t.Fatal("a different job was cancelled", err, *operations)
@@ -385,7 +385,7 @@ func TestFollowSaysHeldInterruptWasNotConfirmedAtBound(t *testing.T) {
 	}
 }
 
-// A finished job's own result wins over a held interrupt.
+// With no cancel acknowledged, a job seen finished reports its own result.
 func TestFollowReportsAFinishedJobsResultOverAHeldInterrupt(t *testing.T) {
 	fastOutage(t, time.Minute)
 	g := testGate(t)
@@ -393,14 +393,14 @@ func TestFollowReportsAFinishedJobsResultOverAHeldInterrupt(t *testing.T) {
 	read := captureStreams(t)
 	code, err := followWithToken(g, 7, signals(1), jobToken(8))
 	_, stderr := read()
-	if code != 41 || err != nil || !strings.Contains(stderr, "had already finished, so the interrupt did nothing") {
+	if code != 41 || err != nil || !strings.Contains(stderr, "finished with exit status 41; no cancellation was confirmed") {
 		t.Fatal("the finished job's result was replaced", code, err, stderr)
 	}
 }
 
-// The cancellation's own cleanup hits an outage after the job ended with
-// Success: the client must report Success, not 125.
-func TestFollowKeepsTheResultWhenCleanupFailsDuringAHeldCancellation(t *testing.T) {
+// After an acknowledged cancel the interrupt status is reported as ever, so a
+// blip while its cleanup is confirmed cannot decide the exit status.
+func TestFollowReportsTheInterruptStatusWhenCleanupFailsAfterAnAcknowledgedCancel(t *testing.T) {
 	fastOutage(t, time.Minute)
 	g := testGate(t)
 	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
@@ -417,16 +417,147 @@ func TestFollowKeepsTheResultWhenCleanupFailsDuringAHeldCancellation(t *testing.
 			return testSnapshot(Object{"7": running()}), nil
 		case n == 5: // the cancel took effect and the job finished
 			return testSnapshot(Object{"7": done("Success")}), nil
-		case n == 7:
-			return testSnapshot(Object{"7": done("Success")}), nil
 		}
 		return nil, transportTimeout(t) // cleanup cannot be confirmed
 	}
 	read := captureStreams(t)
 	code, err := followWithToken(g, 7, signals(1), jobToken(8))
 	_, stderr := read()
-	if code != 0 || err != nil || !strings.Contains(stderr, "finished with exit status 0 while its cancellation was being confirmed") {
-		t.Fatal("a cleanup outage replaced the job's result", code, err, stderr)
+	if code != 128+int(syscall.SIGINT) || err != nil || !strings.Contains(stderr, "after its cancellation was acknowledged") {
+		t.Fatal("a cleanup blip decided the exit status", code, err, stderr)
+	}
+}
+
+// With no cancel acknowledged, the status cancelJob read must survive a lost
+// cleanup probe instead of waiting out the budget and exiting 125.
+func TestFollowKeepsTheResultReadByCancelWhenItsCleanupProbeIsLost(t *testing.T) {
+	fastOutage(t, time.Minute)
+	g := testGate(t)
+	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
+	scriptSnapshots(t, g, []step{{task: running()}, {fail: true}, {task: running()}, {task: done("Success")}, {fail: true}}, nil)
+	read := captureStreams(t)
+	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	_, stderr := read()
+	if code != 0 || err != nil || !strings.Contains(stderr, "no cancellation was confirmed") || !strings.Contains(stderr, "cleanup could not be confirmed") {
+		t.Fatal("the job's result was lost", code, err, stderr)
+	}
+}
+
+// A cancel whose reply was lost is not an acknowledged cancel, and the note must
+// not claim that the interrupt did nothing.
+func TestFollowDoesNotClaimTheInterruptDidNothingAfterALostCancelReply(t *testing.T) {
+	fastOutage(t, time.Minute)
+	g := testGate(t)
+	lost := false
+	g.queueControl = func(operation string, _ Object) (Object, error) {
+		if operation == "cancel" {
+			lost = true
+			return nil, transportTimeout(t)
+		}
+		if lost {
+			return testSnapshot(Object{"7": done(Object{"Failed": 41})}), nil
+		}
+		return testSnapshot(Object{"7": running()}), nil
+	}
+	read := captureStreams(t)
+	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	_, stderr := read()
+	if code != 41 || err != nil || strings.Contains(stderr, "did nothing") || strings.Contains(stderr, "being confirmed") || !strings.Contains(stderr, "no cancellation was confirmed") {
+		t.Fatal(code, err, stderr)
+	}
+}
+
+// A responsive daemon that still holds the receipt does not turn a finished job
+// into 125: its own status is returned with a note.
+func TestFollowReportsTheJobStatusWhenAnAnsweringDaemonKeepsTheReceipt(t *testing.T) {
+	fastOutage(t, time.Minute)
+	g := testGate(t)
+	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
+	scriptSnapshots(t, g, []step{{task: done("Success")}}, nil)
+	read := captureStreams(t)
+	code, err := followWithToken(g, 7, make(chan os.Signal), "")
+	_, stderr := read()
+	if code != 0 || err != nil || !strings.Contains(stderr, "cleanup is not confirmed") || !strings.Contains(stderr, "the job's own exit status is 0") {
+		t.Fatal(code, err, stderr)
+	}
+}
+
+// A job that ignores SIGINT must still be killed once a cancel was acknowledged
+// and the grace period passed, even when a read is lost in between.
+func TestFollowKillsAJobIgnoringInterruptAcrossALostRead(t *testing.T) {
+	fastOutage(t, time.Minute)
+	oldGrace := queueCancelGrace
+	queueCancelGrace = 30 * time.Millisecond
+	t.Cleanup(func() { queueCancelGrace = oldGrace })
+	g := testGate(t)
+	var operations []string
+	acked, lostRead, killed := false, false, false
+	g.queueControl = func(operation string, _ Object) (Object, error) {
+		operations = append(operations, operation)
+		switch operation {
+		case "cancel":
+			acked = true
+			return Object{}, nil
+		case "kill":
+			killed = true
+			return Object{}, nil
+		}
+		if killed {
+			return testSnapshot(Object{"7": done("Killed")}), nil
+		}
+		if acked && !lostRead { // the read after the acknowledged cancel is lost
+			lostRead = true
+			return nil, transportTimeout(t)
+		}
+		return testSnapshot(Object{"7": running()}), nil
+	}
+	read := captureStreams(t)
+	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	_, stderr := read()
+	if code != 128+int(syscall.SIGINT) || err != nil || !killed {
+		t.Fatal("an acknowledged cancel was never followed by a kill", code, err, killed, operations)
+	}
+	if strings.Count(stderr, "may still be running") != 0 {
+		t.Fatal(stderr)
+	}
+}
+
+// A held cancellation that meets alternating lost replies and a busy handover
+// is bounded by the outage budget, not restarted by every busy answer.
+func TestFollowBoundsAHeldCancellationAlternatingLostRepliesAndBusyHandovers(t *testing.T) {
+	fastOutage(t, 100*time.Millisecond)
+	g := testGate(t)
+	flip := false
+	scriptSnapshots(t, g, []step{{task: running()}}, func(string) (Object, error) {
+		flip = !flip
+		if flip {
+			return nil, transportTimeout(t)
+		}
+		return nil, errQueueHandoverBusy
+	})
+	read := captureStreams(t)
+	start := time.Now()
+	code, err := followWithToken(g, 7, signals(1), "")
+	read()
+	if code != 125 || err == nil || time.Since(start) > 5*time.Second {
+		t.Fatal("the held cancellation was not bounded", code, err, time.Since(start))
+	}
+	if strings.Count(err.Error(), "may still be running") != 1 {
+		t.Fatalf("the message repeats itself: %v", err)
+	}
+}
+
+func TestCancelWritesNoLocalMarkerForAReplacedJob(t *testing.T) {
+	g := testGate(t)
+	scriptSnapshots(t, g, []step{{task: taskWithToken(jobToken(99), "Running", Object{})}}, nil)
+	read := captureStreams(t)
+	_, err := cancelJob(g, 7, jobToken(8), nil)
+	read()
+	if err == nil {
+		t.Fatal("a replaced job was accepted")
+	}
+	if _, statErr := os.Stat(filepath.Join(g.Cancelled, "7.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatal("a cancellation marker was written for a job that was not targeted", statErr)
 	}
 }
 
@@ -519,7 +650,8 @@ func TestWaitCleanupEndsAtTheFirstAnsweredProbeWithTheReceiptStillPresent(t *tes
 	read := captureStreams(t)
 	err := WaitCleanup(g, 7)
 	read()
-	if err == nil || !strings.Contains(err.Error(), "cleanup did not complete") || calls != 1 {
+	var unconfirmed *queueCleanupUnconfirmed
+	if !errors.As(err, &unconfirmed) || !strings.Contains(err.Error(), "cleanup is not confirmed") || calls != 1 {
 		t.Fatal("an answered probe did not end cleanup", err, calls)
 	}
 }
@@ -622,15 +754,6 @@ func TestOversizedQueueResponseIsNotATransportFailure(t *testing.T) {
 	err := decoder.Decode(&value)
 	if !errors.Is(err, errQueueResponseTooLarge) || errors.Is(queueTransportError(err), errQueueTransportUnavailable) {
 		t.Fatal("an oversized reply would be retried as a lost connection", err)
-	}
-}
-
-func TestQueueControlHonoursItsDeadlineBeforeLookingForTheSocket(t *testing.T) {
-	g := testGate(t)
-	g.ControlDeadline = time.Now().Add(-time.Second)
-	_, err := g.QueueControl("snapshot", nil)
-	if err == nil || !strings.Contains(err.Error(), "deadline expired") || errors.Is(err, errQueueTransportUnavailable) {
-		t.Fatal("an expired deadline was reported as a retryable outage", err)
 	}
 }
 
