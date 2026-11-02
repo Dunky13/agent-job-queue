@@ -167,18 +167,30 @@ func TestMacOSResumeContinuesRecordsWrittenByEarlierRuns(t *testing.T) {
 	}
 }
 
-// stageRecordToolWiring reports every job that runs a script reading stage records
-// without first building queue-tool and handing that exact path to the step.
-// Artifacts never carry the tool across jobs or architectures.
+// stageRecordToolWiring reads the workflow text and checks path strings and step
+// order. For each job that runs a script reading stage records, it guarantees that:
+//   - an uncommented native `go build` of queue-tool comes before the first consumer
+//   - that build has no `if` or `continue-on-error`
+//   - each consumer step is handed the built path, by step env or `$GITHUB_ENV`
+//   - no later line writes `QUEUE_NOTARY_TOOL` to `$GITHUB_ENV`
+//   - no later `cp`, `mv` or similar line, redirect or download-artifact targets the path
+//
+// It does not interpret the workflow. It cannot see writes through another variable
+// or inside a called script, deletion of the tool, whether the build succeeds, whether
+// the binary is the expected one, or how a script uses it. Those are only found at
+// runtime, in `Distribution`, or not at all if a replaced binary still behaves.
 func stageRecordToolWiring(t *testing.T, workflow []byte) (consumers map[string]bool, problems []string) {
 	t.Helper()
 	var distribution struct {
 		Jobs map[string]struct {
 			Steps []struct {
-				Name string            `yaml:"name"`
-				Run  string            `yaml:"run"`
-				Uses string            `yaml:"uses"`
-				Env  map[string]string `yaml:"env"`
+				Name            string            `yaml:"name"`
+				If              string            `yaml:"if"`
+				ContinueOnError bool              `yaml:"continue-on-error"`
+				Run             string            `yaml:"run"`
+				Uses            string            `yaml:"uses"`
+				Env             map[string]string `yaml:"env"`
+				With            map[string]string `yaml:"with"`
 			} `yaml:"steps"`
 		} `yaml:"jobs"`
 	}
@@ -186,22 +198,66 @@ func stageRecordToolWiring(t *testing.T, workflow []byte) (consumers map[string]
 		t.Fatal(err)
 	}
 	const name = "QUEUE_NOTARY_TOOL"
-	output := regexp.MustCompile(`go build .*-o "?([^" ]+)"? \./cmd/queue-tool`)
-	export := regexp.MustCompile(`printf '` + name + `=%s\\n' "\$` + name + `" >> "\$GITHUB_ENV"`)
-	normalize := func(path string) string { return strings.ReplaceAll(path, "$RUNNER_TEMP", "${{ runner.temp }}") }
+	output := regexp.MustCompile(`^\s*(.*\s)?go build .*-o "?([^" ]+)"? \./cmd/queue-tool`)
+	crossBuild := regexp.MustCompile(`\bGO(OS|ARCH)=`)
+	export := regexp.MustCompile(`^\s*printf '` + name + `=%s\\n' "\$` + name + `" >> "\$GITHUB_ENV"\s*$`)
+	exportAny := regexp.MustCompile(name + `.*GITHUB_ENV`)
+	writer := regexp.MustCompile(`(^|[\s;&|(])(cp|mv|ln|install|ditto|tee|curl|wget|unzip|tar|gh|go)\s`)
+	normalize := func(path string) string {
+		for _, form := range []string{"${RUNNER_TEMP}", "$RUNNER_TEMP"} {
+			path = strings.ReplaceAll(path, form, "${{ runner.temp }}")
+		}
+		return path
+	}
 	consumers = map[string]bool{}
 	for job, definition := range distribution.Jobs {
 		var built, exported string
 		for _, step := range definition.Steps {
-			if match := output.FindStringSubmatch(step.Run); match != nil {
-				built = match[1]
-				if built == "$"+name {
-					built = step.Env[name]
+			for _, line := range strings.Split(step.Run, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "#") {
+					continue
 				}
-				built = normalize(built)
+				resolved := normalize(line)
+				for _, form := range []string{"${" + name + "}", "$" + name} {
+					if value, set := step.Env[name]; set {
+						resolved = strings.ReplaceAll(resolved, form, normalize(value))
+					} else if exported != "" {
+						resolved = strings.ReplaceAll(resolved, form, exported)
+					}
+				}
+				if match := output.FindStringSubmatch(line); match != nil {
+					if built != "" {
+						problems = append(problems, fmt.Sprintf("%s: %q builds queue-tool a second time", job, step.Name))
+					}
+					built = normalize(match[2])
+					if built == "$"+name {
+						built = normalize(step.Env[name])
+					}
+					if step.If != "" || step.ContinueOnError {
+						problems = append(problems, fmt.Sprintf("%s: %q can skip or ignore the build", job, step.Name))
+					}
+					if crossBuild.MatchString(line) || step.Env["GOOS"] != "" || step.Env["GOARCH"] != "" {
+						problems = append(problems, fmt.Sprintf("%s: %q does not build for this runner", job, step.Name))
+					}
+					continue
+				}
+				if export.MatchString(line) && exported == "" && built != "" {
+					exported = normalize(step.Env[name])
+					continue
+				}
+				if exportAny.MatchString(line) {
+					problems = append(problems, fmt.Sprintf("%s: %q rewrites %s in $GITHUB_ENV", job, step.Name, name))
+				}
+				if built != "" && strings.Contains(resolved, built) {
+					if writer.MatchString(resolved) || regexp.MustCompile(`>\s*"?`+regexp.QuoteMeta(built)).MatchString(resolved) {
+						problems = append(problems, fmt.Sprintf("%s: %q writes to the built tool path", job, step.Name))
+					}
+				}
 			}
-			if export.MatchString(step.Run) {
-				exported = normalize(step.Env[name])
+			if built != "" && strings.HasPrefix(step.Uses, "actions/download-artifact@") {
+				if target := normalize(step.With["path"]); target != "" && (target == built || strings.HasPrefix(built, strings.TrimSuffix(target, "/")+"/")) {
+					problems = append(problems, fmt.Sprintf("%s: %q downloads over the built tool path", job, step.Name))
+				}
 			}
 			if !strings.Contains(step.Run, "macos-resume.sh") && !strings.Contains(step.Run, "macos-receipts.sh") && !strings.Contains(step.Run, "distribution-publish.sh") && step.Uses != "./.github/actions/notarization-stage" {
 				continue
@@ -231,12 +287,28 @@ func TestStageRecordToolIsBuiltBeforeEveryConsumer(t *testing.T) {
 	if !consumers["notarize"] || !consumers["publish"] || len(consumers) != 2 {
 		t.Fatalf("unexpected stage record consumers: %v", consumers)
 	}
+	const notarizeBuild = "      - name: Build the notarization client before credential setup\n"
+	const notarizeBuildLine = `          go build -p 2 -trimpath -o "$QUEUE_NOTARY_TOOL" ./cmd/queue-tool`
+	const publishBuild = "      - name: Build the stage record validator from this automation commit\n        run: go build -p 2 -trimpath -o \"$RUNNER_TEMP/queue-notary-tool\" ./cmd/queue-tool\n"
+	const publishEnv = "          GH_TOKEN: ${{ github.token }}\n          QUEUE_NOTARY_TOOL: ${{ runner.temp }}/queue-notary-tool\n"
+	const afterNotarizeBuild = "      - name: Qualify and record selected Apple tools before credentials\n"
+	const publishStep = "      - name: Publish immutable main build\n"
 	for mutation, change := range map[string][2]string{
-		"notarize stops exporting":  {`          printf 'QUEUE_NOTARY_TOOL=%s\n' "$QUEUE_NOTARY_TOOL" >> "$GITHUB_ENV"` + "\n", ""},
-		"notarize builds elsewhere": {`          go build -p 2 -trimpath -o "$QUEUE_NOTARY_TOOL" ./cmd/queue-tool`, `          go build -p 2 -trimpath -o "$RUNNER_TEMP/other" ./cmd/queue-tool`},
-		"publish points elsewhere":  {"          GH_TOKEN: ${{ github.token }}\n          QUEUE_NOTARY_TOOL: ${{ runner.temp }}/queue-notary-tool\n", "          GH_TOKEN: ${{ github.token }}\n          QUEUE_NOTARY_TOOL: ${{ runner.temp }}/wrong-tool\n"},
-		"publish loses the path":    {"          GH_TOKEN: ${{ github.token }}\n          QUEUE_NOTARY_TOOL: ${{ runner.temp }}/queue-notary-tool\n", "          GH_TOKEN: ${{ github.token }}\n"},
-		"publish stops building":    {"      - name: Build the stage record validator from this automation commit\n        run: go build -p 2 -trimpath -o \"$RUNNER_TEMP/queue-notary-tool\" ./cmd/queue-tool\n", ""},
+		"notarize stops exporting":    {`          printf 'QUEUE_NOTARY_TOOL=%s\n' "$QUEUE_NOTARY_TOOL" >> "$GITHUB_ENV"` + "\n", ""},
+		"notarize builds elsewhere":   {notarizeBuildLine, `          go build -p 2 -trimpath -o "$RUNNER_TEMP/other" ./cmd/queue-tool`},
+		"notarize build is commented": {notarizeBuildLine, `          # go build -p 2 -trimpath -o "$QUEUE_NOTARY_TOOL" ./cmd/queue-tool`},
+		"notarize cross-builds":       {notarizeBuildLine, `          GOOS=linux go build -p 2 -trimpath -o "$QUEUE_NOTARY_TOOL" ./cmd/queue-tool`},
+		"notarize build has an if":    {notarizeBuild, notarizeBuild + "        if: github.event_name == 'never'\n"},
+		"later step rewrites the env": {afterNotarizeBuild, "      - name: Replace the path\n        run: printf 'QUEUE_NOTARY_TOOL=/usr/bin/true\\n' >> \"$GITHUB_ENV\"\n" + afterNotarizeBuild},
+		"later cp over the tool":      {afterNotarizeBuild, "      - name: Replace the tool\n        run: cp other \"$QUEUE_NOTARY_TOOL\"\n" + afterNotarizeBuild},
+		"later mv over the tool":      {afterNotarizeBuild, "      - name: Replace the tool\n        run: mv other \"$RUNNER_TEMP/queue-notary-tool\"\n" + afterNotarizeBuild},
+		"later redirect to the tool":  {afterNotarizeBuild, "      - name: Replace the tool\n        run: printf x > \"$QUEUE_NOTARY_TOOL\"\n" + afterNotarizeBuild},
+		"artifact over the tool":      {publishStep, "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333\n        with:\n          name: other\n          path: ${{ runner.temp }}/queue-notary-tool\n" + publishStep},
+		"artifact over its directory": {publishStep, "      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333\n        with:\n          name: other\n          path: ${{ runner.temp }}\n" + publishStep},
+		"publish points elsewhere":    {publishEnv, "          GH_TOKEN: ${{ github.token }}\n          QUEUE_NOTARY_TOOL: ${{ runner.temp }}/wrong-tool\n"},
+		"publish loses the path":      {publishEnv, "          GH_TOKEN: ${{ github.token }}\n"},
+		"publish stops building":      {publishBuild, ""},
+		"publish build is ignorable":  {publishBuild, strings.Replace(publishBuild, "        run:", "        continue-on-error: true\n        run:", 1)},
 	} {
 		t.Run(mutation, func(t *testing.T) {
 			if !strings.Contains(string(workflow), change[0]) {
@@ -267,6 +339,19 @@ func TestStageRecordToolIsBuiltBeforeEveryConsumer(t *testing.T) {
 	}
 	if strings.Contains(string(script), "QUEUE_NOTARY_TOOL") && !strings.Contains(string(recovery), "setup-go") {
 		t.Fatal("distribution recovery can use the tool only in a job that builds it")
+	}
+}
+
+func TestMacOSResumeOriginBindingRequiresBuildContext(t *testing.T) {
+	f := newResumeFixture(t)
+	metadata := filepath.Join(f.state, "metadata.json")
+	before, err := os.ReadFile(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.reject(t, nil, "Original artifact binding requires verified build context.", "bind-origin", f.state, filepath.Join(f.root, "original.zip"), "0.1.0")
+	if after, err := os.ReadFile(metadata); err != nil || string(after) != string(before) {
+		t.Fatalf("refused binding changed metadata: %v", err)
 	}
 }
 
@@ -302,8 +387,9 @@ func wrapUploadTool(t *testing.T, f resumeFixture, beforeSubmit string) {
 	testTool(t, tools, "xcrun", fmt.Sprintf("if [[ $1:$2 == notarytool:submit ]]; then %s\nfi\nexec %q \"$@\"\n", beforeSubmit, filepath.Join(fakes, "xcrun")))
 }
 
-// failAdvanceToSubmitted makes the record tool fail its submitted write, either
-// instead of the write or after it reached the disk.
+// failAdvanceToSubmitted runs script in place of the record tool's submitted write.
+// The only caller performs the write and then reports failure, which models a
+// failure after the rename.
 func failAdvanceToSubmitted(t *testing.T, f resumeFixture, script string) []string {
 	t.Helper()
 	wrapper := filepath.Join(f.root, "tools", "queue-tool-failing")
@@ -362,16 +448,26 @@ func TestMacOSResumeFailedWritesAroundTheProviderCallKeepCustody(t *testing.T) {
 			t.Fatalf("rerun submitted again: %d", count)
 		}
 	})
-	t.Run("provider text that cannot be an id is not echoed", func(t *testing.T) {
+	t.Run("provider text that is not a whole id is not echoed", func(t *testing.T) {
 		f := newResumeFixture(t)
 		f.step(t, "prepare", "app")
-		wrapUploadTool(t, f, `printf '{"id":"private provider text"}\n'; exit 0`)
-		output, err := f.run(t, nil, "submit", f.state, "app", "0.1.0")
-		if err == nil || !strings.Contains(output, "malformed submission ID") || strings.Contains(output, "private provider text") {
-			t.Fatalf("malformed ID handling: %v: %s", err, output)
+		path := filepath.Join(f.state, "stages/app.json")
+		prepared, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if phase := stagePhase(t, f, "app"); phase != "uploading" {
-			t.Fatalf("malformed ID left phase %q", phase)
+		wrapUploadTool(t, f, `printf '{"id":"%s"}\n' "$SIGNING_TEST_UPLOAD_ID"; exit 0`)
+		for _, id := range []string{"private provider text", "deadbeef", "---", strings.Repeat("a", 86)} {
+			if err := os.WriteFile(path, prepared, 0600); err != nil {
+				t.Fatal(err)
+			}
+			output, err := f.run(t, []string{"SIGNING_TEST_UPLOAD_ID=" + id}, "submit", f.state, "app", "0.1.0")
+			if err == nil || !strings.Contains(output, "malformed submission ID") || strings.Contains(output, id) || strings.Contains(output, "Apple submission") {
+				t.Fatalf("%q was echoed as an ID: %v: %s", id, err, output)
+			}
+			if phase := stagePhase(t, f, "app"); phase != "uploading" {
+				t.Fatalf("%q left phase %q", id, phase)
+			}
 		}
 	})
 	t.Run("failure after the rename stays submitted and continues", func(t *testing.T) {

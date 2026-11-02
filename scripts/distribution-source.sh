@@ -82,7 +82,7 @@ if [[ $command == download ]]; then
     distribution_error 'Selected source artifact changed; refusing different build bytes.'
 fi
 gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$temporary/artifact.zip"
-version=$("${QUEUE_NOTARY_TOOL:?Prebuilt trusted queue-tool is required}" verify-build-artifact \
+version=$(env -u GH_TOKEN "${QUEUE_NOTARY_TOOL:?Prebuilt trusted queue-tool is required}" verify-build-artifact \
   --archive "$temporary/artifact.zip" --digest "$artifact_digest" --commit "$sha" --build "$number" --output "$destination")
 if [[ $command == download ]]; then
   [[ $BUILD_VERSION == "$version" && $BUILD_TAG == "build-$number-${sha:0:7}" ]] || distribution_error 'Build version or tag changed.'

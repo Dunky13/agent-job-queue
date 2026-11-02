@@ -26,6 +26,7 @@ case "$2" in
 esac
 `)
 	testTool(t, tools, "queue-tool", `printf '%s\n' "$*" >> "$CHECKPOINT_TEST_ROOT/verifier-calls"
+printf '%s\n' "${GH_TOKEN-unset}" >> "$CHECKPOINT_TEST_ROOT/verifier-token"
 [ "$1" = verify-build-artifact ] || exit 98
 printf '0.1.0\n'
 `)
@@ -83,6 +84,20 @@ func TestDistributionSelectsOriginalArtifactAcrossCIPartialReruns(t *testing.T) 
 				t.Fatalf("original bytes were not bound to build identity: %s", verifier)
 			}
 		})
+	}
+}
+
+func TestDistributionVerifiesSourceArtifactWithoutItsToken(t *testing.T) {
+	f := newDistributionSourceFixture(t, "workflow_dispatch")
+	if output, err := f.run(t, []string{"GH_TOKEN=fixture-only"}, "select", "verified-source"); err != nil {
+		t.Fatalf("select: %v: %s", err, output)
+	}
+	token, err := os.ReadFile(filepath.Join(f.root, "verifier-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(token) != "unset\n" {
+		t.Fatalf("the artifact verifier received the source token: %q", token)
 	}
 }
 

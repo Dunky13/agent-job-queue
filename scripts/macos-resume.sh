@@ -292,7 +292,7 @@ submit_stage() {
       --archive "$upload_archive" --record "$record" --sha256 "$archive_hash"
     return
   fi
-  local response submission
+  local response submission id_pattern='^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$'
   response=$(mktemp)
   # Raw provider output stays outside the durable public state. Do not retain
   # stderr, auth arguments or private runner paths in snapshots.
@@ -305,8 +305,8 @@ submit_stage() {
   rm -f "$response"
   if ! stage_advance submitted --id "$submission"; then
     # A failed write must not lose the only evidence of Apple's ID, as on the REST
-    # path. Provider text that cannot be an ID is still never echoed.
-    [[ $submission =~ ^[A-Fa-f0-9-]+$ ]] || fail 'Upload returned a malformed submission ID; manual reconciliation is required.'
+    # path. Provider text that is not a whole UUID is still never echoed.
+    [[ $submission =~ $id_pattern ]] || fail 'Upload returned a malformed submission ID; manual reconciliation is required.'
     fail "Apple submission $submission could not be recorded; manual reconciliation is required, never resubmit."
   fi
   printf 'Recorded Apple submission %s (%s).\n' "$submission" "$stage"

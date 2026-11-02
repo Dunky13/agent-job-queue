@@ -92,6 +92,7 @@ func TestRecordValidationKeysPhasesAndFormats(t *testing.T) {
 		{"zero attempt", false, set("prepared_attempt", "0")},
 		{"padded attempt", false, set("prepared_attempt", "01")},
 		{"short hash", false, set("archive_sha256", recordHash[:63])},
+		{"non-hex hash", false, set("archive_sha256", "z"+recordHash[1:])},
 		{"uppercase hash", false, set("archive_sha256", strings.ToUpper(recordHash))},
 		{"hash with newline", false, set("archive_sha256", recordHash+"\n")},
 
@@ -101,6 +102,8 @@ func TestRecordValidationKeysPhasesAndFormats(t *testing.T) {
 		{"accepted without id", false, phase("accepted", "", "")},
 		{"finished without id", false, phase("finished", "", recordCompleted)},
 		{"malformed id", false, phase("submitted", "01234567-89ab-cdef-0123", "")},
+		{"non-hex id", false, phase("submitted", "z"+recordID[1:], "")},
+		{"id with a prefix", false, phase("submitted", "0"+recordID, "")},
 		{"id with newline", false, phase("submitted", recordID+"\n", "")},
 		{"prepared with completed", false, phase("prepared", "", recordCompleted)},
 		{"accepted with completed", false, phase("accepted", recordID, recordCompleted)},
@@ -511,8 +514,9 @@ func TestRecordCommandNeedsNoCredentialsAndHidesPaths(t *testing.T) {
 }
 
 // recoveryProjectionDisagreements runs the rules distribution-recover.sh restates
-// through real jq and through valid over the same records. Values with a trailing
-// newline are left out: jq's $ accepts them and that difference is deliberate.
+// through real jq and through valid over the same records. It only sees differences
+// this corpus exposes. Values with a trailing newline are left out: jq's $ accepts
+// them, and Go's stricter answer is deliberate.
 func recoveryProjectionDisagreements(t *testing.T, script string, valid func(stageRecord) bool) []string {
 	t.Helper()
 	hash := regexp.MustCompile(`def hash: test\("[^"]+"\);`).FindString(script)
@@ -530,8 +534,18 @@ func recoveryProjectionDisagreements(t *testing.T, script string, valid func(sta
 	}
 	var records []stageRecord
 	for phase := range phases {
-		for _, id := range []string{"", recordID, strings.ToLower(recordID), "ABCDEF01-ABCD-ABCD-ABCD-ABCDEFABCDEF", recordID[:35], recordID + "0", strings.ReplaceAll(recordID, "-", "_")} {
-			for _, archive := range []string{recordHash, recordHash[:40], recordHash[:63], recordHash + "a", strings.ToUpper(recordHash), ""} {
+		ids := []string{"", recordID, strings.ToLower(recordID), "ABCDEF01-ABCD-ABCD-ABCD-ABCDEFABCDEF", recordID[:35], recordID + "0", "0" + recordID, strings.ReplaceAll(recordID, "-", "_")}
+		// One non-hex group at a time, so narrowing or widening any single group shows.
+		for _, nonHex := range []string{"z", "Z"} {
+			groups := strings.Split(recordID, "-")
+			for i, group := range groups {
+				changed := append([]string{}, groups...)
+				changed[i] = nonHex + group[1:]
+				ids = append(ids, strings.Join(changed, "-"))
+			}
+		}
+		for _, id := range ids {
+			for _, archive := range []string{recordHash, recordHash[:40], recordHash[:63], recordHash + "a", "0" + recordHash, strings.ToUpper(recordHash), "z" + recordHash[1:], "Z" + recordHash[1:], ""} {
 				record := stageRecord{Stage: "app", Phase: phase, PreparedAttempt: "1", ArchiveSHA256: archive, SubmissionID: id}
 				if phase == phaseFinished {
 					record.CompletedSHA256 = recordCompleted
@@ -610,11 +624,30 @@ func TestRecoveryProjectionMatchesRecordRules(t *testing.T) {
 			}
 			return r.valid()
 		}},
-		"recovery hash is 40 characters":       {replace(`def hash: test("^[a-f0-9]{64}$");`, `def hash: test("^[a-f0-9]{40}$");`), stageRecord.valid},
-		"recovery hash accepts uppercase":      {replace(`def hash: test("^[a-f0-9]{64}$");`, `def hash: test("^[a-fA-F0-9]{64}$");`), stageRecord.valid},
-		"recovery allows uploading with an id": {replace(`if .phase == "prepared" or .phase == "uploading" then .submission_id == "" else`, `if .phase == "prepared" then .submission_id == "" else`), stageRecord.valid},
-		"recovery id format narrows":           {replace(`"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-`, `"^[a-f0-9]{8}-[a-fA-F0-9]{4}-`), stageRecord.valid},
-		"recovery drops a phase":               {replace(`.phase == "submitted" or .phase == "accepted"`, `.phase == "accepted"`), stageRecord.valid},
+		"go accepts a non-hex id": {script, func(r stageRecord) bool {
+			if regexp.MustCompile(`^[A-Za-z0-9]{8}(-[A-Za-z0-9]{4}){3}-[A-Za-z0-9]{12}$`).MatchString(r.SubmissionID) {
+				r.SubmissionID = recordID
+			}
+			return r.valid()
+		}},
+		"go accepts a non-hex hash": {script, func(r stageRecord) bool {
+			if regexp.MustCompile(`^[a-z0-9]{64}$`).MatchString(r.ArchiveSHA256) {
+				r.ArchiveSHA256 = recordHash
+			}
+			return r.valid()
+		}},
+		"recovery id class widens to alphanumeric": {strings.ReplaceAll(script, "a-fA-F0-9", "a-zA-Z0-9"), stageRecord.valid},
+		"recovery id class widens to anything":     {strings.ReplaceAll(script, "[a-fA-F0-9]", "."), stageRecord.valid},
+		"recovery id loses its start anchor":       {replace(`"^[a-fA-F0-9]{8}-`, `"[a-fA-F0-9]{8}-`), stageRecord.valid},
+		"recovery id loses its end anchor":         {replace(`[a-fA-F0-9]{12}$"`, `[a-fA-F0-9]{12}"`), stageRecord.valid},
+		"recovery hash class widens":               {replace(`def hash: test("^[a-f0-9]{64}$");`, `def hash: test("^[a-z0-9]{64}$");`), stageRecord.valid},
+		"recovery hash loses its start anchor":     {replace(`def hash: test("^[a-f0-9]{64}$");`, `def hash: test("[a-f0-9]{64}$");`), stageRecord.valid},
+		"recovery hash loses its end anchor":       {replace(`def hash: test("^[a-f0-9]{64}$");`, `def hash: test("^[a-f0-9]{64}");`), stageRecord.valid},
+		"recovery hash is 40 characters":           {replace(`def hash: test("^[a-f0-9]{64}$");`, `def hash: test("^[a-f0-9]{40}$");`), stageRecord.valid},
+		"recovery hash accepts uppercase":          {replace(`def hash: test("^[a-f0-9]{64}$");`, `def hash: test("^[a-fA-F0-9]{64}$");`), stageRecord.valid},
+		"recovery allows uploading with an id":     {replace(`if .phase == "prepared" or .phase == "uploading" then .submission_id == "" else`, `if .phase == "prepared" then .submission_id == "" else`), stageRecord.valid},
+		"recovery id format narrows":               {replace(`"^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-`, `"^[a-f0-9]{8}-[a-fA-F0-9]{4}-`), stageRecord.valid},
+		"recovery drops a phase":                   {replace(`.phase == "submitted" or .phase == "accepted"`, `.phase == "accepted"`), stageRecord.valid},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if len(recoveryProjectionDisagreements(t, test.script, test.valid)) == 0 {
