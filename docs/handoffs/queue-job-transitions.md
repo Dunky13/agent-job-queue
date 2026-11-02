@@ -36,6 +36,7 @@ These changes affect corrupted rows only. Every writer is one atomic statement, 
 - `tick` now returns an error on a `running` row whose status disagrees, which holds dispatch until the row is repaired. An unparseable status already did this.
 - An `outcome` row that disagrees repeats cleanup on each tick instead of retiring, as a failed `Cleanup` already does.
 - A `starting` row with an undecodable or disagreeing task now fails before the worker runs its command. The old blind `UPDATE` would have run it.
+- The worker's final `recordOutcome` now reports a disagreeing row in its returned error, where the old blind `UPDATE` wrote over it.
 
 `RowsAffected` errors are handled one way in `swapJob`. Some sites used to fold them into their stale error. The pinned `modernc.org/sqlite` driver never returns one, so that path cannot be reached.
 
@@ -91,7 +92,7 @@ A baseline run of `validate.sh` on main was not taken. A retest of the full nati
 - `go test -p 2 -parallel 2 ./internal/backend -run 'TestRealDaemon|Handover|TestQueue|TestLease|TestLane|TestRuntimeGeneration|Drained|TestLegacy' -count=1` passed.
 - Eight temporary mutants that removed a guard or check, or moved a side effect, each failed the tests and were reverted. They covered the kind check, both agreement checks, the launch error, the affected-row check, the cleanup tolerance, enqueue ordering and the illegal-edge check.
 - A ninth mutant that wrote before rejecting an edge also failed the tests, and was reverted.
-- The new tests add about 11 seconds to the backend suite.
+- The new tests add about 14 seconds to the backend suite, measured with `-race` on the loaded host.
 
 ## Remaining work
 
