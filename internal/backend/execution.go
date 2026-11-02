@@ -48,9 +48,15 @@ func WaitCleanup(g *Gate, id int) error {
 	}
 	return waitCleanupWithToken(g, id, text(receipt["token"]))
 }
+
+// queueCleanupWindow is how long a finished job may wait for the daemon to
+// release its receipt before the daemon is probed.
+var queueCleanupWindow = 12 * time.Second
+
 func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
-	deadline := time.Now().Add(12 * time.Second)
+	deadline := time.Now().Add(queueCleanupWindow)
 	waitingForHandover := false
+	outage := newQueueOutage(id, os.Stderr)
 	for {
 		receipt, err := g.Receipt(id)
 		if err != nil {
@@ -67,13 +73,21 @@ func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
 					return handoverError
 				}
 				if allowed {
+					outage.reset()
 					waitingForHandover = true
 					deadline = time.Now().Add(400 * time.Millisecond)
 					continue
 				}
-			} else if rpcError == nil && waitingForHandover {
+				// The job already finished; a slow daemon must not turn that into
+				// a failed cleanup while the daemon can still complete it.
+				if outage.lose() {
+					deadline = time.Now().Add(outage.delay())
+					continue
+				}
+				return fmt.Errorf("Job %d finished but cleanup did not complete; the queue daemon has not responded for %s; shared slot retained: %w", id, outage.elapsed(), rpcError)
+			} else if rpcError == nil && (outage.recover() || waitingForHandover) {
 				waitingForHandover = false
-				deadline = time.Now().Add(12 * time.Second)
+				deadline = time.Now().Add(queueCleanupWindow)
 				continue
 			}
 			return fmt.Errorf("Job %d finished but cleanup did not complete; shared slot retained", id)
@@ -89,6 +103,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 	notice := time.Now()
 	path := g.LogPath(id)
 	var pendingSignal os.Signal
+	outage := newQueueOutage(id, os.Stderr)
 	for {
 		var err error
 		offset, err = Drain(path, offset)
@@ -104,10 +119,26 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			}
 			if allowed {
 				task, err = retained, nil
+				outage.reset()
+			} else {
+				// The job was submitted and keeps its place in the daemon; only
+				// this client lost sight of it. Keep following, within the bound.
+				if !outage.lose() {
+					return 125, fmt.Errorf("Lost contact with the queue daemon for %s; job %d may still be running; inspect it with: agent-heavy logs %d: %w", outage.elapsed(), id, id, err)
+				}
+				select {
+				case sig := <-signals:
+					pendingSignal = sig
+				case <-time.After(outage.delay()):
+				}
+				continue
 			}
 		}
 		if err != nil {
 			return 125, err
+		}
+		if rpcAvailable {
+			outage.recover()
 		}
 		if expectedToken == "" {
 			expectedToken = text(task["token"])
@@ -199,11 +230,30 @@ func Cancel(g *Gate, id int) error {
 	}
 	deadline := time.Now().Add(12 * time.Second)
 	var graceful time.Time
-	for time.Now().Before(deadline) {
-		task, err := g.Task(id)
-		if err != nil {
+	outage := newQueueOutage(id, os.Stderr)
+	// A transport failure does not say whether the cancellation took effect. Retry
+	// within the outage bound, without charging the lost time to the deadline.
+	transient := func(err error, started time.Time) error {
+		if !errors.Is(err, errQueueTransportUnavailable) {
 			return err
 		}
+		if !outage.lose() {
+			return fmt.Errorf("Cancellation of job %d could not reach the queue daemon for %s; the job may still be running; inspect it with: agent-heavy logs %d: %w", id, outage.elapsed(), id, err)
+		}
+		time.Sleep(outage.delay())
+		deadline = deadline.Add(time.Since(started))
+		return nil
+	}
+	for time.Now().Before(deadline) {
+		started := time.Now()
+		task, err := g.Task(id)
+		if err != nil {
+			if err = transient(err, started); err != nil {
+				return err
+			}
+			continue
+		}
+		outage.recover()
 		name, details, err := TaskStatus(task)
 		if err != nil {
 			return err
@@ -247,7 +297,10 @@ func Cancel(g *Gate, id int) error {
 			}
 			_, err = g.QueueControl(op, Object{"id": id})
 			if err != nil {
-				return err
+				if err = transient(err, started); err != nil {
+					return err
+				}
+				continue
 			}
 
 		default:

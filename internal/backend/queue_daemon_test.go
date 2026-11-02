@@ -103,7 +103,12 @@ func TestRealDaemonWorkerOutcomeSurvivesDaemonDeath(t *testing.T) {
 	if e := f.daemon.Wait(); e == nil {
 		t.Fatal("daemon did not die")
 	}
-	client.wait(t, 125)
+	// The caller waits for the daemon instead of reporting a failed job.
+	select {
+	case <-client.done:
+		t.Fatal("caller gave up during a short daemon outage")
+	case <-time.After(time.Second):
+	}
 	if e := os.WriteFile(filepath.Join(f.root, "release"), nil, 0600); e != nil {
 		t.Fatal(e)
 	}
@@ -141,6 +146,9 @@ func TestRealDaemonWorkerOutcomeSurvivesDaemonDeath(t *testing.T) {
 	output, e := os.ReadFile(f.gate.LogPath(id))
 	if e != nil || string(output) != "survived" {
 		t.Fatalf("final log lost %q %v", output, e)
+	}
+	if got := client.wait(t, 23); got != "survived" {
+		t.Fatalf("caller lost the job result: %q", got)
 	}
 }
 func TestRealDaemonUnclaimedAttemptFailsWithoutReplay(t *testing.T) {

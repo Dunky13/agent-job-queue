@@ -384,13 +384,14 @@ func laneWait(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupt
 		deadline = timer.C
 	}
 	var last Object
-	unavailableSince := time.Time{}
+	outage := newQueueOutage(id, out.stderr)
 	for {
+		pause := 250 * time.Millisecond
 		lease, err := g.QueueControl("lease-status", Object{"id": id})
 		switch {
 		case err == nil:
 			last = lease
-			unavailableSince = time.Time{}
+			outage.recover()
 			switch text(lease["state"]) {
 			case "held":
 				return out.result(0, lease, describeLease(lease))
@@ -399,11 +400,10 @@ func laneWait(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupt
 				return out.failure(laneExitRefused, fmt.Errorf("Lease %d is %s (%s)", id, text(lease["state"]), text(lease["reason"])), lease)
 			}
 		case errors.Is(err, errQueueTransportUnavailable) || errors.Is(err, errQueueHandoverBusy):
-			if unavailableSince.IsZero() {
-				unavailableSince = time.Now()
-			} else if time.Since(unavailableSince) > 30*time.Second {
-				return out.failure(laneExitRefused, err, Object{"id": id})
+			if !outage.lose() {
+				return out.failure(laneExitRefused, fmt.Errorf("Lost contact with the queue daemon for %s; lease %d may still be queued: %w", outage.elapsed(), id, err), Object{"id": id})
 			}
+			pause = outage.delay()
 		default:
 			return out.failure(laneExit(err), err, Object{"id": id})
 		}
@@ -416,7 +416,7 @@ func laneWait(g *Gate, id int, timeout *time.Duration, out laneOutput, interrupt
 		case <-signals:
 			interrupted()
 			return out.failure(130, fmt.Errorf("Interrupted; lease %d was withdrawn", id), Object{"id": id})
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(pause):
 		}
 	}
 }
