@@ -169,15 +169,18 @@ func TestMacOSResumeContinuesRecordsWrittenByEarlierRuns(t *testing.T) {
 
 // stageRecordToolWiring reads the workflow text and checks path strings and step
 // order. For each job that runs a script reading stage records, it guarantees that:
-//   - an uncommented native `go build` of queue-tool comes before the first consumer
+//   - an uncommented `go build` of queue-tool, with no GOOS on its own line, comes
+//     before the first consumer
 //   - that build has no `if` or `continue-on-error`
 //   - each consumer step is handed the built path, by step env or `$GITHUB_ENV`
 //   - no later line writes `QUEUE_NOTARY_TOOL` to `$GITHUB_ENV`
-//   - no later `cp`, `mv` or similar line, redirect or download-artifact targets the path
+//   - no later single-line `cp` or `mv`, redirect or download-artifact targets the path
 //
 // It does not interpret the workflow. It cannot see writes through another variable
-// or inside a called script, deletion of the tool, whether the build succeeds, whether
-// the binary is the expected one, or how a script uses it. Those are only found at
+// or inside a called script, writes by other tools such as `dd` or `rsync`, a `cp`
+// continued onto the next line or with a path split by quotes, GOOS exported on an
+// earlier line, deletion of the tool, whether the build succeeds, whether the binary
+// is the expected one, or how a script uses it. Those are only found at
 // runtime, in `Distribution`, or not at all if a replaced binary still behaves.
 func stageRecordToolWiring(t *testing.T, workflow []byte) (consumers map[string]bool, problems []string) {
 	t.Helper()
@@ -457,7 +460,8 @@ func TestMacOSResumeFailedWritesAroundTheProviderCallKeepCustody(t *testing.T) {
 			t.Fatal(err)
 		}
 		wrapUploadTool(t, f, `printf '{"id":"%s"}\n' "$SIGNING_TEST_UPLOAD_ID"; exit 0`)
-		for _, id := range []string{"private provider text", "deadbeef", "---", strings.Repeat("a", 86)} {
+		const validID = "12345678-1234-1234-1234-123456789abc"
+		for _, id := range []string{"private provider text", "deadbeef", "---", strings.Repeat("a", 86), validID + "-secret", "secret-" + validID} {
 			if err := os.WriteFile(path, prepared, 0600); err != nil {
 				t.Fatal(err)
 			}

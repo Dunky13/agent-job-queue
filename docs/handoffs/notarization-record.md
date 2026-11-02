@@ -62,12 +62,14 @@ record validation: `verify_publication`, the log and asset bindings in
 `TestStageRecordToolIsBuiltBeforeEveryConsumer` reads the workflow text and checks path
 strings and step order. It does not interpret the workflow.
 
-- **It catches:** a missing, commented-out, conditional or cross-compiled build, a
+- **It catches:** a missing, commented-out or conditional build, a build with GOOS on its own line, a
   build allowed to fail, a missing `$GITHUB_ENV` export, a consumer given a different
   path, a later `$GITHUB_ENV` rewrite, and a later `cp`, `mv`, redirect or
   `download-artifact` onto the path.
 - **It misses, confirmed by trying them:** a write through another variable, `rm` of the
-  tool, and a write inside a called script. A missing tool fails closed at the first
+  tool, a write inside a called script, `dd` or `rsync` onto the path, a `cp` continued
+  onto the next line or with a path split by quotes, and `export GOOS=linux` on an earlier
+  line. A missing tool fails closed at the first
   record read. A replaced binary that still behaves would go unnoticed.
 
 ## Behaviour differences
