@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"github.com/Dunky13/agent-job-queue/internal/census"
 )
 
 var errQueueLaneFull = errors.New("Lane is full")
@@ -264,43 +266,26 @@ func validLeaseMeta(raw any) (Object, error) {
 	return values, nil
 }
 
-type leaseProcess struct {
-	UID          int
-	Birth, State string
-}
+type leaseProcess = census.Process
 type leaseProcesses struct {
 	Boot      string
-	Processes map[int]leaseProcess
+	Processes census.Table
 }
 
 // leaseProcessSnapshot reads the complete process table once so that a missing
 // PID can be told apart from a failed listing; failures keep leases held.
 func leaseProcessSnapshot(boot string) (leaseProcesses, error) {
-	result := leaseProcesses{Boot: boot, Processes: map[int]leaseProcess{}}
-	output, err := identityCommand("/bin/ps", "-axo", "pid=,uid=,stat=,lstart=")
+	result := leaseProcesses{Boot: boot, Processes: census.Table{}}
+	processes, err := identityCensus(census.Wording{
+		Truncated:  "Incomplete lease owner process listing",
+		Invalid:    "Invalid lease owner process listing",
+		Ambiguous:  "Ambiguous lease owner process listing",
+		Incomplete: "Incomplete lease owner process listing",
+	})
 	if err != nil {
 		return result, err
 	}
-	observer := false
-	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 8 {
-			return result, errors.New("Incomplete lease owner process listing")
-		}
-		pid, pidErr := strconv.Atoi(fields[0])
-		uid, uidErr := strconv.Atoi(fields[1])
-		if pidErr != nil || uidErr != nil || pid <= 0 {
-			return result, errors.New("Invalid lease owner process listing")
-		}
-		if _, duplicate := result.Processes[pid]; duplicate {
-			return result, errors.New("Ambiguous lease owner process listing")
-		}
-		result.Processes[pid] = leaseProcess{UID: uid, Birth: strings.Join(fields[3:], " "), State: fields[2]}
-		observer = observer || pid == os.Getpid()
-	}
-	if !observer {
-		return result, errors.New("Incomplete lease owner process listing")
-	}
+	result.Processes = processes
 	return result, nil
 }
 
@@ -311,8 +296,8 @@ func (p leaseProcesses) alive(owner Object) bool {
 	if !ok || text(owner["boot"]) != p.Boot {
 		return false
 	}
-	state, present := p.Processes[pid]
-	return present && state.UID == os.Getuid() && state.Birth == text(owner["birth"]) && !strings.HasPrefix(state.State, "Z")
+	state, liveness := p.Processes.Identify(pid, text(owner["birth"]))
+	return liveness == census.Alive && state.UID == os.Getuid()
 }
 
 func (d *queueDaemon) bootIdentity() (string, error) {
@@ -339,7 +324,7 @@ func (d *queueDaemon) leaseOwner(pid int) (Object, error) {
 		return nil, err
 	}
 	state, present := processes.Processes[pid]
-	if !present || strings.HasPrefix(state.State, "Z") {
+	if !present || census.IsZombie(state.State) {
 		return nil, fmt.Errorf("Owner process %d is not running", pid)
 	}
 	if state.UID != os.Getuid() {

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"testing"
+
+	"github.com/Dunky13/agent-job-queue/internal/census"
 )
 
 type fakeResourceBackend struct {
@@ -280,13 +282,15 @@ func TestResourceBoundaries(t *testing.T) {
 }
 
 func TestResourceCensusRejectsTruncationDuplicatesAndMalformedRows(t *testing.T) {
-	for _, output := range []string{"", "101 400 birth\n", "999 900 observer birth\ninvalid\n", "999 900 observer birth\n101 400 a\n101 400 b\n"} {
-		if _, e := parseResourceProcessListing(output, 400, 999); e == nil {
+	const observerRow = "999 900 501 S Mon Nov 2 18:22:25 2026\n"
+	observer := census.Observer{PID: 999, PGID: 900}
+	for _, output := range []string{"", "101 400 501 S Mon Nov 2 18:22:26 2026\n", observerRow + "invalid\n", observerRow + "101 400 501 S Mon Nov 2 18:22:26 2026\n101 400 501 S Mon Nov 2 18:22:27 2026\n"} {
+		if _, e := parseResourceProcessListing(output, 400, observer); e == nil {
 			t.Fatalf("Unsafe resource census accepted: %q", output)
 		}
 	}
-	members, e := parseResourceProcessListing("999 900 observer birth\n101 400 stable   birth\n", 400, 999)
-	if e != nil || len(members) != 1 || members[0]["birth"] != "stable birth" {
+	members, e := parseResourceProcessListing(observerRow+"101 400 501 S Mon Nov  2 18:22:26 2026\n", 400, observer)
+	if e != nil || len(members) != 1 || members[0]["birth"] != "Mon Nov 2 18:22:26 2026" {
 		t.Fatalf("Valid census rejected: %v %v", members, e)
 	}
 }
