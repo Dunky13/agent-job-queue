@@ -236,6 +236,29 @@ func TestCancelRefusesAJobReplacedBetweenReads(t *testing.T) {
 	}
 }
 
+func TestCancelLeavesAnotherJobsReceiptWhenTheRowIsMissing(t *testing.T) {
+	g := testGate(t)
+	if err := g.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if err := WritePrivate(g.ReceiptPath(7), Object{"token": jobToken(99)}); err != nil {
+		t.Fatal(err)
+	}
+	g.queueControl = func(string, Object) (Object, error) { return testSnapshot(Object{}), nil }
+	read := captureStreams(t)
+	_, err := cancelJob(g, 7, jobToken(8), nil)
+	read()
+	if err == nil || !strings.Contains(err.Error(), "no longer the job this cancellation targeted") {
+		t.Fatal("a missing row with another job's receipt was accepted", err)
+	}
+	if receipt, err := g.Receipt(7); err != nil || receipt == nil {
+		t.Fatal("the other job's receipt was removed", receipt, err)
+	}
+	if _, err := os.Stat(filepath.Join(g.Cancelled, "7.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a cancellation marker was written for another job", err)
+	}
+}
+
 func TestCancelRefusesAMismatchedExpectedTokenBeforeAnyMutation(t *testing.T) {
 	g := testGate(t)
 	operations := scriptSnapshots(t, g, []step{{task: taskWithToken(jobToken(99), "Running", Object{})}}, nil)

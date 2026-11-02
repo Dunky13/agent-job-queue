@@ -182,6 +182,9 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			prefix := fmt.Sprintf("Lost contact with the queue daemon for %s", outage.elapsed())
 			if pendingSignal != nil {
 				prefix = fmt.Sprintf("Queue calls kept failing for %s and the cancellation requested by your interrupt could not be confirmed", outage.elapsed())
+				if !cancelSentAt.IsZero() {
+					prefix = fmt.Sprintf("Queue calls kept failing for %s after the daemon acknowledged the cancellation requested by your interrupt, and the job's exit could not be confirmed", outage.elapsed())
+				}
 			}
 			code, err = end(prefix, cause)
 			return true, code, err
@@ -189,7 +192,11 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		select {
 		case sig := <-signals:
 			if pendingSignal != nil {
-				code, err = end("Interrupted again while the queue daemon was not answering; the cancellation could not be confirmed", cause)
+				message := "Interrupted again while the queue daemon was not answering; the cancellation could not be confirmed"
+				if !cancelSentAt.IsZero() {
+					message = "Interrupted again while the queue daemon was not answering; the cancellation was acknowledged but the job's exit could not be confirmed"
+				}
+				code, err = end(message, cause)
 				return true, code, err
 			}
 			pendingSignal = sig
@@ -405,6 +412,17 @@ func cancelJob(g *Gate, id int, expectedToken string, sentAt *time.Time) (*int, 
 			if expectedToken == "" {
 				expectedToken = got
 			} else if got != expectedToken {
+				return nil, fmt.Errorf("Job %d is no longer the job this cancellation targeted; nothing further was cancelled", id)
+			}
+		}
+		// A row with no task has no token to compare, but its receipt does. Without
+		// this, a stale receipt under a reused ID would lose its payload and marker.
+		if task == nil && expectedToken != "" {
+			receipt, err := g.Receipt(id)
+			if err != nil {
+				return nil, err
+			}
+			if receipt != nil && text(receipt["token"]) != expectedToken {
 				return nil, fmt.Errorf("Job %d is no longer the job this cancellation targeted; nothing further was cancelled", id)
 			}
 		}

@@ -878,6 +878,20 @@ func TestQueueHandoverConsumedReceiptDoesNotCaptureLaterJobs(t *testing.T) {
 			t.Fatalf("job %d: later job was captured by custody: allowed=%v err=%v", id, allowed, err)
 		}
 	}
+	// A committed receipt a crash left behind must not capture later jobs either.
+	// The probe fails this test if custody is consulted, so its daemon's state never
+	// comes into it.
+	committed := *receipt
+	committed.Phase, committed.Consumer = "committed", nil
+	if err := writeQueueHandoverReceipt(g, &committed); err != nil {
+		t.Fatal(err)
+	}
+	if _, allowed, err := queueHandoverRetainedTaskWithProbe(g, 90, token(), "", probe); err != nil || allowed {
+		t.Fatalf("a stale committed receipt captured a later job: allowed=%v err=%v", allowed, err)
+	}
+	if err := writeQueueHandoverReceipt(g, receipt); err != nil {
+		t.Fatal(err)
+	}
 	// A job that existed at handover is still checked against custody.
 	if _, allowed, err := queueHandoverRetainedTaskWithProbe(g, 4, token(), "", func(queueHandoverDaemon) (bool, error) { return true, nil }); err == nil || allowed {
 		t.Fatalf("a pre-handover job outside the dispatch inventory was accepted: allowed=%v err=%v", allowed, err)
