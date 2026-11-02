@@ -8,9 +8,10 @@ import (
 )
 
 // Job state lives twice: the phase column the daemon schedules on, and the
-// Pueue-shaped task["status"] callers read. Every write to a job row goes
+// Pueue-shaped task["status"] callers read. Every write to a live job row goes
 // through this file, so legal edges, matching writes and compare-and-swap guards
-// have one owner. Reads never validate: snapshots must still show a corrupt row.
+// have one owner. The one other writer is importLegacy, which inserts drained
+// history. Reads never validate: snapshots must still show a corrupt row.
 
 var (
 	errQueueChanged           = errors.New("Queue job changed concurrently")
@@ -53,13 +54,7 @@ func queueJobAgreement(j queueJob) error {
 		agrees = name == "Running" || name == "Paused"
 	case "outcome", "done":
 		code, resultErr := ResultCode(details["result"])
-		agrees = name == "Done" && resultErr == nil
-		if j.outcome.Valid {
-			agrees = agrees && int64(code) == j.outcome.Int64
-		} else {
-			// importLegacy retains a completed result without the outcome column.
-			agrees = agrees && j.phase == "done"
-		}
+		agrees = name == "Done" && resultErr == nil && j.outcome.Valid && int64(code) == j.outcome.Int64
 	}
 	if !agrees {
 		return fmt.Errorf("%w: job %d is %s with status %s", errQueueStateDisagreement, j.id, j.phase, name)
@@ -86,6 +81,10 @@ func (s *queueStore) swapJob(after queueJob, stale error, query string, args ...
 	if e := queueJobAgreement(after); e != nil {
 		return e
 	}
+	return s.swapRow(stale, query, args...)
+}
+
+func (s *queueStore) swapRow(stale error, query string, args ...any) error {
 	result, e := s.db.Exec(query, args...)
 	if e != nil {
 		return e
@@ -135,14 +134,66 @@ func (s *queueStore) enqueue(id int, value string, task Object, publish func() e
 	return tx.Commit()
 }
 
-// saveTask writes a task without moving its phase, such as a priority change or
-// Running to Paused. The new status must still fit the phase the caller read.
+// saveTask writes task fields other than status, such as priority. Status has its
+// own methods; the agreement check here catches a caller that composes one.
 func (s *queueStore) saveTask(j queueJob) error {
 	data, e := queueJSON(j.task)
 	if e != nil {
 		return e
 	}
 	return s.swapJob(j, errQueueChanged, "UPDATE queue_jobs SET task=? WHERE id=? AND token=? AND attempt=? AND phase=?", data, j.id, j.token, j.attempt, j.phase)
+}
+
+// setWaiting moves a queued command between Queued and Stashed. A lease cannot
+// be stashed: it has no resource admission to wait for.
+func (s *queueStore) setWaiting(j queueJob, stashed bool) error {
+	if taskIsLease(j.task) || j.phase != "queued" {
+		return fmt.Errorf("%w: %s %d in phase %s cannot be held or enqueued", errQueueIllegalTransition, taskKind(j.task), j.id, j.phase)
+	}
+	if e := queueJobAgreement(j); e != nil {
+		return e
+	}
+	state := "Queued"
+	if stashed {
+		state = "Stashed"
+	}
+	j.task["status"] = Object{state: Object{}}
+	return s.saveTask(j)
+}
+
+// setPaused records a signal the caller already delivered, so it keeps the
+// attempt's details. A lease has no process to pause.
+func (s *queueStore) setPaused(j queueJob, paused bool) error {
+	if taskIsLease(j.task) || j.phase != "starting" && j.phase != "running" {
+		return fmt.Errorf("%w: %s %d in phase %s cannot be paused or resumed", errQueueIllegalTransition, taskKind(j.task), j.id, j.phase)
+	}
+	if e := queueJobAgreement(j); e != nil {
+		return e
+	}
+	_, details, e := TaskStatus(j.task)
+	if e != nil {
+		return e
+	}
+	state := "Running"
+	if paused {
+		state = "Paused"
+	}
+	j.task["status"] = Object{state: details}
+	return s.saveTask(j)
+}
+
+// markCancelled records an operator's request. It writes a held row too, because
+// cancelling is the one way to settle one, and it leaves status alone.
+func (s *queueStore) markCancelled(j queueJob) error {
+	if j.phase == "done" {
+		return fmt.Errorf("%w: %s %d is done and cannot be cancelled", errQueueIllegalTransition, taskKind(j.task), j.id)
+	}
+	j.task["cancelled"] = true
+	data, e := queueJSON(j.task)
+	if e != nil {
+		return e
+	}
+	return s.swapRow(errQueueChanged, "UPDATE queue_jobs SET task=? WHERE id=? AND token=? AND attempt=? AND phase=?", data, j.id, j.token, j.attempt, j.phase)
 }
 
 // claimAttempt durably records a new attempt before any process exists, and
@@ -192,9 +243,13 @@ func (s *queueStore) recordOutcome(j queueJob, code int) error {
 	if e := checkQueueEdge(j, false, "outcome"); e != nil {
 		return e
 	}
+	return s.writeOutcome(j, code)
+}
+
+func (s *queueStore) writeOutcome(j queueJob, code int) error {
 	_, details, e := TaskStatus(j.task)
 	if e != nil {
-		return e
+		details = Object{} // Only a held row gets here with no readable status.
 	}
 	details["end"] = queueNow()
 	details["result"] = queueResult(code)
@@ -237,9 +292,13 @@ func (s *queueStore) endLease(j queueJob, at string) error {
 	if e := checkQueueEdge(j, true, "done"); e != nil {
 		return e
 	}
+	return s.writeLeaseEnd(j, at)
+}
+
+func (s *queueStore) writeLeaseEnd(j queueJob, at string) error {
 	_, details, e := TaskStatus(j.task)
 	if e != nil {
-		return e
+		details = Object{} // Only a held row gets here with no readable status.
 	}
 	details["end"] = at
 	details["result"] = "Success"
@@ -251,4 +310,38 @@ func (s *queueStore) endLease(j queueJob, at string) error {
 	from := j.phase
 	j.phase, j.outcome = "done", sql.NullInt64{Int64: 0, Valid: true}
 	return s.swapJob(j, errQueueChanged, "UPDATE queue_jobs SET phase='done',task=?,outcome=0 WHERE id=? AND token=? AND phase=?", data, j.id, j.token, from)
+}
+
+// checkQueueHeld admits only a row the ordinary edges would refuse. Settling is
+// the operator's way out of a hold, and nothing else may use it.
+func checkQueueHeld(j queueJob, lease bool) error {
+	if taskIsLease(j.task) != lease || j.phase == "done" {
+		return fmt.Errorf("%w: %s %d in phase %s cannot be settled", errQueueIllegalTransition, taskKind(j.task), j.id, j.phase)
+	}
+	if queueJobAgreement(j) == nil {
+		return fmt.Errorf("%w: job %d is not held", errQueueIllegalTransition, j.id)
+	}
+	return nil
+}
+
+// settleHeld gives a held command a result the store can stand behind, which the
+// caller may do only once no verified process remains. A row already at outcome
+// keeps its published exit status when it has one; cleanup then retires it.
+func (s *queueStore) settleHeld(j queueJob, code int) error {
+	if e := checkQueueHeld(j, false); e != nil {
+		return e
+	}
+	if j.phase == "outcome" && j.outcome.Valid {
+		code = int(j.outcome.Int64)
+	} else {
+		j.task["cancelled"] = true
+	}
+	return s.writeOutcome(j, code)
+}
+
+func (s *queueStore) settleHeldLease(j queueJob, at string) error {
+	if e := checkQueueHeld(j, true); e != nil {
+		return e
+	}
+	return s.writeLeaseEnd(j, at)
 }

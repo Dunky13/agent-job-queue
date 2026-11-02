@@ -174,16 +174,18 @@ func TestQueueTransitionPauseDuringClaimStaysLegal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	j.task["status"] = Object{"Paused": details}
-	if err = s.saveTask(j); err != nil {
+	if details["start"] == nil {
+		t.Fatalf("fixture has no start: %v", details)
+	}
+	if err = s.setPaused(j, true); err != nil {
 		t.Fatal(err)
 	}
 	if err = s.claimWorker(j.id, j.token, j.attempt, Object{"pgid": 9}); err != nil {
 		t.Fatal(err)
 	}
 	j = transitionRow(t, s, 1)
-	if j.phase != "running" || transitionStatus(t, j) != "Paused" {
-		t.Fatalf("worker claim lost the pause: %+v", j)
+	if _, kept, err := TaskStatus(j.task); j.phase != "running" || transitionStatus(t, j) != "Paused" || err != nil || kept["start"] != details["start"] {
+		t.Fatalf("worker claim lost the pause or its start: %+v %v", j, err)
 	}
 	if err = s.recordOutcome(j, 130); err != nil {
 		t.Fatal(err)
@@ -454,7 +456,8 @@ func TestQueueTransitionOutOfRangeOutcomeIsRefused(t *testing.T) {
 	requireRowUnchanged(t, s, before)
 }
 
-// importLegacy retains completed history with no outcome column. It stays valid.
+// importLegacy retains completed history with no outcome column. Reads never
+// validate, and no edge leaves done.
 func TestQueueTransitionLegacyHistoryStillAgrees(t *testing.T) {
 	g, s := edgeQueueStore(t)
 	mustWrite(t, g.State+"/legacy-queue-import.json", Object{
@@ -467,12 +470,6 @@ func TestQueueTransitionLegacyHistoryStillAgrees(t *testing.T) {
 	j := transitionRow(t, s, 4)
 	if j.outcome.Valid {
 		t.Fatalf("fixture no longer exercises a missing outcome: %+v", j)
-	}
-	if err := queueJobAgreement(j); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.saveTask(j); err != nil {
-		t.Fatal(err)
 	}
 	if err := s.retire(j); !errors.Is(err, errQueueIllegalTransition) {
 		t.Fatalf("done row moved: %v", err)

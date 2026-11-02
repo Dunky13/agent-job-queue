@@ -234,6 +234,18 @@ func (d *queueDaemon) snapshot() (Object, error) {
 	}
 	snapshot["lanes"] = lanes
 	snapshot["plugins"] = plugins
+	// Omitted when empty, so a healthy queue's snapshot does not change.
+	problems := []Object{}
+	for _, j := range jobs {
+		if why := queueJobAgreement(j); why != nil {
+			problems = append(problems, Object{"id": j.id, "kind": "held", "message": why.Error()})
+		} else if message := d.errors[j.id]; message != "" {
+			problems = append(problems, Object{"id": j.id, "kind": "cleanup", "message": message})
+		}
+	}
+	if len(problems) != 0 {
+		snapshot["problems"] = problems
+	}
 	return snapshot, nil
 }
 
@@ -419,7 +431,7 @@ func (d *queueDaemon) acquireLease(p Object) (Object, error) {
 	d.emitTask("lease.queued", next, task, nil)
 	// Grant immediately when the lane has room, so --no-wait can report held.
 	if err = d.tick(); err != nil {
-		fmt.Fprintln(os.Stderr, "agent-heavy daemon:", err)
+		d.logLimited("tick", err.Error())
 	}
 	return d.leaseView(next)
 }
@@ -448,7 +460,17 @@ func (d *queueDaemon) grantLease(j queueJob) error {
 // endLease moves a lease straight to done: it has no process to clean up.
 // Held leases are released or expire; queued ones are dropped or expire.
 func (d *queueDaemon) endLease(j queueJob, reason string) error {
+	// Cancelling is the one reason that may settle a held lease; the store refuses
+	// the others. Read this first, while the row is as the caller found it.
+	end := d.store.endLease
+	if reason == "cancelled" && queueJobAgreement(j) != nil {
+		end = d.store.settleHeldLease
+	}
 	lease := obj(j.task["lease"])
+	if lease == nil {
+		lease = Object{}
+		j.task["lease"] = lease
+	}
 	held := j.phase == "running"
 	state, event := "dropped", "lease.dropped"
 	switch {
@@ -466,7 +488,7 @@ func (d *queueDaemon) endLease(j queueJob, reason string) error {
 	if reason == "owner-exited" {
 		lease["ownerAlive"] = false
 	}
-	if err := d.store.endLease(j, now); err != nil {
+	if err := end(j, now); err != nil {
 		return err
 	}
 	delete(d.ownerAlive, j.id)
@@ -580,6 +602,10 @@ func (d *queueDaemon) checkLeaseOwners() error {
 			return err
 		}
 		if !taskIsLease(j.task) || j.phase != "queued" && j.phase != "running" || !jsonEqual(obj(obj(j.task["lease"])["owner"]), owner) {
+			continue
+		}
+		if why := queueJobAgreement(j); why != nil {
+			d.holdRow(j, why)
 			continue
 		}
 		if err = d.endLease(j, "owner-exited"); err != nil && !errors.Is(err, errQueueChanged) {

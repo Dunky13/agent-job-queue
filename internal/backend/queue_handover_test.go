@@ -358,7 +358,7 @@ func TestQueueHandoverWorkerRetriesSchedulingSnapshotAfterCapacity(t *testing.T)
 			if err != nil {
 				t.Fatal(err)
 			}
-			job := edgeInsertJob(t, store, "starting")
+			job := transitionCommand(t, store, 7, "starting")
 			job.task["handoverProtocol"] = 1
 			job.task["handoverCaller"] = identity
 			members, err := ProcessGroupMembers(identity.PGID)

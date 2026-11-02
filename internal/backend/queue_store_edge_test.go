@@ -28,25 +28,11 @@ func edgeQueueStore(t *testing.T) (*Gate, *queueStore) {
 	return g, s
 }
 
-func edgeInsertJob(t *testing.T, s *queueStore, phase string) queueJob {
-	t.Helper()
-	j := queueJob{id: 7, token: strings.Repeat("a", 32), attempt: strings.Repeat("b", 32), phase: phase,
-		task: Object{"token": strings.Repeat("a", 32), "priority": 0, "status": Object{"Running": Object{"start": "2026-10-20T00:00:00Z"}}}}
-	data, err := queueJSON(j.task)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = s.db.Exec("INSERT INTO queue_jobs(id,token,attempt,phase,task) VALUES(?,?,?,?,?)", j.id, j.token, j.attempt, j.phase, data); err != nil {
-		t.Fatal(err)
-	}
-	return j
-}
-
 func TestQueueEdgeStaleFinishCannotOverwriteClaimOrOutcome(t *testing.T) {
 	for _, phase := range []string{"running", "outcome"} {
 		t.Run(phase, func(t *testing.T) {
 			_, s := edgeQueueStore(t)
-			stale := edgeInsertJob(t, s, "starting")
+			stale := transitionCommand(t, s, 7, "starting")
 			current, err := s.job(stale.id)
 			if err != nil {
 				t.Fatal(err)
@@ -248,7 +234,7 @@ func TestQueueEdgeStaleSaveTaskPreservesNewAttemptAndOutcome(t *testing.T) {
 	for _, change := range []string{"attempt", "outcome"} {
 		t.Run(change, func(t *testing.T) {
 			_, s := edgeQueueStore(t)
-			stale := edgeInsertJob(t, s, "running")
+			stale := transitionCommand(t, s, 7, "running")
 			if change == "attempt" {
 				if _, err := s.db.Exec("UPDATE queue_jobs SET attempt=? WHERE id=?", strings.Repeat("e", 32), stale.id); err != nil {
 					t.Fatal(err)
@@ -394,7 +380,7 @@ func TestQueueEdgeDuplicateWorkerCannotClaimAlreadyRunningAttempt(t *testing.T) 
 		t.Skip("worker claim verification uses macOS process identities")
 	}
 	g, s := edgeQueueStore(t)
-	j := edgeInsertJob(t, s, "running")
+	j := transitionCommand(t, s, 7, "running")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	executable, err := os.Executable()
@@ -412,7 +398,7 @@ func TestQueueEdgeDuplicateWorkerCannotClaimAlreadyRunningAttempt(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.phase != j.phase || after.attempt != j.attempt || !jsonEqual(after.task, j.task) || after.worker != nil || after.outcome.Valid {
+	if after.phase != j.phase || after.attempt != j.attempt || !jsonEqual(after.task, j.task) || !jsonEqual(after.worker, j.worker) || after.outcome.Valid {
 		t.Fatalf("duplicate worker mutated existing attempt: %+v", after)
 	}
 }

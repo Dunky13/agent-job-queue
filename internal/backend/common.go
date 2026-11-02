@@ -358,6 +358,26 @@ func (g *Gate) Snapshot() (Object, error) {
 	return g.QueueControl("snapshot", nil)
 }
 
+// schedulingSnapshot hides held rows that read as waiting or have no readable
+// status. Hold and start refuse them, and a refusal must not end the pass for
+// every other job. A held row that reads as running stays, as a conservative
+// reservation.
+func (g *Gate) schedulingSnapshot() (Object, error) {
+	snapshot, err := g.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	tasks := obj(snapshot["tasks"])
+	for id := range heldJobIDs(snapshot) {
+		key := strconv.Itoa(id)
+		name, _, err := TaskStatus(obj(tasks[key]))
+		if err != nil || name == "Queued" || name == "Stashed" {
+			delete(tasks, key)
+		}
+	}
+	return snapshot, nil
+}
+
 func (g *Gate) operationContext() context.Context {
 	if g.controlContext != nil {
 		return g.controlContext
