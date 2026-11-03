@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -116,9 +117,40 @@ func corruptedTick(t *testing.T, d *queueDaemon) {
 // tickingForClient keeps the daemon working while Cancel() polls it from outside.
 func tickingForClient(t *testing.T, d *queueDaemon) func() {
 	t.Helper()
+	start := make(chan struct{})
+	close(start)
+	return ticksFrom(d, start)
+}
+
+// tickingAfter holds ticks until the daemon has replied to op, or to anything when
+// op is empty. A tick that came first would settle a row whose worker has exited
+// with 125, before Cancel has read it or sent a cancel.
+func tickingAfter(op string) func(*testing.T, *queueDaemon) func() {
+	return func(t *testing.T, d *queueDaemon) func() {
+		t.Helper()
+		replied := make(chan struct{})
+		var once sync.Once
+		control := d.g.queueControl
+		d.g.queueControl = func(name string, payload Object) (Object, error) {
+			reply, err := control(name, payload)
+			if op == "" || name == op {
+				once.Do(func() { close(replied) })
+			}
+			return reply, err
+		}
+		return ticksFrom(d, replied)
+	}
+}
+
+func ticksFrom(d *queueDaemon, start <-chan struct{}) func() {
 	stop, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(stopped)
+		select {
+		case <-stop:
+			return
+		case <-start:
+		}
 		for {
 			select {
 			case <-stop:
@@ -327,29 +359,30 @@ func TestCorruptedRowsCancelThroughClient(t *testing.T) {
 		name       string
 		setup      func(*testing.T, *queueStore) queueJob
 		code, file int
+		ticking    func(*testing.T, *queueDaemon) func()
 	}{
 		{"queued reading Running", func(t *testing.T, s *queueStore) queueJob {
 			transitionCommand(t, s, 0, "queued")
 			return corruptStatus(t, s, 0, running)
-		}, 130, 130},
+		}, 130, 130, tickingForClient},
 		{"starting reading Queued", func(t *testing.T, s *queueStore) queueJob {
 			transitionCommand(t, s, 0, "starting")
 			return corruptStatus(t, s, 0, queued)
-		}, 130, 130},
+		}, 130, 130, tickingForClient},
 		{"running reading Queued", func(t *testing.T, s *queueStore) queueJob {
 			runningWithWorker(t, s, 0, exitedWorker(t))
 			return corruptStatus(t, s, 0, queued)
-		}, 130, 130},
+		}, 130, 130, tickingAfter("cancel")},
 		{"running reading Done keeps main's reported code", func(t *testing.T, s *queueStore) queueJob {
 			runningWithWorker(t, s, 0, exitedWorker(t))
 			return corruptStatus(t, s, 0, failed)
-		}, 125, 7},
+		}, 125, 7, tickingAfter("")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			d, s, _, _ := corruptedDaemon(t)
 			j := test.setup(t, s)
 			mustWrite(t, d.g.ReceiptPath(0), Object{"task_id": 0, "token": j.token})
-			stop := tickingForClient(t, d)
+			stop := test.ticking(t, d)
 			defer stop()
 			if err := Cancel(d.g, 0); err != nil {
 				t.Fatalf("Cancel: %v", err)

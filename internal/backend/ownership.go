@@ -467,7 +467,24 @@ func VerifyGroupIdentity(marker Object) (bool, error) {
 	if err != nil || !exists {
 		return false, err
 	}
-	return false, errors.New("Process group ownership cannot be verified; shared slot retained without signalling")
+	return false, fmt.Errorf("%w; compared group %d, recorded members %s, current members %s", errGroupOwnershipUnverified, pgid, memberIdentities(marker["members"]), memberIdentities(current))
+}
+
+// errGroupOwnershipUnverified says a process group exists but none of its
+// members is one the record names. A caller never signals on it. One whose row
+// can have settled meanwhile reads the row again: the worker publishes its
+// outcome before it exits, so an unrecorded descendant outliving it is then
+// left to the settled job's cleanup, not to a signal.
+var errGroupOwnershipUnverified = errors.New("Process group ownership cannot be verified; shared slot retained without signalling")
+
+func memberIdentities(members any) string {
+	parts := []string{}
+	for _, raw := range list(members) {
+		member := obj(raw)
+		pid, _ := integer(member["pid"])
+		parts = append(parts, fmt.Sprintf("%d@%s", pid, census.NormalizeBirth(text(member["birth"]))))
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 func removeMissing(path string) error {
 	err := os.Remove(path)

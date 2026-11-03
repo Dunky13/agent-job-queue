@@ -470,7 +470,9 @@ func TestInstallerNewerCopyBesideRunningRecordedAppStops(t *testing.T) {
 	i.app = dropped
 	a.calls = nil
 	report := i.preflight(removalContext(t))
-	if !preflightIDs(report)["app-running"] || len(report.Issues[0].Actions) != 0 {
+	// The fixture's helpers can also hold scheduling.lock, which adds installer-busy.
+	running := slices.IndexFunc(report.Issues, func(issue installPreflightIssue) bool { return issue.ID == "app-running" })
+	if running < 0 || len(report.Issues[running].Actions) != 0 {
 		t.Fatalf("a newer copy did not name the running recorded app: %+v", report)
 	}
 	if err := i.repairAndExecute(removalContext(t)); err == nil || !strings.Contains(err.Error(), "requires review") {

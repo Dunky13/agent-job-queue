@@ -251,6 +251,19 @@ func (s *queueStore) readJobs(filter string) ([]queueJob, error) {
 	}
 	return jobs, rows.Err()
 }
+
+// settledAttempt re-reads j's row. The row is current, and settled reports that
+// the same attempt and worker has published its outcome since j was read. A worker
+// normally publishes before it exits. One that died first leaves the row unsettled
+// until the daemon's wait on it finishes the job.
+func (s *queueStore) settledAttempt(j queueJob) (current queueJob, settled bool, err error) {
+	current, err = s.job(j.id)
+	if err != nil {
+		return j, false, err
+	}
+	same := current.token == j.token && current.attempt == j.attempt && jsonEqual(current.worker, j.worker)
+	return current, same && (current.phase == "outcome" || current.phase == "done"), nil
+}
 func (s *queueStore) job(id int) (queueJob, error) {
 	if e := queuePrivateFiles(s.path); e != nil {
 		return queueJob{}, e

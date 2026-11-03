@@ -395,15 +395,18 @@ func queueHandoverAttempts(store *queueStore) ([]queueHandoverAttempt, error) {
 				return nil, errors.New("Active worker has no ownership evidence")
 			}
 			owned, err := VerifyGroupIdentity(job.worker)
-			if err != nil {
+			if err != nil && !errors.Is(err, errGroupOwnershipUnverified) {
 				return nil, err
 			}
-			if !owned {
-				current, readErr := store.job(job.id)
+			if err != nil || !owned {
+				current, settled, readErr := store.settledAttempt(job)
 				if readErr != nil {
 					return nil, readErr
 				}
-				if current.token != job.token || current.attempt != job.attempt || !jsonEqual(current.worker, job.worker) || current.phase != "outcome" && current.phase != "done" {
+				if !settled {
+					if err != nil {
+						return nil, err
+					}
 					return nil, errors.New("Active worker outcome is not yet known; live upgrade must wait for reconciliation")
 				}
 				job = current
@@ -689,15 +692,18 @@ func validateQueueHandoverAttempts(store *queueStore, receipt *queueHandoverRece
 		}
 		if job.phase == "running" {
 			owned, err := VerifyGroupIdentity(job.worker)
-			if err != nil {
+			if err != nil && !errors.Is(err, errGroupOwnershipUnverified) {
 				return err
 			}
-			if !owned {
-				current, readErr := store.job(job.id)
+			if err != nil || !owned {
+				current, settled, readErr := store.settledAttempt(job)
 				if readErr != nil {
 					return readErr
 				}
-				if current.token != job.token || current.attempt != job.attempt || !jsonEqual(current.worker, job.worker) || current.phase != "outcome" && current.phase != "done" {
+				if !settled {
+					if err != nil {
+						return err
+					}
 					return errors.New("Retained worker ownership is uncertain")
 				}
 				job = current
@@ -966,15 +972,18 @@ func queueHandoverRetainedTaskWithProbe(g *Gate, id int, expectedToken, workerAt
 		} else {
 			owned, err = VerifyGroupIdentity(job.worker)
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, errGroupOwnershipUnverified) {
 			return nil, false, err
 		}
-		if !owned {
-			current, err := store.job(job.id)
-			if err != nil {
-				return nil, false, err
+		if err != nil || !owned {
+			current, settled, readErr := store.settledAttempt(job)
+			if readErr != nil {
+				return nil, false, readErr
 			}
-			if current.token != job.token || current.attempt != job.attempt || !jsonEqual(current.worker, job.worker) || current.phase != "outcome" && current.phase != "done" {
+			if !settled {
+				if err != nil {
+					return nil, false, err
+				}
 				return nil, false, errors.New("Retained worker outcome is uncertain during handover")
 			}
 			job = current

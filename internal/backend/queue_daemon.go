@@ -847,6 +847,13 @@ func (d *queueDaemon) signal(j queueJob, sig syscall.Signal) error {
 		return nil
 	}
 	owned, e := VerifyGroupIdentity(j.worker)
+	if errors.Is(e, errGroupOwnershipUnverified) {
+		// j can be stale: the worker may have finished and exited since it was read,
+		// leaving a descendant its record does not name. Nothing is signalled either way.
+		if _, settled, readErr := d.store.settledAttempt(j); readErr == nil && settled {
+			return nil
+		}
+	}
 	if e != nil {
 		return e
 	}
@@ -925,6 +932,13 @@ func (d *queueDaemon) tick() error {
 			owned, unverified := false, error(nil)
 			if !corrupted || j.worker != nil {
 				owned, unverified = VerifyGroupIdentity(j.worker)
+			}
+			if errors.Is(unverified, errGroupOwnershipUnverified) && !corrupted {
+				// The snapshot can be older than the worker's exit; the next tick sees its outcome.
+				if _, settled, readErr := d.store.settledAttempt(j); readErr == nil && settled {
+					occupy(j)
+					continue
+				}
 			}
 			if unverified != nil && !corrupted {
 				return unverified
