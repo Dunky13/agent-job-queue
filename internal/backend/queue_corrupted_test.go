@@ -275,7 +275,7 @@ func TestCorruptedRowWithLiveProcessIsNotSettledAway(t *testing.T) {
 		mustWrite(t, d.g.ReceiptPath(0), Object{"task_id": 0, "token": j.token})
 		stop := tickingForClient(t, d)
 		defer stop()
-		if err := Cancel(d.g, 0); err == nil || !strings.Contains(err.Error(), "cleanup did not complete") {
+		if err := Cancel(d.g, 0); err == nil || !strings.Contains(err.Error(), "cleanup is not confirmed") {
 			t.Fatalf("a live process was reported cancelled: %v", err)
 		}
 		requireRowUnchanged(t, s, before)
