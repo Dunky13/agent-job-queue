@@ -50,10 +50,39 @@ func safeQueueSocket(path string) error {
 		return e
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
+	if ok && st.Nlink == 0 {
+		return os.ErrNotExist // Lstat raced an unlink during a restart: gone, not unsafe.
+	}
 	if !ok || info.Mode()&os.ModeSocket == 0 || int(st.Uid) != os.Getuid() || info.Mode().Perm() != 0600 || st.Nlink != 1 {
 		return errors.New("Unsafe queue socket; work is held")
 	}
 	return nil
+}
+
+// listenQueueSocket binds on a private name and renames the 0600 socket into
+// place, so callers never see the socket at its default mode (reported as unsafe,
+// which is final) and a stale socket is replaced without a missing-path gap.
+// The name matches queue.sock's length so it binds exactly when the final path can
+// connect: macOS limits unix socket paths to 104 bytes.
+func listenQueueSocket(path string) (*net.UnixListener, error) {
+	staging := filepath.Join(filepath.Dir(path), "queue.next")
+	if e := os.Remove(staging); e != nil && !errors.Is(e, os.ErrNotExist) {
+		return nil, e
+	}
+	listener, e := net.ListenUnix("unix", &net.UnixAddr{Name: staging, Net: "unix"})
+	if e != nil {
+		return nil, e
+	}
+	listener.SetUnlinkOnClose(false)
+	if e = os.Chmod(staging, 0600); e == nil {
+		e = os.Rename(staging, path)
+	}
+	if e != nil {
+		listener.Close()
+		os.Remove(staging)
+		return nil, e
+	}
+	return listener, nil
 }
 func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 	ctx := g.operationContext()
@@ -237,21 +266,14 @@ func ServeQueue(g *Gate) error {
 		if !errors.Is(e, syscall.ECONNREFUSED) {
 			return fmt.Errorf("Cannot safely replace queue socket: %w", e)
 		}
-		if e = os.Remove(path); e != nil {
-			return e
-		}
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return e
 	}
-	listener, e := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	listener, e := listenQueueSocket(path)
 	if e != nil {
 		return e
 	}
-	listener.SetUnlinkOnClose(false)
 	defer listener.Close()
-	if e = os.Chmod(path, 0600); e != nil {
-		return e
-	}
 	defer os.Remove(path)
 	d := newQueueDaemon(g, store)
 	defer d.hooks.wait()

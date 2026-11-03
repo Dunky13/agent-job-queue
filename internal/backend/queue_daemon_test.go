@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -348,5 +349,72 @@ func TestQueueLaunchRejectsUnsafeLogsWithoutBlocking(t *testing.T) {
 				t.Fatal("command ran with unsafe log")
 			}
 		})
+	}
+}
+
+// A caller treats an unsafe socket as final, so a restart must only ever show it a
+// private socket or a retryable absence. The daemon runs with umask 077, so a bound
+// socket starts at 0700. Exit removal and replacing a stale socket can each show a
+// retired inode. The pollers can only miss a bad state, so this cannot fail falsely.
+func TestQueueSocketRestartNeverLooksUnsafe(t *testing.T) {
+	previous := syscall.Umask(077)
+	t.Cleanup(func() { syscall.Umask(previous) })
+	root, err := os.MkdirTemp("/tmp", "queue-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	g := testGate(t)
+	g.State = root
+	if err = privateDirectory(filepath.Join(root, "run")); err != nil {
+		t.Fatal(err)
+	}
+	path := queueSocket(g)
+	stop := make(chan struct{})
+	bad := make(chan error, 3)
+	var pollers sync.WaitGroup
+	for range 3 {
+		pollers.Add(1)
+		go func() {
+			defer pollers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if e := safeQueueSocket(path); e != nil && !errors.Is(queueTransportError(e), errQueueTransportUnavailable) {
+					bad <- e
+					return
+				}
+			}
+		}()
+	}
+	for cycle := range 300 {
+		listener, e := listenQueueSocket(path)
+		if e != nil {
+			close(stop)
+			t.Fatal(e)
+		}
+		if cycle == 299 {
+			conn, e := net.Dial("unix", path)
+			if e != nil {
+				t.Errorf("the renamed socket must accept connections: %v", e)
+			} else {
+				conn.Close()
+			}
+		}
+		listener.Close()
+		// Odd cycles leave a stale socket for the next rename to replace.
+		if cycle%2 == 0 {
+			os.Remove(path)
+		}
+	}
+	close(stop)
+	pollers.Wait()
+	select {
+	case e := <-bad:
+		t.Fatalf("a caller checking during a restart got a final error: %v", e)
+	default:
 	}
 }
