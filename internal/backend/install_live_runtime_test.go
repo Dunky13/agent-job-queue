@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -159,6 +161,182 @@ func liveRuntimeFixture(t *testing.T, executable string) *managedFixture {
 	return m
 }
 
+// callerOutput collects a caller's output while the test may still read it.
+type callerOutput struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (o *callerOutput) Write(data []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buffer.Write(data)
+}
+
+func (o *callerOutput) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buffer.String()
+}
+
+// liveCallerWait watches one `agent-heavy run` caller until its job is accepted
+// and its command starts. Before submitting, the caller identifies the project
+// (git subprocesses) and writes fsynced state, and that takes as long as the
+// host needs: seconds on a loaded hosted Intel runner. The wait therefore ends
+// when the daemon lists the job or the caller exits, and only a total hang
+// reaches liveAcceptBudget. The daemon's dispatch and the worker's start are
+// bounded local process work and get the shorter liveStartBudget.
+type liveCallerWait struct {
+	t        *testing.T
+	i        *installer
+	pid      int
+	finished chan error
+	output   *callerOutput
+	// lifetime, when set, is the context that kills the caller at its deadline.
+	lifetime context.Context
+}
+
+// liveAcceptBudget bounds only the caller's preparation before the daemon lists
+// its job; no test asserts anything about that stage. It replaces an 8 s wait
+// that also covered dispatch. Without it a caller that never submits would
+// spend the scenario's whole 60 s (3 minutes for finish-pending) context, ten
+// hung scenarios would pass the 12 minute `go test` timeout in
+// scripts/test-go-runtime.sh, and its panic discards every buffered report.
+// 20 s is 4 times the slowest completed preparation measured on a CPU and disk
+// stressed hosted Intel runner (5.0 s, a cold first scenario; the rest took 1.1
+// s or less) and 2.5 times the 8 s that failed there. That runner took 448 s for
+// all ten scenarios, so ten hung preparations add 200 s: 648 s, inside the
+// 720 s timeout. A 30 s cap would reach 748 s. See
+// docs/handoffs/live-installer-job-start.md.
+const liveAcceptBudget = 20 * time.Second
+
+// liveStartBudget bounds the daemon's 100 ms dispatch tick plus one worker
+// process start. They took at most 0.6 s on a developer machine and under 2 s
+// on a CPU and disk stressed hosted Intel runner.
+const liveStartBudget = 8 * time.Second
+
+// accepted waits until the daemon lists exactly jobs jobs. The listing includes
+// retained history, and the fixture starts with an empty queue, so the count
+// equals the callers started so far.
+func (w liveCallerWait) accepted(ctx context.Context, jobs int) {
+	w.t.Helper()
+	budget, cancel := context.WithTimeout(ctx, liveAcceptBudget)
+	defer cancel()
+	w.until(budget, fmt.Sprintf("the daemon to accept %d job(s)", jobs), func() bool {
+		value, err := w.i.liveControl(budget, "snapshot", nil)
+		return err == nil && len(obj(value["tasks"])) == jobs
+	})
+}
+
+// started waits for the accepted job's command to create path.
+func (w liveCallerWait) started(ctx context.Context, path string) {
+	w.t.Helper()
+	budget, cancel := context.WithTimeout(ctx, liveStartBudget)
+	defer cancel()
+	w.until(budget, "the accepted job's command to start", func() bool { _, err := os.Stat(path); return err == nil })
+}
+
+// until logs how long each stage took, so a late start that still passes leaves
+// data (shown with go test -v or on any failure).
+func (w liveCallerWait) until(ctx context.Context, what string, ready func() bool) {
+	w.t.Helper()
+	begin := time.Now()
+	for ctx.Err() == nil {
+		if ready() {
+			w.t.Logf("waited %v for %s", time.Since(begin).Round(time.Millisecond), what)
+			return
+		}
+		select {
+		case err := <-w.finished:
+			w.finished <- err
+			if w.lifetime != nil && w.lifetime.Err() != nil {
+				w.t.Fatalf("the scenario deadline expired (%v) and ended the caller (%v) while waiting for %s\n%s", w.lifetime.Err(), err, what, w.describe())
+			}
+			w.t.Fatalf("the caller exited (%v) while waiting for %s\n%s", err, what, w.describe())
+		case <-time.After(40 * time.Millisecond):
+		}
+	}
+	w.t.Fatalf("gave up waiting %v for %s: %v\n%s", time.Since(begin).Round(time.Millisecond), what, ctx.Err(), w.describe())
+}
+
+// liveTail returns at most the last 4 KiB of a file, so a runaway log cannot
+// flood a failure report.
+func liveTail(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return err.Error()
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err.Error()
+	}
+	const limit = 4096
+	buffer := make([]byte, min(info.Size(), limit))
+	count, _ := file.ReadAt(buffer, max(info.Size()-limit, 0))
+	return string(buffer[:count])
+}
+
+// describe reports the daemon's view of every job, each job log, the caller and
+// its subprocesses, and the queue processes, so a hosted-runner failure explains
+// itself.
+func (w liveCallerWait) describe() string {
+	var report strings.Builder
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	snapshot, err := w.i.liveControl(ctx, "snapshot", nil)
+	fmt.Fprintf(&report, "snapshot error: %v\n", err)
+	for id, raw := range obj(snapshot["tasks"]) {
+		name, details, statusError := TaskStatus(obj(raw))
+		fmt.Fprintf(&report, "job %s: %s %v %v\n", id, name, details, statusError)
+	}
+	fmt.Fprintf(&report, "queue: %v\n", obj(snapshot["groups"]))
+	logs, _ := filepath.Glob(filepath.Join(w.i.state, "logs", "*.log"))
+	for _, path := range logs {
+		fmt.Fprintf(&report, "log %s: %q\n", filepath.Base(path), liveTail(path))
+	}
+	select {
+	case err := <-w.finished:
+		w.finished <- err
+		fmt.Fprintf(&report, "caller exited: %v\n", err)
+	default:
+		report.WriteString("caller still running\n")
+	}
+	if w.output != nil {
+		fmt.Fprintf(&report, "caller output: %q\n", w.output.String())
+	}
+	for _, path := range []string{filepath.Join(w.i.home, "daemon.log"), filepath.Join(w.i.state, "daemon.log")} {
+		fmt.Fprintf(&report, "daemon log: %q\n", liveTail(path))
+	}
+	// The caller runs in the test's directory, so its git subprocesses do not
+	// mention the fixture home. Include the caller's descendants by parentage.
+	// Its own limit: a wedged daemon can use up the snapshot's whole context.
+	psContext, finishPS := context.WithTimeout(context.Background(), 5*time.Second)
+	defer finishPS()
+	processes, psError := exec.CommandContext(psContext, "ps", "-axo", "pid,ppid,pgid,etime,stat,command").Output()
+	if psError != nil {
+		fmt.Fprintf(&report, "process list error: %v\n", psError)
+	}
+	lines := strings.Split(string(processes), "\n")
+	family := map[int]bool{w.pid: true}
+	for range 3 {
+		for _, line := range lines {
+			var pid, parent int
+			if _, err := fmt.Sscanf(strings.TrimSpace(line), "%d %d", &pid, &parent); err == nil && family[parent] {
+				family[pid] = true
+			}
+		}
+	}
+	for _, line := range lines {
+		var pid int
+		_, _ = fmt.Sscanf(strings.TrimSpace(line), "%d", &pid)
+		if strings.Contains(line, w.i.home) || (pid != w.pid && family[pid]) {
+			fmt.Fprintln(&report, line)
+		}
+	}
+	return report.String()
+}
+
 func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 	queued := failure == "queued"
 	lostCommit := failure == "lost commit acknowledgement"
@@ -191,6 +369,8 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 		blockerStarted := filepath.Join(i.home, "blocker-started")
 		blocker := exec.CommandContext(callersContext, cli, "run", "--", "/bin/sh", "-c", `touch "$1"; while [ ! -f "$2" ]; do sleep .05; done`, "fixture", blockerStarted, blockerRelease)
 		blocker.Env = environment
+		var blockerOutput callerOutput
+		blocker.Stdout, blocker.Stderr = &blockerOutput, &blockerOutput
 		if err := blocker.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -202,17 +382,20 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 				<-blockerDone
 			}
 		})
-		fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(blockerStarted); return err == nil })
+		blockerWait := liveCallerWait{t: t, i: i, pid: blocker.Process.Pid, finished: blockerDone, output: &blockerOutput}
+		blockerWait.accepted(ctx, 1)
+		blockerWait.started(ctx, blockerStarted)
 	}
 	old := exec.CommandContext(callersContext, cli, "run", "--label", "Active across upgrade", "--", "/bin/sh", "-c", `printf 'once\n' >> "$1"; touch "$2"; while [ ! -f "$3" ]; do sleep .05; done; printf 'original outcome\n'; exit 23`, "fixture", runs, started, release)
 	old.Env = environment
-	var output bytes.Buffer
+	var output callerOutput
 	old.Stdout, old.Stderr = &output, &output
 	if err := old.Start(); err != nil {
 		t.Fatal(err)
 	}
 	finished := make(chan error, 1)
 	go func() { finished <- old.Wait() }()
+	oldWait := liveCallerWait{t: t, i: i, pid: old.Process.Pid, finished: finished, output: &output}
 	joined := false
 	t.Cleanup(func() {
 		_ = os.WriteFile(release, nil, 0600)
@@ -227,10 +410,7 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 		}
 	})
 	if queued {
-		fixtureUntil(t, 8*time.Second, func() bool {
-			value, err := i.liveControl(ctx, "snapshot", nil)
-			return err == nil && len(obj(value["tasks"])) == 2
-		})
+		oldWait.accepted(ctx, 2)
 		if _, err := i.liveControl(ctx, "pause", nil); err != nil {
 			t.Fatal(err)
 		}
@@ -242,7 +422,8 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 		}
 		blockerDone = nil
 	} else {
-		fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(started); return err == nil })
+		oldWait.accepted(ctx, 1)
+		oldWait.started(ctx, started)
 	}
 	before, err := managedCaptureBundle(i.app)
 	if err != nil {
@@ -344,7 +525,7 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 		if _, err := i.liveControl(ctx, "limit", Object{"limit": 2}); err != nil {
 			t.Fatal(err)
 		}
-		fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(started); return err == nil })
+		oldWait.started(ctx, started)
 	}
 	newJob := exec.CommandContext(ctx, cli, "run", "--label", "New runtime job", "--", "/bin/sh", "-c", "printf 'new runtime outcome\\n'")
 	newJob.Env = environment
@@ -418,7 +599,7 @@ func testResumeCommittedHandover(t *testing.T, ctx context.Context, i *installer
 
 // A handover cancelled before commit binds nothing, so setup must not restart
 // one: it waits for the job on the still-running daemon, then upgrades drained.
-func testCancelledHandoverWaitsForActiveJob(t *testing.T, ctx context.Context, i *installer, upgrade func() error, output *bytes.Buffer, finished chan error, release string, joined *bool) {
+func testCancelledHandoverWaitsForActiveJob(t *testing.T, ctx context.Context, i *installer, upgrade func() error, output *callerOutput, finished chan error, release string, joined *bool) {
 	t.Helper()
 	var drain *installDrainPendingError
 	if _, err := i.planManaged(ctx); !errors.As(err, &drain) {
@@ -459,13 +640,14 @@ func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string
 	started, release, runs := filepath.Join(i.home, "started"), filepath.Join(i.home, "release"), filepath.Join(i.home, "attempts")
 	caller := exec.CommandContext(ctx, cli, "run", "--label", "Active across recovery", "--", "/bin/sh", "-c", `printf 'once\n' >> "$1"; touch "$2"; while [ ! -f "$3" ]; do sleep .05; done; printf 'original outcome\n'; exit 23`, "fixture", runs, started, release)
 	caller.Env = i.commandEnvironment([]string{cli, "status", "--json"})
-	var output bytes.Buffer
+	var output callerOutput
 	caller.Stdout, caller.Stderr = &output, &output
 	if err := caller.Start(); err != nil {
 		t.Fatal(err)
 	}
 	finished := make(chan error, 1)
 	go func() { finished <- caller.Wait() }()
+	callerWait := liveCallerWait{t: t, i: i, pid: caller.Process.Pid, finished: finished, output: &output, lifetime: ctx}
 	joined := false
 	t.Cleanup(func() {
 		_ = os.WriteFile(release, nil, 0600)
@@ -473,7 +655,8 @@ func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string
 			<-finished
 		}
 	})
-	fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(started); return err == nil })
+	callerWait.accepted(ctx, 1)
+	callerWait.started(ctx, started)
 	before, err := managedCaptureBundle(i.app)
 	if err != nil {
 		t.Fatal(err)
