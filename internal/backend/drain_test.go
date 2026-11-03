@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -964,7 +965,7 @@ func TestRealDaemonDrainDetachesAnInterruptedCallerWithoutCancelling(t *testing.
 		t.Fatal(err)
 	}
 	client.wait(t, 128+int(syscall.SIGTERM))
-	if !strings.Contains(client.errors.String(), "detaching; job "+strconv.Itoa(id)+" stays in the queue, use agent-heavy cancel "+strconv.Itoa(id)) {
+	if !strings.Contains(client.errors.String(), "detaching; job "+strconv.Itoa(id)+" stays in the queue, use agent-heavy cancel "+strconv.Itoa(id)+" (a running job keeps running)") {
 		t.Fatalf("detach message: %q", client.errors.String())
 	}
 	if err := os.WriteFile(filepath.Join(f.root, "release"), nil, 0o600); err != nil {
@@ -1027,7 +1028,7 @@ func TestWaitCleanupInADrainGap(t *testing.T) {
 	detached := func(t *testing.T, err error) {
 		t.Helper()
 		var unconfirmed *queueCleanupUnconfirmed
-		if !errors.As(err, &unconfirmed) || !strings.Contains(err.Error(), "Detaching while a drain waits") {
+		if !errors.As(err, &unconfirmed) || !strings.Contains(err.Error(), "Detaching during a drain") {
 			t.Fatalf("want a detach note, got %v", err)
 		}
 	}
@@ -1398,7 +1399,12 @@ func TestFollowDetachesOnAnInterruptDuringADrainGap(t *testing.T) {
 			if got := f.result(t); got.code != 128+int(syscall.SIGTERM) || got.err != nil {
 				t.Fatalf("code=%d err=%v", got.code, got.err)
 			}
-			waitForText(t, f.stderr, "detaching; job 5 stays in the queue, use agent-heavy cancel 5")
+			if name == "the daemon answers reads but loses the cancellation" {
+				// A cancel was sent, so the job may be gone or stopping.
+				waitForText(t, f.stderr, "detaching; job 5 may still be running; check agent-heavy status")
+			} else {
+				waitForText(t, f.stderr, "detaching; job 5 stays in the queue, use agent-heavy cancel 5")
+			}
 			if f.cancels.Load() != 0 {
 				t.Fatal("the job was cancelled")
 			}
@@ -1471,7 +1477,7 @@ func TestFollowReportsTheFinishedJobsStatusWhenInterruptedDuringADrain(t *testin
 	if code != 7 || err != nil {
 		t.Fatalf("code=%d err=%v", code, err)
 	}
-	waitForText(t, stderr, "Detaching while a drain waits for the queue daemon: job 8 finished")
+	waitForText(t, stderr, "Detaching during a drain: job 8 finished")
 	waitForText(t, stderr, "the job's own exit status is 7")
 }
 
@@ -1831,5 +1837,377 @@ func TestRetriedLeaseTokenKeepsItsLeaseDuringADrain(t *testing.T) {
 	}
 	if _, err := d.control("lease-acquire", Object{"token": token(), "lane": "qa", "ownerPid": os.Getpid()}); !errors.Is(err, errQueueDraining) {
 		t.Fatalf("new token: %v", err)
+	}
+}
+
+// A job that finishes while the daemon is away has its result in the queue
+// store. An interrupted caller reports that result and its output, not the
+// interrupt, and does not say the job stays in the queue.
+func TestRealDaemonDrainInterruptReportsAJobThatFinishedDuringTheGap(t *testing.T) {
+	f := daemonAcceptance(t)
+	client := f.launch("/bin/sh", "-c", `printf x >> "$1"; while [ ! -f "$2" ]; do sleep .05; done; echo final-output; exit 23`, "fixture", filepath.Join(f.root, "attempts"), filepath.Join(f.root, "release"))
+	fixtureUntil(t, 8*time.Second, func() bool { return f.fileExists("attempts") })
+	id := f.taskIDs()[0]
+	f.cli("drain").wait(t, 0)
+	f.stopDaemon()
+	client.stderrHas(t, "(drain active); still waiting for job")
+	if err := os.WriteFile(filepath.Join(f.root, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixtureUntil(t, 8*time.Second, func() bool {
+		s, err := openQueueStore(f.gate.State, false)
+		if err != nil {
+			return false
+		}
+		defer s.close()
+		j, err := s.job(id)
+		return err == nil && j.phase == "outcome" && j.outcome.Valid && j.outcome.Int64 == 23
+	})
+	if err := client.command.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	client.wait(t, 23)
+	if !strings.Contains(client.out.String(), "final-output") || !strings.Contains(client.errors.String(), "finished with exit status 23 (read from the queue store)") || strings.Contains(client.errors.String(), "stays in the queue") {
+		t.Fatalf("out=%q err=%q", client.out.String(), client.errors.String())
+	}
+}
+
+// Two callers hit the same stalled daemon while a drain holds. The one that
+// waits for the scheduling lock gives up on neither the lock nor the drain.
+func TestWaitCallersStayHeldWhenAStalledCallerKeepsTheSchedulingLock(t *testing.T) {
+	shortened := queueLockWait
+	queueLockWait = 200 * time.Millisecond
+	t.Cleanup(func() { queueLockWait = shortened })
+	g := testGate(t)
+	var mu sync.Mutex
+	tokens := map[string]int{}
+	stalled, release := make(chan struct{}), make(chan struct{})
+	var snapshots atomic.Int32
+	var stalls sync.Once
+	g.queueControl = func(operation string, payload Object) (Object, error) {
+		switch operation {
+		case "snapshot":
+			// The second caller's precheck is the last read before the drain begins.
+			if snapshots.Add(1) == 2 {
+				holdDrain(t, g)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			tasks := Object{}
+			for value, id := range tokens {
+				tasks[strconv.Itoa(id)] = Object{"token": value, "status": Object{"Done": Object{"result": "Success"}}}
+			}
+			return Object{"groups": Object{"default": Object{"status": "Running", "parallel_tasks": 1}}, "tasks": tasks}, nil
+		case "submit":
+			first := false
+			stalls.Do(func() { first = true })
+			if first {
+				close(stalled)
+				<-release
+				return nil, errQueueTransportUnavailable
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			value := text(payload["token"])
+			if _, ok := tokens[value]; !ok {
+				tokens[value] = len(tokens) + 1
+			}
+			return Object{"id": tokens[value]}, nil
+		}
+		return nil, errors.New("unexpected " + operation)
+	}
+	type result struct {
+		code int
+		err  error
+	}
+	results := make(chan result, 2)
+	call := func() {
+		gate := *g
+		code, err := RunInLaneOnDrain(&gate, []string{"/usr/bin/true"}, "", "", drainWait)
+		results <- result{code, err}
+	}
+	go call()
+	<-stalled
+	go call()
+	// The second caller times out on the lock while the first still stalls.
+	fixtureUntil(t, 10*time.Second, func() bool { return snapshots.Load() >= 2 })
+	select {
+	case got := <-results:
+		t.Fatalf("a caller ended during the drain: %+v", got)
+	case <-time.After(3 * queueLockWait):
+	}
+	close(release)
+	for range 2 {
+		select {
+		case got := <-results:
+			if got.code != 0 || got.err != nil {
+				t.Fatalf("code=%d err=%v", got.code, got.err)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatal("a caller did not finish")
+		}
+	}
+}
+
+// waitCallerFake answers a wait caller's snapshots and follow reads, and hands
+// every submit to the test.
+func waitCallerFake(g *Gate, submit func(attempt int, value string) (Object, error)) {
+	var mu sync.Mutex
+	value, attempts := "", 0
+	g.queueControl = func(operation string, payload Object) (Object, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch operation {
+		case "snapshot":
+			tasks := Object{}
+			if value != "" {
+				tasks["1"] = Object{"token": value, "status": Object{"Done": Object{"result": "Success"}}}
+			}
+			return Object{"groups": Object{"default": Object{"status": "Running", "parallel_tasks": 1}}, "tasks": tasks}, nil
+		case "submit":
+			attempts++
+			result, err := submit(attempts, text(payload["token"]))
+			if err == nil {
+				value = text(payload["token"])
+			}
+			return result, err
+		}
+		return nil, errors.New("unexpected " + operation)
+	}
+}
+
+func runWaitCaller(t *testing.T, g *Gate) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		code, err := RunInLaneOnDrain(g, []string{"/usr/bin/true"}, "", "", drainWait)
+		if err == nil && code != 0 {
+			err = fmt.Errorf("exit status %d", code)
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("caller did not finish")
+	}
+}
+
+// A lost daemon is retried without keeping the scheduling lock, so another caller
+// can take it between attempts.
+func TestWaitCallerFreesTheLockBetweenLostAttempts(t *testing.T) {
+	g := testGate(t)
+	var attempts atomic.Int32
+	acquiredAt := make(chan int32, 1)
+	var other sync.Once
+	waitCallerFake(g, func(attempt int, value string) (Object, error) {
+		attempts.Store(int32(attempt))
+		other.Do(func() {
+			holdDrain(t, g)
+			go func() {
+				unlock, err := LockPrivate(g, "scheduling.lock")
+				if err != nil {
+					t.Error(err)
+					acquiredAt <- 0
+					return
+				}
+				acquiredAt <- attempts.Load()
+				unlock()
+			}()
+		})
+		if attempt < 3 {
+			return nil, errQueueTransportUnavailable
+		}
+		return Object{"id": 1}, nil
+	})
+	runWaitCaller(t, g)
+	if got := <-acquiredAt; got == 0 || got >= 3 {
+		t.Fatalf("the lock was free only after attempt %d", got)
+	}
+}
+
+// Only a lost daemon skips the immediate retries: one other failed call must not
+// end a wait caller whose earlier attempt may have committed.
+func TestWaitCallerRetriesAnAnsweredErrorDuringADrain(t *testing.T) {
+	g := testGate(t)
+	waitCallerFake(g, func(attempt int, value string) (Object, error) {
+		switch attempt {
+		case 1:
+			holdDrain(t, g)
+			return nil, errQueueTransportUnavailable
+		case 2:
+			return nil, &queueAnsweredError{"database is locked"}
+		}
+		return Object{"id": 1}, nil
+	})
+	runWaitCaller(t, g)
+}
+
+// A drain that begins while a caller waits for the lock still applies when the
+// lock wait times out.
+func TestWaitCallerHoldsWhenADrainBeginsDuringItsLockWait(t *testing.T) {
+	shortened := queueLockWait
+	queueLockWait = 2 * time.Second
+	t.Cleanup(func() { queueLockWait = shortened })
+	g := testGate(t)
+	unlock, err := LockPrivate(g, "scheduling.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var released sync.Once
+	release := func() { released.Do(unlock) }
+	defer release()
+	waitCallerFake(g, func(attempt int, value string) (Object, error) { return Object{"id": 1}, nil })
+	// The caller's precheck is its last read before the lock wait, so the drain
+	// begins once that wait is under way.
+	fake := g.queueControl
+	var begins sync.Once
+	g.queueControl = func(operation string, payload Object) (Object, error) {
+		if operation == "snapshot" {
+			begins.Do(func() { time.AfterFunc(queueLockWait/2, func() { holdDrain(t, g) }) })
+		}
+		return fake(operation, payload)
+	}
+	done := make(chan error, 1)
+	go func() {
+		code, err := RunInLaneOnDrain(g, []string{"/usr/bin/true"}, "", "", drainWait)
+		if err == nil && code != 0 {
+			err = fmt.Errorf("exit status %d", code)
+		}
+		done <- err
+	}()
+	// The first lock wait ends while the test still holds the lock.
+	select {
+	case err := <-done:
+		t.Fatalf("caller ended during the drain: %v", err)
+	case <-time.After(queueLockWait + time.Second):
+	}
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("caller did not finish")
+	}
+}
+
+// Queued work already cancelled is still reported when running jobs cannot be read.
+func TestDrainCancelReportsWhenRunningJobsCannotBeRead(t *testing.T) {
+	g := testGate(t)
+	g.queueControl = func(operation string, payload Object) (Object, error) {
+		if operation == "cancel-queued" {
+			return Object{"cancelled": 3}, nil
+		}
+		return nil, errors.New("snapshot failed")
+	}
+	stderr := captureStderr(t)
+	if err := cancelForDrain(g, drainOptions{cancelQueued: true, cancelRunning: true}); err == nil || !strings.Contains(err.Error(), "snapshot failed") {
+		t.Fatalf("error: %v", err)
+	}
+	waitForText(t, stderr, "cancelled 3 queued and 0 running or held item(s); running jobs could not be read\n")
+}
+
+// One failing cancel must not leave the jobs after it running.
+func TestDrainCancelRunningTriesEveryJobAndReportsFailures(t *testing.T) {
+	g := testGate(t)
+	running := map[int]bool{1: true, 2: true, 3: true}
+	var mu sync.Mutex
+	g.queueControl = func(operation string, payload Object) (Object, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch operation {
+		case "snapshot":
+			tasks := Object{}
+			for id, live := range running {
+				state := Object{"Done": Object{"result": "Success"}}
+				if live {
+					state = Object{"Running": Object{}}
+				}
+				tasks[strconv.Itoa(id)] = Object{"token": fmt.Sprintf("%032x", id), "status": state}
+			}
+			return Object{"groups": Object{"default": Object{"status": "Running", "parallel_tasks": 1}}, "tasks": tasks}, nil
+		case "cancel", "kill":
+			if mustInteger(payload["id"]) == 2 {
+				return nil, &queueAnsweredError{"database is locked"}
+			}
+			running[mustInteger(payload["id"])] = false
+			return Object{}, nil
+		}
+		return nil, errors.New("unexpected " + operation)
+	}
+	stderr := captureStderr(t)
+	code, err := DrainMain(g, []string{"--cancel-running"})
+	if code == 0 || err == nil || !strings.Contains(err.Error(), "job 2") || !strings.Contains(err.Error(), "database is locked") {
+		t.Fatalf("code=%d err=%v", code, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if running[1] || running[3] || !running[2] {
+		t.Fatalf("every job but the failing one must be cancelled: %v", running)
+	}
+	waitForText(t, stderr, "cancelled 0 queued and 2 running or held item(s); 1 could not be cancelled")
+}
+
+// A worker that exits after publishing its outcome can leave a descendant that
+// ignores SIGINT. A signal that finds the group without a known member must not
+// be sent, and must tell the caller to read the row again when the row moved.
+func TestSignalOfAGroupWhoseWorkerFinishedReadsTheRowAgain(t *testing.T) {
+	d, _ := laneDaemon(t, 8, map[string]string{"qa": laneManifest("qa", `{"name":"qa","concurrency":1}`)})
+	survivor := exec.Command("/bin/sleep", "60")
+	survivor.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := survivor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = survivor.Process.Kill(); _ = survivor.Wait() })
+	boot, err := BootIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The recorded worker is gone; only an unrecorded descendant leads the group.
+	worker := Object{"pgid": survivor.Process.Pid, "pid": survivor.Process.Pid + 1_000_000, "boot_uuid": boot, "members": []Object{{"pid": survivor.Process.Pid + 1_000_000, "birth": "gone"}}}
+	attempt := strings.Repeat("a", 32)
+	value := strings.Repeat("b", 32)
+	task := Object{"token": value, "priority": 0, "created_at": queueNow(), "status": Object{"Running": Object{}}, "logPath": filepath.Join(d.g.State, "logs", "9.log")}
+	data, err := queueJSON(task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerData, err := queueJSON(worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = d.store.db.Exec("INSERT INTO queue_jobs(id,token,task,attempt,phase,worker) VALUES(9,?,?,?,'running',?)", value, data, attempt, workerData); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := d.store.job(9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The row has not moved: the verification failure stands, and nothing is sent.
+	if err = d.signal(stale, syscall.SIGINT); err == nil || errors.Is(err, errQueueChanged) {
+		t.Fatalf("an unmoved row must keep the original error: %v", err)
+	}
+	// The worker publishes its outcome while the signal was being prepared.
+	if _, err = d.store.db.Exec("UPDATE queue_jobs SET phase='outcome', outcome=0 WHERE id=9"); err != nil {
+		t.Fatal(err)
+	}
+	if err = d.signal(stale, syscall.SIGINT); !errors.Is(err, errQueueChanged) {
+		t.Fatalf("a moved row must be read again: %v", err)
+	}
+	// Signals are delivered in order, so a SIGINT sent above would end it first.
+	if err = survivor.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	var exit *exec.ExitError
+	if err = survivor.Wait(); !errors.As(err, &exit) {
+		t.Fatalf("survivor exit: %v", err)
+	}
+	if status, ok := exit.Sys().(syscall.WaitStatus); !ok || status.Signal() != syscall.SIGTERM {
+		t.Fatalf("a signal was sent to a group that could not be verified: %v", exit)
 	}
 }

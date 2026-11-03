@@ -8,7 +8,7 @@ The in-place upgrade flow becomes `agent-heavy drain`, Quit, drag, open, `agent-
 
 ## How it fits the run client
 
-The run client's outage handling (`queue_outage.go`, `followWithToken`) is the only place that rides out a daemon outage. Drain adds one rule to it: while the drain holds, `queueOutage.hold` replaces `lose`, so the outage neither spends the budget nor ends the run, and the budget starts when the drain ends. A first interrupt during such an outage detaches at once with 128 plus the signal and never cancels; a finished job whose cleanup waits ends with the job's own exit status and a note. `Cancel` and `WaitCleanup` still do not retry. `cancel-queued` moves jobs through the store's own transitions (`markCancelled`, `recordOutcome`, `endLease`) in one pass under the daemon lock.
+The run client's outage handling (`queue_outage.go`, `followWithToken`) is the only place that rides out a daemon outage. Drain adds one rule to it: while the drain holds, `queueOutage.hold` replaces `lose`, so the outage neither spends the budget nor ends the run, and the budget starts when the drain ends. A first interrupt during such an outage detaches with 128 plus the signal as soon as the call in progress returns (up to about 15 s with a hung daemon) and never cancels, after reading the job's result from the store when it is there; a finished job whose cleanup waits ends with the job's own exit status and a note. `Cancel` and `WaitCleanup` still do not retry. `cancel-queued` moves jobs through the store's own transitions (`markCancelled`, `recordOutcome`, `endLease`) in one pass under the daemon lock.
 
 ## Decisions
 
@@ -24,7 +24,7 @@ These were reproduced in review. They predate drain and live in older safety cod
 
 1. **Half-removed slot after SIGKILL.** A SIGKILL during slot teardown (`ownership.go`) can leave only `agent-heavy-lease.json` in the slot. After a restart, callers fail with `lstat .../agent-heavy-jobs` and later jobs do not run. Seen once in 44 SIGKILLs. Teardown needs to become crash-safe. An empty, complete slot left by a crash also blocks the setup gate with no receipt to drive recovery, so a repair must cover that window too, and must only ever touch a slot that is provably ours.
 2. **Adaptive grant expiry.** The controller (`scheduler_controller.go:636`) deletes an expired grant even for a started worker still waiting for the shared slot, and the permit (`scheduler.go:447`) then stays false. Reproduce with adaptive mode, Start now, an external slot owner, a gap longer than the 30 s manual grant, then free the slot. The job waits until cancelled, with or without a drain. Likely fix: expire grants only for Queued or Stashed tasks and refresh them for started workers with no pgid.
-3. **Socket mode window.** On daemon start the socket exists at a non-0600 mode for tens of microseconds, and a caller polling then exits 125 with "Unsafe queue socket". Bind to a short temporary name, chmod, then rename, keeping the path within the 104-byte limit.
+3. **Flaky test on main.** `TestCorruptedRowsCancelThroughClient/running_reading_Queued` fails occasionally on clean `main` too (4 of 60 runs with `-race`). The test's ticker starts before `Cancel`, so a tick can finish the row with 125 first. Fix the test's ordering, keeping `running_reading_Done`, which never sends a cancel.
 
 ## Remaining work
 

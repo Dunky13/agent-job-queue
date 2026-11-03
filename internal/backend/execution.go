@@ -114,12 +114,12 @@ func waitCleanupWithToken(g *Gate, id int, expectedToken string, signals <-chan 
 		}
 		// A drain lets a signal end the wait; elsewhere it stays for the caller.
 		var interrupts <-chan os.Signal
-		if drainHolds(g) {
+		if signals != nil && drainHolds(g) {
 			interrupts = signals
 		}
 		select {
 		case <-interrupts:
-			return &queueCleanupUnconfirmed{fmt.Sprintf("Detaching while a drain waits for the queue daemon: job %d finished, and its cleanup completes when the daemon answers", id), nil}
+			return &queueCleanupUnconfirmed{fmt.Sprintf("Detaching during a drain: job %d finished, and its cleanup completes once the queue daemon confirms it", id), nil}
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -149,6 +149,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 	// network blip cannot decide the exit status. With none acknowledged, a job seen
 	// finished reports its own result.
 	var cancelSentAt time.Time
+	cancelTried := false // a cancel was sent, whether or not the daemon acknowledged it
 	finished := func(code int) (int, error) {
 		switch {
 		case pendingSignal == nil:
@@ -170,15 +171,35 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		fmt.Fprintf(os.Stderr, "agent-heavy: %v; the job's own exit status is %d\n", err, code)
 		return nil
 	}
+	// stored reports a job whose result the queue store already holds, which a
+	// caller that cannot reach the daemon must not lose.
+	stored := func() (int, error, bool) {
+		code, ok := queueStoredOutcome(g, id, expectedToken)
+		if !ok {
+			return 0, nil, false
+		}
+		if _, err := Drain(path, offset); err != nil {
+			return 125, err, true
+		}
+		fmt.Fprintf(os.Stderr, "agent-heavy: queue daemon not answering; job %d finished with exit status %d (read from the queue store); its cleanup completes when the daemon answers\n", id, code)
+		code, err := finished(code)
+		return code, err, true
+	}
+	// detach ends an interrupted run during a drain gap without cancelling
+	// anything. A result the store already holds is reported instead of the
+	// interrupt; otherwise the job is left as it is.
+	detach := func(sig os.Signal) (int, error) {
+		if code, err, ok := stored(); ok {
+			return code, err
+		}
+		announceDetach(id, cancelTried)
+		return signalExit(sig), nil
+	}
 	// end reports an outage that cannot be waited out. The store may still prove
 	// the job finished; otherwise the job may still be running.
 	end := func(prefix string, cause error) (int, error) {
-		if code, ok := queueStoredOutcome(g, id, expectedToken); ok {
-			if _, err := Drain(path, offset); err != nil {
-				return 125, err
-			}
-			fmt.Fprintf(os.Stderr, "agent-heavy: queue daemon not answering; job %d finished with exit status %d (read from the queue store); its cleanup completes when the daemon answers\n", id, code)
-			return finished(code)
+		if code, err, ok := stored(); ok {
+			return code, err
 		}
 		message := fmt.Sprintf("%s; job %d may still be running; inspect it with: agent-heavy logs %d", prefix, id, id)
 		if cause == nil {
@@ -204,8 +225,8 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			// An interrupt leaves the job queued instead of cancelling it, unless a
 			// cancellation was already acknowledged, which only the daemon can finish.
 			if pendingSignal != nil && cancelSentAt.IsZero() {
-				announceDetach(id)
-				return true, signalExit(pendingSignal), nil
+				code, err = detach(pendingSignal)
+				return true, code, err
 			}
 			outage.hold(cause)
 			select {
@@ -214,8 +235,8 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 					code, err = end(interruptedAgain(" while the queue daemon was not answering"), cause)
 					return true, code, err
 				}
-				announceDetach(id)
-				return true, signalExit(sig), nil
+				code, err = detach(sig)
+				return true, code, err
 			case <-time.After(outage.delay()):
 			}
 			return false, 0, nil
@@ -302,6 +323,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			return finished(code)
 		}
 		if pendingSignal != nil && rpcAvailable {
+			cancelTried = true
 			seen, err := cancelJob(g, id, expectedToken, &cancelSentAt)
 			switch {
 			case seen != nil:
@@ -390,9 +412,15 @@ func announcePausedQueue(g *Gate, id int) (shown, answered bool) {
 }
 
 // announceDetach says what an interrupted caller leaves behind when a drain
-// keeps it waiting for the daemon: the job stays queued and cancelling is explicit.
-func announceDetach(id int) {
-	fmt.Fprintf(os.Stderr, "agent-heavy: detaching; job %d stays in the queue, use agent-heavy cancel %d\n", id, id)
+// keeps it waiting for the daemon. Without a cancel attempt the job stays queued,
+// and cancelling it is explicit.
+func announceDetach(id int, cancelTried bool) {
+	if cancelTried {
+		// The cancel may have reached the daemon before its reply was lost.
+		fmt.Fprintf(os.Stderr, "agent-heavy: detaching; job %d may still be running; check agent-heavy status\n", id)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "agent-heavy: detaching; job %d stays in the queue, use agent-heavy cancel %d (a running job keeps running)\n", id, id)
 }
 
 func causeSuffix(err error) string {
@@ -683,8 +711,7 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 	responseLost := false
 	attempt := func() (Object, error) {
 		result, e := g.QueueControl(operation, request)
-		var answered *queueAnsweredError
-		if e != nil && !errors.As(e, &answered) && !errors.Is(e, errQueueHandoverBusy) && !errors.Is(e, errQueueUnknownLane) && !errors.Is(e, errQueueDraining) {
+		if e != nil && !queueDefiniteAnswer(e) {
 			responseLost = true
 		}
 		return result, e
@@ -697,6 +724,19 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 	}
 	for {
 		if unlock, err = LockPrivate(g, "scheduling.lock"); err != nil {
+			// While a drain holds, a wait caller has no urgency: a lock that another
+			// stalled caller keeps is waited for, not a failure.
+			if onDrain == drainWait && errors.Is(err, errQueueLockTimeout) && drainHolds(g) {
+				select {
+				case sig := <-signals:
+					if responseLost {
+						fmt.Fprintln(os.Stderr, "agent-heavy: stopped before the submission outcome was known; the job may still exist, check agent-heavy status")
+					}
+					return signalExit(sig), nil
+				case <-time.After(500 * time.Millisecond):
+				}
+				continue
+			}
 			return 125, unknown(err)
 		}
 		if _, err = SchedulingSettings(g); err != nil {
@@ -707,7 +747,11 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 		added, err = attempt()
 		// A lost response does not establish whether submission committed. Reconcile
 		// using the same immutable token; the daemon returns the original identity.
-		for retry := 0; err != nil && !errors.Is(err, errQueueHandoverBusy) && !errors.Is(err, errQueueUnknownLane) && !errors.Is(err, errQueueDraining) && retry < 2; retry++ {
+		for retry := 0; err != nil && !queueCodedRefusal(err) && retry < 2; retry++ {
+			// A wait caller retries a lost daemon below, without keeping the lock.
+			if onDrain == drainWait && errors.Is(err, errQueueTransportUnavailable) && drainHolds(g) {
+				break
+			}
 			added, err = attempt()
 		}
 		// A drain began after the check above: the daemon refused before it
@@ -757,11 +801,10 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 	}
 	if err != nil {
 		unlock()
-		var answered *queueAnsweredError
 		// A daemon that answered the first attempt with an error refused the
 		// request, so nothing was created and the files can go. After any lost
 		// response a later answer proves nothing about the earlier attempt.
-		if errors.Is(err, errQueueHandoverBusy) || errors.Is(err, errQueueUnknownLane) || errors.As(err, &answered) && !responseLost {
+		if queueCodedRefusal(err) || queueDefiniteAnswer(err) && !responseLost {
 			submitted = false
 		}
 		if errors.Is(err, errQueueUnknownLane) {
@@ -780,6 +823,18 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 	unlock()
 	fmt.Fprintf(os.Stderr, "agent-heavy: job %d queued\n", id)
 	return followWithToken(g, id, signals, jobToken)
+}
+
+// queueCodedRefusal is a refusal the daemon codes so that callers can branch on it.
+func queueCodedRefusal(err error) bool {
+	return errors.Is(err, errQueueHandoverBusy) || errors.Is(err, errQueueUnknownLane) || errors.Is(err, errQueueDraining)
+}
+
+// queueDefiniteAnswer is any error the daemon itself returned, as opposed to a
+// lost or garbled reply, after which an earlier request's outcome is unknown.
+func queueDefiniteAnswer(err error) bool {
+	var answered *queueAnsweredError
+	return queueCodedRefusal(err) || errors.As(err, &answered)
 }
 
 // forwardedEnvironment is the caller's environment without queue control variables.

@@ -901,6 +901,12 @@ func (d *queueDaemon) signal(j queueJob, sig syscall.Signal) error {
 		}
 	}
 	if e != nil {
+		// The row was read before the worker may have published its outcome and
+		// exited, leaving only a descendant that ignores signals. If the row has
+		// moved on, nothing is signalled and the caller retries against it.
+		if current, readErr := d.store.job(j.id); readErr == nil && (current.attempt != j.attempt || current.phase != j.phase) {
+			return errQueueChanged
+		}
 		return e
 	}
 	if !owned {

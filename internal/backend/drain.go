@@ -267,6 +267,8 @@ func DrainMain(g *Gate, args []string) (int, error) {
 // was just stopped.
 func cancelForDrain(g *Gate, options drainOptions) error {
 	queued, running := 0, 0
+	var failures []error
+	var unread error
 	if options.cancelQueued {
 		result, err := g.QueueControl("cancel-queued", nil)
 		if err != nil {
@@ -275,9 +277,9 @@ func cancelForDrain(g *Gate, options drainOptions) error {
 		queued, _ = integer(result["cancelled"])
 	}
 	if options.cancelRunning {
-		snapshot, err := g.Snapshot()
-		if err != nil {
-			return err
+		var snapshot Object
+		if snapshot, unread = g.Snapshot(); unread != nil {
+			unread = fmt.Errorf("running jobs could not be read: %w", unread)
 		}
 		tasks := obj(snapshot["tasks"])
 		ids := []int{}
@@ -287,22 +289,29 @@ func cancelForDrain(g *Gate, options drainOptions) error {
 			}
 		}
 		sort.Ints(ids)
+		// A failure on one job must not leave the rest running: try every job, then
+		// report all failures.
 		for _, id := range ids {
 			name, _, err := TaskStatus(obj(tasks[strconv.Itoa(id)]))
+			if err == nil && (name == "Running" || name == "Paused") {
+				if err = Cancel(g, id); err == nil {
+					running++
+				}
+			}
 			if err != nil {
-				return err
+				failures = append(failures, fmt.Errorf("job %d: %w", id, err))
 			}
-			if name != "Running" && name != "Paused" {
-				continue
-			}
-			if err = Cancel(g, id); err != nil {
-				return err
-			}
-			running++
 		}
 	}
-	fmt.Fprintf(os.Stderr, "agent-heavy: cancelled %d queued and %d running or held item(s)\n", queued, running)
-	return nil
+	fmt.Fprintf(os.Stderr, "agent-heavy: cancelled %d queued and %d running or held item(s)", queued, running)
+	if unread != nil {
+		fmt.Fprint(os.Stderr, "; running jobs could not be read")
+	}
+	if len(failures) > 0 {
+		fmt.Fprintf(os.Stderr, "; %d could not be cancelled", len(failures))
+	}
+	fmt.Fprintln(os.Stderr)
+	return errors.Join(append(failures, unread)...)
 }
 
 // waitDrained returns once every task is Done and its cleanup receipt is gone.
