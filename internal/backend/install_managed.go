@@ -281,26 +281,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		return errors.New("Cannot verify drained queue: invalid queue snapshot")
 	}
 	if err := installRequireDrained(tasks); err != nil {
-		var drain *installDrainPendingError
-		if errors.As(err, &drain) {
-			live, liveErr := install.planManagedLive(ctx, p)
-			if liveErr != nil {
-				return liveErr
-			}
-			if live != nil {
-				p.live = live
-				return nil
-			}
-		}
 		return err
-	}
-	// A command can have a durable terminal result while its original caller
-	// is still reading output. Its executable requires the same retained bundle.
-	if live, err := install.planManagedLive(ctx, p); err != nil {
-		return err
-	} else if live != nil {
-		p.live = live
-		return nil
 	}
 	return install.requireLegacyCleanup()
 }
@@ -1453,7 +1434,7 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 		if p.live.adopted {
 			return nil
 		}
-		if err := install.beginManagedLive(ctx, p.live); err != nil {
+		if err := install.confirmManagedLive(ctx, p.live); err != nil {
 			return err
 		}
 	}
@@ -1627,6 +1608,16 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	}
 	if err := install.managedRetireSupersededReceipt(); err != nil {
 		return err
+	}
+	if p.live == nil && !install.prepareReplacement && !install.unregisterServices {
+		// Where resume was skipped, preflight never saw this journal, so it does not
+		// block this run. A journal kept here still refuses the next upgrade.
+		if err := install.retireSpentLive(); err != nil {
+			if liveAllowed(install, p) {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "Agent Queue kept a live-upgrade journal it could not assess: %v\n", err)
+		}
 	}
 	if install.automaticSetup {
 		if err := install.managedBackupLegacyDefinitions(p); err != nil {
@@ -1806,9 +1797,10 @@ func (install *installer) executeManaged(ctx context.Context) error {
 
 // managedSupervised reports whether the menu bar app supervises the helpers.
 // The payload path registers them with Service Management instead, and so does
-// an app bundle completing a live handover, whose replacement daemon launchd
-// has already started and must be waited for. Live handovers are only begun by
-// the payload path.
+// an app bundle resuming a live handover an older release left behind, whose
+// replacement daemon runs under launchd and must be waited for. Setup no longer
+// begins a live handover, so that bundle is the retained build finished by a newer
+// app (see finishPendingInstallation).
 func (install *installer) managedSupervised(p *managedPlan) bool {
 	return install.appBundle && p.live == nil
 }
@@ -2064,7 +2056,10 @@ func (install *installer) preflightManaged(ctx context.Context, report installPr
 	if _, err := install.planManaged(ctx); err != nil {
 		var approval *installApprovalError
 		var drain *installDrainPendingError
+		var pending *installPendingError
 		switch {
+		case errors.As(err, &pending):
+			report.addPendingInstallation(err.Error(), install.liveJournalPath(), "download-release", "reveal")
 		case errors.As(err, &approval):
 			report.add("service-approval", "Allow Agent Queue background services", err.Error(), "", "wait")
 		case errors.Is(err, errInstallPendingCleanup):

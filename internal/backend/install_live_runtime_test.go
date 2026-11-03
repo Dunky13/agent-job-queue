@@ -4,30 +4,39 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 )
 
-// The real product CLI supplies the daemon, worker, caller and
-// capability protocol. Only code-signing/native service registration are
-// injected. This exercises publication and worker outcome writes across the
-// replacement of the actual app files in a temporary private home.
-func TestInstallerManagedLiveUpgradeRetainsRunningAttempts(t *testing.T) {
+// The real product CLI supplies the daemon, worker and caller. Only
+// code-signing/native service registration are injected. This exercises resuming
+// a journal an older release left behind: publication and worker outcome writes
+// across the replacement of the actual app files in a temporary private home.
+// Each scenario names the state setup resumes from, or the failure that leaves
+// the following attempt to resume from released, consumed or cancelled custody.
+func TestInstallerManagedLiveResumeRetainsRunningAttempts(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("managed service handover requires macOS process birth identities")
 	}
 	helper := buildManagedLiveFixtureCLI(t)
-	for _, failure := range []string{"", "queued", "lost commit acknowledgement", "unregister resources", "unregister login", "register resources"} {
+	for _, failure := range []string{"", "queued", "lost commit acknowledgement", "committed", "released", "unregister resources", "unregister login", "register resources"} {
 		name := failure
 		if name == "" {
 			name = "complete"
 		}
-		t.Run(name, func(t *testing.T) { testInstallerManagedLiveUpgrade(t, helper, failure) })
+		t.Run(name, func(t *testing.T) { testInstallerManagedLiveResume(t, helper, failure) })
+	}
+	for phase, failure := range map[string]string{"released": "register queue", "consumed": "register resources"} {
+		t.Run("finish pending from "+phase, func(t *testing.T) { testFinishPendingLiveResume(t, helper, phase, failure) })
 	}
 }
 
@@ -47,22 +56,54 @@ func buildManagedLiveFixtureCLI(t *testing.T) string {
 	return helper
 }
 
-func TestInstallerPackagedLiveUpgrade(t *testing.T) {
+func TestInstallerPackagedLiveResume(t *testing.T) {
 	if runtime.GOOS != "darwin" || os.Getenv("AGENT_QUEUE_TEST_APP_BUNDLE") == "" {
 		t.Skip("requires a built macOS app")
 	}
 	helper := filepath.Join(os.Getenv("AGENT_QUEUE_TEST_APP_BUNDLE"), "Contents/MacOS/agent-heavy")
 	for _, failure := range []string{"", "queued", "register resources"} {
-		t.Run("packaged-"+failure, func(t *testing.T) { testInstallerManagedLiveUpgrade(t, helper, failure) })
+		t.Run("packaged-"+failure, func(t *testing.T) { testInstallerManagedLiveResume(t, helper, failure) })
 	}
 }
 
-func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
-	queued := failure == "queued"
-	lostCommit := failure == "lost commit acknowledgement"
-	if queued || lostCommit {
-		failure = ""
+// seedOlderReleaseHandover leaves the real daemon and journal as an interrupted
+// older release did: prepared against the exact candidate, with nothing replaced.
+func seedOlderReleaseHandover(t *testing.T, ctx context.Context, i *installer) *managedLiveUpgrade {
+	t.Helper()
+	if err := i.validatePayload(); err != nil {
+		t.Fatal(err)
 	}
+	digest, err := i.liveTargetDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := token()
+	prepared, err := i.liveControl(ctx, "prepare-handover", Object{"token": value, "targetSHA256": digest})
+	if err != nil {
+		t.Fatal("prepare older-release handover", err)
+	}
+	attempts, err := liveAttempts(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := &managedLiveUpgrade{SchemaVersion: 1, App: i.app, Target: i.identity, Token: value, TargetSHA256: digest, Attempts: attempts}
+	if err := installAtomic(i.liveJournalPath(), append(mustMetadataJSON(t, live), '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return live
+}
+
+func requireLiveReceiptPhase(t *testing.T, i *installer, phase string) {
+	t.Helper()
+	receipt, err := readQueueHandoverReceipt(&Gate{State: i.state})
+	if err != nil || receipt.Phase != phase {
+		t.Fatalf("handover receipt is not %s: %+v: %v", phase, receipt, err)
+	}
+}
+
+// liveRuntimeFixture installs build 123 with real daemons in a short private home.
+func liveRuntimeFixture(t *testing.T, executable string) *managedFixture {
+	t.Helper()
 	m := managedTestFixture(t)
 	i := m.installer
 	// Darwin's Unix socket pathname budget is smaller than t.TempDir's full
@@ -100,15 +141,6 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 		}
 	}
 	managedPackagedRuntimeFixture(t, m)
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[1] == "handover-capabilities" {
-			command := exec.CommandContext(ctx, args[0], args[1:]...)
-			command.Env = i.commandEnvironment(args)
-			return command.CombinedOutput()
-		}
-		return original(ctx, args)
-	}
 	setupContext, finishSetup := context.WithTimeout(context.Background(), 60*time.Second)
 	defer finishSetup()
 	if _, err := runPackagedSetup(setupContext, m.installFixture, i.execute); err != nil {
@@ -124,6 +156,19 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 	if !errors.Is(setupContext.Err(), context.Canceled) {
 		t.Fatal("initial installation did not complete within its own readiness budget", setupContext.Err())
 	}
+	return m
+}
+
+func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
+	queued := failure == "queued"
+	lostCommit := failure == "lost commit acknowledgement"
+	committed := failure == "committed"
+	released := failure == "released"
+	if queued || lostCommit || committed || released {
+		failure = ""
+	}
+	m := liveRuntimeFixture(t, executable)
+	i := m.installer
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	// Accepted callers belong to the fixture lifecycle, independently of any
@@ -204,6 +249,16 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 		t.Fatal(err)
 	}
 	managedCandidate(t, m, "124")
+	live := seedOlderReleaseHandover(t, ctx, i)
+	if committed {
+		testResumeCommittedHandover(t, ctx, i, live)
+	}
+	if released {
+		if _, err := i.liveControl(ctx, "commit-handover", Object{"token": live.Token}); err != nil {
+			t.Fatal(err)
+		}
+		fixtureUntil(t, 8*time.Second, func() bool { return i.validateManagedLive(ctx, live) == nil })
+	}
 	if lostCommit {
 		i.queueControl = func(ctx context.Context, operation string, payload Object) (Object, error) {
 			response, err := i.liveGate(ctx).QueueControl(operation, payload)
@@ -233,9 +288,26 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 		default:
 		}
 		m.nativeFailure = ""
+		switch failure {
+		case "unregister login":
+			requireLiveReceiptPhase(t, i, "released")
+		case "register resources":
+			// The replacement daemon adopts asynchronously after registration.
+			fixtureUntil(t, 8*time.Second, func() bool {
+				receipt, err := readQueueHandoverReceipt(&Gate{State: i.state})
+				return err == nil && receipt.Phase == "consumed"
+			})
+		case "unregister resources":
+			requireLiveReceiptPhase(t, i, "cancelled")
+			testCancelledHandoverWaitsForActiveJob(t, ctx, i, upgrade, &output, finished, release, &joined)
+			return
+		}
 	}
 	if err := upgrade(); err != nil {
-		t.Fatal("compatible upgrade waited for or interrupted active work", err)
+		t.Fatal("resuming the retained handover waited for or interrupted active work", err)
+	}
+	if _, err := os.Lstat(i.liveJournalPath()); !os.IsNotExist(err) {
+		t.Fatal("completed resume retained its journal", err)
 	}
 	select {
 	case err := <-finished:
@@ -306,5 +378,199 @@ func testInstallerManagedLiveUpgrade(t *testing.T, executable, failure string) {
 	}
 	if _, err := os.Stat(i.runtimeGenerationPath(before)); !os.IsNotExist(err) {
 		t.Fatal("later installer cleanup did not reclaim the completed generation", err)
+	}
+}
+
+// Hold a daemon connection across commit: the daemon cannot publish released
+// custody until that handler returns, which pins the otherwise brief committed
+// phase for setup to observe. Its handler deadline is 15 seconds.
+func testResumeCommittedHandover(t *testing.T, ctx context.Context, i *installer, live *managedLiveUpgrade) {
+	t.Helper()
+	held, err := net.Dial("unix", queueSocket(i.liveGate(ctx)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if _, err := i.liveControl(ctx, "commit-handover", Object{"token": live.Token}); err != nil {
+		t.Fatal(err)
+	}
+	requireLiveReceiptPhase(t, i, "committed")
+	previous, err := appservices.Load(i.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := i.resumeManagedLive(ctx, &managedPlan{previous: previous, loaded: map[string]bool{}})
+	if err != nil || resumed == nil || resumed.released {
+		t.Fatal("committed journal did not resume", resumed, err)
+	}
+	// The listener is closed, so a second prepare or commit would fail here.
+	if err := i.confirmManagedLive(ctx, resumed); err != nil {
+		t.Fatal(err)
+	}
+	requireLiveReceiptPhase(t, i, "committed")
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := i.commitManagedLive(ctx, resumed); err != nil || !resumed.released {
+		t.Fatal("committed journal did not reach released custody", err)
+	}
+}
+
+// A handover cancelled before commit binds nothing, so setup must not restart
+// one: it waits for the job on the still-running daemon, then upgrades drained.
+func testCancelledHandoverWaitsForActiveJob(t *testing.T, ctx context.Context, i *installer, upgrade func() error, output *bytes.Buffer, finished chan error, release string, joined *bool) {
+	t.Helper()
+	var drain *installDrainPendingError
+	if _, err := i.planManaged(ctx); !errors.As(err, &drain) {
+		t.Fatal("setup did not wait for active work after cancellation", err)
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-finished:
+		*joined = true
+		var exited *exec.ExitError
+		if !errors.As(err, &exited) || exited.ExitCode() != 23 {
+			t.Fatal("original caller lost its exact outcome", err, output.String())
+		}
+	case <-ctx.Done():
+		t.Fatal("original caller did not finish", ctx.Err())
+	}
+	if err := upgrade(); err != nil {
+		t.Fatal("drained upgrade after cancellation", err)
+	}
+	current, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
+	if err != nil || current.Build == nil || *current.Build != 124 {
+		t.Fatal("drained upgrade did not complete", current, err)
+	}
+}
+
+// The shipped route to resume on a newer build. Older build T is interrupted after
+// publishing, leaving its marker, retained app and journal. Build N, opened from
+// the other Applications folder, finishes T as a non-supervised app bundle using
+// N's controller, and relocates once the adopted job has finished.
+func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string) {
+	m := liveRuntimeFixture(t, executable)
+	i := m.installer
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	cli := filepath.Join(i.app, "Contents/MacOS/agent-heavy")
+	started, release, runs := filepath.Join(i.home, "started"), filepath.Join(i.home, "release"), filepath.Join(i.home, "attempts")
+	caller := exec.CommandContext(ctx, cli, "run", "--label", "Active across recovery", "--", "/bin/sh", "-c", `printf 'once\n' >> "$1"; touch "$2"; while [ ! -f "$3" ]; do sleep .05; done; printf 'original outcome\n'; exit 23`, "fixture", runs, started, release)
+	caller.Env = i.commandEnvironment([]string{cli, "status", "--json"})
+	var output bytes.Buffer
+	caller.Stdout, caller.Stderr = &output, &output
+	if err := caller.Start(); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() { finished <- caller.Wait() }()
+	joined := false
+	t.Cleanup(func() {
+		_ = os.WriteFile(release, nil, 0600)
+		if !joined {
+			<-finished
+		}
+	})
+	fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(started); return err == nil })
+	before, err := managedCaptureBundle(i.app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedCandidate(t, m, "124")
+	seedOlderReleaseHandover(t, ctx, i)
+	m.nativeFailure = failure
+	if _, err := runPackagedSetup(ctx, m.installFixture, i.repairAndExecute); err == nil {
+		t.Fatal("injected interruption unexpectedly completed", failure)
+	}
+	m.nativeFailure = ""
+	fixtureUntil(t, 8*time.Second, func() bool {
+		receipt, err := readQueueHandoverReceipt(&Gate{State: i.state})
+		return err == nil && receipt.Phase == phase
+	})
+	pendingBuild := i.app
+	services := map[string]string{"queue": pendingBuild, "resources": pendingBuild, "remote": pendingBuild}
+	original := i.command
+	i.command = func(ctx context.Context, args []string) ([]byte, error) {
+		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" {
+			label := filepath.Base(args[2])
+			service := map[string]string{"io.went.agent-heavy": "queue", "io.went.agent-resources": "resources", "io.went.agent-remote": "remote"}[label]
+			if service != "" && m.loaded[label] && m.statuses[service] == "enabled" {
+				helper, command := "agent-heavy", "daemon"
+				if service == "resources" {
+					command = "scheduler"
+				} else if service == "remote" {
+					helper, command = "agent-remote", "serve"
+				}
+				return []byte("program = " + filepath.Join(services[service], "Contents/MacOS", helper) + "\narguments = {\n" + helper + "\n" + command + "\n}\n"), nil
+			}
+		}
+		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" {
+			services[args[3]] = filepath.Dir(filepath.Dir(filepath.Dir(args[0])))
+		}
+		return original(ctx, args)
+	}
+	managedCandidate(t, m, "125")
+	moved := filepath.Join(i.home, "Applications/Agent Queue moved.app")
+	if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), moved); err != nil {
+		t.Fatal(err)
+	}
+	i.app, i.appBundle, i.payload = moved, true, filepath.Join(moved, "Contents/Resources/payload")
+	report := i.preflight(ctx)
+	if len(report.Issues) != 1 || report.Issues[0].ID != "pending-installation" || !slices.ContainsFunc(report.Issues[0].Actions, func(action installRecoveryAction) bool { return action.ID == installFinishPending }) {
+		t.Fatalf("automatic setup cannot reach the retained build: %+v", report)
+	}
+	step, err := installApprovedNext(report)
+	if err != nil || step.action != installFinishPending {
+		t.Fatal("automatic setup did not select the retained build", step, err)
+	}
+	m.calls = nil
+	i.automaticSetup = true
+	if _, err := runPackagedSetup(ctx, m.installFixture, i.finishPendingInstallation); err != nil {
+		t.Fatal("the newer build's controller could not finish the retained build", err)
+	}
+	completed, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
+	if err != nil || completed.Build == nil || *completed.Build != 124 {
+		t.Fatal("the retained build did not complete", completed, err)
+	}
+	requireLiveJournalGone(t, i)
+	// Registering helpers proves the retained app bundle activated non-supervised.
+	if !slices.ContainsFunc(m.calls, func(args []string) bool {
+		return len(args) == 4 && strings.HasPrefix(args[0], pendingBuild+"/") && args[2] == "register" && args[3] == "resources"
+	}) {
+		t.Fatal("the retained app bundle did not activate its registered helpers")
+	}
+	if _, err := os.Stat(i.runtimeGenerationPath(before)); err != nil {
+		t.Fatal("resume did not retain the worker's exact previous bundle", err)
+	}
+	select {
+	case err := <-finished:
+		joined = true
+		t.Fatalf("the caller ended before its job was released: %v: %s", err, output.String())
+	default:
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	err = <-finished
+	joined = true
+	var exited *exec.ExitError
+	if !errors.As(err, &exited) || exited.ExitCode() != 23 || !strings.Contains(output.String(), "original outcome") {
+		t.Fatal("the caller lost its exact outcome", err, output.String())
+	}
+	if raw, err := os.ReadFile(runs); err != nil || string(raw) != "once\n" {
+		t.Fatal("the job was replayed", string(raw), err)
+	}
+	if _, err := runPackagedSetup(ctx, m.installFixture, i.repairAndExecute); err != nil {
+		t.Fatal("the newer build did not relocate after finishing the retained build", err)
+	}
+	completed, err = installReadInfo(filepath.Join(i.root, "build-info.json"))
+	if err != nil || completed.Build == nil || *completed.Build != 125 {
+		t.Fatal("the newer build did not complete", completed, err)
+	}
+	metadata, err := appservices.Load(i.home)
+	if err != nil || metadata == nil || metadata.App != moved {
+		t.Fatal("the newer location was not published", metadata, err)
 	}
 }

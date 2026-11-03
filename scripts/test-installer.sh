@@ -19,6 +19,6 @@ extracted=("$work"/*)
 }
 go run -p 2 ./cmd/queue-tool verify-app --app "$app"
 AGENT_QUEUE_TEST_APP_BUNDLE="$app" \
-  go test -p 2 -parallel 2 ./internal/backend -run '^TestInstallerPackaged(AppBundle|LiveUpgrade)$' -count=1 -v -timeout 3m
+  go test -p 2 -parallel 2 ./internal/backend -run '^TestInstallerPackaged(AppBundle|LiveResume)$' -count=1 -v -timeout 3m
 AGENT_QUEUE_TEST_APP_BUNDLE="$app" \
   go test -p 2 -parallel 2 ./internal/remote -run '^TestRemotePackagedGateway$' -count=1 -v -timeout 3m

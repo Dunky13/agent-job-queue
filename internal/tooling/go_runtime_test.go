@@ -15,7 +15,7 @@ import (
 )
 
 const goRuntimeModule = "github.com/Dunky13/agent-job-queue"
-const goRuntimeInstallerTest = "TestInstallerManagedLiveUpgradeRetainsRunningAttempts"
+const goRuntimeInstallerTest = "TestInstallerManagedLiveResumeRetainsRunningAttempts"
 const goRuntimeInstallerPattern = "^" + goRuntimeInstallerTest + "$"
 const goRuntimeInstallerSummary = "ok\t" + goRuntimeModule + "/internal/backend\t0.123s\n"
 

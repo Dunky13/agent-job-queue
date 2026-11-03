@@ -10,11 +10,10 @@ import (
 // managed plan verifies bundle/registration/process ownership before returning
 // its cleanup blocker; legacy LaunchAgent files are not its ownership evidence.
 func (install *installer) recoverManagedCleanup(ctx context.Context, id int) error {
+	// A job's caller can finish cleaning between inspection and this repair. Being
+	// clean already is the requested result, and the repair loop inspects again.
 	if _, err := install.planManaged(ctx); !errors.Is(err, errInstallPendingCleanup) {
-		if err != nil {
-			return err
-		}
-		return errors.New("The managed queue no longer requires cleanup")
+		return err
 	}
 	snapshot, err := install.managedSnapshot(ctx)
 	if err != nil {

@@ -27,7 +27,6 @@ const usage = `Usage: agent-heavy <command>
   profiles list|show|edit|merge|combine|split|reset|regroup
   agents status|install|remove [--runner codex|claude] [--json]
   version [--json]
-  handover-capabilities --json
   updates check|install
 Commands receive stdin EOF. Supply input as argv or an explicit file.
 `
@@ -51,16 +50,6 @@ func Main(args []string) int {
 		args = append([]string{"version"}, args[1:]...)
 	}
 	switch args[0] {
-	case "handover-capabilities":
-		if len(args) != 2 || args[1] != "--json" {
-			fmt.Fprintln(os.Stderr, "Usage: agent-heavy handover-capabilities --json")
-			return 2
-		}
-		if err := json.NewEncoder(os.Stdout).Encode(Object{"schemaVersion": 1, "protocol": queueHandoverProtocol, "queueSchema": queueHandoverSchema}); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
-		return 0
 	case "version", "updates":
 		return UpdatesMain(args)
 	case "profiles":

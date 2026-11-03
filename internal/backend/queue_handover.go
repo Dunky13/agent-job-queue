@@ -499,16 +499,6 @@ func (d *queueDaemon) handoverControl(operation string, payload Object) (Object,
 	if err := d.expireHandover(); err != nil {
 		return nil, err
 	}
-	if operation == "handover-status" {
-		if len(payload) != 0 {
-			return nil, errors.New("Handover status does not accept arguments")
-		}
-		status, err := d.handoverStatus()
-		if err != nil {
-			return nil, err
-		}
-		return queueHandoverObject(status)
-	}
 	value, ok := payload["token"].(string)
 	if !ok || !validToken(value) {
 		return nil, errors.New("A live handover requires its exact token")

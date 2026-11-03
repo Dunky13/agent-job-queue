@@ -229,28 +229,6 @@ func TestRealDaemonHandoverRetainsClaimedWorkerWaitingForExternalSlot(t *testing
 	}
 }
 
-func TestQueueHandoverCapabilitiesDoesNotTouchPrivateState(t *testing.T) {
-	executable, err := os.Executable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	root := t.TempDir()
-	command := exec.Command(executable, "handover-capabilities", "--json")
-	command.Env = []string{"HOME=" + filepath.Join(root, "missing-home"), "AGENT_HEAVY_STATE=" + filepath.Join(root, "forbidden-state"), "AGENT_HEAVY_CONFIG=" + filepath.Join(root, "forbidden-config")}
-	raw, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatal("capability inspection failed", string(raw), err)
-	}
-	var value map[string]int
-	if err := json.Unmarshal(raw, &value); err != nil || len(value) != 3 || value["schemaVersion"] != 1 || value["protocol"] != 1 || value["queueSchema"] != 2 {
-		t.Fatal("unsupported target declaration", string(raw), err)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil || len(entries) != 0 {
-		t.Fatal("capability inspection created private state", entries, err)
-	}
-}
-
 func TestRealDaemonHandoverRetainsTerminalCallerAndRejectsCallerTamper(t *testing.T) {
 	f := daemonAcceptance(t)
 	caller, err := queueHandoverIdentity()
@@ -274,7 +252,8 @@ func TestRealDaemonHandoverRetainsTerminalCallerAndRejectsCallerTamper(t *testin
 		job, err := store.job(0)
 		return err == nil && job.phase == "done"
 	})
-	raw, err := f.gate.QueueControl("handover-status", nil)
+	handover := token()
+	raw, err := f.gate.QueueControl("prepare-handover", Object{"token": handover, "targetSHA256": handoverTarget(t)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +261,6 @@ func TestRealDaemonHandoverRetainsTerminalCallerAndRejectsCallerTamper(t *testin
 	if err != nil || !status.Eligible || len(status.Attempts) != 1 || status.Attempts[0].Phase != "done" || !jsonEqual(status.Attempts[0].Caller, &caller) {
 		t.Fatal("terminal caller executable was not retained", status, err)
 	}
-	handover := prepareQueueHandover(t, f, handoverTarget(t))
 	store, err := openQueueStore(f.gate.State, false)
 	if err != nil {
 		t.Fatal(err)
@@ -311,13 +289,17 @@ func TestRealDaemonHandoverRetainsTerminalCallerAndRejectsCallerTamper(t *testin
 		if err := store.saveTask(job); err != nil {
 			t.Fatal(err)
 		}
-		raw, err := f.gate.QueueControl("handover-status", nil)
+		next := token()
+		raw, err := f.gate.QueueControl("prepare-handover", Object{"token": next, "targetSHA256": handoverTarget(t)})
 		if err != nil {
 			t.Fatal(err)
 		}
 		status, err := decodeQueueHandoverStatus(raw)
 		if err != nil || !status.Eligible || len(status.Attempts) != 0 {
 			t.Fatal("terminal history permanently blocked upgrades", status, err)
+		}
+		if _, err := f.gate.QueueControl("cancel-handover", Object{"token": next}); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -724,12 +706,8 @@ func TestRealDaemonHandoverRefusesLegacyQueuedCaller(t *testing.T) {
 	if _, err := f.gate.QueueControl("submit", Object{"token": legacy}); err != nil {
 		t.Fatal(err)
 	}
-	status, err := f.gate.QueueControl("handover-status", nil)
-	if err != nil || status["eligible"] != false || !strings.Contains(text(status["reason"]), "legacy caller") {
-		t.Fatal("legacy caller silently qualified", status, err)
-	}
-	if _, err := f.gate.QueueControl("prepare-handover", Object{"token": token(), "targetSHA256": handoverTarget(t)}); err == nil {
-		t.Fatal("legacy caller authorized live handover")
+	if _, err := f.gate.QueueControl("prepare-handover", Object{"token": token(), "targetSHA256": handoverTarget(t)}); err == nil || !strings.Contains(err.Error(), "legacy caller") {
+		t.Fatal("legacy caller authorized live handover", err)
 	}
 	if _, err := os.Stat(queueHandoverPath(f.gate)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("refused handover mutated custody", err)
@@ -812,14 +790,50 @@ func TestQueuePreparedHandoverLeaseExpiresWithoutChangingQueueState(t *testing.T
 	}
 }
 
-func TestRealDaemonAdvertisesSafeLiveHandover(t *testing.T) {
+// A restarted daemon never adopts or expires its predecessor's prepared receipt,
+// so that receipt alone cannot show custody: only the recorded daemon's life can.
+func TestRealDaemonPreparedReceiptBindsNothingOnceItsDaemonRestarts(t *testing.T) {
 	f := daemonAcceptance(t)
-	status, err := f.gate.QueueControl("handover-status", nil)
-	if err != nil {
-		t.Fatalf("daemon has no live-upgrade protocol: %v", err)
+	value := token()
+	digest := handoverTarget(t)
+	if _, err := f.gate.QueueControl("prepare-handover", Object{"token": value, "targetSHA256": digest}); err != nil {
+		t.Fatal(err)
 	}
-	if status["protocol"] != 1 && fmt.Sprint(status["protocol"]) != "1" {
-		t.Fatal("unsupported handover protocol", status)
+	i := &installer{state: f.gate.State}
+	live := &managedLiveUpgrade{Token: value, TargetSHA256: digest}
+	if phase, spent, err := i.liveJournalState(live); err != nil || phase != "prepared" || spent {
+		t.Fatal("a live daemon's prepared receipt was treated as spent", phase, spent, err)
+	}
+	if err := f.daemon.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.daemon.Wait()
+	queueRestartFixture(t, f)
+	if _, err := f.gate.QueueControl("prepare-handover", Object{"token": value, "targetSHA256": digest}); err == nil {
+		t.Fatal("the restarted daemon accepted its predecessor's custody")
+	}
+	if _, err := f.gate.QueueControl("cancel-handover", Object{"token": value}); err == nil {
+		t.Fatal("the restarted daemon cancelled its predecessor's custody")
+	}
+	if phase, spent, err := i.liveJournalState(live); err != nil || phase != "prepared" || !spent {
+		t.Fatal("a dead daemon's prepared receipt still binds", phase, spent, err)
+	}
+	// The freeze died with its daemon, so nothing depends on the receipt.
+	if _, err := f.gate.QueueControl("resume", nil); err != nil {
+		t.Fatal("the restarted daemon remains frozen", err)
+	}
+	runs := filepath.Join(f.root, "runs")
+	f.launch("/bin/sh", "-c", `printf once > "$1"`, "fixture", runs).wait(t, 0)
+	if raw, err := os.ReadFile(runs); err != nil || string(raw) != "once" {
+		t.Fatal("the restarted daemon did not dispatch", string(raw), err)
+	}
+}
+
+func TestRealDaemonRetainsHandoverCustodyWithoutAdvertisingIt(t *testing.T) {
+	f := daemonAcceptance(t)
+	// An older installer reads any failure here as "use the drained path".
+	if _, err := f.gate.QueueControl("handover-status", nil); err == nil || err.Error() != "Unknown queue operation" {
+		t.Fatal("daemon still offers to begin a live handover", err)
 	}
 	executable, err := os.Executable()
 	if err != nil {
