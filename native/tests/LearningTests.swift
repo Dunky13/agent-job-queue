@@ -146,7 +146,7 @@ struct LearningTests {
             "Learning preview uses a conservative group envelope without invented exact-variant confidence")
         let unusual = testDetail(memory: 1_125_899_906_842_623, cpu: 0.123456789012345)
         let unusualData = try JSONEncoder().encode(unusual)
-        let precise = LearningStore(command: { _, _ in unusualData })
+        let precise = LearningStore(command: { _ in unusualData })
         await precise.select(sourceID)?.value
         let unchanged = try precise.editPayload()
         try check(unchanged.memoryFloorBytes == unusual.profile.memoryFloorBytes && unchanged.cpuFloorCores == unusual.profile.cpuFloorCores,
@@ -162,14 +162,14 @@ struct LearningTests {
             "Explicit RAM floor labels use byte or MiB units for values below one GiB")
         let tiny = testDetail(memory: 1, cpu: 1e-20)
         let tinyData = try JSONEncoder().encode(tiny)
-        let tinyStore = LearningStore(command: { _, _ in tinyData })
+        let tinyStore = LearningStore(command: { _ in tinyData })
         await tinyStore.select(sourceID)?.value
         let tinyEdit = try tinyStore.editPayload()
         try check(tinyEdit.memoryFloorBytes == 1 && tinyEdit.cpuFloorCores == 1e-20,
             "Small positive floors remain visible and editable without rounding to zero")
 
         let linkingFixture = LearningFixture()
-        let linkingStore = LearningStore(command: { try await linkingFixture.load($0, $1) })
+        let linkingStore = LearningStore(command: { try await linkingFixture.load($0.arguments, $0.input) })
         await linkingFixture.holdNextCall()
         let catalogLoad = linkingStore.loadPage()
         await linkingFixture.waitUntilHeld()
@@ -180,7 +180,7 @@ struct LearningTests {
             "Initial catalog I/O cannot overwrite a profile selected through a job link")
 
         let fixture = LearningFixture()
-        let store = LearningStore(command: { try await fixture.load($0, $1) })
+        let store = LearningStore(command: { try await fixture.load($0.arguments, $0.input) })
         let openingCalls = await fixture.calls
         try check(openingCalls.isEmpty && store.catalog == nil, "Constructing learning state performs no implicit I/O")
         await store.loadPage()?.value
@@ -196,7 +196,7 @@ struct LearningTests {
             "Operator minimums populate distinct editable fields and automatic remains blank")
 
         let inspectingFixture = LearningFixture()
-        let inspecting = LearningStore(command: { try await inspectingFixture.load($0, $1) })
+        let inspecting = LearningStore(command: { try await inspectingFixture.load($0.arguments, $0.input) })
         await inspecting.select(sourceID)?.value
         inspecting.draftLabel = "Unsaved group name"
         await inspecting.inspectMember(familyID)?.value
@@ -240,7 +240,7 @@ struct LearningTests {
             "Inspection and member search send only read commands with bounded explicit options")
 
         let bulkFixture = LearningFixture()
-        let bulk = LearningStore(command: { try await bulkFixture.load($0, $1) })
+        let bulk = LearningStore(command: { try await bulkFixture.load($0.arguments, $0.input) })
         await bulk.select(sourceID)?.value
         let selectedGroup = LearningMergeItem(identity: sourceID, label: "Web group", isGroup: true, sourceGroup: sourceID, revision: 7)
         let selectedTarget = LearningMergeItem(identity: targetID, label: "Build group", isGroup: true, sourceGroup: targetID, revision: 7)
@@ -398,7 +398,7 @@ struct LearningTests {
             "Reload recovers a failed detail read without inventing a cached profile")
 
         let beforePreview = await fixture.calls
-        let preview = LearningStore(fixtureMode: true, command: { try await fixture.load($0, $1) })
+        let preview = LearningStore(fixtureMode: true, command: { try await fixture.load($0.arguments, $0.input) })
         await preview.loadPage()?.value
         await preview.select(sourceID)?.value
         preview.draftLabel = "Attempted fixture edit"

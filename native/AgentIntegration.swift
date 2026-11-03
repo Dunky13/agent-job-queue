@@ -23,9 +23,9 @@ final class AgentIntegrationStore: ObservableObject {
     @Published private(set) var notice: String?
     @Published private(set) var selected: Set<String> = []
     let fixtureMode: Bool
-    private let command: @Sendable ([String]) async throws -> Data
+    private let command: @Sendable (QueueClient.Command) async throws -> Data
 
-    init(fixtureMode: Bool = false, command: @escaping @Sendable ([String]) async throws -> Data = {
+    init(fixtureMode: Bool = false, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
         try await QueueClient.run($0)
     }) {
         self.fixtureMode = fixtureMode
@@ -53,7 +53,7 @@ final class AgentIntegrationStore: ObservableObject {
         isBusy = true
         defer { isBusy = false }
         do {
-            let result = try decode(try await command(["agents", "status", "--json"]))
+            let result = try decode(try await command(.agentsStatus))
             snapshot = result
             selected = Set(result.runners.filter(\.configured).map(\.id))
             error = nil
@@ -73,13 +73,13 @@ final class AgentIntegrationStore: ObservableObject {
             do {
                 for runner in changes {
                     let action = desired.contains(runner.id) ? "install" : "remove"
-                    self.snapshot = try decode(try await command(["agents", action, "--runner", runner.id, "--json"]))
+                    self.snapshot = try decode(try await command(.agents(action, runner: runner.id)))
                 }
                 notice = "Instructions saved. Start a new agent session to load them."
             } catch {
                 // A preceding runner may have succeeded. Reconcile before offering a retry.
                 self.error = "\(error.localizedDescription) Refresh status before retrying; some changes may have been saved."
-                if let data = try? await command(["agents", "status", "--json"]), let latest = try? decode(data) {
+                if let data = try? await command(.agentsStatus), let latest = try? decode(data) {
                     self.snapshot = latest
                 }
             }

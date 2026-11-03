@@ -97,11 +97,11 @@ final class QueueUpdateStore: ObservableObject {
     @Published private(set) var updateDownloaded = false
     let running: RunningQueueVersion
     let fixtureMode: Bool
-    private let command: @Sendable ([String]) async throws -> Data
+    private let command: @Sendable (QueueClient.Command) async throws -> Data
 
     init(fixtureMode: Bool = false, running: RunningQueueVersion = .current(),
-         command: @escaping @Sendable ([String]) async throws -> Data = {
-             try await QueueClient.run($0, budget: $0.first == "updates" ? .updates : .normal)
+         command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
+             try await QueueClient.run($0)
          }) {
         self.fixtureMode = fixtureMode
         self.running = fixtureMode ? RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100) : running
@@ -160,7 +160,7 @@ final class QueueUpdateStore: ObservableObject {
         defer { operation = nil }
         do {
             let latestInstalled = try JSONDecoder().decode(InstalledQueueVersion.self,
-                from: try await command(["version", "--json"]))
+                from: try await command(.version))
             if let check, check.installed != latestInstalled { self.check = nil }
             installed = latestInstalled
             error = nil
@@ -179,7 +179,7 @@ final class QueueUpdateStore: ObservableObject {
             defer { operation = nil }
             do {
                 let result = try JSONDecoder().decode(QueueUpdateCheck.self,
-                    from: try await command(["updates", "check", "--json"]))
+                    from: try await command(.updatesCheck))
                 if let latest = result.latest {
                     guard latest.build > 0, latest.releaseURL != nil else {
                         throw ClientError.message("The update check returned an invalid release.")
@@ -201,7 +201,7 @@ final class QueueUpdateStore: ObservableObject {
             defer { operation = nil }
             do {
                 let result = try JSONDecoder().decode(QueueUpdateDownload.self,
-                    from: try await command(["updates", "download", "--build", String(release.build), "--json"]))
+                    from: try await command(.updatesDownload(build: release.build)))
                 guard result.downloaded, result.build == release.build else {
                     throw ClientError.message("The requested update was not downloaded. Check for updates before retrying.")
                 }

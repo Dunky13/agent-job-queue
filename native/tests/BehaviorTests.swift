@@ -38,6 +38,18 @@ actor IntegrationFixture {
     }
 }
 
+actor RemoteFixture {
+    var commands: [QueueClient.Command] = []
+    var failure: String?
+    func fail(_ message: String?) { failure = message }
+    func load(_ command: QueueClient.Command) throws -> Data {
+        commands.append(command)
+        if let failure { throw ClientError.message(failure) }
+        return try JSONEncoder().encode(RemoteStatus(enabled: command.arguments != ["disable"], configured: true, running: false,
+            url: "https://192.0.2.10:8743/", port: 8743, username: "agent", certificatePath: "", error: nil))
+    }
+}
+
 @main
 struct BehaviorTests {
     @MainActor static func main() async throws {
@@ -112,8 +124,40 @@ struct BehaviorTests {
         let remote = RemoteAccessStore(fixtureMode: true)
         try check(remote.fixtureMode && !remote.configure(password: "word", enable: true), "Fixture cannot change actual remote credentials")
 
+        let remoteFixture = RemoteFixture()
+        let liveRemote = RemoteAccessStore(fixtureMode: false, command: { try await remoteFixture.load($0) })
+        func settleRemote() async throws {
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while liveRemote.isBusy {
+                guard ProcessInfo.processInfo.systemUptime < deadline else { throw ClientError.message("Remote store did not settle") }
+                try await Task.sleep(for: .milliseconds(5))
+            }
+        }
+        await liveRemote.refresh()
+        var remoteCommands = await remoteFixture.commands
+        try check(remoteCommands == [.remoteStatus] && liveRemote.status?.enabled == true, "Remote refresh names its discardable status read")
+        liveRemote.setEnabled(false)
+        try await settleRemote()
+        liveRemote.setEnabled(true)
+        try await settleRemote()
+        remoteCommands = await remoteFixture.commands
+        try check(remoteCommands == [.remoteStatus, .remoteEnabled(false), .remoteEnabled(true)] &&
+            liveRemote.status?.enabled == true && liveRemote.notice == "Remote access enabled.",
+            "Remote toggles name their long-running lifecycle commands")
+        try check(liveRemote.configure(password: "word", enable: true), "Remote configuration starts through the injected command")
+        try await settleRemote()
+        remoteCommands = await remoteFixture.commands
+        let secret = remoteCommands.dropFirst(3).first
+        try check(remoteCommands.count == 5 && remoteCommands.last == .remoteEnabled(true) &&
+            secret?.arguments == ["configure"] && secret?.input.map { String(decoding: $0, as: UTF8.self) } == #"{"password":"word"}"#,
+            "Remote configuration sends the password only as private input, then enables")
+        await remoteFixture.fail("echoed word failure")
+        try check(liveRemote.configure(password: "word", enable: false), "Failed remote configuration still starts")
+        try await settleRemote()
+        try check(liveRemote.error == "echoed [redacted] failure", "Remote failures never reflect the configured password")
+
         let integrationFixture = IntegrationFixture()
-        let integration = AgentIntegrationStore(command: { try await integrationFixture.load($0) })
+        let integration = AgentIntegrationStore(command: { try await integrationFixture.load($0.arguments) })
         let initialIntegrationCalls = await integrationFixture.calls
         try check(initialIntegrationCalls.isEmpty && !integration.canSave && QueueAppAction.settings.contains(.integration),
             "Agent integration remains opt-in through settings and performs no implicit I/O")

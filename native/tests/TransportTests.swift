@@ -6,6 +6,15 @@ private func check(_ value: Bool, _ name: String) throws {
     if !value { throw ClientError.message(name) }
 }
 
+private final class ConcurrentRuns: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = 0
+    private var highest = 0
+    func enter() { lock.withLock { current += 1; highest = max(highest, current) } }
+    func leave() { lock.withLock { current -= 1 } }
+    var peak: Int { lock.withLock { highest } }
+}
+
 @main
 struct TransportTests {
     static func main() async throws {
@@ -26,23 +35,36 @@ struct TransportTests {
         let executable = URL(fileURLWithPath: CommandLine.arguments[0])
         let transport = QueueClient.Transport(executable: executable, timeout: 2)
         let short = QueueClient.Transport(executable: executable, timeout: 0.15)
-        let automaticInstall = ["install", "--app-bundle", "/Applications/Agent Queue.app", "--repair-and-continue"]
-        try check(QueueClient.timeout(for: automaticInstall, budget: .setup).isInfinite,
+        // A stalled host must not fail checks about something else, so most run without a
+        // deadline. The 2-second transport stays at the 5 call sites that need it to fail:
+        // pipe deadlock, a read that waits for EOF, and overflow before the deadline. Stop
+        // requests have their own detector, `.unsignalled`. A real hang elsewhere has no
+        // backstop here: it waits for the CI job limit, and locally for nothing.
+        let noDeadline = QueueClient.Transport(executable: executable, timeout: .infinity)
+        let automaticTarget = QueueClient.InstallTarget(option: .appBundle, path: "/Applications/Agent Queue.app")
+        let automaticInstall = QueueClient.Command.installRepairAndContinue(automaticTarget)
+        try check(automaticInstall.timeout.isInfinite,
                   "Automatic installation can wait for existing queue work without an aggregate deadline")
-        for arguments in [Array(automaticInstall.dropLast()), automaticInstall + ["--preflight", "--json"],
-                          ["install", "--app-bundle", "/Applications/Agent Queue.app", "--preflight", "--json"],
-                          ["install", "--app-bundle", "/Applications/Agent Queue.app", "--recover", "repair-service"]] {
-            try check(QueueClient.timeout(for: arguments, budget: .setup) == 330,
+        for command in [QueueClient.Command.install(automaticTarget), .setup(automaticInstall.arguments + ["--preflight", "--json"]),
+                        .installPreflight(automaticTarget), .installRecovery(automaticTarget, action: "repair-service")] {
+            try check(command.timeout == 330,
                       "Diagnostic and ambiguous setup commands retain a finite deadline")
         }
-        func arguments(_ scenario: String, _ marker: URL, mutation: Bool = false) -> [String] {
-            (mutation ? ["profiles", "edit"] : ["status"]) + ["--stub", scenario, marker.path]
+        func stubbed(_ command: QueueClient.Command, _ scenario: String, _ marker: URL) -> QueueClient.Command {
+            var stubbed = command
+            stubbed.arguments += ["--stub", scenario, marker.path]
+            return stubbed
+        }
+        func arguments(_ scenario: String, _ marker: URL, mutation: Bool = false, input: Data? = nil) -> QueueClient.Command {
+            var command = stubbed(mutation ? .profilesChange("edit", "stub", payload: Data()) : .status, scenario, marker)
+            command.input = input
+            return command
         }
         // Warm up Foundation's shared Process machinery before counting handles.
-        _ = try await QueueClient.run(arguments("empty", temporary.appendingPathComponent("warmup")), transport: transport)
+        _ = try await QueueClient.run(arguments("empty", temporary.appendingPathComponent("warmup")), transport: noDeadline)
         let handlesBefore = openHandleCount()
         for index in 0..<12 {
-            let final = try await QueueClient.run(arguments("final", temporary.appendingPathComponent("cleanup-\(index)")), transport: transport)
+            let final = try await QueueClient.run(arguments("final", temporary.appendingPathComponent("cleanup-\(index)")), transport: noDeadline)
             try check(String(decoding: final, as: UTF8.self) == "final response", "Final controller bytes survive the child-exit fence")
         }
         try check(openHandleCount() == handlesBefore, "Repeated private read completion closes all per-request pipe handles")
@@ -50,7 +72,7 @@ struct TransportTests {
         let earlyMarker = temporary.appendingPathComponent("early")
         let early = Task {
             withUnsafeCurrentTask { $0?.cancel() }
-            return try await QueueClient.run(arguments("hold", earlyMarker), transport: transport)
+            return try await QueueClient.run(arguments("hold", earlyMarker), transport: noDeadline)
         }
         do { _ = try await early.value; throw ClientError.message("Cancelled read succeeded") }
         catch is CancellationError { }
@@ -58,7 +80,7 @@ struct TransportTests {
                   "Already-cancelled read never launches its private child")
 
         let heldMarker = temporary.appendingPathComponent("held")
-        let held = Task { try await QueueClient.run(arguments("hold", heldMarker), transport: transport) }
+        let held = Task { try await QueueClient.run(arguments("hold", heldMarker), transport: noDeadline) }
         try await waitForFile(heldMarker)
         let start = ProcessInfo.processInfo.systemUptime
         held.cancel()
@@ -68,7 +90,7 @@ struct TransportTests {
                   "In-flight cancellation promptly terminates and reaps the private read child")
 
         let resistantMarker = temporary.appendingPathComponent("resistant")
-        let resistant = Task { try await QueueClient.run(arguments("resist", resistantMarker), transport: transport) }
+        let resistant = Task { try await QueueClient.run(arguments("resist", resistantMarker), transport: noDeadline) }
         try await waitForFile(resistantMarker)
         resistant.cancel()
         do { _ = try await resistant.value; throw ClientError.message("Resistant read succeeded") }
@@ -96,17 +118,17 @@ struct TransportTests {
         for scenario in ["hold", "continuous", "stdin"] {
             let marker = temporary.appendingPathComponent("deadline-\(scenario)")
             do {
-                _ = try await QueueClient.run(arguments(scenario, marker, mutation: scenario == "stdin"),
-                    input: scenario == "stdin" ? Data(repeating: 65, count: 16_384) : nil, transport: short)
+                _ = try await QueueClient.run(arguments(scenario, marker, mutation: scenario == "stdin",
+                    input: scenario == "stdin" ? Data(repeating: 65, count: 16_384) : nil), transport: short)
                 throw ClientError.message("Stalled response succeeded")
             } catch {
-                try check(error.localizedDescription.contains("did not respond within") && childIsGone(marker),
+                try check(error.localizedDescription.contains("did not respond within") && reapedAfterShortDeadline(marker),
                           "Deadline and cleanup survive \(scenario) controller I/O")
             }
         }
 
         let mutationMarker = temporary.appendingPathComponent("mutation")
-        let mutation = Task { try await QueueClient.run(arguments("mutation", mutationMarker, mutation: true), transport: transport) }
+        let mutation = Task { try await QueueClient.run(arguments("mutation", mutationMarker, mutation: true), transport: noDeadline) }
         try await waitForFile(mutationMarker)
         mutation.cancel()
         let result = try await mutation.value
@@ -114,55 +136,55 @@ struct TransportTests {
             FileManager.default.fileExists(atPath: mutationMarker.appendingPathExtension("done").path) && childIsGone(mutationMarker),
             "Cancelling an accepted mutation leaves its private controller operation intact")
 
-        for target in ["--app-bundle", "--payload"] {
+        for target in [QueueClient.InstallTarget.Option.appBundle, .payload] {
             let marker = temporary.appendingPathComponent("preflight-read")
-            let read = Task { try await QueueClient.run(["install", target, marker.path, "--preflight", "--json"],
-                budget: .setup, transport: transport) }
+            let read = Task { try await QueueClient.run(.installPreflight(.init(option: target, path: marker.path)), transport: noDeadline) }
             try await waitForFile(marker)
             read.cancel()
             do { _ = try await read.value; throw ClientError.message("Cancelled setup preflight succeeded") }
             catch is CancellationError { }
-            try check(childIsGone(marker), "Cancelling \(target) setup preflight reaps its private read controller")
+            try check(childIsGone(marker), "Cancelling \(target.rawValue) setup preflight reaps its private read controller")
             try FileManager.default.removeItem(at: marker)
         }
-        for (index, extra) in [["--recover", "repair-service"], ["--disable-phone-access"], ["--unexpected"]].enumerated() {
+        // The app cannot combine preflight with other options. Its real mutating
+        // forms, and any setup argv without a named policy, keep their response.
+        let retainedForms: [(QueueClient.InstallTarget) -> QueueClient.Command] = [
+            { .installRecovery($0, action: "repair-service") }, { .installDisablingPhoneAccess($0) },
+            { .setup(["install", "--app-bundle", $0.path, "--preflight", "--json", "--unexpected"]) },
+        ]
+        for (index, form) in retainedForms.enumerated() {
             let marker = temporary.appendingPathComponent("preflight-mutation-\(index)")
-            let mutation = Task { try await QueueClient.run(["install", "--app-bundle", marker.path, "--preflight", "--json"] + extra,
-                budget: .setup, transport: transport) }
+            let command = form(.init(option: .appBundle, path: marker.path))
+            let mutation = Task { try await QueueClient.run(command, transport: noDeadline) }
             try await waitForFile(marker)
             mutation.cancel()
             let response = try await mutation.value
             try check(String(decoding: response, as: UTF8.self) == "accepted" &&
                 FileManager.default.fileExists(atPath: marker.appendingPathExtension("done").path),
-                "Preflight syntax with additional options retains its accepted operation")
+                "Setup forms other than the exact preflight retain their accepted operation")
         }
 
         let setupWaitMarker = temporary.appendingPathComponent("automatic-wait")
-        let setupWait = Task { try await QueueClient.run(["install", "--app-bundle", setupWaitMarker.path, "--repair-and-continue"],
-            budget: .setup, transport: transport) }
-        try await waitForFile(setupWaitMarker)
+        let setupWait = Task { try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: setupWaitMarker.path)),
+            transport: noDeadline, onOutput: deliverWaiting(setupWaitMarker)) }
+        try await waitForFile(setupWaitMarker.appendingPathExtension("delivered"))
         setupWait.cancel()
         do { _ = try await setupWait.value; throw ClientError.message("Cancelled automatic wait succeeded") }
         catch is CancellationError { }
-        try check(childIsGone(setupWaitMarker), "Stopping automatic waiting terminates and reaps only its private setup controller")
+        try check(childIsGone(setupWaitMarker) && stopSignalArrived(setupWaitMarker), "Stopping automatic waiting terminates and reaps only its private setup controller")
         let hintMarker = temporary.appendingPathComponent("automatic-hint")
         let hint = Task {
-            try await QueueClient.run(["install", "--app-bundle", hintMarker.path, "--repair-and-continue"],
-                budget: .setup, transport: transport, onOutput: { data in
-                    if QueueSetupProgress.parse(String(decoding: data, as: UTF8.self)).isWaiting {
-                        try? Data().write(to: hintMarker.appendingPathExtension("delivered"))
-                    }
-                })
+            try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: hintMarker.path)),
+                transport: noDeadline, onOutput: deliverWaiting(hintMarker))
         }
         try await waitForFile(hintMarker.appendingPathExtension("delivered"))
         hint.cancel()
         do { _ = try await hint.value; throw ClientError.message("Cancelled hint wait succeeded") }
         catch is CancellationError { }
-        try check(childIsGone(hintMarker), "Throttled waiting progress is delivered even when the child emits no more output")
+        try check(childIsGone(hintMarker) && stopSignalArrived(hintMarker), "Throttled waiting progress is delivered even when the child emits no more output")
 
         let setupMutationMarker = temporary.appendingPathComponent("automatic-mutation")
-        let setupMutation = Task { try await QueueClient.run(["install", "--app-bundle", setupMutationMarker.path, "--repair-and-continue"],
-            budget: .setup, transport: transport) }
+        let setupMutation = Task { try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: setupMutationMarker.path)), transport: noDeadline) }
         try await waitForFile(setupMutationMarker)
         setupMutation.cancel()
         let setupMutationResult = try await setupMutation.value
@@ -175,8 +197,8 @@ struct TransportTests {
         let resumeReader = DispatchSemaphore(value: 0)
         defer { resumeReader.signal() }
         let transition = Task {
-            try await QueueClient.run(["install", "--app-bundle", transitionMarker.path, "--repair-and-continue"],
-                budget: .setup, transport: transport, onOutput: { data in
+            try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: transitionMarker.path)),
+                transport: noDeadline, onOutput: { data in
                     if QueueSetupProgress.parse(String(decoding: data, as: UTF8.self)).isWaiting {
                         try? Data().write(to: transitionMarker.appendingPathExtension("observed"))
                         resumeReader.wait()
@@ -194,51 +216,232 @@ struct TransportTests {
             "A stale waiting marker cannot interrupt an accepted setup mutation")
 
         let interleavedInput = Data(repeating: 66, count: 16_384)
-        let interleaved = try await QueueClient.run(arguments("interleaved", temporary.appendingPathComponent("interleaved"), mutation: true),
-                                                    input: interleavedInput, transport: transport)
+        let interleaved = try await QueueClient.run(arguments("interleaved", temporary.appendingPathComponent("interleaved"), mutation: true, input: interleavedInput),
+                                                    transport: transport)
         try check(interleaved.count == 81_920 && interleaved.suffix(interleavedInput.count) == interleavedInput,
                   "Private stdin and combined stderr/stdout make progress together without pipe deadlock")
-        let empty = try await QueueClient.run(arguments("interleaved", temporary.appendingPathComponent("empty-input"), mutation: true),
-                                              input: Data(), transport: transport)
+        let empty = try await QueueClient.run(arguments("interleaved", temporary.appendingPathComponent("empty-input"), mutation: true, input: Data()),
+                                              transport: transport)
         try check(empty.count == 65_536, "Empty private input closes promptly and lets the controller observe EOF")
 
         let daemonMarker = temporary.appendingPathComponent("daemon-controller")
-        let daemonStart = ProcessInfo.processInfo.systemUptime
+        // The daemon holds the inherited output until released, past the read's own
+        // deadline, so a read that waited for EOF fails here regardless of host load.
         _ = try await QueueClient.run(arguments("daemon", daemonMarker), transport: transport)
         let daemonPID = daemonMarker.appendingPathExtension("child")
-        try check(ProcessInfo.processInfo.systemUptime - daemonStart < 0.5 && !childIsGone(daemonPID),
+        try check(!childIsGone(daemonPID),
                   "Read finishes after its direct child exits while an independent daemon holds inherited output")
+        try Data().write(to: daemonPID.appendingPathExtension("release"))
         try await waitForFile(daemonPID.appendingPathExtension("done"))
         try check(childIsGone(daemonMarker), "Independent daemon work completes after its private read controller has been reaped")
 
         do {
-            _ = try await QueueClient.run(arguments("failure", temporary.appendingPathComponent("failure"), mutation: true), transport: transport)
+            _ = try await QueueClient.run(arguments("failure", temporary.appendingPathComponent("failure"), mutation: true), transport: noDeadline)
             throw ClientError.message("Failed controller succeeded")
         } catch {
             try check(error.localizedDescription == "Useful controller diagnostic", "Bounded stderr preserves controller diagnostics")
         }
         for _ in 0..<5 {
-            let setup = try await QueueClient.run(arguments("setup-output", temporary.appendingPathComponent("setup-output"), mutation: true),
-                budget: .setup, transport: transport)
+            let setup = try await QueueClient.run(.setup(["--stub", "setup-output", temporary.appendingPathComponent("setup-output").path]),
+                transport: noDeadline)
             try check(setup.count == 32_768 && String(decoding: setup, as: UTF8.self).hasSuffix("final setup bytes"),
                 "Verbose setup output stays bounded and preserves the macOS child-exit tail")
         }
         do {
-            _ = try await QueueClient.run(arguments("setup-failure", temporary.appendingPathComponent("setup-failure"), mutation: true),
-                budget: .setup, transport: transport)
+            _ = try await QueueClient.run(.setup(["--stub", "setup-failure", temporary.appendingPathComponent("setup-failure").path]),
+                transport: noDeadline)
             throw ClientError.message("Failed setup succeeded")
         } catch {
             try check(error.localizedDescription.utf8.count <= 8_000 && error.localizedDescription.hasSuffix("final setup bytes"),
                 "Setup failure retains the actionable bounded stderr tail")
         }
         do {
-            _ = try await QueueClient.run(["profiles", "show", "--stub", "profile-failure", temporary.appendingPathComponent("profile-failure").path], transport: transport)
+            _ = try await QueueClient.run(stubbed(.profilesShow("stub"), "profile-failure", temporary.appendingPathComponent("profile-failure")), transport: noDeadline)
             throw ClientError.message("Failed profile controller succeeded")
         } catch {
             try check(error.localizedDescription == "Workload changed", "Structured workload errors preserve their diagnostic")
         }
 
-        try await selectionChecks(temporary: temporary, transport: transport)
+        try await selectionChecks(temporary: temporary, transport: noDeadline)
+        try await policyChecks(temporary: temporary, executable: executable, transport: noDeadline, short: short)
+    }
+
+    /// The old-to-new call-site table: every command the app sends, every policy column.
+    private static func policyTable() -> [(name: String, command: QueueClient.Command, expected: QueueClient.Command)] {
+        typealias Command = QueueClient.Command
+        let payload = Data("{}".utf8)
+        let app = QueueClient.InstallTarget(option: .appBundle, path: "/Applications/Agent Queue.app")
+        let appArguments = ["install", "--app-bundle", app.path]
+        func queue(_ arguments: [String], timeout: TimeInterval = 25, cancellation: Command.Cancellation = .retain) -> Command {
+            Command(controller: .heavy, arguments: arguments, input: nil, timeout: timeout, cancellation: cancellation,
+                    reporting: .queue, decodesStructuredErrors: false)
+        }
+        func profiles(_ arguments: [String], input: Data? = nil, cancellation: Command.Cancellation) -> Command {
+            Command(controller: .heavy, arguments: ["profiles"] + arguments + ["--json"], input: input, timeout: 25,
+                    cancellation: cancellation, reporting: .queue, decodesStructuredErrors: true)
+        }
+        func updates(_ arguments: [String]) -> Command {
+            Command(controller: .heavy, arguments: arguments, input: nil, timeout: 130, cancellation: .retain,
+                    reporting: .updates, decodesStructuredErrors: false)
+        }
+        func remote(_ arguments: [String], input: Data? = nil, timeout: TimeInterval = 125,
+                    cancellation: Command.Cancellation = .retain) -> Command {
+            Command(controller: .remote, arguments: arguments, input: input, timeout: timeout, cancellation: cancellation,
+                    reporting: .queue, decodesStructuredErrors: false)
+        }
+        func setup(_ arguments: [String], timeout: TimeInterval = 330, cancellation: Command.Cancellation = .retain) -> Command {
+            Command(controller: .heavy, arguments: arguments, input: nil, timeout: timeout, cancellation: cancellation,
+                    reporting: .setup, decodesStructuredErrors: false)
+        }
+        var table: [(name: String, command: Command, expected: Command)] = [
+            ("status", .status, queue(["status", "--json"], timeout: 8, cancellation: .discard)),
+            ("resume", .resume, queue(["resume"])),
+            ("limit", .limit(3), queue(["limit", "3"])),
+            ("scheduling", .scheduling(.adaptive), queue(["scheduling", SchedulingMode.adaptive.rawValue])),
+            ("version", .version, queue(["version", "--json"])),
+            ("agents status", .agentsStatus, queue(["agents", "status", "--json"])),
+            ("agents install", .agents("install", runner: "codex"), queue(["agents", "install", "--runner", "codex", "--json"])),
+            ("agents remove", .agents("remove", runner: "claude"), queue(["agents", "remove", "--runner", "claude", "--json"])),
+            ("profiles list", .profilesList(offset: 50, limit: 50, query: "go"),
+             profiles(["list", "--offset", "50", "--limit", "50", "--query", "go"], cancellation: .discard)),
+            ("profiles show", .profilesShow("id"), profiles(["show", "id"], cancellation: .discard)),
+            ("profiles show family", .profilesShow("id", family: "f"), profiles(["show", "id", "--family", "f"], cancellation: .discard)),
+            ("profiles show members", .profilesShow("id", membersQuery: "q", membersOffset: 2),
+             profiles(["show", "id", "--members-query", "q", "--members-offset", "2"], cancellation: .discard)),
+            ("updates check", .updatesCheck, updates(["updates", "check", "--json"])),
+            ("updates download", .updatesDownload(build: 7), updates(["updates", "download", "--build", "7", "--json"])),
+            ("remote status", .remoteStatus, remote(["status", "--json"], timeout: 8, cancellation: .discard)),
+            ("remote enable", .remoteEnabled(true), remote(["enable"])),
+            ("remote disable", .remoteEnabled(false), remote(["disable"])),
+            ("remote configure", .remoteConfigure(payload), remote(["configure"], input: payload)),
+            ("install", .install(app), setup(appArguments)),
+            ("install preflight", .installPreflight(app), setup(appArguments + ["--preflight", "--json"], cancellation: .discard)),
+            ("install repair and continue", .installRepairAndContinue(app),
+             setup(appArguments + ["--repair-and-continue"], timeout: .infinity, cancellation: .stopWhileWaiting)),
+            ("install disabling phone access", .installDisablingPhoneAccess(app), setup(appArguments + ["--disable-phone-access"])),
+            ("install recovery", .installRecovery(app, action: "repair-service"), setup(appArguments + ["--recover", "repair-service"])),
+            ("install recovery job", .installRecovery(app, action: "cleanup-job", jobID: 4),
+             setup(appArguments + ["--recover", "cleanup-job", "--job-id", "4"])),
+            ("install recovery revision", .installRecovery(app, action: "reset-callback", expectedRevision: "abc"),
+             setup(appArguments + ["--recover", "reset-callback", "--expected-revision", "abc"])),
+            // A path that is not exactly absolute earns neither a discardable nor an unbounded policy.
+            ("relative preflight", .installPreflight(.init(option: .appBundle, path: "relative")),
+             setup(["install", "--app-bundle", "relative", "--preflight", "--json"])),
+            ("relative repair and continue", .installRepairAndContinue(.init(option: .appBundle, path: "relative")),
+             setup(["install", "--app-bundle", "relative", "--repair-and-continue"])),
+        ]
+        for action in ["next", "last", "cancel", "start"] {
+            table.append(("job \(action)", .jobAction(action, id: 9), queue([action, "9"])))
+        }
+        for operation in ["edit", "merge", "split", "combine", "reset"] {
+            table.append(("profiles \(operation)", .profilesChange(operation, "id", payload: payload),
+                          profiles([operation, "id"], input: payload, cancellation: .retain)))
+        }
+        for service in QueueServiceManagement.Service.allCases {
+            table.append(("service status \(service.rawValue)", .serviceStatus(service),
+                          setup(["--service-management", "status", service.rawValue], timeout: 5, cancellation: .discard)))
+        }
+        return table
+    }
+
+    private static func policyChecks(temporary: URL, executable: URL, transport: QueueClient.Transport,
+                                     short: QueueClient.Transport) async throws {
+        let directory = temporary.appendingPathComponent("policy")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        func stubbed(_ command: QueueClient.Command, _ scenario: String, _ marker: URL) -> QueueClient.Command {
+            var stubbed = command
+            stubbed.arguments += ["--stub", scenario, marker.path]
+            return stubbed
+        }
+        // Policy only: Process itself rejects an argument containing NUL, so this cannot launch.
+        try check(QueueClient.Command.installRepairAndContinue(.init(option: .appBundle, path: "/a\0b")) ==
+            .setup(["install", "--app-bundle", "/a\0b", "--repair-and-continue"]),
+            "A path containing NUL earns neither a discardable nor an unbounded policy")
+        for (index, row) in policyTable().enumerated() {
+            try check(row.command == row.expected, "\(row.name): argv, controller, input, timeout, cancellation, reporting and decoder")
+
+            // Cancellation outcome through the real process runner.
+            let cancelMarker = directory.appendingPathComponent("cancel-\(index)")
+            switch row.command.cancellation {
+            case .discard:
+                let read = Task { try await QueueClient.run(stubbed(row.command, "hold", cancelMarker), transport: transport) }
+                try await waitForFile(cancelMarker)
+                read.cancel()
+                do { _ = try await read.value; throw ClientError.message("\(row.name): cancelled read succeeded") }
+                catch is CancellationError { }
+                try check(childIsGone(cancelMarker), "\(row.name): cancelling discards the response and reaps the child")
+            case .retain:
+                let change = Task { try await QueueClient.run(stubbed(row.command, "mutation", cancelMarker), transport: transport) }
+                try await waitForFile(cancelMarker)
+                change.cancel()
+                let response = try await change.value
+                try check(String(decoding: response, as: UTF8.self) == "accepted" &&
+                    FileManager.default.fileExists(atPath: cancelMarker.appendingPathExtension("done").path) && childIsGone(cancelMarker),
+                    "\(row.name): cancelling keeps the accepted operation and its response")
+            case .stopWhileWaiting:
+                let waiting = Task { try await QueueClient.run(stubbed(row.command, "automatic-wait", cancelMarker),
+                    transport: transport, onOutput: deliverWaiting(cancelMarker)) }
+                try await waitForFile(cancelMarker.appendingPathExtension("delivered"))
+                waiting.cancel()
+                do { _ = try await waiting.value; throw ClientError.message("\(row.name): cancelled wait succeeded") }
+                catch is CancellationError { }
+                try check(childIsGone(cancelMarker) && stopSignalArrived(cancelMarker), "\(row.name): cancelling a reported wait stops only its child")
+                let mutationMarker = directory.appendingPathComponent("cancel-\(index)-mutation")
+                let mutation = Task { try await QueueClient.run(stubbed(row.command, "mutation", mutationMarker), transport: transport) }
+                try await waitForFile(mutationMarker)
+                mutation.cancel()
+                let response = try await mutation.value
+                try check(String(decoding: response, as: UTF8.self) == "accepted" && childIsGone(mutationMarker),
+                    "\(row.name): cancelling outside a reported wait keeps the accepted operation")
+            }
+
+            // Deadline wording through the real process runner.
+            let deadlineMarker = directory.appendingPathComponent("deadline-\(index)")
+            do {
+                _ = try await QueueClient.run(stubbed(row.command, "hold", deadlineMarker), transport: short)
+                throw ClientError.message("\(row.name): stalled command succeeded")
+            } catch {
+                let wording = switch row.command.reporting {
+                case .queue: "The queue did not respond within"
+                case .updates: "The update operation did not finish within"
+                case .setup: "Setup did not finish within"
+                }
+                try check(error.localizedDescription.hasPrefix(wording) && reapedAfterShortDeadline(deadlineMarker),
+                    "\(row.name): deadline reports its own wording and reaps the child")
+            }
+
+            // Failure decoding through the real process runner.
+            do {
+                _ = try await QueueClient.run(stubbed(row.command, "profile-failure", directory.appendingPathComponent("failure-\(index)")), transport: transport)
+                throw ClientError.message("\(row.name): failed command succeeded")
+            } catch {
+                try check(error.localizedDescription == (row.command.decodesStructuredErrors ? "Workload changed" : "{\"error\":\"Workload changed\"}"),
+                          "\(row.name): failure uses its own decoder")
+            }
+        }
+
+        // Without a transport override, the command's own deadline applies.
+        var quick = QueueClient.Command.status
+        quick.timeout = 0.15
+        let quickMarker = directory.appendingPathComponent("own-deadline")
+        do {
+            _ = try await QueueClient.run(stubbed(quick, "hold", quickMarker), transport: .init(executable: executable))
+            throw ClientError.message("Command deadline did not apply")
+        } catch {
+            try check(error.localizedDescription.contains("did not respond within") && reapedAfterShortDeadline(quickMarker),
+                      "A transport without a timeout applies the command's own deadline")
+        }
+        var quickSetup = QueueClient.Command.serviceStatus(.queue)
+        quickSetup.timeout = 0.15
+        let installerMarker = directory.appendingPathComponent("installer-deadline")
+        do {
+            _ = try await QueueBootstrapModel.runInstaller(.init(executable: executable,
+                command: stubbed(quickSetup, "hold", installerMarker))) { _ in }
+            throw ClientError.message("Installer deadline did not apply")
+        } catch {
+            try check(error.localizedDescription.hasPrefix("Setup did not finish within") && reapedAfterShortDeadline(installerMarker),
+                      "Setup requests run with their command's own deadline and wording")
+        }
     }
 
     private static func waitForFile(_ url: URL) async throws {
@@ -254,6 +457,40 @@ struct TransportTests {
         return kill(pid, 0) == -1 && errno == ESRCH
     }
 
+    // Cancel only after the runner has delivered the wait. The stub writes its marker
+    // first, and a stop request before it reports waiting would look like success.
+    private static func deliverWaiting(_ marker: URL) -> @Sendable (Data) -> Void {
+        { data in
+            if QueueSetupProgress.parse(String(decoding: data, as: UTF8.self)).isWaiting {
+                try? Data().write(to: marker.appendingPathExtension("delivered"))
+            }
+        }
+    }
+
+    // A waiting stub exits by itself after its sleep, which also looks like a stopped wait.
+    private static func stopSignalArrived(_ marker: URL) -> Bool {
+        !FileManager.default.fileExists(atPath: marker.appendingPathExtension("unsignalled").path)
+    }
+
+    // A stray temporary file from a killed atomic marker write names no child.
+    private static func childIsAlive(_ marker: URL) -> Bool {
+        guard let text = try? String(contentsOf: marker, encoding: .utf8), let pid = Int32(text) else { return false }
+        return kill(pid, 0) == 0 || errno != ESRCH
+    }
+
+    // A child killed at a very short deadline may not have written its marker yet,
+    // so reaping is also checked without one. Controller runs here are sequential.
+    private static func reapedAfterShortDeadline(_ marker: URL) -> Bool {
+        (!FileManager.default.fileExists(atPath: marker.path) || childIsGone(marker)) && directChildren().isEmpty
+    }
+
+    // Includes zombies, so a child that exited without being reaped is still listed.
+    private static func directChildren() -> [pid_t] {
+        var children = [pid_t](repeating: 0, count: 64)
+        let count = proc_listchildpids(getpid(), &children, Int32(children.count * MemoryLayout<pid_t>.size))
+        return Array(children.prefix(max(0, Int(count))))
+    }
+
     private static func openHandleCount() -> Int {
         (0..<getdtablesize()).reduce(0) { count, descriptor in
             count + (fcntl(descriptor, F_GETFD) == -1 ? 0 : 1)
@@ -263,9 +500,14 @@ struct TransportTests {
     @MainActor private static func selectionChecks(temporary: URL, transport: QueueClient.Transport) async throws {
         let directory = temporary.appendingPathComponent("selections")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-        let store = LearningStore(command: { arguments, input in
-            try await QueueClient.run(arguments + ["--stub", "detail", directory.appendingPathComponent(arguments[2]).path],
-                                      input: input, transport: transport)
+        // A child's whole life sits inside its run, so overlapping children need overlapping runs.
+        let runs = ConcurrentRuns()
+        let store = LearningStore(command: { command in
+            var stubbed = command
+            stubbed.arguments += ["--stub", "detail", directory.appendingPathComponent(command.arguments[2]).path]
+            runs.enter()
+            defer { runs.leave() }
+            return try await QueueClient.run(stubbed, transport: transport)
         })
         let first = store.select("first")
         try await waitForFile(directory.appendingPathComponent("first"))
@@ -280,10 +522,11 @@ struct TransportTests {
         await latest?.value
         let markers = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         try check(store.selectedID == "latest" && store.detail?.profile.id == "latest" && store.error == nil &&
-                  !store.isDetailLoading && markers.allSatisfy(childIsGone),
+                  !store.isDetailLoading && !markers.contains(where: childIsAlive),
                   "Rapid real-process selections publish only the current detail and reap all read children")
-        // Each child checks all predecessors on entry. Overlap creates this sentinel.
-        try check(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("overlap").path),
+        // Each child also checks all predecessors on entry. Overlap creates this sentinel,
+        // though a slow launch usually outlasts a cancelled predecessor.
+        try check(runs.peak == 1 && !FileManager.default.fileExists(atPath: directory.appendingPathComponent("overlap").path),
                   "Rapid selections never have more than one live private detail child")
     }
 
@@ -297,11 +540,12 @@ struct TransportTests {
         if scenario == "resist" { signal(SIGTERM, SIG_IGN) }
         if scenario == "detail" {
             let others = try FileManager.default.contentsOfDirectory(at: marker.deletingLastPathComponent(), includingPropertiesForKeys: nil)
-            for other in others where !childIsGone(other) {
+            for other in others where childIsAlive(other) {
                 try Data().write(to: marker.deletingLastPathComponent().appendingPathComponent("overlap"))
             }
         }
-        try Data(String(getpid()).utf8).write(to: marker)
+        // Atomic, so a child killed here cannot leave an empty marker that names no process.
+        try Data(String(getpid()).utf8).write(to: marker, options: .atomic)
         let bytes = Data(repeating: 65, count: 16_384)
         switch scenario {
         case "empty": return
@@ -342,6 +586,7 @@ struct TransportTests {
         case "automatic-wait":
             try FileHandle.standardOutput.write(contentsOf: Data((QueueSetupProgress.waitingMarker + "\nWaiting for original callers\n").utf8))
         case "mutation":
+            _ = try FileHandle.standardInput.readToEnd()
             Thread.sleep(forTimeInterval: 0.25)
             try Data().write(to: marker.appendingPathExtension("done"))
             try FileHandle.standardOutput.write(contentsOf: Data("accepted".utf8))
@@ -367,13 +612,18 @@ struct TransportTests {
             }
             return
         case "independent-daemon":
-            Thread.sleep(forTimeInterval: 0.75)
+            let deadline = ProcessInfo.processInfo.systemUptime + 5
+            while !FileManager.default.fileExists(atPath: marker.appendingPathExtension("release").path),
+                  ProcessInfo.processInfo.systemUptime < deadline {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
             try Data().write(to: marker.appendingPathExtension("done"))
             return
         case "failure":
             try FileHandle.standardError.write(contentsOf: Data("Useful controller diagnostic".utf8))
             exit(3)
         case "profile-failure":
+            _ = try FileHandle.standardInput.readToEnd()
             try FileHandle.standardError.write(contentsOf: Data("{\"error\":\"Workload changed\"}".utf8))
             exit(3)
         case "detail":
@@ -394,5 +644,9 @@ struct TransportTests {
         default: break
         }
         Thread.sleep(forTimeInterval: 5)
+        // The stop signal's handler exits without reaching this.
+        if ["automatic-wait", "automatic-hint"].contains(scenario) {
+            try Data().write(to: marker.appendingPathExtension("unsignalled"))
+        }
     }
 }

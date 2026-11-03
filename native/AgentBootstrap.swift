@@ -97,8 +97,8 @@ struct QueueBootstrapEnvironment: Sendable {
         } catch {
             throw ClientError.message("Agent Queue's embedded setup payload is incomplete or invalid. Download the app again. \(error.localizedDescription)")
         }
-        let request = QueueBootstrapRequest(executable: managed ? app.appendingPathComponent("Contents/MacOS/agent-heavy") : source.appendingPathComponent("bin/agent-heavy"),
-            arguments: ["install", "--app-bundle", app.path])
+        let request = QueueBootstrapInstall(executable: managed ? app.appendingPathComponent("Contents/MacOS/agent-heavy") : source.appendingPathComponent("bin/agent-heavy"),
+            target: .init(option: .appBundle, path: app.path))
         let cli = home.appendingPathComponent(".local/bin")
         let launch = home.appendingPathComponent("Library/LaunchAgents")
         let privateScope = QueueBootstrapFiles.Scope(root: root)
@@ -205,8 +205,8 @@ struct QueueBootstrapEnvironment: Sendable {
         guard try QueueBootstrapFiles.safeExecutable(executable, scope: scope) else {
             throw ClientError.message("The app launcher is missing or unsafe. Download Agent Queue again.")
         }
-        return ["queue", "resources", "remote"].map {
-            QueueBootstrapRequest(executable: executable, arguments: ["--service-management", "status", $0])
+        return [QueueServiceManagement.Service.queue, .resources, .remote].map {
+            QueueBootstrapRequest(executable: executable, command: .serviceStatus($0))
         }
     }
 
@@ -404,12 +404,27 @@ private struct QueueBootstrapLaunch: Decodable {
 
 struct QueueBootstrapRequest: Equatable, Sendable {
     let executable: URL
-    let arguments: [String]
+    let command: QueueClient.Command
+    var arguments: [String] { command.arguments }
+}
+
+/// The installer selected for this launch and the commands setup can send it.
+struct QueueBootstrapInstall: Equatable, Sendable {
+    let executable: URL
+    let target: QueueClient.InstallTarget
+
+    var plain: QueueBootstrapRequest { .init(executable: executable, command: .install(target)) }
+    var preflight: QueueBootstrapRequest { .init(executable: executable, command: .installPreflight(target)) }
+    var repairAndContinue: QueueBootstrapRequest { .init(executable: executable, command: .installRepairAndContinue(target)) }
+    var disablingPhoneAccess: QueueBootstrapRequest { .init(executable: executable, command: .installDisablingPhoneAccess(target)) }
+    func recovery(action: String, jobID: Int?, expectedRevision: String? = nil) -> QueueBootstrapRequest {
+        .init(executable: executable, command: .installRecovery(target, action: action, jobID: jobID, expectedRevision: expectedRevision))
+    }
 }
 
 enum QueueBootstrapDecision: Equatable, Sendable {
     case legacy, ready
-    case install(QueueBootstrapRequest, String)
+    case install(QueueBootstrapInstall, String)
 }
 
 struct QueueBootstrapAction: Codable, Equatable, Sendable, Identifiable {
@@ -510,8 +525,8 @@ final class QueueBootstrapModel: ObservableObject {
     private let waitLimit: Int
     private var attempt = 0
     private var operation: Task<Void, Never>?
-    private var request: QueueBootstrapRequest?
-    private var serviceSetupRequest: QueueBootstrapRequest?
+    private var request: QueueBootstrapInstall?
+    private var serviceSetupRequest: QueueBootstrapInstall?
     private var revision: String?
     private var legacyPhoneAccess = false
 
@@ -567,8 +582,7 @@ final class QueueBootstrapModel: ObservableObject {
 
     nonisolated static func runInstaller(_ request: QueueBootstrapRequest,
                                         output: @escaping @Sendable (Data) -> Void) async throws -> Data {
-        try await QueueClient.run(request.arguments, budget: .setup,
-            transport: .init(executable: request.executable, timeout: QueueClient.timeout(for: request.arguments, budget: .setup)), onOutput: output)
+        try await QueueClient.run(request.command, transport: .init(executable: request.executable), onOutput: output)
     }
 
     @discardableResult func start(disablePhoneAccess: Bool = false) -> Task<Void, Never>? {
@@ -598,11 +612,9 @@ final class QueueBootstrapModel: ObservableObject {
                     self.request = request
                     if disablePhoneAccess {
                         legacyPhoneAccess = false
-                        try await install(QueueBootstrapRequest(executable: request.executable,
-                            arguments: request.arguments + ["--disable-phone-access"]), reason: reason, current: current)
+                        try await install(request.disablingPhoneAccess, reason: reason, current: current)
                     } else if try await preflight(request, current: current, automatic: true) {
-                        let setup = environment.arguments.contains("--setup") ? request : QueueBootstrapRequest(executable: request.executable,
-                            arguments: request.arguments + ["--repair-and-continue"])
+                        let setup = environment.arguments.contains("--setup") ? request.plain : request.repairAndContinue
                         try await install(setup, reason: reason, current: current)
                     }
                 } else if try await hasLeftoverRegistrations() {
@@ -615,12 +627,12 @@ final class QueueBootstrapModel: ObservableObject {
                         onSetupRequired?()
                         return
                     }
-                    let setup = QueueBootstrapRequest(executable: environment.app.appendingPathComponent("Contents/MacOS/agent-heavy"),
-                        arguments: ["install", "--app-bundle", environment.app.path])
+                    let setup = QueueBootstrapInstall(executable: environment.app.appendingPathComponent("Contents/MacOS/agent-heavy"),
+                        target: .init(option: .appBundle, path: environment.app.path))
                     request = setup
                     serviceSetupRequest = setup
                     if try await preflight(setup, current: current, automatic: true) {
-                        try await install(.init(executable: setup.executable, arguments: setup.arguments + ["--repair-and-continue"]),
+                        try await install(setup.repairAndContinue,
                             reason: "Retiring background services from an older version…", current: current)
                     }
                 } else {
@@ -647,14 +659,12 @@ final class QueueBootstrapModel: ObservableObject {
                 let decision = try await inspectDecision(current)
                 guard case let .install(request, reason) = decision else { finish(current); return }
                 self.request = request
-                var arguments = request.arguments + ["--recover", actionID]
-                if let jobID { arguments += ["--job-id", String(jobID)] }
-                if actionID == "reset-callback", let approvedRevision { arguments += ["--expected-revision", approvedRevision] }
-                let data = try await execute(.init(executable: request.executable, arguments: arguments)) { _ in }
+                let data = try await execute(request.recovery(action: actionID, jobID: jobID,
+                    expectedRevision: actionID == "reset-callback" ? approvedRevision : nil)) { _ in }
                 _ = try QueueBootstrapReport.decode(data)
                 guard attempt == current else { return }
                 if try await preflight(request, current: current) {
-                    try await install(request, reason: reason, current: current)
+                    try await install(request.plain, reason: reason, current: current)
                 }
             } catch { await fail(error, current: current) }
         }
@@ -674,7 +684,7 @@ final class QueueBootstrapModel: ObservableObject {
                     guard case let .install(request, reason) = decision else { finish(current); return }
                     self.request = request
                     if try await preflight(request, current: current, waiting: true) {
-                        try await install(request, reason: reason, current: current)
+                        try await install(request.plain, reason: reason, current: current)
                         return
                     }
                     guard issues.allSatisfy({ Self.approvedRepairStep($0) != nil }) else {
@@ -704,9 +714,7 @@ final class QueueBootstrapModel: ObservableObject {
                         }
                         phase = .recovering
                         message = issues.flatMap(\.actions).first(where: { $0.id == actionID })?.title.appending("…") ?? "Repairing setup…"
-                        var arguments = request.arguments + ["--recover", actionID]
-                        if let jobID { arguments += ["--job-id", String(jobID)] }
-                        let data = try await execute(.init(executable: request.executable, arguments: arguments)) { _ in }
+                        let data = try await execute(request.recovery(action: actionID, jobID: jobID)) { _ in }
                         _ = try QueueBootstrapReport.decode(data)
                         guard attempt == current else { return }
                         phase = .checking
@@ -739,7 +747,7 @@ final class QueueBootstrapModel: ObservableObject {
                     guard case let .install(request, reason) = decision else { finish(current); return }
                     self.request = request
                     if try await preflight(request, current: current, waiting: true) {
-                        try await install(request, reason: reason, current: current)
+                        try await install(request.plain, reason: reason, current: current)
                         return
                     }
                     guard issues.allSatisfy({ $0.actions.contains(where: { $0.id == "wait" }) }) else {
@@ -837,9 +845,8 @@ final class QueueBootstrapModel: ObservableObject {
         return result
     }
 
-    private func preflight(_ request: QueueBootstrapRequest, current: Int, waiting: Bool = false, automatic: Bool = false) async throws -> Bool {
-        let data = try await execute(.init(executable: request.executable,
-            arguments: request.arguments + ["--preflight", "--json"])) { _ in }
+    private func preflight(_ request: QueueBootstrapInstall, current: Int, waiting: Bool = false, automatic: Bool = false) async throws -> Bool {
+        let data = try await execute(request.preflight) { _ in }
         guard attempt == current else { throw CancellationError() }
         try Task.checkCancellation()
         let report = try QueueBootstrapReport.decode(data)
@@ -922,8 +929,7 @@ final class QueueBootstrapModel: ObservableObject {
             issues = []
             revision = nil
             do {
-                let data = try await execute(.init(executable: request.executable,
-                    arguments: request.arguments + ["--preflight", "--json"])) { _ in }
+                let data = try await execute(request.preflight) { _ in }
                 guard attempt == current else { return }
                 try Task.checkCancellation()
                 let report = try QueueBootstrapReport.decode(data)

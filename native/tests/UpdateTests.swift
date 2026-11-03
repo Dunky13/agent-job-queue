@@ -99,7 +99,7 @@ struct UpdateTests {
         try check(RunningQueueVersion.current(bundle: publishedBundle).metadataError != nil,
             "Mismatched running metadata is reported instead of silently treated as legacy")
         let fixture = UpdateFixture()
-        let store = QueueUpdateStore(running: running, command: { try await fixture.load($0) })
+        let store = QueueUpdateStore(running: running, command: { try await fixture.load($0.arguments) })
         try check(store.running.displayVersion == "1.0.0 · build 100" && store.installed == nil,
             "Running bundle version appears before controller I/O")
         let initialCalls = await fixture.calls
@@ -160,19 +160,19 @@ struct UpdateTests {
         try check(!store.canDownload, "Newer installed source build cannot downgrade")
         await fixture.setComparison(.available, installable: true)
         let newerRunning = QueueUpdateStore(running: RunningQueueVersion(version: "1.1.0", bundleBuild: "105", publishedBuild: 105),
-            command: { try await fixture.load($0) })
+            command: { try await fixture.load($0.arguments) })
         await newerRunning.checkForUpdates()?.value
         try check(!newerRunning.canDownload && newerRunning.compatibilityMessage?.contains("newer") == true,
             "A newer running bundle independently prevents backend-triggered downgrade")
         let unknownRunning = QueueUpdateStore(running: RunningQueueVersion(version: "1.0.0", bundleBuild: "0"),
-            command: { try await fixture.load($0) })
+            command: { try await fixture.load($0.arguments) })
         await unknownRunning.checkForUpdates()?.value
         try check(unknownRunning.canDownload && unknownRunning.isReplacement &&
             unknownRunning.downloadButtonLabel == "Download published build…" &&
             unknownRunning.compatibilityMessage?.contains("replace") == true,
             "Unknown running build offers an explicit published-build replacement")
         let invalidRunning = QueueUpdateStore(running: RunningQueueVersion(version: "1.0.0", bundleBuild: "100",
-            metadataError: "Running metadata is invalid"), command: { try await fixture.load($0) })
+            metadataError: "Running metadata is invalid"), command: { try await fixture.load($0.arguments) })
         await invalidRunning.checkForUpdates()?.value
         try check(!invalidRunning.canDownload && invalidRunning.compatibilityMessage == "Running metadata is invalid",
             "Invalid running provenance disables downloading with a visible explanation")
@@ -196,27 +196,28 @@ struct UpdateTests {
             "Untrusted release URL is rejected before it reaches links or download controls")
 
         let callsBeforePreview = await fixture.calls
-        let preview = QueueUpdateStore(fixtureMode: true, command: { try await fixture.load($0) })
+        let preview = QueueUpdateStore(fixtureMode: true, command: { try await fixture.load($0.arguments) })
         await preview.refreshInstalled()
         try check(preview.checkForUpdates() == nil && preview.downloadUpdate() == nil && !preview.canDownload,
             "Fixture update controls cannot invoke live commands")
         let callsAfterPreview = await fixture.calls
         try check(callsAfterPreview == callsBeforePreview && preview.check?.latest?.build == 101,
             "Snapshot fixture has a simulated release and performs no external effects")
-        for role in ["queue", "resources", "remote", "login"] {
-            try check(QueueClient.timeout(for: ["--service-management", "status", role], budget: .setup) == 5,
-                "Exact native status for \(role) has a five-second read budget")
+        for service in QueueServiceManagement.Service.allCases {
+            try check(QueueClient.Command.serviceStatus(service).timeout == 5,
+                "Exact native status for \(service.rawValue) has a five-second read budget")
         }
-        try check(QueueClient.timeout(for: ["--service-management", "register", "queue"], budget: .setup) == 330 &&
-            QueueClient.timeout(for: ["--service-management", "status", "queue", "extra"], budget: .setup) == 330 &&
-            QueueClient.timeout(for: ["--service-management", "status", "unknown"], budget: .setup) == 330,
-            "Native mutation and malformed arguments cannot inherit discardable read budgets")
-        try check(QueueClient.timeout(for: ["status"], budget: .updates) == 8 &&
-            QueueClient.timeout(for: ["cancel", "1"]) == 25 &&
-            QueueClient.timeout(for: ["status"], controller: .remote) == 8 &&
-            QueueClient.timeout(for: ["configure"], controller: .remote) == 125 &&
-            QueueClient.timeout(for: ["updates", "download"], budget: .updates) == 130 &&
-            QueueClient.timeout(for: ["updates", "download"]) == 25,
+        try check([["--service-management", "register", "queue"], ["--service-management", "status", "queue", "extra"],
+                   ["--service-management", "status", "unknown"]].allSatisfy {
+                let command = QueueClient.Command.setup($0)
+                return command.timeout == 330 && command.cancellation == .retain
+            }, "Native mutation and malformed arguments cannot inherit discardable read budgets")
+        try check(QueueClient.Command.status.timeout == 8 &&
+            QueueClient.Command.jobAction("cancel", id: 1).timeout == 25 &&
+            QueueClient.Command.remoteStatus.timeout == 8 &&
+            QueueClient.Command.remoteConfigure(Data()).timeout == 125 &&
+            QueueClient.Command.updatesDownload(build: 1).timeout == 130 &&
+            QueueClient.Command.version.timeout == 25,
             "Explicit update deadline leaves normal queue and remote deadlines unchanged")
     }
 }
