@@ -79,8 +79,9 @@ func TestManagedRemovalAfterUnregisterAcceptsNotFoundOnlyWhenUnloaded(t *testing
 			managedRemovalTarget(i)
 			original := i.command
 			i.command = func(ctx context.Context, args []string) ([]byte, error) {
-				// A later lookup can miss a service that unregistered successfully.
-				if len(args) == 3 && args[1] == "--prepare-app-replacement" {
+				// Only the final check reads this status once the login item is gone. A
+				// lookup there can miss a service that unregistered successfully.
+				if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" && args[3] == "queue" && m.statuses["login"] == "notRegistered" {
 					m.statuses["queue"] = "notFound"
 					if loaded {
 						m.loaded["io.went.agent-heavy"] = true
@@ -123,8 +124,8 @@ func TestManagedRemovalOfSupervisedApp(t *testing.T) {
 	private := integrationTestRead(t, QueueDatabasePath(i.state))
 	managedRemovalTarget(i)
 
-	// A running app's daemon holds its lifetime lock and launchd knows nothing of
-	// it, so removal refuses before it reaches its quit step.
+	// Nothing proves this holder belongs to the app, so removal refuses. A running
+	// app's own daemon is covered in install_managed_running_app_test.go.
 	held, err := installLock(i.state, "queue-daemon.lock")
 	if err != nil {
 		t.Fatal(err)
@@ -132,7 +133,7 @@ func TestManagedRemovalOfSupervisedApp(t *testing.T) {
 	before := installTreeWitness(t, i.home)
 	m.calls = nil
 	if err := m.run(t); err == nil || !strings.Contains(err.Error(), "lifetime lock") {
-		t.Fatal("removal ran beside a running daemon", err)
+		t.Fatal("removal ran beside an unowned daemon", err)
 	}
 	managedRequireNoServiceMutation(t, m.calls)
 	if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {

@@ -24,7 +24,7 @@
 
 <p>The first launch completes setup. Opening the app from Applications writes the <code>agent-heavy</code> and <code>agent-remote</code> wrappers to <code>~/.local/bin</code>, migrates state and unregisters any queue, resource or phone-access services that older versions registered. The app then starts and supervises its own queue processes; only its login item is registered with Service Management. A later <code>brew upgrade</code> replaces the app, and the next launch completes the upgrade. Normal app launch only reads installation and authorization state until setup runs; it never deletes executable code.</p>
 
-<p>Homebrew uninstall asks a running app to quit, which stops its queue processes while running job processes continue, then removes the app. Services, jobs, history and credentials are removed only by the app&#39;s ownership-checked service-removal command, which the cask caveats name and which must run before deleting the app:</p>
+<p>Homebrew uninstall asks a running app to quit, which stops its queue processes while running job processes continue, then removes the app. Services, jobs, history and credentials are removed only by the app&#39;s ownership-checked service-removal command, which the cask caveats name and which must run before deleting the app. It asks a running app&#39;s queue whether it is drained and then quits the app. With active jobs it refuses and leaves the app running:</p>
 
 <pre>~/.local/bin/agent-heavy install --app-bundle "/Applications/Agent Queue.app" --unregister-services</pre>
 

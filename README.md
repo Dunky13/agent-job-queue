@@ -40,7 +40,7 @@ To upgrade, quit Agent Queue, drag the new version over the old one and choose *
 
 If you move the app between `/Applications` and `~/Applications`, delete or replace the old copy first. Setup refuses to adopt a second copy while the recorded one still exists.
 
-To remove Agent Queue, finish queued and running jobs, quit the app, which stops its queue processes, then run this command, which removes its login item, and move the app to the Trash:
+To remove Agent Queue, finish queued and running jobs, then run this command and move the app to the Trash. It asks the queue whether it is drained, quits the app, which stops its queue processes, and removes its login item. If jobs are still active it refuses and leaves the app running.
 
 ```sh
 agent-heavy install --app-bundle "/Applications/Agent Queue.app" --unregister-services

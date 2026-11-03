@@ -45,11 +45,28 @@ Still live, despite how they read: `serviceEnvironment`, `managedStopMenu`, `man
 
 ## Removal on a supervised app
 
-Traced through the code and exercised by `TestManagedRemovalOfSupervisedApp` and the packaged test. It has not been run against real Service Management on a real Mac.
+Owner decision: removal checks the drain over RPC, then quits the app itself. `--unregister-services` on a running app now works like this:
 
-With the app quit, it works: planning accepts `notFound` for queue, resources and remote, the offline drain gate runs against the stopped store, only the login item is unregistered, the menu app is asked to quit, and the wrappers, `installation.json` and the marker are removed. The app, queue store and private data stay.
+1. **Recognise the lock holders.** For each lifetime lock that is busy with nothing loaded in launchd, `managedHeldByApp` finds the holders with `lsof`, then requires the kernel's record of each one's executable to be this bundle's helper and its parent's to be this bundle's `AgentQueue`. Anything else, including no evidence, is still "unowned" and refuses. That includes the app's own helper running without the app.
+2. **Ask the running daemon.** `managedRunningAppDrained` reads the snapshot over RPC. With active or queued jobs it refuses with a message that says so, and it never quits the app. If the daemon does not answer it also refuses.
+3. **Quit, then unregister.** `managedStopMenu` now runs before `quiesceManaged`, because only quitting stops the helpers the app supervises and `quiesceManaged` needs their locks free. The native step waits for the app to exit, and the app exits only after its helpers stop.
 
-**With the app running, it refuses.** Its daemon holds `queue-daemon.lock` and launchd knows nothing of it, so `managedDrain` stops with "An unowned queue process holds its lifetime lock". That is before the quit step runs, and nothing changes. The README said the command quits the app, which was wrong for any running app, so the README now says to quit first. See follow-up 1.
+The check runs twice, the second time under `scheduling.lock`, which job submission also needs, so a job submitted through `agent-heavy run` cannot start between the check and the quit. Removal now waits up to 10 seconds for that lock, the bound `LockPrivate` gives everyone else, because a running app's helpers hold it briefly during normal work.
+
+After the quit, the existing checks still apply. If a job somehow shows `phase != done` while the snapshot shows `Done`, the offline drain refuses at that point, with the app already quit. That is the one way the app can be quit and removal still refuse. The marker stays and retrying works.
+
+**Preflight had the same check.** Run from outside against a healthy running app, it reported "An unowned queue process holds its lifetime lock", from the same `managedDrain` branch. It and setup now report `app-running` and `errInstallAppRunning`, and change nothing. Setup still cannot run beside the app's helpers. The ID has only a `wait` action, and Go and Swift both treat it as needing review, as they did `managed-setup-blocked`.
+
+**What ran against the real thing.** `install_managed_running_app_test.go` uses a real process tree: copies of the test binary at the bundle's `AgentQueue` and `agent-heavy` paths, with the real daemon and scheduler as children, real `flock`, real `lsof`, the kernel's process records and real daemon RPC. Mutations removing recognition, the parent check or the drain check, or moving the quit after unregistering, each fail these tests.
+
+**What has not run against the real thing:**
+
+- Real Service Management, `codesign` and the native quit request are mocked, so nothing here shows `NSRunningApplication` quitting a real menu bar app. The fixture "app" stops its children on SIGTERM.
+- The phone service in the test is a stand-in holding its lock and record, not `agent-remote serve`.
+- `lsof` on a real signed app has not been seen.
+- Kernel paths are compared exactly. A real app launched through LaunchServices should record its plain `/Applications/...` path, as `managedLoadedBundleProgram` already assumes, but only a run on a real Mac shows it.
+
+**The cask caveat changed with it,** in `internal/tooling/tooling.go` and `packaging/homebrew/refresh.go`, along with `refresh_test.go`. **A companion PR against the tap's `tap` branch must merge before this PR.** It copies `refresh.go`, `refresh_test.go`, `test-cask.rb` and `.github/workflows/refresh.yml` byte for byte, following `docs/homebrew-delivery.md`. Delivery compares those helpers byte for byte, so merging here first fails delivery visibly. The published cask keeps its text until the next numbered build. I have not opened that PR.
 
 ## Test porting
 
@@ -69,7 +86,7 @@ Limits of the seeding:
 
 Seeding the marker first caused a flake while porting, in about one run in 12 on a busy host. The fixture's real daemon and scheduler take `scheduling.lock` during normal work, so setup can get the transient refusal in follow-up 3 of `retire-handover-begin.md`. `runPackagedSetup` retries that only when no pending marker predates the call, and on #67 none did. Now `managedOlderPublication` sets `seededPending`, which excuses that one marker for one call. `TestPackagedSetupRetriesBusyOnlyOverASeededMarkerOnce` holds the rule, and the strict case in `TestPackagedSetupNeverRetriesMutationOrUncertainHistory` is unchanged. The finish-pending test now logs the setup error, last phase and daemon log when that wait fails.
 
-Backend top-level tests went from 501 to 478. Tests not listed below keep their names. Many had their setup ported and lost assertions on the launchd definitions that only the tail wrote. Each kept its subject: callback spellings, drain, Pueue import, slot, phone recovery, ownership refusal and so on.
+Backend top-level tests went from 501 to 486. Tests not listed below keep their names. Many had their setup ported and lost assertions on the launchd definitions that only the tail wrote. Each kept its subject: callback spellings, drain, Pueue import, slot, phone recovery, ownership refusal and so on.
 
 | Before | After | Reason |
 |---|---|---|
@@ -89,6 +106,7 @@ Backend top-level tests went from 501 to 478. Tests not listed below keep their 
 | `TestManagedSharedAppStagesThenMovesThroughFD`, `TestManagedSharedCopyBoundsAndOwnership`, `TestManagedSharedCopyDetectsReboundChild`, `TestManagedSharedCopyPinsParentDescriptor`, `TestManagedSharedCopyPreservesPrivateBoundary`, `TestManagedSharedCopyRefusesUnsafeEntries`, `TestManagedSharedNativeCopyRetainsMetadataAndVerifiesBeforeMove` | deleted | Tested the deleted copier. |
 | | `TestManagedRemovalAfterUnregisterAcceptsNotFoundOnlyWhenUnloaded`, `TestManagedRemovalOfSupervisedApp` | New, for the removal fix. Both fail with the old checks restored. |
 | | `TestPackagedSetupRetriesBusyOnlyOverASeededMarkerOnce` | New, for the seeded marker above. |
+| | `TestManagedRemovalOfRunningAppQuitsItOnceDrained`, `TestManagedRemovalOfRunningAppStopsItsPhoneService`, `TestManagedRemovalOfRunningAppRefusesActiveJobs`, `TestManagedRemovalRefusesWhenDrainCannotBeVerified`, `TestManagedRemovalRefusesUnownedLockHolder`, `TestManagedSetupAndPreflightNameARunningApp`, `TestManagedPreflightStillReportsUnownedLockHolder`, `TestManagedRemovalWaitsBrieflyForSchedulingLock` | New, for removal from a running app. |
 
 Subtests that went away:
 
@@ -103,6 +121,7 @@ Some legacy preflight tests now seed phone access or a blocked older install, be
 - Any validated bundle is marked and self-contained. No code path copies an app or writes a launchd definition.
 - `validatePayload` and `validateServices` return their results and set nothing.
 - Setup registers only the login item, except when a live handover is being resumed.
+- A lifetime lock held by this app's own child helper is the running app, not an unowned process. Setup refuses it as `errInstallAppRunning`, and removal quits it once drained.
 - Publication receipts and backups are only ever read and retired. Nothing writes a new one.
 - `install.run`'s argv sniffing and the Swift setup logic are unchanged, apart from removing the payload alternatives from `commandEnvironment`.
 
@@ -110,14 +129,14 @@ Some legacy preflight tests now seed phone access or a blocked older install, be
 
 | | Added | Removed | Net |
 |---|---|---|---|
-| Production | 291 | 1627 | -1336 |
-| Tests | 1124 | 2158 | -1034 |
+| Production | 419 | 1636 | -1217 |
+| Tests | 1575 | 2165 | -590 |
 
 This is one PR rather than two: with `--payload` gone, the small shape is what remains.
 
 ## Follow-ups, not fixed here
 
-1. **Removal refuses a running app, with a misleading message.** The cask caveat, "Before removing the app, stop its services with", does not say to quit either, and the tap tooling pins that text. The options are to keep quit-first and improve the message, or to verify the drain over RPC when the lifetime lock is busy and then quit the app. The second makes the old README promise true, and is what I would do.
+1. **The tap companion PR** for the changed cask template, which must merge first. See Removal on a supervised app.
 2. **An untracked build cannot install after removal.** Removal keeps `build-info.json` so it cannot reset version ordering, and setup refuses an untracked build over it. The check stays. `CONTRIBUTING.md` now gives the route: build with a higher `BUILD_NUMBER` and `SOURCE_COMMIT`. `TestManagedRemovalOfSupervisedApp` holds both sides.
 3. **`native/AgentQueue.swift` and `TransportTests.swift` still classify `--payload` argv.** This is harmless, and belongs in a Swift PR.
 4. **The `service-approval` ID** is still recognised in `install_approved_repair.go` and `AgentBootstrap.swift`, and nothing emits it now.
@@ -134,5 +153,5 @@ Validation results are recorded in the PR description, pinned to its head.
 
 1. Independent review of the head, including a real older build through the seeded phases if wanted.
 2. Hosted CI on this PR, which is the first run of the ported packaged tests on Intel and Apple Silicon.
-3. The owner's decision on follow-up 1.
+3. The tap companion PR, then a run of removal against a running app on a real Mac.
 4. The stacked PR for `install.run` argv sniffing and typed commands.

@@ -3,6 +3,7 @@ package backend
 import (
 	"bytes"
 	"errors"
+	"os"
 
 	"golang.org/x/sys/unix"
 )
@@ -22,4 +23,17 @@ func installProcessExecutable(pid int) (string, error) {
 		return "", errors.New("process executable path is unavailable")
 	}
 	return string(path), nil
+}
+
+// installProcessParent returns the parent the kernel records for a process this
+// user owns.
+func installProcessParent(pid int) (int, error) {
+	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil {
+		return 0, err
+	}
+	if int(info.Proc.P_pid) != pid || info.Eproc.Pcred.P_ruid != uint32(os.Getuid()) {
+		return 0, errors.New("process does not belong to this user")
+	}
+	return int(info.Eproc.Ppid), nil
 }

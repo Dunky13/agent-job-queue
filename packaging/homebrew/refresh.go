@@ -776,7 +776,7 @@ const caskTemplate = `cask "agent-job-queue" do
 
   caveats <<~EOS
     Open Agent Queue from Applications to use its menu bar.
-    Before removing the app, stop its services with:
+    Before removing the app, finish its jobs, then quit it and stop its services with:
       ~/.local/bin/agent-heavy install --app-bundle "#{appdir}/Agent Queue.app" --unregister-services
   EOS
 end

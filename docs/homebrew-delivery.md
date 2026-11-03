@@ -22,7 +22,7 @@ The cask is a plain app cask. Its only artifacts are `app "Agent Queue.app"`, wh
 
 The first launch completes setup. Opening the app from Applications writes the `agent-heavy` and `agent-remote` wrappers to `~/.local/bin`, migrates state and unregisters any queue, resource or phone-access services that older versions registered. The app then starts and supervises its own queue processes; only its login item is registered with Service Management. A later `brew upgrade` replaces the app, and the next launch completes the upgrade. Normal app launch only reads installation and authorization state until setup runs; it never deletes executable code.
 
-Homebrew uninstall asks a running app to quit, which stops its queue processes while running job processes continue, then removes the app. Services, jobs, history and credentials are removed only by the app's ownership-checked service-removal command, which the cask caveats name and which must run before deleting the app:
+Homebrew uninstall asks a running app to quit, which stops its queue processes while running job processes continue, then removes the app. Services, jobs, history and credentials are removed only by the app's ownership-checked service-removal command, which the cask caveats name and which must run before deleting the app. It asks a running app's queue whether it is drained and then quits the app. With active jobs it refuses and leaves the app running:
 
 ```sh
 ~/.local/bin/agent-heavy install --app-bundle "/Applications/Agent Queue.app" --unregister-services

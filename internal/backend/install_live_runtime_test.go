@@ -106,12 +106,10 @@ func requireLiveReceiptPhase(t *testing.T, i *installer, phase string) {
 }
 
 // liveRuntimeFixture installs build 123 with real daemons in a short private home.
-func liveRuntimeFixture(t *testing.T, executable string) *managedFixture {
+// managedShortHome moves the fixture and its bundle under a short private home,
+// because Darwin's Unix socket pathname budget is smaller than t.TempDir's path.
+func managedShortHome(t *testing.T, i *installer) {
 	t.Helper()
-	m := managedTestFixture(t)
-	i := m.installer
-	// Darwin's Unix socket pathname budget is smaller than t.TempDir's full
-	// descriptive path. Keep the private fixture home deliberately short.
 	base, err := os.MkdirTemp("/tmp", "aq-live-")
 	if err != nil {
 		t.Fatal(err)
@@ -132,10 +130,17 @@ func liveRuntimeFixture(t *testing.T, executable string) *managedFixture {
 	i.config = filepath.Join(i.home, ".config/agent-heavy")
 	i.launch = filepath.Join(i.home, "Library/LaunchAgents")
 	i.app = filepath.Join(i.home, "Applications/Agent Queue.app")
-	i.path += ":/usr/bin:/bin"
 	if err := installCopyTree(bundle, i.app); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func liveRuntimeFixture(t *testing.T, executable string) *managedFixture {
+	t.Helper()
+	m := managedTestFixture(t)
+	i := m.installer
+	managedShortHome(t, i)
+	i.path += ":/usr/bin:/bin"
 	binary, err := os.ReadFile(executable)
 	if err != nil {
 		t.Fatal(err)

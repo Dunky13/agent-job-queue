@@ -60,9 +60,17 @@ var errInstallServiceNotLoaded = errors.New("Launch service is not loaded")
 var errInstallPendingCleanup = errors.New("Queue migration must wait for queue work and cleanup to finish. Retained receipts or owned lease markers may still belong to running jobs. Existing files were preserved.")
 var errInstallCustomCallback = errors.New("Custom cleanup callback cannot be retained by managed migration; it will be backed up before replacement")
 
-type installDrainPendingError struct{ tasks Object }
+var errInstallAppRunning = errors.New("Agent Queue is running and owns its queue processes. Quit it before running setup. Removal with --unregister-services quits it once its queue is drained")
+
+type installDrainPendingError struct {
+	tasks   Object
+	removal bool
+}
 
 func (err *installDrainPendingError) Error() string {
+	if err.removal {
+		return "Agent Queue still has active or queued jobs. Finish or cancel them, then run removal again. The app was left running and nothing was changed"
+	}
 	return "Queue migration requires a drained queue. Finish or cancel all queued, stashed, running, and paused jobs, then open Agent Queue again"
 }
 

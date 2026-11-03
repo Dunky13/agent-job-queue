@@ -16,7 +16,7 @@ For an incompatible legacy cleanup callback, automatic setup backs up the exact 
 
 ## Upgrading with active jobs
 
-Setup never starts a live handover. If a queue daemon is still running, as one registered by an older version can be, setup waits for its running and queued jobs to finish before replacing it. Removal and relocation always require a drained queue. Uncertain attempts, ownership or changed custody still fail closed; setup never discards their evidence.
+Setup never starts a live handover. If a queue daemon is still running, as one registered by an older version can be, setup waits for its running and queued jobs to finish before replacing it. Removal and relocation always require a drained queue. Removal from a running app asks that app's daemon, and quits the app only when the queue is drained; otherwise it refuses and leaves the app running. A lifetime lock held by anything but this app's own helper, running as this app's child, still refuses. Setup run from outside a running app reports `app-running` instead of changing anything. Uncertain attempts, ownership or changed custody still fail closed; setup never discards their evidence.
 
 Quitting the app stops its daemon without stopping independent jobs, so a normal upgrade at the same location has no daemon to wait for. What happens next differs by who is watching:
 

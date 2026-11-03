@@ -219,23 +219,36 @@ func (install *installer) managedSnapshot(ctx context.Context) (Object, error) {
 }
 
 func (install *installer) managedDrain(ctx context.Context, p *managedPlan) error {
+	appRunning := false
 	for name, label := range map[string]string{"queue-daemon.lock": "io.went.agent-heavy", "resource-controller.lock": "io.went.agent-resources"} {
 		busy, err := installInspectLock(install.state, name)
 		if err != nil {
 			return err
 		}
 		if busy && !p.loaded[label] {
-			return errors.New("An unowned queue process holds its lifetime lock; setup refused before service mutation")
+			if !install.managedHeldByApp(ctx, filepath.Join(install.state, name), "agent-heavy") {
+				return errors.New("An unowned queue process holds its lifetime lock; setup refused before service mutation")
+			}
+			appRunning = true
 		}
 	}
 	busy, err := installInspectLock(filepath.Join(install.state, "remote"), "supervisor.lock")
 	if err != nil {
 		return err
 	}
+	remoteRunning := false
 	if busy && !p.loaded["io.went.agent-remote"] {
-		return errors.New("An unowned phone access process holds its lifetime lock; setup refused before service mutation")
+		if !install.managedHeldByApp(ctx, filepath.Join(install.state, "remote/supervisor.lock"), "agent-remote") {
+			return errors.New("An unowned phone access process holds its lifetime lock; setup refused before service mutation")
+		}
+		appRunning, remoteRunning = true, true
 	}
-	if install.unregisterServices && !p.loaded["io.went.agent-remote"] {
+	if appRunning && !install.unregisterServices {
+		return errInstallAppRunning
+	}
+	// A phone service the app supervises legitimately holds these records until
+	// the app stops it. managedStopped checks them again after that.
+	if install.unregisterServices && !p.loaded["io.went.agent-remote"] && !remoteRunning {
 		cleanup, err := install.disabledRemoteCleanup(ctx)
 		if err != nil {
 			return err
@@ -243,6 +256,9 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		if cleanup {
 			return errors.New("Phone access has retained process ownership records without an owned loaded service; disable phone access before retrying")
 		}
+	}
+	if appRunning {
+		return install.managedRunningAppDrained(ctx)
 	}
 	if p.pueue {
 		return nil
@@ -281,6 +297,58 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		return errors.New("Cannot verify drained queue: invalid queue snapshot")
 	}
 	if err := installRequireDrained(tasks); err != nil {
+		return err
+	}
+	return install.requireLegacyCleanup()
+}
+
+// managedHeldByApp reports whether every process holding a lifetime lock is this
+// app's own helper, running as a child of this app. launchd knows nothing of
+// those, so the kernel's record of each executable and parent is the evidence.
+// Anything else, including no evidence, leaves the holder unowned.
+func (install *installer) managedHeldByApp(ctx context.Context, lock, helper string) bool {
+	output, err := install.run(ctx, "/usr/sbin/lsof", "-nP", "-t", "--", lock)
+	if err != nil {
+		return false
+	}
+	holders := strings.Fields(string(output))
+	for _, holder := range holders {
+		pid, err := strconv.Atoi(holder)
+		if err != nil || pid <= 1 {
+			return false
+		}
+		executable, err := installProcessExecutable(pid)
+		if err != nil || executable != filepath.Join(install.app, "Contents/MacOS", helper) {
+			return false
+		}
+		parent, err := installProcessParent(pid)
+		if err != nil || parent <= 1 {
+			return false
+		}
+		executable, err = installProcessExecutable(parent)
+		if err != nil || executable != filepath.Join(install.app, "Contents/MacOS/AgentQueue") {
+			return false
+		}
+	}
+	return len(holders) > 0
+}
+
+// managedRunningAppDrained asks the running daemon, because removal may only quit
+// the app when that strands nothing. It changes nothing either way.
+func (install *installer) managedRunningAppDrained(ctx context.Context) error {
+	snapshot, err := install.managedSnapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("Cannot verify that the running queue is drained. The app was left running and nothing was changed: %w", err)
+	}
+	tasks := obj(snapshot["tasks"])
+	if tasks == nil {
+		return errors.New("Cannot verify that the running queue is drained: invalid queue snapshot. The app was left running and nothing was changed")
+	}
+	var drain *installDrainPendingError
+	if err := installRequireDrained(tasks); errors.As(err, &drain) {
+		drain.removal = true
+		return drain
+	} else if err != nil {
 		return err
 	}
 	return install.requireLegacyCleanup()
@@ -1031,6 +1099,23 @@ func (install *installer) managedRemovalNotFound(ctx context.Context, service st
 	return nil
 }
 
+// managedRemovalSchedulingLock gives a busy lock the bound LockPrivate gives
+// everyone else, because a running app's helpers take it during normal work.
+func (install *installer) managedRemovalSchedulingLock(ctx context.Context) (*os.File, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		lock, err := installLock(install.state, "scheduling.lock")
+		if err == nil || !errors.Is(err, unix.EWOULDBLOCK) || time.Now().After(deadline) {
+			return lock, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 // Removal is an explicit mutation, separate from read-only preflight. The app
 // may be deleted only after this operation succeeds.
 func (install *installer) prepareManaged(ctx context.Context) error {
@@ -1039,7 +1124,9 @@ func (install *installer) prepareManaged(ctx context.Context) error {
 			return err
 		}
 	}
-	for _, entry := range []struct{ directory, name string }{{install.state, "install.lock"}, {install.state, "scheduling.lock"}, {filepath.Join(install.state, "remote"), "control.lock"}} {
+	// A running app's helpers hold scheduling.lock for moments at a time, so that
+	// one is only waited for below.
+	for _, entry := range []struct{ directory, name string }{{install.state, "install.lock"}, {filepath.Join(install.state, "remote"), "control.lock"}} {
 		busy, err := installInspectLock(entry.directory, entry.name)
 		if err != nil {
 			return err
@@ -1061,7 +1148,8 @@ func (install *installer) prepareManaged(ctx context.Context) error {
 		return err
 	}
 	// The first complete inspection above creates no files. Recheck under all
-	// three locks, retaining scheduling.lock through drain and daemon shutdown.
+	// three locks, retaining scheduling.lock through drain and daemon shutdown:
+	// job submission needs it, so nothing can start after the check below.
 	for _, directory := range []string{install.root, install.state, filepath.Join(install.state, "remote")} {
 		exists, err := updateExists(directory)
 		if err != nil {
@@ -1080,7 +1168,7 @@ func (install *installer) prepareManaged(ctx context.Context) error {
 		return err
 	}
 	defer lock.Close()
-	scheduling, err := installLock(install.state, "scheduling.lock")
+	scheduling, err := install.managedRemovalSchedulingLock(ctx)
 	if err != nil {
 		return err
 	}
@@ -1119,10 +1207,12 @@ func (install *installer) prepareManaged(ctx context.Context) error {
 	if err := installAtomic(marker, raw, 0600); err != nil {
 		return err
 	}
-	if err := install.quiesceManaged(ctx, p); err != nil {
+	// A running app must quit first: only that stops the helpers it supervises,
+	// which quiesceManaged requires, and it replies only once they have stopped.
+	if err := install.managedStopMenu(ctx); err != nil {
 		return err
 	}
-	if err := install.managedStopMenu(ctx); err != nil {
+	if err := install.quiesceManaged(ctx, p); err != nil {
 		return err
 	}
 	for service := range p.statuses {
@@ -1741,6 +1831,8 @@ func (install *installer) preflightManaged(ctx context.Context, report installPr
 		var drain *installDrainPendingError
 		var pending *installPendingError
 		switch {
+		case errors.Is(err, errInstallAppRunning):
+			report.add("app-running", "Agent Queue is running", err.Error(), "", "wait")
 		case errors.As(err, &pending):
 			report.addPendingInstallation(err.Error(), install.liveJournalPath(), "download-release", "reveal")
 		case errors.Is(err, errInstallPendingCleanup):

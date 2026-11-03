@@ -21,6 +21,10 @@ func TestMain(m *testing.M) {
 	// exercises the real CLI and worker implementation without a nested build.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case fixtureSupervisingApp:
+			os.Exit(fixtureSuperviseHelpers(os.Args[2], os.Args[3:]...))
+		case fixturePhoneService:
+			os.Exit(fixtureHoldPhoneService(os.Args[2]))
 		case "daemon", "pause", "resume", "execute-attempt", "execute", "cleanup", "run", "status", "cancel", "limit", "next", "last", "priority", "start", "scheduler", "scheduling", "profiles", "agents", "updates", "version", "install":
 			os.Exit(Main(os.Args[1:]))
 		}
