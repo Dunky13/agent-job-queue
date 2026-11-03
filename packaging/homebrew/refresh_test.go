@@ -315,7 +315,7 @@ func TestRenderedCaskRetainsQuarantine(t *testing.T) {
 			t.Fatalf("rendered cask contains quarantine bypass: %s", unsafe)
 		}
 	}
-	for _, expected := range []string{"Agent-Queue-0.1.0-universal.zip\"", "\n  app \"Agent Queue.app\"\n", "\n  uninstall quit: \"io.went.agent-queue\"\n", "Open Agent Queue from Applications to use its menu bar.", "finish its jobs, then quit it", "--unregister-services", "Preserve quarantine so macOS can assess the notarized release."} {
+	for _, expected := range []string{"Agent-Queue-0.1.0-universal.zip\"", "\n  app \"Agent Queue.app\"\n", "\n  uninstall quit: \"io.went.agent-queue\"\n", "Open Agent Queue from Applications to use its menu bar.", "It quits the app and removes its login item", "--unregister-services", "Preserve quarantine so macOS can assess the notarized release."} {
 		if !strings.Contains(cask, expected) {
 			t.Fatalf("rendered cask is missing %q", expected)
 		}

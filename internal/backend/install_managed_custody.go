@@ -234,7 +234,7 @@ func (install *installer) managedBackupAccess() error {
 	}
 	if !present {
 		if exists {
-			return nil // Recovery checks the same receipt under locks before rename.
+			return nil // Planning refuses a missing app with a retained backup, and keeps both.
 		}
 		return errors.New("Publication receipt has neither its candidate nor its backup; evidence preserved")
 	}
@@ -268,9 +268,9 @@ func (install *installer) managedLifecycleCustody() error {
 }
 
 func (install *installer) managedValidateExpected(expected BuildInfo) error {
-	// validatePayload rechecks source, pending and target build ordering. Never
+	// validateBundle rechecks source, pending and target build ordering. Never
 	// allow its identity refresh to replace the already selected candidate.
-	current, err := install.validatePayload()
+	current, err := install.validateBundle()
 	if err != nil {
 		return err
 	}

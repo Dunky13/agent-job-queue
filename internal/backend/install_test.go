@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1579,29 +1580,108 @@ func TestInstallerPhoneAccessRecoveryRejectsUnownedServices(t *testing.T) {
 	}
 }
 
+// The app reads this marker from InstallMain's stderr. Nothing here is mocked but
+// Service Management and launchctl: the bundle carries real ad hoc signatures.
 func TestInstallMainLegacyPhoneAccessRecoveryDiagnostic(t *testing.T) {
-	f := installTestFixture(t)
-	f.legacy(t)
-	install := f.installer
-	integrationTestWrite(t, filepath.Join(install.config, "remote.json"), []byte(`{"enabled":true}`))
-	command := install.command
-	install.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if slices.Equal(args, []string{filepath.Join(install.app, "Contents/MacOS/agent-remote"), "disable"}) {
-			return nil, errors.New("fixture disable failure")
-		}
-		return command(ctx, args)
+	if runtime.GOOS != "darwin" {
+		t.Skip("signature verification requires macOS")
 	}
-	for _, recovery := range []bool{false, true} {
-		install.disablePhoneAccess = recovery
-		err := f.run(t)
-		var message bytes.Buffer
-		installReportFailure(&message, err)
-		marker := strings.Contains(message.String(), "\n"+installDisablePhoneAccessRecovery+"\n")
-		if err == nil || marker == recovery {
-			t.Fatalf("recovery=%v: marker=%v diagnostic=%s", recovery, marker, message.String())
+	f := installTestFixture(t)
+	i := f.installer
+	root, err := os.MkdirTemp("/tmp", "agent-queue-install-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	if root, err = filepath.EvalSymlinks(root); err != nil {
+		t.Fatal(err)
+	}
+	bundle := i.app
+	i.home, i.path = filepath.Join(root, "User With Spaces"), filepath.Join(root, "tools")
+	for _, directory := range []string{i.home, i.path} {
+		if err := os.Mkdir(directory, 0700); err != nil {
+			t.Fatal(err)
 		}
-		if recovery && !strings.Contains(message.String(), "fixture disable failure") {
-			t.Fatalf("recovery failed without actionable diagnostic: %s", message.String())
+	}
+	t.Setenv("HOME", i.home)
+	i.root = filepath.Join(i.home, ".local/share/agent-heavy")
+	i.state = filepath.Join(i.home, ".local/state/agent-heavy")
+	i.config = filepath.Join(i.home, ".config/agent-heavy")
+	i.launch = filepath.Join(i.home, "Library/LaunchAgents")
+	i.app = filepath.Join(i.home, "Applications/Agent Queue.app")
+	if err := installCopyTree(bundle, i.app); err != nil {
+		t.Fatal(err)
+	}
+	info, err := updatePlist(filepath.Join(i.app, "Contents/Info.plist"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info["CFBundleExecutable"], info["CFBundlePackageType"] = "AgentQueue", "APPL"
+	if err := i.writePlist(filepath.Join(i.app, "Contents/Info.plist"), info); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"AgentQueue", "agent-heavy", "agent-remote"} {
+		filename := filepath.Join(i.app, "Contents/MacOS", name)
+		integrationTestWrite(t, filename, []byte("#!/bin/sh\nexit 99\n"))
+		if err := os.Chmod(filename, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, target := range []string{filepath.Join(i.app, "Contents/MacOS/agent-heavy"), filepath.Join(i.app, "Contents/MacOS/agent-remote"), i.app} {
+		if output, err := exec.Command("/usr/bin/codesign", "--force", "--sign", "-", target).CombinedOutput(); err != nil {
+			t.Fatalf("ad hoc signing: %v: %s", err, output)
+		}
+	}
+	for name, script := range map[string]string{
+		"launchctl":          fmt.Sprintf("#!/bin/sh\nprintf 'Bad request.\\nCould not find service \"%%s\" in domain for user gui: %d\\n' \"${2##*/}\" >&2\nexit 113\n", os.Getuid()),
+		"service-management": "#!/bin/sh\nprintf '{\"schemaVersion\":1,\"service\":\"%s\",\"status\":\"notRegistered\"}\\n' \"$2\"\n",
+		"pueued":             "#!/bin/sh\nexit 0\n",
+	} {
+		integrationTestWrite(t, filepath.Join(i.path, name), []byte(script))
+		if err := os.Chmod(filepath.Join(i.path, name), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	socket := filepath.Join(root, "native.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	if err := os.Chmod(socket, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MODE", "1")
+	t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", i.path)
+	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", "private-native-lifecycle")
+	f.legacy(t)
+	integrationTestWrite(t, filepath.Join(i.config, "remote.json"), []byte(`{"enabled":true}`))
+	for _, recovery := range []bool{false, true} {
+		args := []string{"--app-bundle", i.app}
+		if recovery {
+			args = append(args, "--disable-phone-access")
+		}
+		output, err := os.CreateTemp(t.TempDir(), "installer-stderr")
+		if err != nil {
+			t.Fatal(err)
+		}
+		original := os.Stderr
+		os.Stderr = output
+		code := InstallMain(args)
+		os.Stderr = original
+		if err := output.Close(); err != nil {
+			t.Fatal(err)
+		}
+		message, err := os.ReadFile(output.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		marker := strings.Contains(string(message), "\n"+installDisablePhoneAccessRecovery+"\n")
+		if code != 1 || marker == recovery {
+			t.Fatalf("recovery=%v: exit=%d marker=%v diagnostic=%s", recovery, code, marker, message)
+		}
+		if recovery && !strings.Contains(string(message), "agent-remote") {
+			t.Fatalf("recovery failed without actionable diagnostic: %s", message)
 		}
 	}
 }
@@ -1620,7 +1700,7 @@ func TestInstallerRemoteServiceAbsenceRequiresExactEvidence(t *testing.T) {
 		{strings.ReplaceAll(missing, "io.went.agent-remote", "unrelated"), 113, false},
 		{missing + "unexpected diagnostic", 113, false},
 	} {
-		if got := installRemoteServiceAbsent([]byte(test.output), test.code); got != test.absent {
+		if got := installServiceAbsent([]byte(test.output), test.code, "io.went.agent-remote"); got != test.absent {
 			t.Fatalf("exit %d diagnostic %q: absence=%v", test.code, test.output, got)
 		}
 	}

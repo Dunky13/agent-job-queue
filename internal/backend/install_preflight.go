@@ -64,7 +64,7 @@ type installOptions struct {
 
 func installParseOptions(args []string) (installOptions, error) {
 	options := installOptions{}
-	usage := errors.New("Usage: agent-heavy install --app-bundle ABSOLUTE_APP_PATH [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access | --repair-and-continue | --prepare-replacement (payload only) | --unregister-services (app-bundle only)]")
+	usage := errors.New("Usage: agent-heavy install --app-bundle ABSOLUTE_APP_PATH [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access | --repair-and-continue | --unregister-services]")
 	if len(args) < 2 || args[0] != "--app-bundle" || !integrationValidPath(args[1]) || filepath.Clean(args[1]) != args[1] {
 		return options, usage
 	}
@@ -365,7 +365,7 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 		report.add("platform-unsupported", "macOS is required", "Agent Queue installation requires macOS.", "")
 		return report
 	}
-	identity, err := install.validatePayload()
+	identity, err := install.validateBundle()
 	if err != nil {
 		var pending *installPendingError
 		if errors.As(err, &pending) {
@@ -840,7 +840,7 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 	if action == installFinishPending {
 		return install.finishPendingInstallation(ctx)
 	}
-	identity, err := install.validatePayload()
+	identity, err := install.validateBundle()
 	if err != nil {
 		return err
 	}

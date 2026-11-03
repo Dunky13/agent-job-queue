@@ -55,7 +55,7 @@ func (install *installer) managedPendingSuperseded(identity, pending BuildInfo) 
 // never clears or replaces an unfinished identity to let a different build in.
 func (install *installer) pendingInstallation(ctx context.Context) (*installer, error) {
 	var pending *installPendingError
-	if _, err := install.validatePayload(); !errors.As(err, &pending) {
+	if _, err := install.validateBundle(); !errors.As(err, &pending) {
 		if err != nil {
 			return nil, err
 		}
@@ -72,9 +72,8 @@ func (install *installer) pendingInstallation(ctx context.Context) (*installer, 
 	if previous != nil {
 		retained.app = previous.App
 	}
-	retained.unregisterServices = false
 	retained.pendingIdentity = &pending.identity
-	identity, err := retained.validatePayload()
+	identity, err := retained.validateBundle()
 	if err != nil {
 		return nil, fmt.Errorf("The exact pending app cannot be recovered: %w", err)
 	}

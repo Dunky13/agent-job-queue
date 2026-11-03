@@ -72,7 +72,7 @@ func TestInstallerPackagedLiveResume(t *testing.T) {
 // older release did: prepared against the exact candidate, with nothing replaced.
 func seedOlderReleaseHandover(t *testing.T, ctx context.Context, i *installer) *managedLiveUpgrade {
 	t.Helper()
-	identity, err := i.validatePayload()
+	identity, err := i.validateBundle()
 	if err != nil {
 		t.Fatal(err)
 	}

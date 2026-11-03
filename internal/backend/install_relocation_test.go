@@ -299,7 +299,7 @@ func TestManagedDistinctAppDoesNotSupersedeRecordedPendingWithoutReceipt(t *test
 		t.Fatal(err)
 	}
 	var pending *installPendingError
-	if _, err := i.validatePayload(); !errors.As(err, &pending) {
+	if _, err := i.validateBundle(); !errors.As(err, &pending) {
 		t.Fatal("a different app superseded the still-retained exact pending build", err)
 	}
 	if err := i.repairAndExecute(context.Background()); err != nil {

@@ -263,3 +263,133 @@ func TestManagedNotFoundRemoteCannotHideOwnedWork(t *testing.T) {
 		})
 	}
 }
+
+// The resume route verifies registrations itself, so a lookup miss must not hide
+// phone work there either. The supervised branch has its own test above.
+func TestManagedResumedActivationNotFoundRemoteCannotHideOwnedWork(t *testing.T) {
+	for _, kind := range []string{"clean", "loaded-job", "generation"} {
+		t.Run(kind, func(t *testing.T) {
+			m := managedOlderRegistration(t)
+			i := m.installer
+			m.statuses["remote"] = "notFound"
+			switch kind {
+			case "loaded-job":
+				m.loaded["io.went.agent-remote"] = true
+			case "generation":
+				integrationTestWrite(t, filepath.Join(i.state, "remote/processes.json"), []byte(`{"active":true}`))
+			}
+			err := i.managedVerifyRegistrations(context.Background(), false, false, false)
+			if kind == "clean" {
+				if err != nil {
+					t.Fatal("a phone service nothing registered refused verification", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "owned work remains") {
+				t.Fatal("unresolved remote lookup hid existing work", err)
+			}
+		})
+	}
+}
+
+// The login item has no launchd label, so a miss cannot show it is gone.
+func TestManagedRemovalRefusesLoginItemItCannotVerify(t *testing.T) {
+	t.Run("before unregistering", func(t *testing.T) {
+		m := managedTestFixture(t)
+		if err := m.run(t); err != nil {
+			t.Fatal(err)
+		}
+		i := m.installer
+		managedRemovalTarget(i)
+		m.statuses["login"] = "notFound"
+		before := installTreeWitness(t, i.home)
+		m.calls = nil
+		if err := m.run(t); err == nil || !strings.Contains(err.Error(), "cannot be verified") {
+			t.Fatal("removal passed on no evidence about the login item", err)
+		}
+		managedRequireNoServiceMutation(t, m.calls)
+		if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
+			t.Fatal("refusal retired custody")
+		}
+		m.statuses["login"] = "enabled"
+		if err := m.run(t); err != nil {
+			t.Fatal("removal after the lookup answered", err)
+		}
+		if got := managedServiceCalls(m, "unregister"); !slices.Equal(got, []string{"login"}) {
+			t.Fatalf("unregistered %v, want the login item", got)
+		}
+	})
+	t.Run("in the final check", func(t *testing.T) {
+		m := managedTestFixture(t)
+		if err := m.run(t); err != nil {
+			t.Fatal(err)
+		}
+		i := m.installer
+		managedRemovalTarget(i)
+		original := i.command
+		reads := 0
+		i.command = func(ctx context.Context, args []string) ([]byte, error) {
+			if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" && args[3] == "login" && m.statuses["login"] == "notRegistered" {
+				// Unregistering read it back once; a later read is the final check.
+				if reads++; reads == 2 {
+					m.statuses["login"] = "notFound"
+				}
+			}
+			return original(ctx, args)
+		}
+		if err := m.run(t); err == nil || !strings.Contains(err.Error(), "cannot be verified") {
+			t.Fatal("the final check passed on no evidence about the login item", err)
+		}
+		for _, filename := range []string{filepath.Join(i.root, "installation.json"), filepath.Join(i.home, ".local/bin/agent-heavy")} {
+			if _, err := os.Lstat(filename); err != nil {
+				t.Fatal("refusal retired custody", filename, err)
+			}
+		}
+	})
+}
+
+// managedAction requires notRegistered straight after unregistering, so a miss at
+// that moment fails closed. The next run sees what actually happened.
+func TestManagedRemovalRetryAfterNotFoundFollowsUnregister(t *testing.T) {
+	for _, test := range []struct {
+		service string
+		heals   bool
+	}{{"queue", false}, {"login", true}} {
+		t.Run(test.service, func(t *testing.T) {
+			m := managedOlderRegistration(t)
+			i := m.installer
+			managedRemovalTarget(i)
+			original := i.command
+			missed := false
+			i.command = func(ctx context.Context, args []string) ([]byte, error) {
+				output, err := original(ctx, args)
+				if len(args) == 4 && args[1] == "--service-management" && args[2] == "unregister" && args[3] == test.service && !missed {
+					missed = true
+					m.statuses[test.service] = "notFound"
+				}
+				return output, err
+			}
+			if err := m.run(t); err == nil || !strings.Contains(err.Error(), "notFound after unregister") {
+				t.Fatal("a miss straight after unregistering was accepted", err)
+			}
+			for _, filename := range []string{filepath.Join(i.root, "installation.json"), filepath.Join(i.root, "install-in-progress.json"), filepath.Join(i.home, ".local/bin/agent-heavy")} {
+				if _, err := os.Lstat(filename); err != nil {
+					t.Fatal("the failed run retired custody", filename, err)
+				}
+			}
+			if test.heals {
+				// Still no evidence about the login item, so the retry refuses too.
+				if err := m.run(t); err == nil || !strings.Contains(err.Error(), "cannot be verified") {
+					t.Fatal("a retry passed on no evidence about the login item", err)
+				}
+				m.statuses[test.service] = "notRegistered"
+			}
+			if err := m.run(t); err != nil {
+				t.Fatal("removal could not finish on retry", err)
+			}
+			for _, filename := range []string{filepath.Join(i.root, "installation.json"), filepath.Join(i.root, "install-in-progress.json"), filepath.Join(i.home, ".local/bin/agent-heavy")} {
+				if _, err := os.Lstat(filename); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("the retry retained", filename, err)
+				}
+			}
+		})
+	}
+}

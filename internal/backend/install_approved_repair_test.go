@@ -278,6 +278,7 @@ func TestInstallerApprovedRepairKnownIssueContract(t *testing.T) {
 		{"pending-unavailable", approvedTestIssue("pending-installation", "reveal"), false},
 		{"pending-foreign-action", approvedTestIssue("service-definitions-missing", installFinishPending), false},
 		{"phone", approvedTestIssue("legacy-phone-access", "disable-phone-access"), true},
+		{"running app", installPreflightIssue{ID: "app-running", Title: "Agent Queue is running"}, false},
 		{"remote-migration", approvedTestIssue("remote-migration", "disable-phone-access"), true},
 		{"start", approvedTestIssue("service-not-ready", "repair-service"), true},
 		{"service-wait", approvedTestIssue("service-not-ready", "wait"), true},

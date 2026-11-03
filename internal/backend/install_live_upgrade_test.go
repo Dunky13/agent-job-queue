@@ -264,7 +264,7 @@ func TestManagedRetireSpentLiveKeepsJournalBindingCustody(t *testing.T) {
 			}
 			requireLiveJournalKept(t, i)
 			managedCandidate(t, m, "124")
-			identity, err := i.validatePayload()
+			identity, err := i.validateBundle()
 			if err != nil {
 				t.Fatal(err)
 			}

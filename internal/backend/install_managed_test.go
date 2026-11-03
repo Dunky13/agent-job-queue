@@ -200,7 +200,7 @@ func TestManagedResumedActivationWaitsForApprovalWithoutReregistering(t *testing
 		t.Fatal("approval-required retry completed", err)
 	}
 	for _, args := range m.calls {
-		if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" && args[3] != "queue" {
+		if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" {
 			t.Fatal("re-registered approval-required service", args)
 		}
 	}
@@ -392,7 +392,7 @@ func TestManagedOfflineDrainReadsPrivateCopy(t *testing.T) {
 	}
 	store.close()
 	before := installTreeWitness(t, i.home)
-	if err := i.managedOfflineDrain(context.Background()); err != nil {
+	if err := i.managedOfflineDrainHolding(context.Background(), nil, "queue-daemon.lock", "resource-controller.lock"); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
@@ -407,7 +407,7 @@ func TestManagedOfflineDrainReadsPrivateCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := i.managedOfflineDrain(context.Background()); err == nil {
+	if err := i.managedOfflineDrainHolding(context.Background(), nil, "queue-daemon.lock", "resource-controller.lock"); err == nil {
 		t.Fatal("offline unfinished attempt accepted")
 	}
 }

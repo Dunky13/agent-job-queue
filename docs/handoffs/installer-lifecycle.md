@@ -22,7 +22,7 @@ No lifecycle type was added, because deleting the other states left nothing for 
 | `disablePhoneAccess` | 2 | 1 | A resolved option. |
 | `automaticSetup` | 8 | 8 | See below. |
 
-`validatePayload` now returns the identity and `validateServices` returns the slot. Their callers store the result, so nothing is set as a side effect of validation, and `managedValidateExpected` no longer has to restore `identity` afterwards. `identity` and `serviceSlot` stay as fields because planning and `commandEnvironment` read them.
+`validatePayload`, now `validateBundle`, returns the identity and `validateServices` returns the slot. Their callers store the result, so nothing is set as a side effect of validation, and `managedValidateExpected` no longer has to restore `identity` afterwards. `identity` and `serviceSlot` stay as fields because planning and `commandEnvironment` read them.
 
 `automaticSetup` is still set by `repairAndExecute`, not at parse. Moving it would change what `finishPendingInstallation` and every repair caller see, and validation does not set it, so it stayed. A later PR can resolve it at parse.
 
@@ -39,7 +39,10 @@ Still live, despite how they read: `serviceEnvironment`, `managedStopMenu`, `man
 
 ## Behaviour that changed
 
-1. **Removal no longer refuses a service that was never registered.** `--unregister-services` failed with `The remote service is notFound` whenever phone access had never been registered, seen on a real Mac on build 166. A `notFound` service now passes both before and after unregistering, unless launchd still has its label loaded. `managedRemovalNotFound` holds that check. Registered, enabled and awaiting-approval services are handled as before, and retained phone process records still refuse.
+1. **Removal no longer refuses a helper service that was never registered.** `--unregister-services` failed with `The remote service is notFound` whenever phone access had never been registered, seen on a real Mac on build 166. For queue, resources and remote, a `notFound` lookup now passes during planning and in the final check, unless launchd still has the label loaded. `managedRemovalNotFound` holds that check. Three limits apply:
+   - **The login item refuses on `notFound`.** It has no launchd label, so nothing shows that a miss means it is gone, and passing would retire wrappers and custody while it might still be registered. It refuses, as `main` did, until the lookup answers. Whether a real Mac ever reports this has not been seen.
+   - **A miss straight after a real unregister fails closed,** because `managedAction` requires `notRegistered` at that moment. The next run finishes for a helper service, and for the login item once its lookup answers. `TestManagedRemovalRetryAfterNotFoundFollowsUnregister` verifies both.
+   - Registered, enabled and awaiting-approval services are handled as before, and retained phone process records still refuse.
 2. **`--recover disable-phone-access` now works on a packaged app.** It ran `Contents/Resources/payload/source/bin/agent-remote`, a path `appservices.ValidateBundle` forbids, so it could only fail. It now runs `Contents/MacOS/agent-remote`, as `executeManaged` does.
 3. **Failure-path differences no shipped flow should notice.** A bundle without the marker is now refused instead of installing through the tail. When the bundle is invalid, preflight no longer also reports a spurious custom callback for an `~/.local/bin/agent-heavy` callback. A `validatePayload` failure now leaves `identity` empty, so a relocation in that state also reports that the app changed.
 
@@ -55,7 +58,9 @@ The check runs twice, the second time under `scheduling.lock`, which job submiss
 
 After the quit, the existing checks still apply. If a job somehow shows `phase != done` while the snapshot shows `Done`, the offline drain refuses at that point, with the app already quit. That is the one way the app can be quit and removal still refuse. The marker stays and retrying works.
 
-**Preflight had the same check.** Run from outside against a healthy running app, it reported "An unowned queue process holds its lifetime lock", from the same `managedDrain` branch. It and setup now report `app-running` and `errInstallAppRunning`, and change nothing. Setup still cannot run beside the app's helpers. The ID has only a `wait` action, and Go and Swift both treat it as needing review, as they did `managed-setup-blocked`.
+**Preflight had the same check.** Run from outside against a healthy running app, it reported "An unowned queue process holds its lifetime lock", from the same `managedDrain` branch. It and setup now report `app-running` and `errInstallAppRunning`, and change nothing. Setup still cannot run beside the app's helpers.
+
+**What the app does beside a running copy.** It stops and shows the message with Retry. It does not wait, because only the user can clear this, and a silent wait would look like a hang. `app-running` therefore offers no `wait` action, and neither `install_approved_repair.go` nor `approvedRepairStep` recognises it, so both stop for review as they do for any unknown requirement. No Swift logic changed; `BootstrapTests` and `TestInstallerAutomaticSetupStopsForARunningApp` hold this. A newer copy opened beside the running recorded app gets the same report, because recognition checks the recorded app during a relocation. Retry then continues once the other copy has quit. The menu's wording for this has not been looked at on a real Mac.
 
 **What ran against the real thing.** `install_managed_running_app_test.go` uses a real process tree: copies of the test binary at the bundle's `AgentQueue` and `agent-heavy` paths, with the real daemon and scheduler as children, real `flock`, real `lsof`, the kernel's process records and real daemon RPC. Mutations removing recognition, the parent check or the drain check, or moving the quit after unregistering, each fail these tests.
 
@@ -66,7 +71,30 @@ After the quit, the existing checks still apply. If a job somehow shows `phase !
 - `lsof` on a real signed app has not been seen.
 - Kernel paths are compared exactly. A real app launched through LaunchServices should record its plain `/Applications/...` path, as `managedLoadedBundleProgram` already assumes, but only a run on a real Mac shows it.
 
-**The cask caveat changed with it,** in `internal/tooling/tooling.go` and `packaging/homebrew/refresh.go`, along with `refresh_test.go`. **A companion PR against the tap's `tap` branch must merge before this PR.** It copies `refresh.go`, `refresh_test.go`, `test-cask.rb` and `.github/workflows/refresh.yml` byte for byte, following `docs/homebrew-delivery.md`. Delivery compares those helpers byte for byte, so merging here first fails delivery visibly. The published cask keeps its text until the next numbered build. I have not opened that PR.
+## Tap companion PR, not opened yet
+
+The caveat in `internal/tooling/tooling.go` and `packaging/homebrew/refresh.go` now reads "Before removing the app, finish its jobs, then run this. It quits the app and removes its login item:". The tap has to receive that first, because delivery compares its helpers byte for byte (`internal/delivery/sync.go`) and a stale copy fails delivery visibly.
+
+Files, copied byte for byte from this PR's final head:
+
+| From | To, in the tap |
+|---|---|
+| `packaging/homebrew/refresh.go` | `refresh.go` |
+| `packaging/homebrew/refresh_test.go` | `refresh_test.go` |
+| `packaging/homebrew/test-cask.rb` | `test-cask.rb` |
+| `packaging/homebrew/.github/workflows/refresh.yml` | `.github/workflows/refresh.yml` |
+| `LICENSE` | `LICENSE` |
+
+Do not copy `SEED.txt`.
+
+Steps, once this PR's head is final:
+
+1. In a checkout of the tap's `tap` branch, copy the files above.
+2. Run `go test -p 2 refresh.go refresh_test.go` and `go vet refresh.go` with Go 1.26 or later.
+3. Open a PR against `tap` with signed, DCO-signed-off commits, and merge it.
+4. Only then merge this PR.
+
+The published cask keeps its old text, verified as a historical asset, until the next numbered build. Only `refresh.go` and `refresh_test.go` differ from what the tap has now.
 
 ## Test porting
 
@@ -86,7 +114,7 @@ Limits of the seeding:
 
 Seeding the marker first caused a flake while porting, in about one run in 12 on a busy host. The fixture's real daemon and scheduler take `scheduling.lock` during normal work, so setup can get the transient refusal in follow-up 3 of `retire-handover-begin.md`. `runPackagedSetup` retries that only when no pending marker predates the call, and on #67 none did. Now `managedOlderPublication` sets `seededPending`, which excuses that one marker for one call. `TestPackagedSetupRetriesBusyOnlyOverASeededMarkerOnce` holds the rule, and the strict case in `TestPackagedSetupNeverRetriesMutationOrUncertainHistory` is unchanged. The finish-pending test now logs the setup error, last phase and daemon log when that wait fails.
 
-Backend top-level tests went from 501 to 486. Tests not listed below keep their names. Many had their setup ported and lost assertions on the launchd definitions that only the tail wrote. Each kept its subject: callback spellings, drain, Pueue import, slot, phone recovery, ownership refusal and so on.
+Backend top-level tests went from 540 to 532. Tests not listed below keep their names. Many had their setup ported and lost assertions on the launchd definitions that only the tail wrote. Each kept its subject: callback spellings, drain, Pueue import, slot, phone recovery, ownership refusal and so on.
 
 | Before | After | Reason |
 |---|---|---|
@@ -106,6 +134,10 @@ Backend top-level tests went from 501 to 486. Tests not listed below keep their 
 | `TestManagedSharedAppStagesThenMovesThroughFD`, `TestManagedSharedCopyBoundsAndOwnership`, `TestManagedSharedCopyDetectsReboundChild`, `TestManagedSharedCopyPinsParentDescriptor`, `TestManagedSharedCopyPreservesPrivateBoundary`, `TestManagedSharedCopyRefusesUnsafeEntries`, `TestManagedSharedNativeCopyRetainsMetadataAndVerifiesBeforeMove` | deleted | Tested the deleted copier. |
 | | `TestManagedRemovalAfterUnregisterAcceptsNotFoundOnlyWhenUnloaded`, `TestManagedRemovalOfSupervisedApp` | New, for the removal fix. Both fail with the old checks restored. |
 | | `TestPackagedSetupRetriesBusyOnlyOverASeededMarkerOnce` | New, for the seeded marker above. |
+| | `TestManagedResumedActivationNotFoundRemoteCannotHideOwnedWork` | Restores the resume-route gate's coverage, which the port lost. |
+| | `TestManagedRemovalRefusesLoginItemItCannotVerify`, `TestManagedRemovalRetryAfterNotFoundFollowsUnregister` | New, for the login item and for retrying. |
+| | `TestInstallerPreflightReviewsStateBesideAnInvalidBundle`, `TestInstallerPreflightLegacyDiagnostics` | New, for the invalid-bundle branch and the diagnostics that lost coverage. |
+| | `TestInstallerAutomaticSetupStopsForARunningApp`, `TestInstallerNewerCopyBesideRunningRecordedAppStops` | New, for `app-running`. |
 | | `TestManagedRemovalOfRunningAppQuitsItOnceDrained`, `TestManagedRemovalOfRunningAppStopsItsPhoneService`, `TestManagedRemovalOfRunningAppRefusesActiveJobs`, `TestManagedRemovalRefusesWhenDrainCannotBeVerified`, `TestManagedRemovalRefusesUnownedLockHolder`, `TestManagedSetupAndPreflightNameARunningApp`, `TestManagedPreflightStillReportsUnownedLockHolder`, `TestManagedRemovalWaitsBrieflyForSchedulingLock` | New, for removal from a running app. |
 
 Subtests that went away:
@@ -119,7 +151,7 @@ Some legacy preflight tests now seed phone access or a blocked older install, be
 
 - `install.app` is always the bundle in question, and the payload is always `Contents/Resources/payload` inside it.
 - Any validated bundle is marked and self-contained. No code path copies an app or writes a launchd definition.
-- `validatePayload` and `validateServices` return their results and set nothing.
+- `validateBundle` and `validateServices` return their results and set nothing.
 - Setup registers only the login item, except when a live handover is being resumed.
 - A lifetime lock held by this app's own child helper is the running app, not an unowned process. Setup refuses it as `errInstallAppRunning`, and removal quits it once drained.
 - Publication receipts and backups are only ever read and retired. Nothing writes a new one.
@@ -129,21 +161,22 @@ Some legacy preflight tests now seed phone access or a blocked older install, be
 
 | | Added | Removed | Net |
 |---|---|---|---|
-| Production | 419 | 1636 | -1217 |
-| Tests | 1575 | 2165 | -590 |
+| Production | 489 | 1715 | -1226 |
+| Tests | 1966 | 2146 | -180 |
 
 This is one PR rather than two: with `--payload` gone, the small shape is what remains.
 
 ## Follow-ups, not fixed here
 
-1. **The tap companion PR** for the changed cask template, which must merge first. See Removal on a supervised app.
+1. **The tap companion PR** for the changed cask template, which must merge first. See that section.
 2. **An untracked build cannot install after removal.** Removal keeps `build-info.json` so it cannot reset version ordering, and setup refuses an untracked build over it. The check stays. `CONTRIBUTING.md` now gives the route: build with a higher `BUILD_NUMBER` and `SOURCE_COMMIT`. `TestManagedRemovalOfSupervisedApp` holds both sides.
 3. **`native/AgentQueue.swift` and `TransportTests.swift` still classify `--payload` argv.** This is harmless, and belongs in a Swift PR.
 4. **The `service-approval` ID** is still recognised in `install_approved_repair.go` and `AgentBootstrap.swift`, and nothing emits it now.
 5. **`automaticSetup`** can move to parse. See Shape.
-6. **Naming.** `install_managed_copy.go` now holds only `managedPublicationParent`, and its name should change.
+6. **Naming.** `validatePayload`, `prepareManaged` and `install_managed_copy.go` are now `validateBundle`, `removeManaged` and `install_managed_parent.go`. Left to rename: `readPayload`, `installReadPayload`, `installPayloadParent`, `installValidatePayloadTree`, and the `payload-invalid` ID, which the wire contract uses.
 7. **The follow-ups in `retire-handover-begin.md` stand.** Its item 6, the payload path's different drain rule, no longer applies.
 8. **`buildManagedLiveFixtureCLI` has a one-minute build limit,** and a race build was killed at that limit on a busy host, failing the iteration. This predates this PR. Hosted runners have not shown it.
+9. **Gaps the independent review listed, all present before this PR:** `validate-skips-pendingBundle`, `pending-skips-retained-backup-access`, `setup-skips-runtime-cleanup`, `plan-ignores-unsafe-runtime-bin` and same-path runtime reclamation.
 
 ## Evidence
 

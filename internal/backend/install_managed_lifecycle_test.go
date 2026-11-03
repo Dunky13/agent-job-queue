@@ -45,7 +45,7 @@ func managedBundleBuild(t *testing.T, i *installer, app, build string) BuildInfo
 // build never registers them on its own, but resume still has to.
 func managedOlderRegistered(ctx context.Context, m *managedFixture) error {
 	i := m.installer
-	identity, err := i.validatePayload()
+	identity, err := i.validateBundle()
 	if err != nil {
 		return err
 	}

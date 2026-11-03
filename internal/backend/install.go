@@ -60,7 +60,7 @@ var errInstallServiceNotLoaded = errors.New("Launch service is not loaded")
 var errInstallPendingCleanup = errors.New("Queue migration must wait for queue work and cleanup to finish. Retained receipts or owned lease markers may still belong to running jobs. Existing files were preserved.")
 var errInstallCustomCallback = errors.New("Custom cleanup callback cannot be retained by managed migration; it will be backed up before replacement")
 
-var errInstallAppRunning = errors.New("Agent Queue is running and owns its queue processes. Quit it before running setup. Removal with --unregister-services quits it once its queue is drained")
+var errInstallAppRunning = errors.New("Agent Queue is running and owns its queue processes. Quit it, then try setup again. Removal with --unregister-services quits it once its queue is drained")
 
 type installDrainPendingError struct {
 	tasks   Object
@@ -280,10 +280,6 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 		return nil, fmt.Errorf("Installer command %s failed: %w", filepath.Base(args[0]), err)
 	}
 	return output.Bytes(), nil
-}
-
-func installRemoteServiceAbsent(output []byte, exitCode int) bool {
-	return installServiceAbsent(output, exitCode, "io.went.agent-remote")
 }
 
 func installServiceAbsent(output []byte, exitCode int, label string) bool {
@@ -525,7 +521,7 @@ func installValidatePayloadTree(root string) error {
 }
 
 // validateMarkedBundle establishes that app is a marked bundle in an allowed
-// location, before validatePayload trusts anything inside it.
+// location, before validateBundle trusts anything inside it.
 func (install *installer) validateMarkedBundle() error {
 	if err := installValidateAppPath(install.home, install.app); err != nil {
 		return err
@@ -556,9 +552,9 @@ func (install *installer) validateMarkedBundle() error {
 	return nil
 }
 
-// validatePayload returns the build identity of the bundle at app. It changes
+// validateBundle returns the build identity of the bundle at app. It changes
 // nothing, so its callers decide when that identity becomes the selected one.
-func (install *installer) validatePayload() (BuildInfo, error) {
+func (install *installer) validateBundle() (BuildInfo, error) {
 	if err := install.validateMarkedBundle(); err != nil {
 		return BuildInfo{}, err
 	}
@@ -1597,13 +1593,13 @@ func (install *installer) execute(ctx context.Context) error {
 	if !install.testing && runtime.GOOS != "darwin" {
 		return errors.New("Agent Job Queue requires macOS")
 	}
-	identity, err := install.validatePayload()
+	identity, err := install.validateBundle()
 	if err != nil {
 		return err
 	}
 	install.identity = identity
 	if install.unregisterServices {
-		return install.prepareManaged(ctx)
+		return install.removeManaged(ctx)
 	}
 	return install.executeManaged(ctx)
 }

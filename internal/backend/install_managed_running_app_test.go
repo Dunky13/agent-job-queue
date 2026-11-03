@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 )
 
 const fixtureSupervisingApp = "fixture-supervising-app"
@@ -430,5 +432,45 @@ func TestManagedRemovalWaitsBrieflyForSchedulingLock(t *testing.T) {
 	time.AfterFunc(300*time.Millisecond, func() { held.Close() })
 	if err := i.execute(removalContext(t)); err != nil {
 		t.Fatal("a helper's brief hold on scheduling.lock failed removal", err)
+	}
+}
+
+// Only the user can clear a running copy, so automatic setup stops and says so
+// rather than waiting. Native code treats the issue the same way, and Retry works.
+func TestInstallerAutomaticSetupStopsForARunningApp(t *testing.T) {
+	a := runningAppFixture(t, true)
+	i := a.installer
+	a.calls = nil
+	if err := i.repairAndExecute(removalContext(t)); err == nil || !strings.Contains(err.Error(), "requires review") || !strings.Contains(err.Error(), "Agent Queue is running") {
+		t.Fatal("automatic setup did not stop for a running app", err)
+	}
+	a.requireUntouched(t)
+	a.stop(t)
+	if err := i.repairAndExecute(removalContext(t)); err != nil {
+		t.Fatal("setup could not continue once the app quit", err)
+	}
+}
+
+func TestInstallerNewerCopyBesideRunningRecordedAppStops(t *testing.T) {
+	a := runningAppFixture(t, true)
+	i := a.installer
+	recorded := i.app
+	dropped := filepath.Join(i.home, "Applications/Agent Queue dragged.app")
+	if err := installCopyTree(recorded, dropped); err != nil {
+		t.Fatal(err)
+	}
+	managedBundleBuild(t, i, dropped, "124")
+	i.app = dropped
+	a.calls = nil
+	report := i.preflight(removalContext(t))
+	if !preflightIDs(report)["app-running"] || len(report.Issues[0].Actions) != 0 {
+		t.Fatalf("a newer copy did not name the running recorded app: %+v", report)
+	}
+	if err := i.repairAndExecute(removalContext(t)); err == nil || !strings.Contains(err.Error(), "requires review") {
+		t.Fatal("a newer copy did not stop for the running recorded app", err)
+	}
+	a.requireUntouched(t)
+	if metadata, err := appservices.Load(i.home); err != nil || metadata == nil || metadata.App != recorded {
+		t.Fatal("the recorded app changed", metadata, err)
 	}
 }

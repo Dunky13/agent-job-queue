@@ -226,7 +226,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 			return err
 		}
 		if busy && !p.loaded[label] {
-			if !install.managedHeldByApp(ctx, filepath.Join(install.state, name), "agent-heavy") {
+			if !install.managedHeldByApp(ctx, p.serviceApp(install.app), filepath.Join(install.state, name), "agent-heavy") {
 				return errors.New("An unowned queue process holds its lifetime lock; setup refused before service mutation")
 			}
 			appRunning = true
@@ -238,7 +238,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 	}
 	remoteRunning := false
 	if busy && !p.loaded["io.went.agent-remote"] {
-		if !install.managedHeldByApp(ctx, filepath.Join(install.state, "remote/supervisor.lock"), "agent-remote") {
+		if !install.managedHeldByApp(ctx, p.serviceApp(install.app), filepath.Join(install.state, "remote/supervisor.lock"), "agent-remote") {
 			return errors.New("An unowned phone access process holds its lifetime lock; setup refused before service mutation")
 		}
 		appRunning, remoteRunning = true, true
@@ -302,11 +302,11 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 	return install.requireLegacyCleanup()
 }
 
-// managedHeldByApp reports whether every process holding a lifetime lock is this
-// app's own helper, running as a child of this app. launchd knows nothing of
+// managedHeldByApp reports whether every process holding a lifetime lock is app's
+// own helper, running as a child of app. launchd knows nothing of
 // those, so the kernel's record of each executable and parent is the evidence.
 // Anything else, including no evidence, leaves the holder unowned.
-func (install *installer) managedHeldByApp(ctx context.Context, lock, helper string) bool {
+func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helper string) bool {
 	output, err := install.run(ctx, "/usr/sbin/lsof", "-nP", "-t", "--", lock)
 	if err != nil {
 		return false
@@ -318,7 +318,7 @@ func (install *installer) managedHeldByApp(ctx context.Context, lock, helper str
 			return false
 		}
 		executable, err := installProcessExecutable(pid)
-		if err != nil || executable != filepath.Join(install.app, "Contents/MacOS", helper) {
+		if err != nil || executable != filepath.Join(app, "Contents/MacOS", helper) {
 			return false
 		}
 		parent, err := installProcessParent(pid)
@@ -326,7 +326,7 @@ func (install *installer) managedHeldByApp(ctx context.Context, lock, helper str
 			return false
 		}
 		executable, err = installProcessExecutable(parent)
-		if err != nil || executable != filepath.Join(install.app, "Contents/MacOS/AgentQueue") {
+		if err != nil || executable != filepath.Join(app, "Contents/MacOS/AgentQueue") {
 			return false
 		}
 	}
@@ -352,12 +352,6 @@ func (install *installer) managedRunningAppDrained(ctx context.Context) error {
 		return err
 	}
 	return install.requireLegacyCleanup()
-}
-
-// Inspect a stopped queue using private copies. SQLite may create sidecars even
-// in read-only mode, so never open the user's live database during preflight.
-func (install *installer) managedOfflineDrain(ctx context.Context) error {
-	return install.managedOfflineDrainHolding(ctx, nil, "queue-daemon.lock", "resource-controller.lock")
 }
 
 // Each named lifetime lock must be free; its owner could still change the store.
@@ -1085,11 +1079,12 @@ func (install *installer) managedStopMenu(ctx context.Context) error {
 
 // A service nothing ever registered reads as notFound, which is already what
 // removal wants. The lookup miss proves nothing about launchd, so a label that is
-// still loaded keeps refusing.
+// still loaded keeps refusing. The login item has no launchd label, so nothing
+// can show that a miss means it is gone, and it refuses until the lookup answers.
 func (install *installer) managedRemovalNotFound(ctx context.Context, service string) error {
 	label := map[string]string{"queue": "io.went.agent-heavy", "resources": "io.went.agent-resources", "remote": "io.went.agent-remote"}[service]
 	if label == "" {
-		return nil
+		return fmt.Errorf("The %s service is notFound, so its registration cannot be verified; application must be preserved", service)
 	}
 	if _, loaded, err := install.inspectService(ctx, label); err != nil {
 		return err
@@ -1118,7 +1113,7 @@ func (install *installer) managedRemovalSchedulingLock(ctx context.Context) (*os
 
 // Removal is an explicit mutation, separate from read-only preflight. The app
 // may be deleted only after this operation succeeds.
-func (install *installer) prepareManaged(ctx context.Context) error {
+func (install *installer) removeManaged(ctx context.Context) error {
 	for _, directory := range []string{install.root, install.state, install.config, install.launch, filepath.Join(install.home, ".local/bin"), filepath.Join(install.state, "remote")} {
 		if err := installInspectDirectory(directory); err != nil {
 			return err
@@ -1178,7 +1173,7 @@ func (install *installer) prepareManaged(ctx context.Context) error {
 		return err
 	}
 	defer remote.Close()
-	identity, err := install.validatePayload()
+	identity, err := install.validateBundle()
 	if err != nil {
 		return err
 	}
@@ -1482,7 +1477,7 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		return err
 	}
 	defer remote.Close()
-	identity, err := install.validatePayload()
+	identity, err := install.validateBundle()
 	if err != nil {
 		return err
 	}
@@ -1832,7 +1827,8 @@ func (install *installer) preflightManaged(ctx context.Context, report installPr
 		var pending *installPendingError
 		switch {
 		case errors.Is(err, errInstallAppRunning):
-			report.add("app-running", "Agent Queue is running", err.Error(), "", "wait")
+			// Only the user can clear this, so automatic setup stops and says so.
+			report.add("app-running", "Agent Queue is running", err.Error(), "")
 		case errors.As(err, &pending):
 			report.addPendingInstallation(err.Error(), install.liveJournalPath(), "download-release", "reveal")
 		case errors.Is(err, errInstallPendingCleanup):
