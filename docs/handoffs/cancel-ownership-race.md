@@ -35,15 +35,17 @@ Ruled out:
 
 | Check | Result |
 | --- | --- |
-| `TestSignalFromAStaleRowAfterTheWorkerExited` without the fix | fails: the settled row's refusal, with the new comparison text |
+| `TestSignalFromAStaleRowAfterTheWorkerExited` with only the `queue_daemon.go` change reverted (the test needs the named error from `ownership.go` to compile) | fails: the settled row's refusal, with the new comparison text |
 | Same test with the fix | passes |
 | Backend tests matching `Queue\|Handover\|Cancel\|Ownership\|Group\|Lease\|Signal\|Census\|Corrupt\|RealDaemon`, queue job | pass, 138s |
+| `go build ./... && go vet ./...` | pass |
 | Race-built `TestRealDaemonCancellationRemovesDescendants` plus the new test, 120 runs under `taskpolicy -c background` | pass |
 
 Not reproduced: the intermittent failure of the real test. It was 1 in 390 on main under throttling with `-race`, so 120 passes do not show the fix removes it. The focused test shows the refusal state and that the fix handles it.
 
 ## Not checked
 
+- The worker's outcome write guards only on id, token, attempt and phase, and it runs before the process exits, so a concurrent cancel flag does not stop it. If it fails for another reason, the daemon's wait on the worker settles the row, and a signal landing before that still refuses.
 - The full backend suite and hosted CI on this branch.
 - Intel hardware. The reproduction and probes ran on arm64.
 - `managedHeldByApp` reading a healthy lock holder as unowned on Intel. No link was found: the CI failure with "An unowned queue process holds its lifetime lock" comes from `managedDrain` in `install_managed.go`, which inspects locks and does not use process group ownership.
