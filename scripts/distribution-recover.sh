@@ -138,6 +138,8 @@ recovery_candidate() (
   [[ sha256:$(shasum -a 256 "$temporary/receipt.zip" | awk '{print $1}') == "$digest" ]] || distribution_error 'Receipt archive digest mismatch.'
   recovery_archive "$temporary/receipt.zip"
 
+  # recovery.json is not a stage record. This job has no Go toolchain, so jq restates
+  # the record module's phases and IDs; TestRecoveryProjectionMatchesRecordRules guards them.
   jq -e --arg repo "$GITHUB_REPOSITORY" --arg build "$build" --arg id "$id" --arg attempt "$receipt_attempt" --arg sha "$sha" --arg mode "$mode" '
     def number: test("^[1-9][0-9]{0,14}$");
     def hash: test("^[a-f0-9]{64}$");

@@ -127,7 +127,7 @@ func newPublishFixture(t *testing.T) checkpointFixture {
 	}
 	f.env = append(f.env, "PATH="+filepath.Join(f.root, "tools")+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"GITHUB_REPOSITORY=owner/project", "BUILD_SHA="+checkpointSHA, "BUILD_RUN_NUMBER=45",
-		"BUILD_TAG=build-45-1111111", "BUILD_RUN_ID=123", "BUILD_RUN_ATTEMPT=1", "BUILD_ARTIFACT_ID=800", "BUILD_ARTIFACT_DIGEST=sha256:"+strings.Repeat("c", 64), "GH_TOKEN=fixture-only", "PUBLISH_TEST_ROOT="+f.root)
+		"BUILD_TAG=build-45-1111111", "BUILD_RUN_ID=123", "BUILD_RUN_ATTEMPT=1", "BUILD_ARTIFACT_ID=800", "BUILD_ARTIFACT_DIGEST=sha256:"+strings.Repeat("c", 64), "GH_TOKEN=fixture-only", "PUBLISH_TEST_ROOT="+f.root, "QUEUE_NOTARY_TOOL="+stageRecordTool(t))
 	f.writeJSON(t, "assets.json", []any{})
 	f.writeJSON(t, "refs.json", []any{})
 	for _, extension := range []string{"zip", "dmg"} {
@@ -146,7 +146,7 @@ func newPublishFixture(t *testing.T) checkpointFixture {
 			extension = "dmg"
 		}
 		completed := fmt.Sprintf("%x", sha256.Sum256([]byte("accepted "+extension+" bytes")))
-		stages = append(stages, map[string]any{"stage": name, "phase": "finished", "submission_id": id, "archive_sha256": strings.Repeat("d", 64), "completed_sha256": completed})
+		stages = append(stages, map[string]any{"stage": name, "phase": "finished", "prepared_attempt": "1", "prepared_run_id": "999", "submission_id": id, "archive_sha256": strings.Repeat("d", 64), "completed_sha256": completed})
 		logs = append(logs, map[string]any{"jobId": id, "sha256": strings.Repeat("d", 64), "status": "Accepted"})
 	}
 	f.writeJSON(t, "dist/apple-notarization.json", map[string]any{"schema": 1, "metadata": map[string]any{

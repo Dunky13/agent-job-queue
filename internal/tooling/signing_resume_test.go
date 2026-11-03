@@ -39,6 +39,8 @@ func newResumeFixture(t *testing.T, extra ...string) resumeFixture {
 	}
 	f.environment = append(f.environment, signingProductionEnvironment()...)
 	f.environment = append(f.environment, "GITHUB_SHA="+strings.Repeat("a", 40), "GITHUB_REPOSITORY=fixture/queue", "GITHUB_RUN_ID=1234", "GITHUB_RUN_NUMBER=21", "GITHUB_RUN_ATTEMPT=1", "SIGNING_TEST_ROOT="+f.root)
+	record := stageRecordTool(t)
+	f.environment = append(f.environment, "QUEUE_NOTARY_TOOL="+record, "SIGNING_TEST_RECORD_TOOL="+record)
 	f.environment = append(f.environment, extra...)
 	fixture := resumeFixture{signingFixture: f, state: filepath.Join(f.root, "state")}
 	fixture.command(t, nil, "init", f.app, fixture.state, "0.1.0")
@@ -543,6 +545,8 @@ func TestMacOSResumeBindsLegacyStateOnlyAfterActualOriginVerification(t *testing
 // This trusted mock models only the CLI/state seam. Native tools and provider
 // calls remain simulated; the Go client's separate tests cover real durability.
 const resumeRESTTestTool = `set -euo pipefail
+# Stage record rules are real in every fixture; only the provider seam is mocked.
+if [[ ${1:-} == notarize && ${2:-} == record ]]; then exec "$SIGNING_TEST_RECORD_TOOL" "$@"; fi
 printf 'queue-tool' >> "$SIGNING_TEST_EVENTS"; printf '|%s' "$@" >> "$SIGNING_TEST_EVENTS"; printf '\n' >> "$SIGNING_TEST_EVENTS"
 [[ $1 == notarize ]] || exit 90
 operation=$2; shift 2

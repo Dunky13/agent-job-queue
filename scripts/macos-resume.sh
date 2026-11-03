@@ -9,7 +9,8 @@ source "$root/scripts/macos-signing.sh"
 fail() { macos_signing_error "$*"; exit 1; }
 sha256() { shasum -a 256 "$1" | awk '{print $1}'; }
 json_field() { jq -er ".$2" "$1"; }
-atomic_json() { jq "$2" "$1" > "$1.new"; mv "$1.new" "$1"; }
+stage_field() { "$QUEUE_NOTARY_TOOL" notarize record get --record "$1" --field "$2"; }
+stage_advance() { "$QUEUE_NOTARY_TOOL" notarize record advance --record "$record" --to "$@"; }
 archive() { ditto -c -k --sequesterRsrc --keepParent "$1" "$2"; }
 
 identity() {
@@ -46,14 +47,14 @@ check_file() {
 }
 
 check_receipt() {
-  local stage=$1 record="$state/stages/$1.json" receipt="$state/receipts/$1.json"
+  local stage=$1 submission=$2 archive=$3 receipt="$state/receipts/$1.json"
   [[ -f $receipt && ! -L $receipt ]] || fail "$stage acceptance receipt is missing."
-  jq -e --arg id "$(json_field "$record" submission_id)" --arg hash "$(json_field "$record" archive_sha256)" '
+  jq -e --arg id "$submission" --arg hash "$archive" '
     keys == ["jobId", "sha256", "status"] and .status == "Accepted" and .jobId == $id and .sha256 == $hash
   ' "$receipt" >/dev/null || fail "$stage acceptance receipt does not match its submission and exact archive."
   local log="$state/receipts/$stage.log.json"
   [[ -f $log && ! -L $log ]] || fail "$stage accepted Apple log is missing."
-  jq -e --arg id "$(json_field "$record" submission_id)" --arg hash "$(json_field "$record" archive_sha256)" '
+  jq -e --arg id "$submission" --arg hash "$archive" '
     .status == "Accepted" and .jobId == $id and .sha256 == $hash
   ' "$log" >/dev/null || fail "$stage accepted Apple log does not match its exact submission and archive."
   check_log_name "$log" "$stage"
@@ -71,7 +72,10 @@ check_log_name() {
 }
 
 verify_state() {
-  local metadata="$state/metadata.json" stage phase previous=finished record hash
+  local metadata="$state/metadata.json" stage phase previous=finished record hash fields submission completed
+  # Every operation on existing state reads its stage records through this client.
+  [[ ${QUEUE_NOTARY_TOOL:-} == /* && -f ${QUEUE_NOTARY_TOOL:-} && -x ${QUEUE_NOTARY_TOOL:-} ]] ||
+    fail 'Resumable state requires an executable prebuilt notarization client in QUEUE_NOTARY_TOOL.'
   [[ -f $metadata && ! -L $metadata ]] || fail 'State metadata is missing.'
   jq -e --arg version "$resume_version" --arg team "$APPLE_TEAM_ID" --arg sha "$source_sha" \
     --arg repository "$GITHUB_REPOSITORY" --arg run "$source_run" --arg number "$source_number" \
@@ -104,26 +108,16 @@ verify_state() {
       continue
     fi
     [[ $previous == finished && -f $record && ! -L $record ]] || fail 'State stages are out of order.'
-    jq -e --arg stage "$stage" '
-      ((keys == ["archive_sha256", "completed_sha256", "phase", "prepared_attempt", "prepared_run_id", "stage", "submission_id"] and
-        (.prepared_run_id | type == "string" and test("^[1-9][0-9]*$"))) or
-       keys == ["archive_sha256", "completed_sha256", "phase", "prepared_attempt", "stage", "submission_id"]) and
-      .stage == $stage and (.prepared_attempt | type == "string" and test("^[1-9][0-9]*$")) and
-      (.archive_sha256 | type == "string" and test("^[a-f0-9]{64}$")) and
-      (.phase == "prepared" or .phase == "uploading" or .phase == "submitted" or .phase == "accepted" or .phase == "finished") and
-      (if .phase == "prepared" or .phase == "uploading" then .submission_id == "" else
-        (.submission_id | type == "string" and test("^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$")) end) and
-      (if .phase == "finished" then (.completed_sha256 | type == "string" and test("^[a-f0-9]{64}$")) else .completed_sha256 == "" end)
-    ' "$record" >/dev/null || fail "$stage state record is malformed or its submission ID is missing."
-    phase=$(json_field "$record" phase)
-    hash=$(json_field "$record" archive_sha256)
+    fields=$("$QUEUE_NOTARY_TOOL" notarize record get --record "$record" --stage "$stage" \
+      --field phase,archive_sha256,submission_id,completed_sha256) ||
+      fail "$stage state record is malformed or its submission ID is missing."
+    IFS=, read -r phase hash submission completed <<< "$fields"
     if [[ $stage == dmg ]]; then check_file "$state/archives/dmg.dmg" "$hash";
     else check_file "$state/archives/$stage.zip" "$hash"; fi
-    case "$phase" in accepted|finished) check_receipt "$stage" ;; esac
+    case "$phase" in accepted|finished) check_receipt "$stage" "$submission" "$hash" ;; esac
     if [[ $phase == finished ]]; then
-      hash=$(json_field "$record" completed_sha256)
-      if [[ $stage == dmg ]]; then check_file "$state/completed/dmg.dmg" "$hash";
-      else check_file "$state/completed/$stage.zip" "$hash"; fi
+      if [[ $stage == dmg ]]; then check_file "$state/completed/dmg.dmg" "$completed";
+      else check_file "$state/completed/$stage.zip" "$completed"; fi
     fi
     previous=$phase
   done
@@ -167,7 +161,7 @@ publication_evidence() {
     fail 'Publication evidence requires an artifact-bound CI candidate.'
   local stage
   for stage in app dmg; do
-    [[ -f $state/stages/$stage.json && $(json_field "$state/stages/$stage.json" phase) == finished ]] ||
+    [[ -f $state/stages/$stage.json && $(stage_field "$state/stages/$stage.json" phase) == finished ]] ||
       fail 'All stages must finish before retaining publication evidence.'
   done
   if [[ ! -e $state/publication.json && ! -L $state/publication.json ]]; then
@@ -194,10 +188,6 @@ configure_credentials() {
   macos_signing_configure || return
   MACOS_NOTARY_REST=0
   if [[ -n ${NOTARY_KEY_FILE:-} ]]; then
-    if [[ ${QUEUE_NOTARY_TOOL:-} != /* || ! -f ${QUEUE_NOTARY_TOOL:-} || ! -x ${QUEUE_NOTARY_TOOL:-} ]]; then
-      macos_signing_error 'Raw API keys require an executable prebuilt notarization client in QUEUE_NOTARY_TOOL.'
-      return 1
-    fi
     # Native notarytool accepts bare seconds. Normalize only the REST path and
     # reject its unsupported wait budget before signing or creating a submission.
     local timeout_amount=${NOTARY_TIMEOUT%[smh]} timeout_unit=${NOTARY_TIMEOUT##*[0-9]} timeout_max
@@ -242,7 +232,7 @@ prepare_stage() {
   local image_signing_arguments
   [[ ! -f $record ]] || { printf '%s already prepared.\n' "$stage"; return; }
   if [[ $stage == dmg ]]; then
-    [[ -f $state/stages/app.json && $(json_field "$state/stages/app.json" phase) == finished ]] ||
+    [[ -f $state/stages/app.json && $(stage_field "$state/stages/app.json" phase) == finished ]] ||
       fail 'The previous stage must be accepted and finished before preparing this stage.'
   fi
   macos_signing_operation configure-credentials configure_credentials
@@ -270,22 +260,21 @@ prepare_stage() {
       macos_signing_operation verify-dmg macos_verify_disk_image_code "$submitted_archive"
       ;;
   esac
-  jq -n --arg stage "$stage" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg hash "$(sha256 "$submitted_archive")" '
-    {stage:$stage, phase:"prepared", prepared_run_id:$run, prepared_attempt:$attempt, archive_sha256:$hash, submission_id:"", completed_sha256:""}
-  ' > "$record.new"
-  mv "$record.new" "$record"
+  "$QUEUE_NOTARY_TOOL" notarize record create --record "$record" --stage "$stage" \
+    --run "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --sha256 "$(sha256 "$submitted_archive")"
   rm -rf "$state/work"
 }
 
 submit_stage() {
   [[ -f $record ]] || fail 'Prepare this stage before submitting it.'
-  [[ $(json_field "$record" phase) != uploading ]] || fail 'A previous upload has an unknown outcome; manual reconciliation is required, never resubmit.'
-  [[ $(json_field "$record" phase) == prepared ]] || { printf '%s submission already recorded.\n' "$stage"; return; }
+  local fields phase prepared_run prepared_attempt archive_hash
+  fields=$("$QUEUE_NOTARY_TOOL" notarize record get --record "$record" --field phase,prepared_run_id,prepared_attempt,archive_sha256)
+  IFS=, read -r phase prepared_run prepared_attempt archive_hash <<< "$fields"
+  [[ $phase != uploading ]] || fail 'A previous upload has an unknown outcome; manual reconciliation is required, never resubmit.'
+  [[ $phase == prepared ]] || { printf '%s submission already recorded.\n' "$stage"; return; }
   # Legacy records were prepared by the source CI execution. Attempt numbers
   # alone are not identities: every new distribution execution starts at one.
-  local prepared_run
-  prepared_run=$(jq -er --arg legacy "$source_run" '.prepared_run_id // $legacy' "$record")
-  [[ $prepared_run == "$GITHUB_RUN_ID" && $(json_field "$record" prepared_attempt) == "$GITHUB_RUN_ATTEMPT" ]] ||
+  [[ ${prepared_run:-$source_run} == "$GITHUB_RUN_ID" && $prepared_attempt == "$GITHUB_RUN_ATTEMPT" ]] ||
     fail 'Prepared snapshot has no submission ID from an earlier attempt. Upload outcome is unknown; reconcile with Apple manually, never resubmit.'
   configure_credentials
   # Keep checkpoint paths stable, but give Apple a recognizable submission name.
@@ -295,28 +284,31 @@ submit_stage() {
   rm -rf "$state/work"
   mkdir "$state/work"
   cp "$submitted_archive" "$upload_archive"
-  check_file "$upload_archive" "$(json_field "$record" archive_sha256)"
+  check_file "$upload_archive" "$archive_hash"
   if [[ $MACOS_NOTARY_REST == 1 ]]; then
     # The client preflights authentication before recording upload intent, then
     # durably records Apple's ID before S3. Never premark or rewrite its record.
     macos_signing_operation notary-submit "$QUEUE_NOTARY_TOOL" notarize submit \
-      --archive "$upload_archive" --record "$record" --sha256 "$(json_field "$record" archive_sha256)"
+      --archive "$upload_archive" --record "$record" --sha256 "$archive_hash"
     return
   fi
   local response submission id_pattern='^[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}$'
   response=$(mktemp)
   # Raw provider output stays outside the durable public state. Do not retain
   # stderr, auth arguments or private runner paths in snapshots.
-  atomic_json "$record" '.phase="uploading"'
+  stage_advance uploading
   if ! xcrun notarytool submit "$upload_archive" "${MACOS_NOTARY_AUTH[@]}" --output-format json --no-progress > "$response"; then
     rm -f "$response"
     fail 'Notary upload failed or its outcome is unknown; preserve the prepared snapshot for manual reconciliation.'
   fi
   submission=$(jq -er '.id | strings' "$response") || { rm -f "$response"; fail 'Upload returned no submission ID; manual reconciliation is required.'; }
   rm -f "$response"
-  [[ $submission =~ $id_pattern ]] || fail 'Upload returned a malformed submission ID; manual reconciliation is required.'
-  jq --arg id "$submission" '.phase="submitted" | .submission_id=$id' "$record" > "$record.new"
-  mv "$record.new" "$record"
+  if ! stage_advance submitted --id "$submission"; then
+    # A failed write must not lose the only evidence of Apple's ID, as on the REST
+    # path. Provider text that is not a whole UUID is still never echoed.
+    [[ $submission =~ $id_pattern ]] || fail 'Upload returned a malformed submission ID; manual reconciliation is required.'
+    fail "Apple submission $submission could not be recorded; manual reconciliation is required, never resubmit."
+  fi
   printf 'Recorded Apple submission %s (%s).\n' "$submission" "$stage"
 }
 
@@ -344,8 +336,9 @@ save_provider_log() {
 
 finish_stage() {
   [[ -f $record ]] || fail 'No submission exists for this stage.'
-  local phase submission response provider_log completed hash wait_result=0 log_result=0
-  phase=$(json_field "$record" phase)
+  local fields phase submission response provider_log completed hash wait_result=0 log_result=0
+  fields=$("$QUEUE_NOTARY_TOOL" notarize record get --record "$record" --field phase,submission_id,archive_sha256)
+  IFS=, read -r phase submission hash <<< "$fields"
   [[ $phase != prepared && $phase != uploading ]] || fail 'No submission ID exists for this prepared stage.'
   [[ $phase != finished ]] || { printf '%s already finished.\n' "$stage"; return; }
   # An earlier transient must never authorize a retry of a later terminal error.
@@ -353,7 +346,6 @@ finish_stage() {
   MACOS_TICKET_RECOVERY_FILE="$state/receipts/$stage.retry"
   if [[ $phase == submitted ]]; then
     configure_credentials
-    submission=$(json_field "$record" submission_id)
     response=$(mktemp)
     provider_log=$(mktemp)
     if [[ $MACOS_NOTARY_REST == 1 ]]; then
@@ -397,7 +389,6 @@ finish_stage() {
       rm -f "$response" "$provider_log"
       fail 'Cannot retrieve the Apple acceptance log.'
     fi
-    hash=$(json_field "$record" archive_sha256)
     if ! jq -e --arg id "$submission" --arg hash "$hash" '
       .status == "Accepted" and .jobId == $id and .sha256 == $hash
     ' "$provider_log" >/dev/null; then
@@ -411,7 +402,7 @@ finish_stage() {
     jq '{jobId, sha256, status}' "$provider_log" > "$state/receipts/$stage.json.new"
     mv "$state/receipts/$stage.json.new" "$state/receipts/$stage.json"
     rm -f "$response" "$provider_log"
-    atomic_json "$record" '.phase="accepted"'
+    stage_advance accepted
   fi
   # Recover a crash during stapling from the immutable submitted archive rather
   # than modifying it or applying a new signature.
@@ -431,8 +422,7 @@ finish_stage() {
     macos_verify_app_distribution "$app"
     archive "$app" "$completed"
   fi
-  jq --arg hash "$(sha256 "$completed")" '.phase="finished" | .completed_sha256=$hash' "$record" > "$record.new"
-  mv "$record.new" "$record"
+  stage_advance finished --completed-sha256 "$(sha256 "$completed")"
   rm -f "$state/receipts/$stage.retry"
   rm -rf "$state/work"
 }
@@ -442,7 +432,7 @@ export_assets() {
   rm -f "$state/receipts/dmg.retry"
   MACOS_TICKET_RECOVERY_FILE="$state/receipts/dmg.retry"
   for stage in app dmg; do
-    [[ -f $state/stages/$stage.json && $(json_field "$state/stages/$stage.json" phase) == finished ]] ||
+    [[ -f $state/stages/$stage.json && $(stage_field "$state/stages/$stage.json" phase) == finished ]] ||
       fail 'Both stages must be Accepted and finished before publishing.'
   done
   destination=$(macos_signing_canonical_path "$destination")
@@ -462,8 +452,7 @@ export_assets() {
 }
 
 bind_origin() {
-  [[ -n ${BUILD_RUN_ID:-} && ${QUEUE_NOTARY_TOOL:-} == /* && -x ${QUEUE_NOTARY_TOOL:-} ]] ||
-    fail 'Original artifact binding requires verified build context and the prebuilt trusted verifier.'
+  [[ -n ${BUILD_RUN_ID:-} ]] || fail 'Original artifact binding requires verified build context.'
   "$QUEUE_NOTARY_TOOL" verify-checkpoint-origin --original "$original_archive" --initial "$state/initial.zip"
   if [[ $(json_field "$state/metadata.json" schema) == 1 ]]; then
     # Metadata upgrade follows exact original-byte/mode/resource verification.

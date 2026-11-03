@@ -19,6 +19,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, getenv func(strin
 	if len(args) == 0 {
 		return failure("invalid_arguments")
 	}
+	if args[0] == "record" {
+		return runRecord(args[1:], stdout)
+	}
 	flags := flag.NewFlagSet("notarize", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	var archive, record, hash, id, output string

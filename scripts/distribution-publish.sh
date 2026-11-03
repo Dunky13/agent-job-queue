@@ -11,6 +11,7 @@ hash() { shasum -a 256 "$1" | awk '{print $1}'; }
   ${BUILD_SHA:-} =~ ^[a-f0-9]{40}$ && ${BUILD_RUN_NUMBER:-} =~ ^[1-9][0-9]{0,8}$ &&
   ${BUILD_TAG:-} == "build-$BUILD_RUN_NUMBER-${BUILD_SHA:0:7}" ]] || fail 'Invalid release source identity.'
 [[ -n ${GH_TOKEN:-} ]] || fail 'GH_TOKEN is required.'
+[[ ${QUEUE_NOTARY_TOOL:-} == /* && -f ${QUEUE_NOTARY_TOOL:-} && -x ${QUEUE_NOTARY_TOOL:-} ]] || fail 'An executable prebuilt QUEUE_NOTARY_TOOL is required.'
 assets=$(cd -- "$1" && pwd)
 temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
@@ -71,12 +72,18 @@ jq -e --arg repo "$GITHUB_REPOSITORY" --arg sha "$BUILD_SHA" --arg version "$ver
   ([.stages[].stage] == ["app", "dmg"]) and (.logs | length) == 2 and
   all(range(0;2); . as $i |
     $evidence.stages[$i].phase == "finished" and $evidence.logs[$i].status == "Accepted" and
-    ($evidence.stages[$i].submission_id | test("^[A-Fa-f0-9]{8}(-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}$")) and
-    ($evidence.stages[$i].archive_sha256 | test("^[a-f0-9]{64}$")) and
     $evidence.logs[$i].jobId == $evidence.stages[$i].submission_id and
     $evidence.logs[$i].sha256 == $evidence.stages[$i].archive_sha256) and
   .stages[0].completed_sha256 == $zip and .stages[1].completed_sha256 == $dmg
 ' "$candidate/apple-notarization.json" >/dev/null || fail 'Public Apple evidence does not bind Accepted stages to this source and final candidate.'
+# The jq above binds the stages to their logs and assets; their shape is the record module's.
+index=0
+for stage in app dmg; do
+  jq ".stages[$index]" "$candidate/apple-notarization.json" > "$temporary/stage.json"
+  env -u GH_TOKEN "$QUEUE_NOTARY_TOOL" notarize record validate --record "$temporary/stage.json" --stage "$stage" ||
+    fail 'Public Apple evidence does not bind Accepted stages to this source and final candidate.'
+  index=$((index + 1))
+done
 {
   printf '%s\n\n%s\n\n' \
     "Automated app from validated main commit ${BUILD_SHA}. Includes Apple Silicon and Intel executables plus checksum-pinned Homebrew metadata." \

@@ -1,0 +1,9 @@
+{
+  "stage": "app",
+  "phase": "accepted",
+  "prepared_run_id": "40297953014",
+  "prepared_attempt": "2",
+  "archive_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "submission_id": "01234567-89ab-cdef-0123-456789ABCDEF",
+  "completed_sha256": ""
+}
