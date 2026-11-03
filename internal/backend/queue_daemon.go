@@ -55,6 +55,34 @@ func safeQueueSocket(path string) error {
 	}
 	return nil
 }
+
+// listenQueueSocket binds on a private name and renames the 0600 socket into
+// place, so callers never see the socket at its default mode (reported as unsafe,
+// which is final) and a stale socket is replaced without a missing-path gap.
+// The name is short because unix socket paths are limited to 104 bytes on macOS.
+func listenQueueSocket(path string, bound func()) (*net.UnixListener, error) {
+	staging := filepath.Join(filepath.Dir(path), "q.new")
+	if e := os.Remove(staging); e != nil && !errors.Is(e, os.ErrNotExist) {
+		return nil, e
+	}
+	listener, e := net.ListenUnix("unix", &net.UnixAddr{Name: staging, Net: "unix"})
+	if e != nil {
+		return nil, e
+	}
+	listener.SetUnlinkOnClose(false)
+	if bound != nil {
+		bound()
+	}
+	if e = os.Chmod(staging, 0600); e == nil {
+		e = os.Rename(staging, path)
+	}
+	if e != nil {
+		listener.Close()
+		os.Remove(staging)
+		return nil, e
+	}
+	return listener, nil
+}
 func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 	ctx := g.operationContext()
 	if err := ctx.Err(); err != nil {
@@ -237,21 +265,14 @@ func ServeQueue(g *Gate) error {
 		if !errors.Is(e, syscall.ECONNREFUSED) {
 			return fmt.Errorf("Cannot safely replace queue socket: %w", e)
 		}
-		if e = os.Remove(path); e != nil {
-			return e
-		}
 	} else if !errors.Is(e, os.ErrNotExist) {
 		return e
 	}
-	listener, e := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	listener, e := listenQueueSocket(path, nil)
 	if e != nil {
 		return e
 	}
-	listener.SetUnlinkOnClose(false)
 	defer listener.Close()
-	if e = os.Chmod(path, 0600); e != nil {
-		return e
-	}
 	defer os.Remove(path)
 	d := newQueueDaemon(g, store)
 	defer d.hooks.wait()

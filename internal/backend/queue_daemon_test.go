@@ -350,3 +350,38 @@ func TestQueueLaunchRejectsUnsafeLogsWithoutBlocking(t *testing.T) {
 		})
 	}
 }
+
+// A caller treats an unsafe socket as final, so the daemon must never expose its
+// socket at the path before it is private (the daemon runs with umask 077, so the bound mode is 0700, not 0600).
+func TestQueueSocketIsNeverVisibleBeforeItIsPrivate(t *testing.T) {
+	previous := syscall.Umask(077)
+	t.Cleanup(func() { syscall.Umask(previous) })
+	root, err := os.MkdirTemp("/tmp", "queue-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	g := testGate(t)
+	g.State = root
+	if err = privateDirectory(filepath.Join(root, "run")); err != nil {
+		t.Fatal(err)
+	}
+	path := queueSocket(g)
+	var seen error
+	listener, err := listenQueueSocket(path, func() { seen = safeQueueSocket(path) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if seen == nil || strings.Contains(seen.Error(), "Unsafe") || !errors.Is(queueTransportError(seen), errQueueTransportUnavailable) {
+		t.Fatalf("a caller checking while the daemon binds must see a retryable absence, got %v", seen)
+	}
+	if err = safeQueueSocket(path); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("the renamed socket must accept connections: %v", err)
+	}
+	conn.Close()
+}
