@@ -24,10 +24,15 @@ struct QueueBootstrapEnvironment: Sendable {
     var source: URL { resources.appendingPathComponent("payload/source") }
     var allowsInstallation: Bool { setupAllowed && !arguments.contains("--fixture") }
 
+    static func isTestOption(_ argument: String) -> Bool {
+        ["--fixture", "--snapshot", "--verify-"].contains { argument.hasPrefix($0) }
+    }
+
     func validateDiagnostics() throws {
         if arguments.filter({ $0 == "--setup" }).count > 1 || arguments.contains(where: { $0.hasPrefix("--setup=") }) {
             throw ClientError.message("Pass --setup at most once; setup runs automatically on launch.")
         }
+        #if AGENT_QUEUE_TEST_HOOKS
         let fixtureIndices = arguments.indices.filter { arguments[$0] == "--fixture" }
         if !fixtureIndices.isEmpty || arguments.contains(where: { $0.hasPrefix("--fixture=") }) {
             guard fixtureIndices.count == 1, let index = fixtureIndices.first,
@@ -49,6 +54,12 @@ struct QueueBootstrapEnvironment: Sendable {
                 throw ClientError.message("--snapshot requires a PNGFILE argument. No backend changes have been made.")
             }
         }
+        #else
+        // Without their hooks these would otherwise fall through to a real launch and setup.
+        if arguments.contains(where: Self.isTestOption) {
+            throw ClientError.message("Test options need the test build. No backend changes have been made.")
+        }
+        #endif
     }
 
     func inspect() throws -> QueueBootstrapDecision {

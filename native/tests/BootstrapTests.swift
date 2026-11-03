@@ -1,3 +1,4 @@
+@testable import AgentQueueCore
 import Foundation
 import Darwin
 
@@ -442,6 +443,9 @@ struct BootstrapTests {
         try check(try inert.inspect() == .legacy, "Fixture arguments are inert even for a damaged packaged app")
         inert.arguments = ["--fixture"]
         try check(rejects(inert, containing: "requires a JSONFILE"), "Malformed fixture selection fails closed before real queue startup")
+        try check(["--fixture", "--fixture=x", "--snapshot", "--snapshot-menu", "--verify-detail-navigation"].allSatisfy(QueueBootstrapEnvironment.isTestOption)
+            && !["--setup", "--open-window", "fixture.json"].contains(where: QueueBootstrapEnvironment.isTestOption),
+            "The shipped build refuses exactly the options whose hooks it leaves out")
         let diagnosticFresh = try fixture()
         for arguments in [["--snapshot", "output.png"], ["--snapshot"], ["--fixture"], ["--fixture", ""],
                           ["--fixture", "--snapshot", "output.png"], ["--fixture", "--another-flag"],

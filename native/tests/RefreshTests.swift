@@ -1,3 +1,4 @@
+@testable import AgentQueueCore
 import Foundation
 import Combine
 

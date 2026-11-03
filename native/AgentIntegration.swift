@@ -30,12 +30,14 @@ final class AgentIntegrationStore: ObservableObject {
     }) {
         self.fixtureMode = fixtureMode
         self.command = command
+        #if AGENT_QUEUE_TEST_HOOKS
         if fixtureMode {
             snapshot = AgentIntegrationSnapshot(runners: [
                 AgentRunnerConfiguration(id: "codex", name: "Codex", path: "~/.codex/AGENTS.md", configured: false, error: nil),
                 AgentRunnerConfiguration(id: "claude", name: "Claude Code", path: "~/.claude/CLAUDE.md", configured: false, error: nil)
             ], instruction: "Run heavy builds and broad tests through agent-heavy -- <command>.\nKeep lightweight checks outside the queue.")
         }
+        #endif
     }
 
     var hasChanges: Bool {
