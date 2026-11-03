@@ -310,7 +310,13 @@ func (w liveCallerWait) describe() string {
 	}
 	// The caller runs in the test's directory, so its git subprocesses do not
 	// mention the fixture home. Include the caller's descendants by parentage.
-	processes, _ := exec.CommandContext(ctx, "ps", "-axo", "pid,ppid,pgid,etime,stat,command").Output()
+	// Its own limit: a wedged daemon can use up the snapshot's whole context.
+	psContext, finishPS := context.WithTimeout(context.Background(), 5*time.Second)
+	defer finishPS()
+	processes, psError := exec.CommandContext(psContext, "ps", "-axo", "pid,ppid,pgid,etime,stat,command").Output()
+	if psError != nil {
+		fmt.Fprintf(&report, "process list error: %v\n", psError)
+	}
 	lines := strings.Split(string(processes), "\n")
 	family := map[int]bool{w.pid: true}
 	for range 3 {
@@ -363,6 +369,8 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 		blockerStarted := filepath.Join(i.home, "blocker-started")
 		blocker := exec.CommandContext(callersContext, cli, "run", "--", "/bin/sh", "-c", `touch "$1"; while [ ! -f "$2" ]; do sleep .05; done`, "fixture", blockerStarted, blockerRelease)
 		blocker.Env = environment
+		var blockerOutput callerOutput
+		blocker.Stdout, blocker.Stderr = &blockerOutput, &blockerOutput
 		if err := blocker.Start(); err != nil {
 			t.Fatal(err)
 		}
@@ -374,7 +382,7 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 				<-blockerDone
 			}
 		})
-		blockerWait := liveCallerWait{t: t, i: i, pid: blocker.Process.Pid, finished: blockerDone}
+		blockerWait := liveCallerWait{t: t, i: i, pid: blocker.Process.Pid, finished: blockerDone, output: &blockerOutput}
 		blockerWait.accepted(ctx, 1)
 		blockerWait.started(ctx, blockerStarted)
 	}

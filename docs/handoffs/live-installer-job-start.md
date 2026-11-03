@@ -35,12 +35,15 @@ passing ones, which fits a transient window better than a uniformly slow runner.
 - Same run, iterations 2 and 3, load still on: 8 of 8 starts took 1.68 to 2.0 s.
   So load alone does not explain the failures. Something warms up or a transient
   clears, and that is unexplained.
-- Run 41577937033, same load, all ten scenarios once, against this PR's code:
-  all passed. Waiting for the daemon to list the job took 4.97 s in the first
+- Run 41577937033, same load, all ten scenarios once, against `0eba4ed`, this
+  PR's code with a 30 s stage-one cap instead of 20 s: all passed. Waiting for the daemon to list the job took 4.97 s in the first
   scenario (`complete`, cold) and 0.64 to 1.12 s in the other nine; the command
   then started in 0.21 to 0.50 s. The whole test took 448 s. This run did not
-  reproduce the slow window, so it does not show how the later flat waits behave
-  inside one (see below).
+  reproduce the slow window. Its slowest caller start, 5.34 s, would also have
+  passed the old 8 s wait, so it does not prove the fix, and it does not show how
+  the later flat waits behave inside a slow window (see below). The evidence that
+  the fix matters is local: a 12 s pre-submit delay now passes, which the flat 8 s
+  wait could not allow.
 
 Limits of the evidence:
 
@@ -120,6 +123,5 @@ and was reparented to PID 1.
   passes (exit 0, all ten scenarios).
 - Failure reporting was exercised by pointing the wait at a file that never
   appears: the report names the job as Running, the live caller and its worker.
-- Hosted CI cannot run while this PR targets `arch/retire-handover-begin`; it runs
-  after retargeting to `main` once #67 merges. A rare slow window cannot be proven
-  absent from passing runs.
+- #67 has merged, so this PR now targets `main` and runs hosted CI. A rare slow
+  window cannot be proven absent from passing runs.
