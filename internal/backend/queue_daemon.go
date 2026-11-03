@@ -380,10 +380,27 @@ func (d *queueDaemon) recover() error {
 	return nil
 }
 
-// queueRowRefused reports a store refusal the daemon settles instead of failing:
-// a corrupted row must never stop the queue. Stale errors are not refusals.
+// queueRowRefused reports a store refusal the daemon settles instead of failing.
+// Stale errors are not refusals.
 func queueRowRefused(e error) bool {
 	return errors.Is(e, errQueueStateDisagreement) || errors.Is(e, errQueueIllegalTransition)
+}
+
+// queuePublishedCode is the exit status a corrupted outcome row already holds: its
+// column, then a result its status can still give. Only then is it unknown.
+func queuePublishedCode(j queueJob) int {
+	if j.outcome.Valid {
+		return int(j.outcome.Int64)
+	}
+	if name, details, e := TaskStatus(j.task); e == nil && name == "Done" {
+		if code, e := ResultCode(details["result"]); e == nil {
+			return code
+		}
+	}
+	if boolean(j.task["cancelled"]) {
+		return 130
+	}
+	return 125
 }
 
 // reportRow writes one line per row per daemon run. daemon.log is bounded only at
@@ -630,6 +647,10 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		if name != "Running" && name != "Paused" {
 			return nil, errors.New("Only active jobs can be paused or resumed")
 		}
+		// A refusal must send nothing: a stopped process with no record stays stopped.
+		if e = checkQueuePausable(j); e != nil {
+			return nil, e
+		}
 		sig := syscall.SIGSTOP
 		if op == "resume-job" {
 			sig = syscall.SIGCONT
@@ -847,15 +868,29 @@ func (d *queueDaemon) tick() error {
 				}
 				continue
 			}
+			name, _, unreadable := TaskStatus(j.task)
+			if unreadable != nil {
+				if e = d.endLease(j, "corrupted"); e != nil && !errors.Is(e, errQueueChanged) {
+					return e
+				}
+				continue
+			}
 			if j.phase == "running" {
 				occupy(j)
-			} else if name, _, e := TaskStatus(j.task); e == nil && name == "Queued" {
+			} else if name == "Queued" {
 				waiting = append(waiting, j)
 			}
 			continue
 		}
 		switch j.phase {
 		case "starting":
+			// A live child settles the row itself when it exits.
+			if _, _, unreadable := TaskStatus(j.task); unreadable != nil && d.children[j.id] == nil {
+				if e = d.finish(j, 125); e != nil && !errors.Is(e, errQueueChanged) {
+					return e
+				}
+				continue
+			}
 			occupy(j)
 		case "running":
 			if d.children[j.id] != nil {
@@ -890,13 +925,7 @@ func (d *queueDaemon) tick() error {
 			occupy(j)
 			// Its exit status stands if it has one. The next tick retires it as usual.
 			if queueJobAgreement(j) != nil {
-				code := 125
-				if j.outcome.Valid {
-					code = int(j.outcome.Int64)
-				} else if boolean(j.task["cancelled"]) {
-					code = 130
-				}
-				if e = d.finish(j, code); e != nil && !errors.Is(e, errQueueChanged) {
+				if e = d.finish(j, queuePublishedCode(j)); e != nil && !errors.Is(e, errQueueChanged) {
 					return e
 				}
 				continue

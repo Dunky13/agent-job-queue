@@ -731,3 +731,310 @@ func TestRealDaemonStartsWithCorruptedStartingRows(t *testing.T) {
 		t.Fatalf("lease row: %+v", j)
 	}
 }
+
+func TestCorruptedLeaseWithUnreadableStatusEnds(t *testing.T) {
+	for _, test := range []struct {
+		name, want string
+		phase      string
+	}{{"granted", "released", "running"}, {"queued", "dropped", "queued"}} {
+		t.Run(test.name, func(t *testing.T) {
+			d, s, _, output := corruptedDaemon(t)
+			transitionLease(t, s, 0, test.phase)
+			corruptTask(t, s, 0, `{"kind":"lease","lane":"qa","priority":0,"lease":{"state":"held"}}`)
+			corruptedTick(t, d)
+			corruptedTick(t, d)
+			j := transitionRow(t, s, 0)
+			if j.phase != "done" || !j.outcome.Valid || j.outcome.Int64 != 0 {
+				t.Fatalf("row: %+v", j)
+			}
+			lease := obj(j.task["lease"])
+			if lease["state"] != test.want || lease["reason"] != "corrupted" {
+				t.Fatalf("lease: %v", lease)
+			}
+			line := fmt.Sprintf("corrupted job 0: phase %s, status unreadable", test.phase)
+			if count := strings.Count(output.String(), line); count != 1 {
+				t.Fatalf("%q appears %d times in %q", line, count, output.String())
+			}
+		})
+	}
+	t.Run("gives up its lane slot", func(t *testing.T) {
+		d, _ := laneDaemon(t, 8, map[string]string{"one": laneManifest("one", `{"name":"one","concurrency":1}`)})
+		d.logOutput = &bytes.Buffer{}
+		first := acquireTestLease(t, d, "one", Object{"ttlSeconds": 3600})
+		second := acquireTestLease(t, d, "one", Object{"ttlSeconds": 3600})
+		requireLeaseState(t, d, second, "queued")
+		id, _ := integer(first["id"])
+		corruptTask(t, d.store, id, `{"kind":"lease","lane":"one","priority":0,"lease":{"state":"held"}}`)
+		corruptedTick(t, d)
+		requireLeaseState(t, d, second, "held")
+	})
+}
+
+func TestCorruptedStartingRowWithUnreadableStatus(t *testing.T) {
+	d, s, _, output := corruptedDaemon(t)
+	if _, err := s.db.Exec("UPDATE queue_settings SET parallel_limit=1"); err != nil {
+		t.Fatal(err)
+	}
+	transitionCommand(t, s, 0, "starting")
+	before := corruptTask(t, s, 0, `{"priority":0}`)
+	queued := transitionCommand(t, s, 1, "queued")
+	d.children[0] = &exec.Cmd{}
+	corruptedTick(t, d)
+	// A live child still owns it, and it keeps its slot until that child exits.
+	requireRowUnchanged(t, s, before)
+	requireRowUnchanged(t, s, queued)
+	delete(d.children, 0)
+	if err := s.setWaiting(queued, true); err != nil {
+		t.Fatal(err)
+	}
+	corruptedTick(t, d)
+	j := transitionRow(t, s, 0)
+	if j.phase != "outcome" || !j.outcome.Valid || j.outcome.Int64 != 125 {
+		t.Fatalf("row: %+v", j)
+	}
+	if count := strings.Count(output.String(), "corrupted job 0: phase starting, status unreadable"); count != 1 {
+		t.Fatalf("log: %q", output.String())
+	}
+}
+
+// Counting a row raises the ceiling, so an unreadable one stays uncounted. A live
+// worker still counts against the ceiling through its slot member.
+func TestLeaseCapacityWithUnreadableRows(t *testing.T) {
+	group := func(limit int) Object {
+		return Object{"default": Object{"parallel_tasks": limit, "status": "Running"}}
+	}
+	running := Object{"priority": 0, "status": Object{"Running": Object{}}}
+	for _, test := range []struct {
+		name  string
+		limit int
+		tasks Object
+		want  int
+	}{
+		{"unreadable rows leave the limit", 1, Object{"1": Object{"priority": 0}, "2": Object{"group": "default"}}, 1},
+		{"unreadable rows add nothing to what is admitted", 1, Object{"1": running, "2": running, "3": Object{"priority": 0}}, 2},
+		{"readable rows still count as on main", 1, Object{"1": running, "2": running}, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			g := testGate(t)
+			fakeQueue(t, g, Object{"tasks": test.tasks, "groups": group(test.limit)})
+			capacity, err := LeaseCapacity(g)
+			if err != nil {
+				t.Fatalf("an unreadable row failed the worker: %v", err)
+			}
+			if capacity != test.want {
+				t.Fatalf("capacity %d, want %d", capacity, test.want)
+			}
+		})
+	}
+	t.Run("a live member with an unreadable row still fills the ceiling", func(t *testing.T) {
+		g := testGate(t)
+		fakeQueue(t, g, Object{"tasks": Object{"1": Object{"priority": 0}, "2": running}, "groups": group(1)})
+		boot, err := BootIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		member := marker(1)
+		member["boot_uuid"] = boot
+		if acquired, err := AcquireLease(g, member, 1); err != nil || !acquired {
+			t.Fatalf("first member: %v %v", acquired, err)
+		}
+		capacity, err := LeaseCapacity(g)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := marker(2)
+		next["boot_uuid"] = boot
+		if acquired, err := AcquireLease(g, next, capacity); err != nil || acquired {
+			t.Fatalf("a job joined a full slot at capacity %d: %v %v", capacity, acquired, err)
+		}
+	})
+}
+
+func TestCorruptedOutcomeRowUsesAReadableResult(t *testing.T) {
+	for _, test := range []struct {
+		name, task string
+		cancelled  bool
+		want       int64
+		result     any
+	}{
+		{"Done with Success stays Success", `{"status":{"Done":{"result":"Success"}},"priority":0}`, false, 0, "Success"},
+		{"Done with a failure keeps its code", `{"status":{"Done":{"result":{"Failed":7}}},"priority":0}`, false, 7, Object{"Failed": 7}},
+		{"Done with an unknown result is unknown", `{"status":{"Done":{"result":"Mystery"}},"priority":0}`, false, 125, Object{"Failed": 125}},
+		{"Running has no result", `{"status":{"Running":{}},"priority":0}`, false, 125, Object{"Failed": 125}},
+		{"unreadable has no result", `{"priority":0}`, false, 125, Object{"Failed": 125}},
+		{"a cancelled row with no result", `{"cancelled":true,"priority":0}`, true, 130, Object{"Failed": 130}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d, s, _, _ := corruptedDaemon(t)
+			transitionCommand(t, s, 0, "outcome")
+			corruptTask(t, s, 0, test.task)
+			if _, err := s.db.Exec("UPDATE queue_jobs SET outcome=NULL WHERE id=0"); err != nil {
+				t.Fatal(err)
+			}
+			corruptedTick(t, d)
+			corruptedTick(t, d)
+			j := transitionRow(t, s, 0)
+			_, details, err := TaskStatus(j.task)
+			if err != nil || j.phase != "done" || !j.outcome.Valid || j.outcome.Int64 != test.want || !jsonEqual(details["result"], test.result) {
+				t.Fatalf("row %+v details %v err %v", j, details, err)
+			}
+			if err = queueJobAgreement(j); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func processStopped(t *testing.T, pid int) bool {
+	t.Helper()
+	raw, err := exec.Command("/bin/ps", "-o", "stat=", "-p", fmt.Sprint(pid)).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.HasPrefix(strings.TrimSpace(string(raw)), "T")
+}
+
+func TestPauseRefusalSendsNoSignal(t *testing.T) {
+	for _, phase := range []string{"queued", "outcome", "done"} {
+		t.Run(phase+" reading Running", func(t *testing.T) {
+			d, s, _, _ := corruptedDaemon(t)
+			worker, pgid, _ := liveWorker(t)
+			runningWithWorker(t, s, 0, worker)
+			if _, err := s.db.Exec("UPDATE queue_jobs SET phase=? WHERE id=0", phase); err != nil {
+				t.Fatal(err)
+			}
+			before := transitionRow(t, s, 0)
+			if _, err := d.control("pause-job", Object{"id": 0}); !errors.Is(err, errQueueIllegalTransition) {
+				t.Fatalf("pause: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			if processStopped(t, pgid) {
+				t.Fatal("a refused pause stopped the process")
+			}
+			if err := syscall.Kill(-pgid, syscall.SIGSTOP); err != nil {
+				t.Fatal(err)
+			}
+			fixtureUntil(t, 4*time.Second, func() bool { return processStopped(t, pgid) })
+			if _, err := d.control("resume-job", Object{"id": 0}); !errors.Is(err, errQueueIllegalTransition) {
+				t.Fatalf("resume: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			if !processStopped(t, pgid) {
+				t.Fatal("a refused resume continued the process")
+			}
+			requireRowUnchanged(t, s, before)
+		})
+	}
+	t.Run("a healthy row still pauses and resumes", func(t *testing.T) {
+		d, s, _, _ := corruptedDaemon(t)
+		worker, pgid, _ := liveWorker(t)
+		runningWithWorker(t, s, 0, worker)
+		if _, err := d.control("pause-job", Object{"id": 0}); err != nil {
+			t.Fatal(err)
+		}
+		fixtureUntil(t, 4*time.Second, func() bool { return processStopped(t, pgid) })
+		if got := transitionStatus(t, transitionRow(t, s, 0)); got != "Paused" {
+			t.Fatalf("status %s", got)
+		}
+		if _, err := d.control("resume-job", Object{"id": 0}); err != nil {
+			t.Fatal(err)
+		}
+		fixtureUntil(t, 4*time.Second, func() bool { return !processStopped(t, pgid) })
+		if got := transitionStatus(t, transitionRow(t, s, 0)); got != "Running" {
+			t.Fatalf("status %s", got)
+		}
+	})
+}
+
+// A real daemon at limit 1 starts through recover() with one unreadable row, and a
+// job submitted afterwards must still run: on main, LeaseCapacity failed it with 125.
+func TestRealDaemonJobRunsPastUnreadableRowAtLimitOne(t *testing.T) {
+	stoppedAtLimitOne := func(t *testing.T) (*daemonFixture, *queueStore) {
+		t.Helper()
+		f := daemonAcceptance(t)
+		if _, err := f.gate.QueueControl("limit", Object{"limit": 1}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.daemon.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.daemon.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		s, err := openQueueStore(f.gate.State, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(s.close)
+		return f, s
+	}
+	insert := func(t *testing.T, s *queueStore, phase, task string, worker, outcome any) {
+		t.Helper()
+		if _, err := s.db.Exec("INSERT INTO queue_jobs(id,token,task,attempt,phase,worker,outcome) VALUES(40,?,?,?,?,?,?)", strings.Repeat("c", 32), task, strings.Repeat("d", 32), phase, worker, outcome); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.db.Exec("UPDATE queue_settings SET next_id=41 WHERE id=1"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const command, lease = `{"priority":0}`, `{"kind":"lease","lane":"gone","priority":0,"lease":{"state":"held"}}`
+	for _, test := range []struct {
+		name, phase, task string
+		exited            bool
+		outcome           any
+	}{
+		{"queued", "queued", command, false, nil},
+		{"starting", "starting", command, false, nil},
+		{"running with an exited worker", "running", command, true, nil},
+		{"outcome", "outcome", command, false, 7},
+		{"done", "done", command, false, 7},
+		{"queued lease", "queued", lease, false, nil},
+		{"granted lease", "running", lease, false, nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, s := stoppedAtLimitOne(t)
+			var worker any
+			if test.exited {
+				data, err := queueJSON(exitedWorker(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+				worker = data
+			}
+			insert(t, s, test.phase, test.task, worker, test.outcome)
+			queueRestartFixture(t, f)
+			if output := f.launch("/bin/sh", "-c", "printf ran").wait(t, 0); output != "ran" {
+				t.Fatalf("a job after the row did not run: %q", output)
+			}
+			fixtureUntil(t, 8*time.Second, func() bool { return transitionRow(t, s, 40).phase == "done" })
+		})
+	}
+	t.Run("running with a verified live worker keeps its slot", func(t *testing.T) {
+		f, s := stoppedAtLimitOne(t)
+		worker, pgid, exited := liveWorker(t)
+		data, err := queueJSON(worker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		insert(t, s, "running", command, data, nil)
+		before := transitionRow(t, s, 40)
+		queueRestartFixture(t, f)
+		started := filepath.Join(f.root, "started")
+		client := f.launch("/bin/sh", "-c", `touch "$1"; printf ran`, "fixture", started)
+		time.Sleep(time.Second)
+		requireRowUnchanged(t, s, before)
+		if _, err = os.Stat(started); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a job took the slot of a live worker: %v", err)
+		}
+		if err = syscall.Kill(-pgid, 0); err != nil {
+			t.Fatalf("the live worker was signalled: %v", err)
+		}
+		if err = syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
+			t.Fatal(err)
+		}
+		<-exited
+		if output := client.wait(t, 0); output != "ran" {
+			t.Fatalf("the waiting job did not run: %q", output)
+		}
+	})
+}

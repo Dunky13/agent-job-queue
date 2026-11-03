@@ -13,10 +13,9 @@ import (
 // have one owner. The one other writer is importLegacy, which inserts drained
 // history. Reads never validate: snapshots must still show a corrupt row.
 //
-// The overwrite methods at the end of this file are the deliberate exception. A
-// corrupted row must never stop the queue, refuse startup or stall other jobs, so
-// the daemon settles one and logs it. Nothing else may call them, and every other
-// write refuses an illegal edge or a disagreeing row.
+// The overwrite methods at the end of this file are the deliberate exception: the
+// daemon uses them to settle a corrupted row and log it. Nothing else may call
+// them, and every other write refuses an illegal edge or a disagreeing row.
 
 var (
 	errQueueChanged           = errors.New("Queue job changed concurrently")
@@ -166,13 +165,19 @@ func (s *queueStore) setWaiting(j queueJob, stashed bool) error {
 	return s.saveTask(j)
 }
 
-// setPaused records a signal the caller already delivered, so it keeps the
-// attempt's details. A lease has no process to pause.
-func (s *queueStore) setPaused(j queueJob, paused bool) error {
+// checkQueuePausable is setPaused's refusal, for a caller to ask before it signals.
+// A lease has no process to pause.
+func checkQueuePausable(j queueJob) error {
 	if taskIsLease(j.task) || j.phase != "starting" && j.phase != "running" {
 		return fmt.Errorf("%w: %s %d in phase %s cannot be paused or resumed", errQueueIllegalTransition, taskKind(j.task), j.id, j.phase)
 	}
-	if e := queueJobAgreement(j); e != nil {
+	return queueJobAgreement(j)
+}
+
+// setPaused records a signal the caller already delivered, so it keeps the
+// attempt's details.
+func (s *queueStore) setPaused(j queueJob, paused bool) error {
+	if e := checkQueuePausable(j); e != nil {
 		return e
 	}
 	_, details, e := TaskStatus(j.task)

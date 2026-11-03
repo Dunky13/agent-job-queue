@@ -2,7 +2,7 @@
 
 ## Result
 
-The queue store now owns job state transitions, in `internal/backend/queue_store_transitions.go`. There is no schema or handover protocol change. A healthy queue behaves as on main, and its snapshot is byte-identical to main's.
+The queue store now owns job state transitions, in `internal/backend/queue_store_transitions.go`. There is no schema or handover protocol change. A healthy queue behaves as on main, and its snapshot is byte-identical to main's. Corrupted rows are held to "no worse than main", with the known limits listed below.
 
 Callers ask the store for one of these:
 
@@ -22,63 +22,84 @@ Callers ask the store for one of these:
 
 An illegal edge returns `errQueueIllegalTransition`, and a row whose phase and status disagree returns `errQueueStateDisagreement`. Both fail before any write. Each statement keeps its original `WHERE` guards. `importLegacy` is the one other writer, inserting drained history.
 
-## Corrupted rows: settle it, and log it
+## Corrupted rows: no worse than main
 
-**Decision history:** the first version refused such a row and let it stop the queue. The second held only that row. Having seen the cost of that machinery, the owner decided to settle the row as main does and log it. No writer in any release can produce such a row, and independent review found 0 of 2,772 live rows rejected.
+**Decision history:** the first version refused such a row and let it stop the queue. The second held only that row. The third settled the row and logged it, and claimed a corrupted row could never stop the queue. Review showed that claim was false, and it is retracted. **This change's bar is no worse than main on corrupted rows, plus the listed fixes.** No writer in any release can produce such a row, and independent review found 0 of 2,772 live rows rejected.
 
-A corrupted row can never stop the queue, refuse startup or stall other jobs. The daemon's own settling path is the only thing allowed to overwrite one, through three narrow store methods that the file header names as the deliberate exception:
+The daemon's own settling path is the only thing allowed to overwrite a corrupted row, through three narrow store methods that the file header names as the deliberate exception:
 
 | Method | Stands in for | Used by |
 | --- | --- | --- |
 | `overwriteOutcome` | `recordOutcome` | `finish`, for `recover`, `tick`, `cancel` and a finished child |
-| `overwriteLeaseEnd` | `endLease` | `endLease` in the daemon: TTL, owner exit, cancel and release |
+| `overwriteLeaseEnd` | `endLease` | `endLease` in the daemon: TTL, owner exit, cancel, release and an unreadable status |
 | `overwriteCancelled` | `markCancelled` | `cancel` and `kill`, so the settled result still reads as cancelled |
 
-Each keeps the guards of the write it stands in for, and refuses a healthy row or a finished one. The review asked for one method; three were needed because each writes different columns.
+Each keeps the guards of the write it stands in for, and refuses a healthy row or a finished one.
 
-**What the daemon does:**
+**What the daemon settles:**
 
-- **`recover`:** a `starting` row in any state records 125 and startup proceeds. That includes a lease at `starting`, which no lease edge covers.
+- **`recover`:** a `starting` row in any state records 125 and startup proceeds, including a lease at `starting`, which no lease edge covers.
 - **`tick`:**
   - A corrupted `running` row verifies its group identity as main does, and settles when no owned process remains. A verified live process is left alone.
-  - A corrupted `outcome` row keeps its published exit status and retires.
-  - A `queued` row with an unreadable status settles with 125.
-- **`Cancel()`, the client path:** behaves as on main. It settles the row, or returns an error if it can't; a live process is never reported as cancelled.
-- **Logging:** one line per row per daemon run, with the job ID, phase and status. `daemon.log` is bounded only at spawn, so this can't flood it, and each row has its own entry so one row can't hide another. The first report stands.
+  - A corrupted `outcome` row retires. It keeps its exit status from the outcome column, or from a readable result in its status. It gets 130 if cancelled, and 125 only if neither gives a code.
+  - A `queued` row, or a `starting` row with no live child, settles with 125 if its status is unreadable.
+  - A lease with an unreadable status ends with reason `corrupted`.
+- **`LeaseCapacity`:** an unreadable row no longer fails every job with 125.
+  - It adds nothing to capacity, which is `max(limit, readable admitted rows)`.
+  - That errs on the safe side because counting a row *raises* this ceiling, so counting an unreadable one could let extra jobs in.
+  - A row with a verified live worker still counts against the ceiling through its slot member, which `AcquireLease` compares with capacity. Its slot is also kept by `tick`, which keeps counting that row while the worker lives.
+  - It runs in the worker, whose output goes to the job's own log, so it logs nothing.
+- **`pause-job` and `resume-job`:** the store's check now runs before the signal, so a refusal sends nothing.
 
-### Compared with main
+**Logging:** one line per row per daemon run, with the job ID, phase and status, each row with its own entry. It is written when the daemon settles a row or can't verify its worker. **Rows the daemon doesn't touch are never logged:**
 
-A scratch scenario using raw SQL and shared APIs ran on both main (`7b4b27c`) and this branch, covering `recover`, `tick`, lease TTL, a healthy snapshot and `Cancel()`, including live processes. Only these outcomes differ. All three follow from the decision that a corrupted row can never stop the queue:
+- `done` rows.
+- `queued` rows reading a readable wrong status.
+- `starting` rows reading a readable wrong status, until a restart settles them.
+- Leases reading a readable wrong status, until they end.
+- A corrupted row with a verified live worker or a live child, until it settles.
+
+### What a corrupted row can still do
+
+Each of these matches main unless noted. They are listed under "Remaining work":
+
+- **Stop the tick for every job:** undecodable task JSON, which stops every read of unfinished jobs and prints an error every 100 ms. An agreeing `running` row with an unverifiable worker also does this.
+- **Stall adaptive mode:** `schedulingPermit` and `heldLeases` still fail on an unreadable row, so a job in adaptive mode gets 125. A corrupted row that reads as waiting can end a scheduling pass.
+- **Hold a slot:**
+  - A corrupted `running` row whose worker can't be verified stays until it can be, and survives restart. Main stopped the tick here.
+  - A `starting` row reading a readable wrong status, with no child, stays until a restart or `cancel`.
+  - A lease reading a readable wrong status stays until TTL, owner exit or release.
+  - At limit 1 a held slot blocks every other job that shares the limit.
+- **Break `agent-heavy status`:** `StatusData` fails while any row has an unreadable status. That is permanent for a `done` row, and lasts while a live worker's row exists.
+- **Break reordering:** `next` and `last` fail while any row has an unreadable status.
+- **Resist `Cancel()`:** see Defects 2 and 3 under "Remaining work".
+
+### Differences from main
+
+A scratch scenario using raw SQL and shared APIs ran on both main (`7b4b27c`) and an earlier commit of this branch, covering `recover`, `tick`, lease TTL, a healthy snapshot and `Cancel()` with live processes. It did not cover every row shape, and it was not re-run after these fixes. These are all the outcome differences known so far:
 
 | Row | Main | This branch |
 | --- | --- | --- |
-| `starting` with an unreadable status | `recover` refuses startup | records 125 and starts |
-| `outcome` with a bad status | reaches `done` with that bad status | status rewritten to agree; reaches `done` with its exit status, or 125 |
+| `starting` with an unreadable status, in `recover` | refuses startup | records 125 and starts |
+| `starting` with an unreadable status and no child, in `tick` | keeps its slot | records 125 |
+| `queued` with an unreadable status, in `tick` | stops the tick | records 125 |
+| lease with an unreadable status | left alone unless expired, then stops the tick | ends with reason `corrupted` |
+| `outcome` with a bad status | reaches `done` with that bad status | status rewritten to agree; reaches `done` with its exit status |
+| `outcome`, no outcome column, status `Done` | reaches `done` with no column | column filled from the result, which is kept; its end time is rewritten |
 | `running`, disagreeing, worker cannot be verified | stops the whole tick | stays unsettled and is not signalled; the tick continues |
+| any unreadable row, in `LeaseCapacity` | fails every job with 125 | skipped |
+| `cancel` on a `done` row reading `Queued` or `Running` | `Cancel()` times out after 12 s | fails at once with an illegal-transition error |
+| lease with no lease object, granted or ended | panics the daemon | no panic |
 
-Beyond that scenario, a corrupted lease row with no lease object panics the daemon on main. Here it no longer does.
-
-### Stricter than main, by design
-
-The strict writes stay strict, so these differ on a corrupted row. None can stall other jobs:
+**Stricter than main by design.** Each of these affects only that row's own request. None changes how other rows are dispatched in fixed or shadow mode:
 
 - `claimWorker` refuses, so the command doesn't run. Main ran it. The worker exits 125 and the daemon settles the row.
 - A worker can't publish its own final outcome. The daemon records the child's exit status, or 125 or 130 once no owned process remains.
 - `priority`, `next`, `last` and `lease-renew` go through `saveTask` and return the disagreement error, where main wrote the field.
-- `pause-job` and `resume-job` on a queued row reading `Running` or `Paused` return an illegal-transition error, where main changed the status.
+- `pause-job` and `resume-job` return an illegal-transition error and send no signal on a row outside `starting` or `running`. Main signalled and changed the status.
 - `hold` and `enqueue` on a corrupted row do nothing, where main could change the status.
 
-`start` keeps main's result: `Job changed before launch` for a command, and `errQueueChanged` for a lease.
-
-### Left as main
-
-- **Undecodable task JSON:** still stops every read of unfinished jobs, and the tick error still prints every 100 ms.
-- **A lease settled at `starting`:** stays at `outcome` afterwards, as on main. It holds no slot, but without a TTL it stays unfinished and blocks live handover.
-- **A corrupted `starting` row during a run with no child process:** keeps its slot until a restart or `cancel`, as on main.
-- **Adaptive scheduling:** a corrupted row that reads as waiting can still be selected, and the refused `start` ends that pass, as on main. Scheduler changes were removed on request.
-- **Findings 12 and 17:** a cancel whose signal fails leaves the cancel flag set, and `SIGCONT` is sent only to a row reading `Paused`. Both match main, so both stay.
-
-Finding 14 is fixed, because the settling path depends on it: an unreadable status now satisfies `errors.Is(errQueueStateDisagreement)`.
+`start` keeps main's result: `Job changed before launch` for a command, and `errQueueChanged` for a lease. A cancel whose signal fails leaves the cancel flag set, and `SIGCONT` goes only to a row reading `Paused`, both as on main.
 
 ## Where the checks are not strict, and why
 
@@ -94,7 +115,7 @@ Finding 14 is fixed, because the settling path depends on it: an unreadable stat
 ## Tests
 
 - `queue_store_transitions_test.go` covers the store's interface on temporary SQLite: both lifecycles, every kind, phase and method combination, stale views, disagreeing rows and atomic enqueue.
-- `queue_corrupted_test.go` covers the daemon through `recover()`, `tick()` and the real client `Cancel()`, and runs a real daemon end to end. Its healthy-snapshot golden was captured from main.
+- `queue_corrupted_test.go` covers the daemon through `recover()`, `tick()` and the real client `Cancel()`. `TestRealDaemonJobRunsPastUnreadableRowAtLimitOne` submits a real job at limit 1 after an unreadable row in each phase, in both lease phases, and with a verified live worker. Its healthy-snapshot golden was captured from main.
 
 These raw SQL fixtures stay on purpose:
 
@@ -105,20 +126,15 @@ These raw SQL fixtures stay on purpose:
 
 ## Evidence
 
-Results are for the commit that added the settling path. The host is under memory pressure and `scripts/validate.sh` is being fixed separately, so **no full batch ran**, and hosted CI is the only broad check.
+The branch is rebased on `origin/main`, which added the #61 `go.mod` and `go.sum` bump. All results below are on that base. The host is under memory pressure and `scripts/validate.sh` is being fixed separately, so **no full batch ran**, and hosted CI is the only broad check.
 
-- `bash scripts/lint.sh` and `go vet ./internal/backend/` passed.
-- `go test -p 2 -parallel 2 -race ./internal/backend -run 'Corrupted|TestHealthySnapshot|TestQueueControlHold|TestQueueStoreStatus|TestQueueStoreOverwrite|TestLegacyHistory|TestQueueTransition|TestQueueEdge|TestQueueCleanup|TestLease' -count=1` passed in 30s.
-- `go test -p 2 -parallel 2 ./internal/backend -run 'TestRealDaemon|Handover|TestQueue|TestLease|TestLane|TestRuntimeGeneration|Drained|Drain|TestLegacy|Corrupted|TestHealthySnapshot|Scheduling|TestScheduler|Supervised|DragDrop|TestManaged.*Stopped' -count=1` passed in 155s.
-- `node --test remote/static/schema.test.mjs` passed all 8 tests.
-- The main comparison above gave 36 rows on this branch. The 976-byte healthy snapshot matched main's exactly.
+- `bash scripts/lint.sh`, `go vet ./internal/backend/` and `node --test remote/static/schema.test.mjs` each exited 0.
+- `go test -p 2 -parallel 2 -race ./internal/backend -run 'Corrupted|TestLeaseCapacity|TestPauseRefusal|TestRealDaemonJobRunsPast|TestHealthySnapshot|TestQueueControlHold|TestQueueStoreStatus|TestQueueStoreOverwrite|TestLegacyHistory|TestQueueTransition|TestQueueEdge|TestQueueCleanup|TestLease' -count=1` exited 0 in 62s.
+- `go test -p 2 -parallel 2 ./internal/backend -run 'TestRealDaemon|Handover|TestQueue|TestLease|TestLane|TestRuntimeGeneration|Drained|Drain|TestLegacy|Corrupted|TestHealthySnapshot|Scheduling|TestScheduler|Supervised|DragDrop|TestManaged.*Stopped|Ownership|Slot|Shared' -count=1` exited 0 in 150s.
 
-**Mutants:** 26 temporary mutants against the real paths each failed the tests, and were reverted.
+**Mutants for these fixes:** 10 temporary mutants each failed the tests, and were reverted. They ignored an unreadable lease, ignored an unreadable `starting` row, settled one with a live child, failed the worker in `LeaseCapacity`, counted an unreadable row as capacity, ignored a readable result, ignored the outcome column, ignored the cancel flag, signalled before the pause check, and removed the store's pause check. Two first failed only to compile and were rewritten so that they really ran.
 
-- **Failing on `Cancel()` subtests, confirmed by running only those subtests (6):** not settling an outcome, dropping the cancel flag, refusing the flag on a corrupted row, not settling a lease end, settling while a process lives, and the missing lease object panic.
-- **Failing through `tick()` and `recover()` only (11):** the worker verification rules, outcome retirement and its exit status, the unreadable queued row, the log rules, the lease at `starting`, and the raw agreement error. Settling an unverifiable row fails a test that mixes `tick()` and `Cancel()`, so it is counted here.
-- **Failing at the store or control level only (9):** the overwrite guards, `markCancelled` strictness, the stashed lease, the added snapshot field, and the `start`, `hold` and lease grant results. None of these covers `Cancel()`.
-- One mutant first failed only to compile. It was re-run so that it really executes.
+**Earlier mutants, not re-run:** 26 mutants at the previous commit failed the tests. 6 of those fail on `Cancel()` subtests. None of the 10 above exercises `Cancel()`.
 
 **Known test risk:** `exitedWorker` could flake if its exited process ID is reused before the check runs, though the chance is low.
 
@@ -126,13 +142,20 @@ Results are for the commit that added the settling path. The host is under memor
 
 ## Remaining work
 
-Independent review of this commit comes next. These existing problems are out of scope and are not fixed here:
+Independent review of this commit comes next. These are follow-ups, not fixed here. Each matches main:
 
+- **The most realistic of these:** an agreeing `running` row with an unverifiable worker stops the whole tick. A reboot with a reused process group could reach this without any corrupted write.
+- **Defect 2:** `Cancel()` returns nil without settling a lease at `running` reading `Done`. Only `lease-release` clears it.
+- **Defect 3:** `Cancel()` can't clear a `starting` or `queued` row reading `Done` or an unknown name.
+- **Defect 4:** adaptive mode stalls on a corrupted row, and can exceed the limit with a held lease reading `Stashed` or `Done`, because `heldLeases` counts only `Running`.
+- `StatusData` fails on an unreadable row.
+- `next` and `last` fail when any row is unreadable.
 - A `Cleanup` that fails permanently stalls in silence, because `d.errors` is written and never read.
-- An agreeing `running` row with an unverifiable worker stops the whole tick.
-- A `done` row with a bad status fails `StatusData` and `LeaseCapacity`.
+- A `done` row with a bad status fails `StatusData`. `LeaseCapacity` no longer fails on an unreadable one, but `LeaseCapacity` and `StatusData` still read a readable wrong status at face value.
 - The 0.5-second assertion in `native/tests/TransportTests.swift` can fail on a loaded host.
 - A later refactor could move the `queue_settings` writes behind the store.
+
+**Accepted, not a follow-up:** a disagreeing `running` row with an unverifiable worker takes a slot indefinitely and survives restart, by fail-closed ownership.
 
 ## Next steps
 
