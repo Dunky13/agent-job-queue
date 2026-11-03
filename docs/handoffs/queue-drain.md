@@ -20,11 +20,10 @@ The run client's outage handling (`queue_outage.go`, `followWithToken`) is the o
 
 ## Deliberately not in this change
 
-These were reproduced in review. They predate drain and live in older safety code. Fixes attempted here broke `TestCleanupAfterConcurrentCompletion` and fail-closed ownership rules, so they were reverted and belong in focused PRs. The first two are also listed as known limitations in the README and `docs/upgrade-recovery.md`.
+These were reproduced in review. They predate drain and live in older safety code. Fixes attempted here broke `TestCleanupAfterConcurrentCompletion` and fail-closed ownership rules, so they were reverted and belong in focused PRs. Both are also listed as known limitations in the README and `docs/upgrade-recovery.md`.
 
 1. **Half-removed slot after SIGKILL.** A SIGKILL during slot teardown (`ownership.go`) can leave only `agent-heavy-lease.json` in the slot. After a restart, callers fail with `lstat .../agent-heavy-jobs` and later jobs do not run. Seen once in 44 SIGKILLs. Teardown needs to become crash-safe. An empty, complete slot left by a crash also blocks the setup gate with no receipt to drive recovery, so a repair must cover that window too, and must only ever touch a slot that is provably ours.
 2. **Adaptive grant expiry.** The controller (`scheduler_controller.go:636`) deletes an expired grant even for a started worker still waiting for the shared slot, and the permit (`scheduler.go:447`) then stays false. Reproduce with adaptive mode, Start now, an external slot owner, a gap longer than the 30 s manual grant, then free the slot. The job waits until cancelled, with or without a drain. Likely fix: expire grants only for Queued or Stashed tasks and refresh them for started workers with no pgid.
-3. **Flaky test on main.** `TestCorruptedRowsCancelThroughClient/running_reading_Queued` fails occasionally on clean `main` too (4 of 60 runs with `-race`). The test's ticker starts before `Cancel`, so a tick can finish the row with 125 first. Fix the test's ordering, keeping `running_reading_Done`, which never sends a cancel.
 
 ## Remaining work
 

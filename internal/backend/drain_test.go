@@ -2192,12 +2192,19 @@ func TestSignalOfAGroupWhoseWorkerFinishedReadsTheRowAgain(t *testing.T) {
 	if err = d.signal(stale, syscall.SIGINT); err == nil || errors.Is(err, errQueueChanged) {
 		t.Fatalf("an unmoved row must keep the original error: %v", err)
 	}
-	// The worker publishes its outcome while the signal was being prepared.
-	if _, err = d.store.db.Exec("UPDATE queue_jobs SET phase='outcome', outcome=0 WHERE id=9"); err != nil {
+	// Another attempt took the row while the signal was being prepared.
+	if _, err = d.store.db.Exec("UPDATE queue_jobs SET attempt=? WHERE id=9", strings.Repeat("c", 32)); err != nil {
 		t.Fatal(err)
 	}
 	if err = d.signal(stale, syscall.SIGINT); !errors.Is(err, errQueueChanged) {
 		t.Fatalf("a moved row must be read again: %v", err)
+	}
+	// The same worker publishes its outcome instead: nothing is left to signal.
+	if _, err = d.store.db.Exec("UPDATE queue_jobs SET attempt=?, phase='outcome', outcome=0 WHERE id=9", attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err = d.signal(stale, syscall.SIGINT); err != nil {
+		t.Fatalf("a settled row has nothing to signal: %v", err)
 	}
 	// Signals are delivered in order, so a SIGINT sent above would end it first.
 	if err = survivor.Process.Signal(syscall.SIGTERM); err != nil {
