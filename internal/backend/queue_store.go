@@ -21,8 +21,6 @@ import (
 // QueueDatabasePath is shared by the daemon and the installation health check.
 func QueueDatabasePath(state string) string { return filepath.Join(state, "queue.sqlite3") }
 
-var errQueueChanged = errors.New("Queue job changed concurrently")
-
 type queueStore struct {
 	state, path string
 	db          *sql.DB
@@ -259,6 +257,24 @@ func (s *queueStore) job(id int) (queueJob, error) {
 	}
 	return scanQueueJob(s.db.QueryRow("SELECT "+queueColumns+" FROM queue_jobs WHERE id=?", id))
 }
+
+// stoppedQueueTasks reads a private copy of a stopped daemon's database, for a
+// schema that openQueueStore would migrate. It refuses unfinished work.
+func stoppedQueueTasks(ctx context.Context, db *sql.DB, path string) (Object, error) {
+	var unfinished int
+	if e := db.QueryRowContext(ctx, "SELECT count(*) FROM queue_jobs WHERE phase != 'done'").Scan(&unfinished); e != nil {
+		return nil, e
+	}
+	if unfinished != 0 {
+		return nil, errors.New("Managed setup requires a drained queue; stopped queue has unfinished jobs or attempts")
+	}
+	store := &queueStore{db: db, path: path}
+	snapshot, e := store.snapshot()
+	if e != nil {
+		return nil, e
+	}
+	return obj(snapshot["tasks"]), nil
+}
 func (s *queueStore) snapshot() (Object, error) {
 	settings, e := s.settings()
 	if e != nil {
@@ -281,21 +297,6 @@ func queueResult(code int) any {
 		return "Success"
 	}
 	return Object{"Failed": code}
-}
-func (s *queueStore) saveTask(j queueJob) error {
-	v, e := queueJSON(j.task)
-	if e != nil {
-		return e
-	}
-	result, e := s.db.Exec("UPDATE queue_jobs SET task=? WHERE id=? AND token=? AND attempt=? AND phase=?", v, j.id, j.token, j.attempt, j.phase)
-	if e != nil {
-		return e
-	}
-	n, e := result.RowsAffected()
-	if e == nil && n != 1 {
-		return errQueueChanged
-	}
-	return e
 }
 
 // importLegacy is atomic and idempotent. The installer publishes this only after

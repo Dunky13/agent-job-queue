@@ -155,6 +155,8 @@ type queueDaemon struct {
 	finished     map[int]bool
 	boot         string
 	now          func() time.Time
+	reported     map[int]bool
+	logOutput    io.Writer
 }
 
 // queueCodedError keeps the daemon's message while restoring the sentinel the
@@ -377,6 +379,70 @@ func (d *queueDaemon) recover() error {
 	}
 	return nil
 }
+
+// queueRowRefused reports a store refusal the daemon settles instead of failing.
+// Stale errors are not refusals.
+func queueRowRefused(e error) bool {
+	return errors.Is(e, errQueueStateDisagreement) || errors.Is(e, errQueueIllegalTransition)
+}
+
+// queuePublishedCode is the exit status a corrupted outcome row already holds: its
+// column, then a result its status can still give. Only then is it unknown.
+func queuePublishedCode(j queueJob) int {
+	if j.outcome.Valid {
+		return int(j.outcome.Int64)
+	}
+	if name, details, e := TaskStatus(j.task); e == nil && name == "Done" {
+		if code, e := ResultCode(details["result"]); e == nil {
+			return code
+		}
+	}
+	if boolean(j.task["cancelled"]) {
+		return 130
+	}
+	return 125
+}
+
+// reportRow writes one line per row per daemon run. daemon.log is bounded only at
+// spawn, and tick repeats every 100 ms. The first report for a row stands.
+func (d *queueDaemon) reportRow(j queueJob) {
+	if d.reported[j.id] {
+		return
+	}
+	if d.reported == nil {
+		d.reported = map[int]bool{}
+	}
+	d.reported[j.id] = true
+	status := "unreadable"
+	if name, _, e := TaskStatus(j.task); e == nil {
+		status = name
+	}
+	var output io.Writer = os.Stderr
+	if d.logOutput != nil {
+		output = d.logOutput
+	}
+	fmt.Fprintf(output, "agent-heavy daemon: corrupted job %d: phase %s, status %s; settling it once no owned process remains\n", j.id, j.phase, status)
+}
+
+// finish records a command's result. A row the store refuses is settled and logged.
+func (d *queueDaemon) finish(j queueJob, code int) error {
+	e := d.store.recordOutcome(j, code)
+	if !queueRowRefused(e) {
+		return e
+	}
+	d.reportRow(j)
+	return d.store.overwriteOutcome(j, code)
+}
+
+func (d *queueDaemon) markCancelled(j queueJob) error {
+	e := d.store.markCancelled(j)
+	if !errors.Is(e, errQueueStateDisagreement) {
+		return e
+	}
+	d.reportRow(j)
+	return d.store.overwriteCancelled(j)
+}
+
 func (d *queueDaemon) control(op string, p Object) (Object, error) {
 	for range 8 {
 		value, e := d.controlOnce(op, p)
@@ -403,8 +469,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 			if !validToken(value) {
 				return nil, errors.New("Invalid submission token")
 			}
-			var id int
-			err := d.store.db.QueryRow("SELECT id FROM queue_jobs WHERE token=?", value).Scan(&id)
+			id, err := d.store.jobIDByToken(value)
 			if err == nil {
 				if op == "lease-acquire" {
 					return d.leaseView(id)
@@ -481,7 +546,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	if e != nil {
 		return nil, e
 	}
-	name, details, e := TaskStatus(j.task)
+	name, _, e := TaskStatus(j.task)
 	if e != nil {
 		return nil, e
 	}
@@ -500,13 +565,9 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		}
 		return d.snapshot()
 	case "hold", "enqueue":
-		if (name == "Queued" || name == "Stashed") && !taskIsLease(j.task) {
-			state := "Queued"
-			if op == "hold" {
-				state = "Stashed"
-			}
-			j.task["status"] = Object{state: Object{}}
-			e = d.store.saveTask(j)
+		// Holding or enqueueing anything that is not waiting has always done nothing.
+		if e = d.store.setWaiting(j, op == "hold"); queueRowRefused(e) {
+			e = nil
 		}
 	case "priority", "next", "last":
 		if name != "Queued" && name != "Stashed" {
@@ -559,8 +620,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		}
 		if op == "kill" {
 			if name != "Done" {
-				j.task["cancelled"] = true
-				if e = d.store.saveTask(j); e == nil {
+				if e = d.markCancelled(j); e == nil {
 					e = d.signal(j, syscall.SIGKILL)
 				}
 			}
@@ -569,8 +629,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		if name == "Done" {
 			return j.task, nil
 		}
-		j.task["cancelled"] = true
-		if e = d.store.saveTask(j); e != nil {
+		if e = d.markCancelled(j); e != nil {
 			return nil, e
 		}
 		if j.phase == "queued" || j.phase == "starting" {
@@ -588,15 +647,16 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		if name != "Running" && name != "Paused" {
 			return nil, errors.New("Only active jobs can be paused or resumed")
 		}
+		// A refusal must send nothing: a stopped process with no record stays stopped.
+		if e = checkQueuePausable(j); e != nil {
+			return nil, e
+		}
 		sig := syscall.SIGSTOP
-		state := "Paused"
 		if op == "resume-job" {
 			sig = syscall.SIGCONT
-			state = "Running"
 		}
 		if e = d.signal(j, sig); e == nil {
-			j.task["status"] = Object{state: details}
-			e = d.store.saveTask(j)
+			e = d.store.setPaused(j, op == "pause-job")
 		}
 	default:
 		return nil, errors.New("Unknown queue operation")
@@ -614,8 +674,7 @@ func (d *queueDaemon) submitLane(p Object, lane string) (Object, error) {
 	if !validToken(value) {
 		return nil, errors.New("Invalid submission token")
 	}
-	var existing int
-	e := d.store.db.QueryRow("SELECT id FROM queue_jobs WHERE token=?", value).Scan(&existing)
+	existing, e := d.store.jobIDByToken(value)
 	if e == nil {
 		return Object{"id": existing}, nil
 	}
@@ -680,30 +739,15 @@ func (d *queueDaemon) submitLane(p Object, lane string) (Object, error) {
 		task["handoverProtocol"] = queueHandoverProtocol
 		task["handoverCaller"] = caller
 	}
-	data, e := queueJSON(task)
+	e = d.store.enqueue(next, value, task, func() error {
+		payload["task_id"] = next
+		payload["resource_managed"] = managed
+		if e := WriteJobPayload(path, payload); e != nil {
+			return e
+		}
+		return WritePrivate(d.g.ReceiptPath(next), Object{"task_id": next, "token": value})
+	})
 	if e != nil {
-		return nil, e
-	}
-	tx, e := d.store.db.Begin()
-	if e != nil {
-		return nil, e
-	}
-	defer tx.Rollback()
-	if _, e = tx.Exec("INSERT INTO queue_jobs(id,token,task,phase) VALUES(?,?,?,'queued')", next, value, data); e != nil {
-		return nil, e
-	}
-	if _, e = tx.Exec("UPDATE queue_settings SET next_id=? WHERE id=1", next+1); e != nil {
-		return nil, e
-	}
-	payload["task_id"] = next
-	payload["resource_managed"] = managed
-	if e = WriteJobPayload(path, payload); e != nil {
-		return nil, e
-	}
-	if e = WritePrivate(d.g.ReceiptPath(next), Object{"task_id": next, "token": value}); e != nil {
-		return nil, e
-	}
-	if e = tx.Commit(); e != nil {
 		return nil, e
 	}
 	if lane != defaultLaneName {
@@ -719,21 +763,13 @@ func (d *queueDaemon) launch(j queueJob) error {
 	if e := d.laneRoom(taskLane(j.task)); e != nil {
 		return e
 	}
-	j.attempt = token()
-	j.task["status"] = Object{"Running": Object{"start": queueNow()}}
-	data, e := queueJSON(j.task)
+	j, e := d.store.claimAttempt(j)
+	if queueRowRefused(e) {
+		return errQueueLaunchChanged // The result main gives its guard on such a row.
+	}
 	if e != nil {
 		return e
 	}
-	res, e := d.store.db.Exec("UPDATE queue_jobs SET attempt=?,phase='starting',task=? WHERE id=? AND phase='queued'", j.attempt, data, j.id)
-	if e != nil {
-		return e
-	}
-	n, e := res.RowsAffected()
-	if e != nil || n != 1 {
-		return errors.New("Job changed before launch")
-	}
-	j.phase = "starting"
 	path := text(j.task["logPath"])
 	fd, e := syscall.Open(path, syscall.O_CREAT|syscall.O_APPEND|syscall.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0600)
 	if e != nil {
@@ -802,28 +838,6 @@ func (d *queueDaemon) signal(j queueJob, sig syscall.Signal) error {
 	}
 	return e
 }
-func (d *queueDaemon) finish(j queueJob, code int) error {
-	_, details, e := TaskStatus(j.task)
-	if e != nil {
-		return e
-	}
-	details["end"] = queueNow()
-	details["result"] = queueResult(code)
-	j.task["status"] = Object{"Done": details}
-	data, e := queueJSON(j.task)
-	if e != nil {
-		return e
-	}
-	result, e := d.store.db.Exec("UPDATE queue_jobs SET phase='outcome',task=?,outcome=? WHERE id=? AND token=? AND attempt=? AND phase=?", data, code, j.id, j.token, j.attempt, j.phase)
-	if e != nil {
-		return e
-	}
-	n, e := result.RowsAffected()
-	if e == nil && n != 1 {
-		return errQueueChanged
-	}
-	return e
-}
 func (d *queueDaemon) tick() error {
 	if e := d.expireHandover(); e != nil {
 		return e
@@ -854,26 +868,49 @@ func (d *queueDaemon) tick() error {
 				}
 				continue
 			}
+			name, _, unreadable := TaskStatus(j.task)
+			if unreadable != nil {
+				if e = d.endLease(j, "corrupted"); e != nil && !errors.Is(e, errQueueChanged) {
+					return e
+				}
+				continue
+			}
 			if j.phase == "running" {
 				occupy(j)
-			} else if name, _, e := TaskStatus(j.task); e == nil && name == "Queued" {
+			} else if name == "Queued" {
 				waiting = append(waiting, j)
 			}
 			continue
 		}
 		switch j.phase {
 		case "starting":
+			// A live child settles the row itself when it exits.
+			if _, _, unreadable := TaskStatus(j.task); unreadable != nil && d.children[j.id] == nil {
+				if e = d.finish(j, 125); e != nil && !errors.Is(e, errQueueChanged) {
+					return e
+				}
+				continue
+			}
 			occupy(j)
 		case "running":
 			if d.children[j.id] != nil {
 				occupy(j)
 				continue
 			}
-			owned, e := VerifyGroupIdentity(j.worker)
-			if e != nil {
-				return e
+			// A corrupted row with no worker recorded has nothing to verify. One whose
+			// worker cannot be verified is neither settled nor allowed to stop the tick.
+			corrupted := queueJobAgreement(j) != nil
+			owned, unverified := false, error(nil)
+			if !corrupted || j.worker != nil {
+				owned, unverified = VerifyGroupIdentity(j.worker)
 			}
-			if owned {
+			if unverified != nil && !corrupted {
+				return unverified
+			}
+			if unverified != nil {
+				d.reportRow(j)
+			}
+			if owned || unverified != nil {
 				occupy(j)
 				continue
 			}
@@ -886,6 +923,13 @@ func (d *queueDaemon) tick() error {
 			}
 		case "outcome":
 			occupy(j)
+			// Its exit status stands if it has one. The next tick retires it as usual.
+			if queueJobAgreement(j) != nil {
+				if e = d.finish(j, queuePublishedCode(j)); e != nil && !errors.Is(e, errQueueChanged) {
+					return e
+				}
+				continue
+			}
 			if !d.finished[j.id] {
 				if d.finished == nil {
 					d.finished = map[int]bool{}
@@ -910,8 +954,8 @@ func (d *queueDaemon) tick() error {
 						d.errors[job.id] = cleanupError.Error()
 						return
 					}
-					_, cleanupError = d.store.db.Exec("UPDATE queue_jobs SET phase='done' WHERE id=? AND token=? AND attempt=? AND phase='outcome'", job.id, job.token, job.attempt)
-					if cleanupError != nil {
+					// A row that already moved on is not a cleanup failure.
+					if cleanupError = d.store.retire(job); cleanupError != nil && !errors.Is(cleanupError, errQueueChanged) {
 						d.errors[job.id] = cleanupError.Error()
 					} else {
 						delete(d.errors, job.id)
@@ -922,7 +966,10 @@ func (d *queueDaemon) tick() error {
 		case "queued":
 			name, _, e := TaskStatus(j.task)
 			if e != nil {
-				return e
+				if e = d.finish(j, 125); e != nil && !errors.Is(e, errQueueChanged) {
+					return e
+				}
+				continue
 			}
 			if name == "Queued" {
 				waiting = append(waiting, j)
@@ -1038,17 +1085,8 @@ func ExecuteAttempt(g *Gate, id int, value, attempt string) (code int, err error
 		return 125, errors.New("Cannot establish worker birth identity")
 	}
 	worker := Object{"pgid": pgid, "pid": os.Getpid(), "boot_uuid": boot, "members": members}
-	workerJSON, e := queueJSON(worker)
-	if e != nil {
+	if e = s.claimWorker(id, value, attempt, worker); e != nil {
 		return 125, e
-	}
-	result, e := s.db.Exec("UPDATE queue_jobs SET phase='running',worker=? WHERE id=? AND token=? AND attempt=? AND phase='starting'", workerJSON, id, value, attempt)
-	if e != nil {
-		return 125, e
-	}
-	count, e := result.RowsAffected()
-	if e != nil || count != 1 {
-		return 125, errors.New("Execution attempt is no longer authorized")
 	}
 	code = 125
 	defer func() {
@@ -1061,19 +1099,10 @@ func ExecuteAttempt(g *Gate, id int, value, attempt string) (code int, err error
 			err = errors.Join(err, errors.New("Execution attempt identity changed"))
 			return
 		}
-		_, details, e := TaskStatus(j.task)
-		if e != nil {
+		// A row settled since the read above keeps the outcome it already has.
+		if e = s.recordOutcome(j, code); !errors.Is(e, errQueueChanged) {
 			err = errors.Join(err, e)
-			return
 		}
-		details["end"] = queueNow()
-		details["result"] = queueResult(code)
-		j.task["status"] = Object{"Done": details}
-		data, e := queueJSON(j.task)
-		if e == nil {
-			_, e = s.db.Exec("UPDATE queue_jobs SET phase='outcome',task=?,outcome=? WHERE id=? AND token=? AND attempt=? AND phase='running'", data, code, id, value, attempt)
-		}
-		err = errors.Join(err, e)
 	}()
 	return executeWithAttempt(g, value, attempt)
 }

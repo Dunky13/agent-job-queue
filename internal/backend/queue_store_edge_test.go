@@ -28,50 +28,35 @@ func edgeQueueStore(t *testing.T) (*Gate, *queueStore) {
 	return g, s
 }
 
-func edgeInsertJob(t *testing.T, s *queueStore, phase string) queueJob {
-	t.Helper()
-	j := queueJob{id: 7, token: strings.Repeat("a", 32), attempt: strings.Repeat("b", 32), phase: phase,
-		task: Object{"token": strings.Repeat("a", 32), "priority": 0, "status": Object{"Running": Object{"start": "2026-10-20T00:00:00Z"}}}}
-	data, err := queueJSON(j.task)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = s.db.Exec("INSERT INTO queue_jobs(id,token,attempt,phase,task) VALUES(?,?,?,?,?)", j.id, j.token, j.attempt, j.phase, data); err != nil {
-		t.Fatal(err)
-	}
-	return j
-}
-
 func TestQueueEdgeStaleFinishCannotOverwriteClaimOrOutcome(t *testing.T) {
 	for _, phase := range []string{"running", "outcome"} {
 		t.Run(phase, func(t *testing.T) {
-			g, s := edgeQueueStore(t)
-			stale := edgeInsertJob(t, s, "starting")
-			actual := stale
-			actual.phase = phase
+			_, s := edgeQueueStore(t)
+			stale := transitionCommand(t, s, 7, "starting")
+			current, err := s.job(stale.id)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if phase == "outcome" {
-				actual.task = Object{"status": Object{"Done": Object{"result": "Success", "end": "2026-10-20T00:01:00Z"}}}
+				err = s.recordOutcome(current, 0)
+			} else {
+				err = s.claimWorker(stale.id, stale.token, stale.attempt, Object{"pgid": 1})
 			}
-			data, err := queueJSON(actual.task)
 			if err != nil {
 				t.Fatal(err)
 			}
-			expected, err := decodeObject([]byte(data))
+			expected, err := s.job(stale.id)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err = s.db.Exec("UPDATE queue_jobs SET phase=?,attempt=?,task=?,outcome=? WHERE id=?", phase, actual.attempt, data, 0, actual.id); err != nil {
-				t.Fatal(err)
-			}
-			d := queueDaemon{g: g, store: s}
-			if err = d.finish(stale, 130); !errors.Is(err, errQueueChanged) {
+			if err = s.recordOutcome(stale, 130); !errors.Is(err, errQueueChanged) {
 				t.Fatalf("stale finish error=%v; want errQueueChanged", err)
 			}
-			got, err := s.job(actual.id)
+			got, err := s.job(stale.id)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got.phase != phase || got.attempt != actual.attempt || !jsonEqual(got.task, expected) || !got.outcome.Valid || got.outcome.Int64 != 0 {
+			if got.phase != phase || got.attempt != stale.attempt || !jsonEqual(got.task, expected.task) || !jsonEqual(got.worker, expected.worker) || got.outcome != expected.outcome || phase == "outcome" && (!got.outcome.Valid || got.outcome.Int64 != 0) {
 				t.Fatalf("stale completion overwrote newer durable state: phase=%s attempt=%s task=%v outcome=%v", got.phase, got.attempt, got.task, got.outcome)
 			}
 		})
@@ -249,17 +234,17 @@ func TestQueueEdgeStaleSaveTaskPreservesNewAttemptAndOutcome(t *testing.T) {
 	for _, change := range []string{"attempt", "outcome"} {
 		t.Run(change, func(t *testing.T) {
 			_, s := edgeQueueStore(t)
-			stale := edgeInsertJob(t, s, "running")
+			stale := transitionCommand(t, s, 7, "running")
 			if change == "attempt" {
 				if _, err := s.db.Exec("UPDATE queue_jobs SET attempt=? WHERE id=?", strings.Repeat("e", 32), stale.id); err != nil {
 					t.Fatal(err)
 				}
 			} else {
-				data, err := queueJSON(Object{"status": Object{"Done": Object{"result": "Success"}}})
+				current, err := s.job(stale.id)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if _, err = s.db.Exec("UPDATE queue_jobs SET phase='outcome',task=?,outcome=0 WHERE id=?", data, stale.id); err != nil {
+				if err = s.recordOutcome(current, 0); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -395,7 +380,7 @@ func TestQueueEdgeDuplicateWorkerCannotClaimAlreadyRunningAttempt(t *testing.T) 
 		t.Skip("worker claim verification uses macOS process identities")
 	}
 	g, s := edgeQueueStore(t)
-	j := edgeInsertJob(t, s, "running")
+	j := transitionCommand(t, s, 7, "running")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	executable, err := os.Executable()
@@ -413,7 +398,7 @@ func TestQueueEdgeDuplicateWorkerCannotClaimAlreadyRunningAttempt(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.phase != j.phase || after.attempt != j.attempt || !jsonEqual(after.task, j.task) || after.worker != nil || after.outcome.Valid {
+	if after.phase != j.phase || after.attempt != j.attempt || !jsonEqual(after.task, j.task) || !jsonEqual(after.worker, j.worker) || after.outcome.Valid {
 		t.Fatalf("duplicate worker mutated existing attempt: %+v", after)
 	}
 }

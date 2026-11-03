@@ -354,8 +354,7 @@ func (d *queueDaemon) acquireLease(p Object) (Object, error) {
 	if !validToken(value) {
 		return nil, errors.New("Invalid lease token")
 	}
-	var existing int
-	err := d.store.db.QueryRow("SELECT id FROM queue_jobs WHERE token=?", value).Scan(&existing)
+	existing, err := d.store.jobIDByToken(value)
 	if err == nil {
 		return d.leaseView(existing)
 	}
@@ -411,22 +410,7 @@ func (d *queueDaemon) acquireLease(p Object) (Object, error) {
 		lease["expiresAt"] = d.clock().Add(time.Duration(ttl) * time.Second).UTC().Format(time.RFC3339Nano)
 	}
 	task := Object{"kind": "lease", "lane": name, "label": label, "priority": 0, "created_at": now, "status": Object{"Queued": Object{}}, "lease": lease}
-	data, err := queueJSON(task)
-	if err != nil {
-		return nil, err
-	}
-	tx, err := d.store.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	if _, err = tx.Exec("INSERT INTO queue_jobs(id,token,task,phase) VALUES(?,?,?,'queued')", next, value, data); err != nil {
-		return nil, err
-	}
-	if _, err = tx.Exec("UPDATE queue_settings SET next_id=? WHERE id=1", next+1); err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
+	if err = d.store.enqueue(next, value, task, nil); err != nil {
 		return nil, err
 	}
 	if lease["owner"] != nil {
@@ -440,6 +424,17 @@ func (d *queueDaemon) acquireLease(p Object) (Object, error) {
 	return d.leaseView(next)
 }
 
+// taskLeaseObject keeps a corrupted lease row with no lease object from panicking
+// the daemon on the lease fields written below.
+func taskLeaseObject(task Object) Object {
+	lease := obj(task["lease"])
+	if lease == nil {
+		lease = Object{}
+		task["lease"] = lease
+	}
+	return lease
+}
+
 func (d *queueDaemon) grantLease(j queueJob) error {
 	if d.handover != nil {
 		return errors.New("Queue dispatch is frozen for live handover")
@@ -447,24 +442,19 @@ func (d *queueDaemon) grantLease(j queueJob) error {
 	if err := d.laneRoom(taskLane(j.task)); err != nil {
 		return err
 	}
-	lease := obj(j.task["lease"])
+	lease := taskLeaseObject(j.task)
 	now := d.stamp()
 	lease["state"] = "held"
 	lease["grantedAt"] = now
 	if ttl, _ := integer(lease["ttlSeconds"]); ttl > 0 {
 		lease["expiresAt"] = d.clock().Add(time.Duration(ttl) * time.Second).UTC().Format(time.RFC3339Nano)
 	}
-	j.task["status"] = Object{"Running": Object{"start": now}}
-	data, err := queueJSON(j.task)
+	err := d.store.grantLease(j, now)
+	if queueRowRefused(err) {
+		return errQueueChanged // The result main gives its guard on such a row.
+	}
 	if err != nil {
 		return err
-	}
-	result, err := d.store.db.Exec("UPDATE queue_jobs SET phase='running',task=? WHERE id=? AND token=? AND phase='queued'", data, j.id, j.token)
-	if err != nil {
-		return err
-	}
-	if n, err := result.RowsAffected(); err != nil || n != 1 {
-		return errQueueChanged
 	}
 	d.emitTask("lease.granted", j.id, j.task, nil)
 	return nil
@@ -473,7 +463,7 @@ func (d *queueDaemon) grantLease(j queueJob) error {
 // endLease moves a lease straight to done: it has no process to clean up.
 // Held leases are released or expire; queued ones are dropped or expire.
 func (d *queueDaemon) endLease(j queueJob, reason string) error {
-	lease := obj(j.task["lease"])
+	lease := taskLeaseObject(j.task)
 	held := j.phase == "running"
 	state, event := "dropped", "lease.dropped"
 	switch {
@@ -486,27 +476,18 @@ func (d *queueDaemon) endLease(j queueJob, reason string) error {
 	}
 	lease["state"] = state
 	lease["reason"] = reason
-	lease["endedAt"] = d.stamp()
+	now := d.stamp()
+	lease["endedAt"] = now
 	if reason == "owner-exited" {
 		lease["ownerAlive"] = false
 	}
-	_, details, err := TaskStatus(j.task)
+	err := d.store.endLease(j, now)
+	if queueRowRefused(err) {
+		d.reportRow(j)
+		err = d.store.overwriteLeaseEnd(j, now)
+	}
 	if err != nil {
 		return err
-	}
-	details["end"] = lease["endedAt"]
-	details["result"] = "Success"
-	j.task["status"] = Object{"Done": details}
-	data, err := queueJSON(j.task)
-	if err != nil {
-		return err
-	}
-	result, err := d.store.db.Exec("UPDATE queue_jobs SET phase='done',task=?,outcome=0 WHERE id=? AND token=? AND phase=?", data, j.id, j.token, j.phase)
-	if err != nil {
-		return err
-	}
-	if n, err := result.RowsAffected(); err != nil || n != 1 {
-		return errQueueChanged
 	}
 	delete(d.ownerAlive, j.id)
 	d.emitTask(event, j.id, j.task, Object{"reason": reason})

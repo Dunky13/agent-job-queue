@@ -266,7 +266,10 @@ func LeaseCapacity(g *Gate) (int, error) {
 		task := obj(raw)
 		name, _, err := TaskStatus(task)
 		if err != nil {
-			return 0, err
+			// Counting a row raises this ceiling, so an unreadable one stays uncounted
+			// and nothing extra is admitted. A live worker still has a slot member,
+			// which AcquireLease counts against the ceiling.
+			continue
 		}
 		group := text(task["group"])
 		// A held lease is Running but never claims a slot member.

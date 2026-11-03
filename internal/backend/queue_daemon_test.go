@@ -161,6 +161,8 @@ func TestRealDaemonUnclaimedAttemptFailsWithoutReplay(t *testing.T) {
 	value := strings.Repeat("c", 32)
 	attempt := strings.Repeat("d", 32)
 	id := 32
+	// Raw on purpose: this daemon is live, and a queued row could be dispatched
+	// before a real claim. The row must appear already claimed.
 	task := Object{"token": value, "priority": 0, "created_at": queueNow(), "status": Object{"Running": Object{"start": queueNow()}}, "logPath": filepath.Join(f.gate.State, "logs", strconv.Itoa(id)+".log")}
 	data, e := queueJSON(task)
 	if e != nil {
@@ -210,12 +212,14 @@ func TestQueueCleanupDoesNotBlockSnapshotWhileLeaseLocked(t *testing.T) {
 	defer s.close()
 	id := 0
 	value := strings.Repeat("a", 32)
-	task := Object{"token": value, "priority": 0, "status": Object{"Done": Object{"result": "Success", "end": queueNow()}}}
-	data, e := queueJSON(task)
+	if e = s.enqueue(id, value, Object{"token": value, "priority": 0, "status": Object{"Queued": Object{}}}, nil); e != nil {
+		t.Fatal(e)
+	}
+	queued, e := s.job(id)
 	if e != nil {
 		t.Fatal(e)
 	}
-	if _, e = s.db.Exec("INSERT INTO queue_jobs(id,token,task,phase,outcome) VALUES(?,?,?,'outcome',0)", id, value, data); e != nil {
+	if e = s.recordOutcome(queued, 0); e != nil {
 		t.Fatal(e)
 	}
 	mustWrite(t, g.ReceiptPath(id), Object{"task_id": id, "token": value})
@@ -304,12 +308,7 @@ func TestQueueLaunchRejectsUnsafeLogsWithoutBlocking(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			task := Object{"token": value, "logPath": path, "priority": 0, "status": Object{"Queued": Object{}}}
-			data, e := queueJSON(task)
-			if e != nil {
-				t.Fatal(e)
-			}
-			if _, e = s.db.Exec("INSERT INTO queue_jobs(id,token,task,phase) VALUES(0,?,?,'queued')", value, data); e != nil {
+			if e = s.enqueue(0, value, Object{"token": value, "logPath": path, "priority": 0, "status": Object{"Queued": Object{}}}, nil); e != nil {
 				t.Fatal(e)
 			}
 			job, e := s.job(0)
