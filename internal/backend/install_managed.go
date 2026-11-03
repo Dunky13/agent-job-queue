@@ -1610,7 +1610,8 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		return err
 	}
 	if p.live == nil && !install.prepareReplacement && !install.unregisterServices {
-		// Where resume was skipped, preflight never saw this journal and it blocks nothing.
+		// Where resume was skipped, preflight never saw this journal, so it does not
+		// block this run. A journal kept here still refuses the next upgrade.
 		if err := install.retireSpentLive(); err != nil {
 			if liveAllowed(install, p) {
 				return err

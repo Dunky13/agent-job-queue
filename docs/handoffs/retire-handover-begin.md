@@ -38,7 +38,9 @@ N dragged over T at the same path has replaced T's app, so it has no such route.
    - **A caller on a job in that receipt never returns,** from reading `execution.go:65`, not from a run.
 3. **Busy lock during installation.** `execute` with `scheduling.lock` held returns "Another installer or queue change is running", which is a failure with Retry in the app. A test hit this once and I restructured the test. The holder is unverified. Fix later by treating it as a wait in the repair loop.
 4. **Misleading caller message.** A caller whose job is still running can print "Queue daemon unavailable; command was not run directly" (`queue_daemon.go:67,79`), which reads as if the job never ran. This PR does not change that code, and #64 touches nearby behaviour.
-5. **A finished journal with an unreadable receipt refuses.** `7b4b27c` skipped reading the receipt there. A daemon cannot start on such a receipt in either version, so setup now shows the problem earlier.
+5. **A finished journal can now refuse where `7b4b27c` did not.** That build skipped reading the receipt there. An unreadable receipt, a same-token digest change or a `ps` failure now refuses. A daemon cannot start on an unreadable receipt in either version, so setup shows that problem earlier.
+6. **An unassessable journal kept by a run that skips resume** does not block that run, but the next upgrade and preflight refuse with a bare `unexpected EOF`. `7b4b27c` also refused that upgrade, with a different message.
+7. **Reused PID with the lock held.** A dead daemon's receipt whose PID now belongs to another process, while a restarted daemon holds the lock, keeps binding and says "Finish that exact build", which T cannot do. It clears when the lock is free, the other process exits, or after a reboot. No message or doc says so. Failing closed is the right call here.
 6. **Payload path behaviour change.** It previously took a handover when a job was done but its caller was still reading output. It now treats that queue as drained, so that caller can see a transport error during the outage. App bundles never had this protection.
 
 ## Fixed along the way
