@@ -6,6 +6,15 @@ private func check(_ value: Bool, _ name: String) throws {
     if !value { throw ClientError.message(name) }
 }
 
+private final class ConcurrentRuns: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current = 0
+    private var highest = 0
+    func enter() { lock.withLock { current += 1; highest = max(highest, current) } }
+    func leave() { lock.withLock { current -= 1 } }
+    var peak: Int { lock.withLock { highest } }
+}
+
 @main
 struct TransportTests {
     static func main() async throws {
@@ -26,6 +35,10 @@ struct TransportTests {
         let executable = URL(fileURLWithPath: CommandLine.arguments[0])
         let transport = QueueClient.Transport(executable: executable, timeout: 2)
         let short = QueueClient.Transport(executable: executable, timeout: 0.15)
+        // Most checks are not about deadlines, so a stalled host must not fail them. The
+        // 2-second transport stays only where its deadline detects the regression under
+        // test: pipe deadlock, a read that waits for EOF, and overflow before the deadline.
+        let noDeadline = QueueClient.Transport(executable: executable, timeout: .infinity)
         let automaticTarget = QueueClient.InstallTarget(option: .appBundle, path: "/Applications/Agent Queue.app")
         let automaticInstall = QueueClient.Command.installRepairAndContinue(automaticTarget)
         try check(automaticInstall.timeout.isInfinite,
@@ -46,10 +59,10 @@ struct TransportTests {
             return command
         }
         // Warm up Foundation's shared Process machinery before counting handles.
-        _ = try await QueueClient.run(arguments("empty", temporary.appendingPathComponent("warmup")), transport: transport)
+        _ = try await QueueClient.run(arguments("empty", temporary.appendingPathComponent("warmup")), transport: noDeadline)
         let handlesBefore = openHandleCount()
         for index in 0..<12 {
-            let final = try await QueueClient.run(arguments("final", temporary.appendingPathComponent("cleanup-\(index)")), transport: transport)
+            let final = try await QueueClient.run(arguments("final", temporary.appendingPathComponent("cleanup-\(index)")), transport: noDeadline)
             try check(String(decoding: final, as: UTF8.self) == "final response", "Final controller bytes survive the child-exit fence")
         }
         try check(openHandleCount() == handlesBefore, "Repeated private read completion closes all per-request pipe handles")
@@ -57,7 +70,7 @@ struct TransportTests {
         let earlyMarker = temporary.appendingPathComponent("early")
         let early = Task {
             withUnsafeCurrentTask { $0?.cancel() }
-            return try await QueueClient.run(arguments("hold", earlyMarker), transport: transport)
+            return try await QueueClient.run(arguments("hold", earlyMarker), transport: noDeadline)
         }
         do { _ = try await early.value; throw ClientError.message("Cancelled read succeeded") }
         catch is CancellationError { }
@@ -65,7 +78,7 @@ struct TransportTests {
                   "Already-cancelled read never launches its private child")
 
         let heldMarker = temporary.appendingPathComponent("held")
-        let held = Task { try await QueueClient.run(arguments("hold", heldMarker), transport: transport) }
+        let held = Task { try await QueueClient.run(arguments("hold", heldMarker), transport: noDeadline) }
         try await waitForFile(heldMarker)
         let start = ProcessInfo.processInfo.systemUptime
         held.cancel()
@@ -75,7 +88,7 @@ struct TransportTests {
                   "In-flight cancellation promptly terminates and reaps the private read child")
 
         let resistantMarker = temporary.appendingPathComponent("resistant")
-        let resistant = Task { try await QueueClient.run(arguments("resist", resistantMarker), transport: transport) }
+        let resistant = Task { try await QueueClient.run(arguments("resist", resistantMarker), transport: noDeadline) }
         try await waitForFile(resistantMarker)
         resistant.cancel()
         do { _ = try await resistant.value; throw ClientError.message("Resistant read succeeded") }
@@ -113,7 +126,7 @@ struct TransportTests {
         }
 
         let mutationMarker = temporary.appendingPathComponent("mutation")
-        let mutation = Task { try await QueueClient.run(arguments("mutation", mutationMarker, mutation: true), transport: transport) }
+        let mutation = Task { try await QueueClient.run(arguments("mutation", mutationMarker, mutation: true), transport: noDeadline) }
         try await waitForFile(mutationMarker)
         mutation.cancel()
         let result = try await mutation.value
@@ -123,7 +136,7 @@ struct TransportTests {
 
         for target in [QueueClient.InstallTarget.Option.appBundle, .payload] {
             let marker = temporary.appendingPathComponent("preflight-read")
-            let read = Task { try await QueueClient.run(.installPreflight(.init(option: target, path: marker.path)), transport: transport) }
+            let read = Task { try await QueueClient.run(.installPreflight(.init(option: target, path: marker.path)), transport: noDeadline) }
             try await waitForFile(marker)
             read.cancel()
             do { _ = try await read.value; throw ClientError.message("Cancelled setup preflight succeeded") }
@@ -140,7 +153,7 @@ struct TransportTests {
         for (index, form) in retainedForms.enumerated() {
             let marker = temporary.appendingPathComponent("preflight-mutation-\(index)")
             let command = form(.init(option: .appBundle, path: marker.path))
-            let mutation = Task { try await QueueClient.run(command, transport: transport) }
+            let mutation = Task { try await QueueClient.run(command, transport: noDeadline) }
             try await waitForFile(marker)
             mutation.cancel()
             let response = try await mutation.value
@@ -150,8 +163,9 @@ struct TransportTests {
         }
 
         let setupWaitMarker = temporary.appendingPathComponent("automatic-wait")
-        let setupWait = Task { try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: setupWaitMarker.path)), transport: transport) }
-        try await waitForFile(setupWaitMarker)
+        let setupWait = Task { try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: setupWaitMarker.path)),
+            transport: noDeadline, onOutput: deliverWaiting(setupWaitMarker)) }
+        try await waitForFile(setupWaitMarker.appendingPathExtension("delivered"))
         setupWait.cancel()
         do { _ = try await setupWait.value; throw ClientError.message("Cancelled automatic wait succeeded") }
         catch is CancellationError { }
@@ -159,11 +173,7 @@ struct TransportTests {
         let hintMarker = temporary.appendingPathComponent("automatic-hint")
         let hint = Task {
             try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: hintMarker.path)),
-                transport: transport, onOutput: { data in
-                    if QueueSetupProgress.parse(String(decoding: data, as: UTF8.self)).isWaiting {
-                        try? Data().write(to: hintMarker.appendingPathExtension("delivered"))
-                    }
-                })
+                transport: noDeadline, onOutput: deliverWaiting(hintMarker))
         }
         try await waitForFile(hintMarker.appendingPathExtension("delivered"))
         hint.cancel()
@@ -172,7 +182,7 @@ struct TransportTests {
         try check(childIsGone(hintMarker), "Throttled waiting progress is delivered even when the child emits no more output")
 
         let setupMutationMarker = temporary.appendingPathComponent("automatic-mutation")
-        let setupMutation = Task { try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: setupMutationMarker.path)), transport: transport) }
+        let setupMutation = Task { try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: setupMutationMarker.path)), transport: noDeadline) }
         try await waitForFile(setupMutationMarker)
         setupMutation.cancel()
         let setupMutationResult = try await setupMutation.value
@@ -186,7 +196,7 @@ struct TransportTests {
         defer { resumeReader.signal() }
         let transition = Task {
             try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: transitionMarker.path)),
-                transport: transport, onOutput: { data in
+                transport: noDeadline, onOutput: { data in
                     if QueueSetupProgress.parse(String(decoding: data, as: UTF8.self)).isWaiting {
                         try? Data().write(to: transitionMarker.appendingPathExtension("observed"))
                         resumeReader.wait()
@@ -224,34 +234,34 @@ struct TransportTests {
         try check(childIsGone(daemonMarker), "Independent daemon work completes after its private read controller has been reaped")
 
         do {
-            _ = try await QueueClient.run(arguments("failure", temporary.appendingPathComponent("failure"), mutation: true), transport: transport)
+            _ = try await QueueClient.run(arguments("failure", temporary.appendingPathComponent("failure"), mutation: true), transport: noDeadline)
             throw ClientError.message("Failed controller succeeded")
         } catch {
             try check(error.localizedDescription == "Useful controller diagnostic", "Bounded stderr preserves controller diagnostics")
         }
         for _ in 0..<5 {
             let setup = try await QueueClient.run(.setup(["--stub", "setup-output", temporary.appendingPathComponent("setup-output").path]),
-                transport: transport)
+                transport: noDeadline)
             try check(setup.count == 32_768 && String(decoding: setup, as: UTF8.self).hasSuffix("final setup bytes"),
                 "Verbose setup output stays bounded and preserves the macOS child-exit tail")
         }
         do {
             _ = try await QueueClient.run(.setup(["--stub", "setup-failure", temporary.appendingPathComponent("setup-failure").path]),
-                transport: transport)
+                transport: noDeadline)
             throw ClientError.message("Failed setup succeeded")
         } catch {
             try check(error.localizedDescription.utf8.count <= 8_000 && error.localizedDescription.hasSuffix("final setup bytes"),
                 "Setup failure retains the actionable bounded stderr tail")
         }
         do {
-            _ = try await QueueClient.run(stubbed(.profilesShow("stub"), "profile-failure", temporary.appendingPathComponent("profile-failure")), transport: transport)
+            _ = try await QueueClient.run(stubbed(.profilesShow("stub"), "profile-failure", temporary.appendingPathComponent("profile-failure")), transport: noDeadline)
             throw ClientError.message("Failed profile controller succeeded")
         } catch {
             try check(error.localizedDescription == "Workload changed", "Structured workload errors preserve their diagnostic")
         }
 
-        try await selectionChecks(temporary: temporary, transport: transport)
-        try await policyChecks(temporary: temporary, executable: executable, transport: transport, short: short)
+        try await selectionChecks(temporary: temporary, transport: noDeadline)
+        try await policyChecks(temporary: temporary, executable: executable, transport: noDeadline, short: short)
     }
 
     /// The old-to-new call-site table: every command the app sends, every policy column.
@@ -367,8 +377,9 @@ struct TransportTests {
                     FileManager.default.fileExists(atPath: cancelMarker.appendingPathExtension("done").path) && childIsGone(cancelMarker),
                     "\(row.name): cancelling keeps the accepted operation and its response")
             case .stopWhileWaiting:
-                let waiting = Task { try await QueueClient.run(stubbed(row.command, "automatic-wait", cancelMarker), transport: transport) }
-                try await waitForFile(cancelMarker)
+                let waiting = Task { try await QueueClient.run(stubbed(row.command, "automatic-wait", cancelMarker),
+                    transport: transport, onOutput: deliverWaiting(cancelMarker)) }
+                try await waitForFile(cancelMarker.appendingPathExtension("delivered"))
                 waiting.cancel()
                 do { _ = try await waiting.value; throw ClientError.message("\(row.name): cancelled wait succeeded") }
                 catch is CancellationError { }
@@ -444,6 +455,16 @@ struct TransportTests {
         return kill(pid, 0) == -1 && errno == ESRCH
     }
 
+    // Cancel only after the runner has delivered the wait. The stub writes its marker
+    // first, and a stop request before it reports waiting would look like success.
+    private static func deliverWaiting(_ marker: URL) -> @Sendable (Data) -> Void {
+        { data in
+            if QueueSetupProgress.parse(String(decoding: data, as: UTF8.self)).isWaiting {
+                try? Data().write(to: marker.appendingPathExtension("delivered"))
+            }
+        }
+    }
+
     // A stray temporary file from a killed atomic marker write names no child.
     private static func childIsAlive(_ marker: URL) -> Bool {
         guard let text = try? String(contentsOf: marker, encoding: .utf8), let pid = Int32(text) else { return false }
@@ -472,9 +493,13 @@ struct TransportTests {
     @MainActor private static func selectionChecks(temporary: URL, transport: QueueClient.Transport) async throws {
         let directory = temporary.appendingPathComponent("selections")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        // A child's whole life sits inside its run, so overlapping children need overlapping runs.
+        let runs = ConcurrentRuns()
         let store = LearningStore(command: { command in
             var stubbed = command
             stubbed.arguments += ["--stub", "detail", directory.appendingPathComponent(command.arguments[2]).path]
+            runs.enter()
+            defer { runs.leave() }
             return try await QueueClient.run(stubbed, transport: transport)
         })
         let first = store.select("first")
@@ -492,8 +517,9 @@ struct TransportTests {
         try check(store.selectedID == "latest" && store.detail?.profile.id == "latest" && store.error == nil &&
                   !store.isDetailLoading && !markers.contains(where: childIsAlive),
                   "Rapid real-process selections publish only the current detail and reap all read children")
-        // Each child checks all predecessors on entry. Overlap creates this sentinel.
-        try check(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("overlap").path),
+        // Each child also checks all predecessors on entry. Overlap creates this sentinel,
+        // though a slow launch usually outlasts a cancelled predecessor.
+        try check(runs.peak == 1 && !FileManager.default.fileExists(atPath: directory.appendingPathComponent("overlap").path),
                   "Rapid selections never have more than one live private detail child")
     }
 

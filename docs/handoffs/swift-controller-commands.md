@@ -132,6 +132,26 @@ at `--before-ref`, where the store injects `[String]`. Its `before` build now ad
 that one closure, the way it already shims the historical `QueueStore`. The
 reference itself is unchanged.
 
+### Flakes fixed before the merge queue
+
+These test-only changes remove races before the serial merge queue. No production code changed.
+
+- **Automatic-wait cancel:** the stub writes its marker before it reports waiting, so cancelling on the marker could signal it in that gap. It exited 0 without reporting a wait, and the runner correctly returned success. Both sites now cancel only after the runner delivers the waiting output, like the `automatic-hint` check. The runner records the wait before delivering it, so the check is safe.
+- **Irrelevant deadline:** a child stalled past the 2 s test deadline failed comparisons that have nothing to do with deadlines. Review saw this in 1 of 15 full runs, and in 43 of 2,300 focused tries. Those checks, including 18 sibling sites in `main()` and the policy and selection checks, now run with no runner deadline. Their stubs all exit on their own. The 2 s value is unchanged.
+- **Deadline checks kept:** all `short` deadline checks are unchanged. The 2 s transport stays at 5 sites where its deadline detects the regression under test: oversized output (3 scenarios at one site), the exact-capture pipe check, the two stdin pipe checks, and the daemon read.
+- **Overlap detection:** the child-side sentinel missed real overlap, because a slow launch usually outlasts a cancelled predecessor. The test now also counts in-flight runs in the injected closure and requires a peak of 1. A child lives entirely inside its run, so this checks "never more than one live child" directly.
+
+| Check | Result |
+| --- | --- |
+| `TransportTests`, direct, 12 runs, load 4 to 19 | Exit 0 every time, 222 PASS lines |
+| Runner cancellation check removed | Fails at `Cancelled automatic wait succeeded` |
+| Same, removed only for the policy table | Fails at `install repair and continue: cancelled wait succeeded` |
+| `await previous?.value` removed from `LearningStore.select` | Fails 5 of 5 at `Rapid selections never have more than one live private detail child` |
+| 0.4 s marker-to-waiting gap added to the stub | New test passes; previous test fails at `Cancelled automatic wait succeeded` |
+| 2.5 s stall added to one decoder child | New test passes; previous test fails at `status: failure uses its own decoder` |
+
+Remaining limit: `waitForFile` still gives a stub 3 s to launch, so a longer stall can fail with `Private stub did not launch`. I left it because it is a separate wall-clock wait and raising it was not authorized.
+
 ## Evidence
 
 All jobs ran through the shared queue while other agents' work kept host load
