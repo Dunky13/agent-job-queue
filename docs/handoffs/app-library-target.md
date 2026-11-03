@@ -38,6 +38,13 @@ The packaged binary measured 8,696,752 bytes, well under setup's 128 MB limit.
 
 Launching the packaged binary with `--fixture`, `--snapshot` or `--verify-detail-navigation` exits 1 with `Test options need the test build`, and left its private home empty.
 
+Every native suite links the `test` flavour, so the release flavour's normal launch was checked separately, on two paths that cannot start helpers, each with a private home:
+
+- The packaged app outside Applications refuses setup and keeps running: alive after 8 seconds, no child processes, nothing written to its home, and exit 143 on SIGTERM.
+- The same binary in a bundle with no payload or service marker, launched with `--open-window`, takes the legacy path through `finishLaunching` and the real `QueueMenuBarController`: alive after 8 seconds, no child processes, one 700x792 window on screen, nothing written to its home, and exit 143 on SIGTERM.
+
+Neither run read the window's contents, because `screencapture` could not capture it here, or clicked the menu. A complete managed launch of the release binary that starts the helpers was not run on this host, because it would touch the live queue. Quitting through the menu was not run either.
+
 Runtime class names change from `arm64.AppDelegate` and `x86_64.AppDelegate` to `AgentQueueCore.AppDelegate`. Nothing in `native/` looks up classes by name.
 
 ## Evidence
