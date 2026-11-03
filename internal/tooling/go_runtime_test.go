@@ -17,6 +17,10 @@ import (
 const goRuntimeModule = "github.com/Dunky13/agent-job-queue"
 const goRuntimeInstallerTest = "TestInstallerManagedLiveResumeRetainsRunningAttempts"
 const goRuntimeInstallerPattern = "^" + goRuntimeInstallerTest + "$"
+
+// goRuntimeBlowfishFlag keeps cost-14 bcrypt tests inside their time budgets;
+// the driver sets it for non-backend calls only.
+const goRuntimeBlowfishFlag = "-gcflags=golang.org/x/crypto/blowfish=-race=false"
 const goRuntimeInstallerSummary = "ok\t" + goRuntimeModule + "/internal/backend\t0.123s\n"
 
 type goRuntimeFixtureConfig struct {
@@ -156,7 +160,7 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 	if strings.TrimSpace(string(cwd)) != repository {
 		t.Fatalf("enumerated in %q, want repository %q", cwd, repository)
 	}
-	want := []string{"test", "-p", "2", "-parallel", "2", "-race"}
+	want := []string{"test", "-p", "2", "-parallel", "2", "-race", goRuntimeBlowfishFlag}
 	for _, index := range []int{0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12} {
 		want = append(want, packages[index])
 	}
@@ -187,6 +191,8 @@ func TestGoRuntimeCoreHTTPSAndInstallerCoverOriginalScopeExactlyOnce(t *testing.
 	}
 	backend := packages[1]
 	base := []string{"test", "-p", "2", "-parallel", "2", "-race"}
+	// Only calls that can reach bcrypt build blowfish without race instrumentation.
+	flagged := append(append([]string{}, base...), goRuntimeBlowfishFlag)
 	selected := map[string]int{}
 	// A future test with the same name in another package must remain in core,
 	// along with all examples, fuzz seeds and unrelated future backend tests.
@@ -198,9 +204,9 @@ func TestGoRuntimeCoreHTTPSAndInstallerCoverOriginalScopeExactlyOnce(t *testing.
 	}{
 		{"core", [][]string{
 			append(append([]string{}, base...), backend, "-skip", goRuntimeInstallerPattern, "-timeout", "12m"),
-			append(append([]string{}, base...), packages[3], packages[4], packages[5], packages[6], packages[7], "-timeout", "12m"),
+			append(append([]string{}, flagged...), packages[3], packages[4], packages[5], packages[6], packages[7], "-timeout", "12m"),
 		}, true},
-		{"https", [][]string{append(append([]string{}, base...), packages[2], "-timeout", "12m")}, false},
+		{"https", [][]string{append(append([]string{}, flagged...), packages[2], "-timeout", "12m")}, false},
 		{"installer", [][]string{append(append([]string{}, base...), backend, "-run", goRuntimeInstallerPattern, "-timeout", "12m")}, true},
 	} {
 		root, err, output := goRuntimeFixture(t, strings.Join(packages, "\n"), "0", "0", suite.name)
