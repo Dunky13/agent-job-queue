@@ -35,9 +35,11 @@ struct TransportTests {
         let executable = URL(fileURLWithPath: CommandLine.arguments[0])
         let transport = QueueClient.Transport(executable: executable, timeout: 2)
         let short = QueueClient.Transport(executable: executable, timeout: 0.15)
-        // Most checks are not about deadlines, so a stalled host must not fail them. The
-        // 2-second transport stays only where its deadline detects the regression under
-        // test: pipe deadlock, a read that waits for EOF, and overflow before the deadline.
+        // A stalled host must not fail checks about something else, so most run without a
+        // deadline. The 2-second transport stays at the 5 call sites that need it to fail:
+        // pipe deadlock, a read that waits for EOF, and overflow before the deadline. Stop
+        // requests have their own detector, `.unsignalled`. A real hang elsewhere has no
+        // backstop here: it waits for the CI job limit, and locally for nothing.
         let noDeadline = QueueClient.Transport(executable: executable, timeout: .infinity)
         let automaticTarget = QueueClient.InstallTarget(option: .appBundle, path: "/Applications/Agent Queue.app")
         let automaticInstall = QueueClient.Command.installRepairAndContinue(automaticTarget)
@@ -169,7 +171,7 @@ struct TransportTests {
         setupWait.cancel()
         do { _ = try await setupWait.value; throw ClientError.message("Cancelled automatic wait succeeded") }
         catch is CancellationError { }
-        try check(childIsGone(setupWaitMarker), "Stopping automatic waiting terminates and reaps only its private setup controller")
+        try check(childIsGone(setupWaitMarker) && stopSignalArrived(setupWaitMarker), "Stopping automatic waiting terminates and reaps only its private setup controller")
         let hintMarker = temporary.appendingPathComponent("automatic-hint")
         let hint = Task {
             try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: hintMarker.path)),
@@ -179,7 +181,7 @@ struct TransportTests {
         hint.cancel()
         do { _ = try await hint.value; throw ClientError.message("Cancelled hint wait succeeded") }
         catch is CancellationError { }
-        try check(childIsGone(hintMarker), "Throttled waiting progress is delivered even when the child emits no more output")
+        try check(childIsGone(hintMarker) && stopSignalArrived(hintMarker), "Throttled waiting progress is delivered even when the child emits no more output")
 
         let setupMutationMarker = temporary.appendingPathComponent("automatic-mutation")
         let setupMutation = Task { try await QueueClient.run(.installRepairAndContinue(.init(option: .appBundle, path: setupMutationMarker.path)), transport: noDeadline) }
@@ -383,7 +385,7 @@ struct TransportTests {
                 waiting.cancel()
                 do { _ = try await waiting.value; throw ClientError.message("\(row.name): cancelled wait succeeded") }
                 catch is CancellationError { }
-                try check(childIsGone(cancelMarker), "\(row.name): cancelling a reported wait stops only its child")
+                try check(childIsGone(cancelMarker) && stopSignalArrived(cancelMarker), "\(row.name): cancelling a reported wait stops only its child")
                 let mutationMarker = directory.appendingPathComponent("cancel-\(index)-mutation")
                 let mutation = Task { try await QueueClient.run(stubbed(row.command, "mutation", mutationMarker), transport: transport) }
                 try await waitForFile(mutationMarker)
@@ -463,6 +465,11 @@ struct TransportTests {
                 try? Data().write(to: marker.appendingPathExtension("delivered"))
             }
         }
+    }
+
+    // A waiting stub exits by itself after its sleep, which also looks like a stopped wait.
+    private static func stopSignalArrived(_ marker: URL) -> Bool {
+        !FileManager.default.fileExists(atPath: marker.appendingPathExtension("unsignalled").path)
     }
 
     // A stray temporary file from a killed atomic marker write names no child.
@@ -637,5 +644,9 @@ struct TransportTests {
         default: break
         }
         Thread.sleep(forTimeInterval: 5)
+        // The stop signal's handler exits without reaching this.
+        if ["automatic-wait", "automatic-hint"].contains(scenario) {
+            try Data().write(to: marker.appendingPathExtension("unsignalled"))
+        }
     }
 }

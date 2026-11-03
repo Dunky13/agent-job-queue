@@ -1,6 +1,6 @@
 # Swift controller commands
 
-Base: `7b4b27c`. Branch: `arch/swift-controller-commands`. Authorized endpoint:
+Originally based on `7b4b27c`, rebased on `b845eb1`. Branch: `arch/swift-controller-commands`. Authorized endpoint:
 draft PR. Independent review, merge and release are separate steps.
 
 ## Result
@@ -137,13 +137,18 @@ reference itself is unchanged.
 These test-only changes remove races before the serial merge queue. No production code changed.
 
 - **Automatic-wait cancel:** the stub writes its marker before it reports waiting, so cancelling on the marker could signal it in that gap. It exited 0 without reporting a wait, and the runner correctly returned success. Both sites now cancel only after the runner delivers the waiting output, like the `automatic-hint` check. The runner records the wait before delivering it, so the check is safe.
-- **Irrelevant deadline:** a child stalled past the 2 s test deadline failed comparisons that have nothing to do with deadlines. Review saw this in 1 of 15 full runs, and in 43 of 2,300 focused tries. Those checks, including 18 sibling sites in `main()` and the policy and selection checks, now run with no runner deadline. Their stubs all exit on their own. The 2 s value is unchanged.
-- **Deadline checks kept:** all `short` deadline checks are unchanged. The 2 s transport stays at 5 sites where its deadline detects the regression under test: oversized output (3 scenarios at one site), the exact-capture pipe check, the two stdin pipe checks, and the daemon read.
+- **Irrelevant deadline:** a child stalled past the 2 s test deadline failed comparisons that have nothing to do with deadlines. Review saw this in 1 of 15 full runs, and in 43 of 2,300 focused tries. Those checks, including 18 sibling sites in `main()` and the policy and selection checks, now run with no runner deadline. The 2 s value is unchanged.
+- **Deadline checks kept:** all `short` deadline checks are unchanged. The 2 s transport stays at 5 call sites: oversized output (3 scenarios at one site), the exact-capture pipe check, the two stdin pipe checks, and the daemon read.
+- **Correction, coverage this change lost and its repair:** an earlier version of this note said the deadline detected a regression only at those 5 sites, and offered "their stubs all exit on their own" as reassurance. Both were wrong. It was 8 sites, and those self-exiting stubs are how the coverage was lost. At `TransportTests.swift:174`, `:184` and `:388`, the deadline was the only detector for a missing "Stop waiting" signal. Without it, a stub that never got SIGUSR1 slept 5 s and exited by itself, the runner threw `CancellationError` because `stoppable` was already true, and all three checks passed. Production uses no deadline for this command, so "Stop waiting" would have stopped nothing until the backend's wait ended, with CI green. Review found this. These stubs now write a `.unsignalled` file after their sleep, and all three sites require it to be absent. This adds no tight wall-clock check, and it can misfire only if the signal takes more than 5 s to arrive.
+- **Known cost, hangs have no fast failure:** a real hang at the `setup-output` or `setup-failure` checks (`TransportTests.swift:245`, `:251`), or with the runner's observed-exit break removed (`AgentQueue.swift:437`), now takes the 20-minute job limit (`.github/workflows/ci.yml:125`) with no diagnostic, and has no limit locally. With that break removed, a local run was still going with no output when killed at 90 s, exit 124.
 - **Overlap detection:** the child-side sentinel missed real overlap, because a slow launch usually outlasts a cancelled predecessor. The test now also counts in-flight runs in the injected closure and requires a peak of 1. A child lives entirely inside its run, so this checks "never more than one live child" directly.
 
 | Check | Result |
 | --- | --- |
-| `TransportTests`, direct, 12 runs, load 4 to 19 | Exit 0 every time, 222 PASS lines |
+| `TransportTests`, direct, 12 runs before the `.unsignalled` repair, load 4 to 19 | Exit 0 every time, 222 PASS lines |
+| `TransportTests`, direct, 8 runs on the final test file, rebased on `b845eb1`, load 7 to 9 | Exit 0 every time, 222 PASS lines |
+| `kill` call removed from the runner | Exit 133 in 13 s at `Stopping automatic waiting terminates and reaps only its private setup controller`. Before the repair this exited 0 with 222 PASS lines. |
+| Same, in a scratch build where failed checks print and continue | Exactly 3 FAIL lines, one per site: `Stopping automatic waiting...`, `Throttled waiting progress...`, `install repair and continue: cancelling a reported wait stops only its child` |
 | Runner cancellation check removed | Fails at `Cancelled automatic wait succeeded` |
 | Same, removed only for the policy table | Fails at `install repair and continue: cancelled wait succeeded` |
 | `await previous?.value` removed from `LearningStore.select` | Fails 5 of 5 at `Rapid selections never have more than one live private detail child` |
@@ -169,6 +174,8 @@ around 10 to 13.
 | Bootstrap UI with one condition relaxed in scratch, branch | 2794 | PASS, all 12 scenarios, 92 PASS lines |
 
 ### `validate.sh`
+
+Job 2801 ran before the rebase. #63 has since changed `validate.sh` to run the CI Go partitions, and it has not been rerun locally here.
 
 This diff changes no Go files. `internal/backend` and `internal/tooling` hit the
 12-minute limit with no assertion failure. In `internal/remote`, two tests failed
