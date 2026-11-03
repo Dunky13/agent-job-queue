@@ -141,6 +141,7 @@ agent-heavy plugins reload
   | `cancel` (CLI, app, dashboard) | `released`, reason `cancelled` | `dropped`, reason `cancelled` | `lease.released` or `lease.dropped` |
   | Owner exited | `expired`, reason `owner-exited` | `dropped`, reason `owner-exited` | `lease.expired` or `lease.dropped` |
   | TTL | `expired`, reason `ttl` | `expired`, reason `ttl` | `lease.expired` |
+  | Corrupted row, unreadable status | `released`, reason `corrupted` | `dropped`, reason `corrupted` | `lease.released` or `lease.dropped` |
 
 - The owner must be a running process of your user when the lease is acquired. The daemon checks owners about once per second. A missing process, a zombie, a different start time or a different boot ends the lease; if the process table cannot be read, leases stay as they are.
 - `--owner-pid` defaults to `AGENT_QUEUE_OWNER_PID` when that is set, for both `acquire` and `release`. A lease acquired with only a TTL has no recorded owner and can be released without `--force`.

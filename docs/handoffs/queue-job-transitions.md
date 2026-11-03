@@ -40,7 +40,7 @@ Each keeps the guards of the write it stands in for, and refuses a healthy row o
 
 - **`recover`:** a `starting` row in any state records 125 and startup proceeds, including a lease at `starting`, which no lease edge covers.
 - **`tick`:**
-  - A corrupted `running` row verifies its group identity as main does, and settles when no owned process remains. A verified live process is left alone.
+  - A corrupted `running` row verifies its group identity as main does, and settles when no owned process remains. A verified live process is left alone. An unreadable `running` row with no worker recorded has nothing to verify or signal, so it records 125 at once, where main stops the tick.
   - A corrupted `outcome` row retires. It keeps its exit status from the outcome column, or from a readable result in its status. It gets 130 if cancelled, and 125 only if neither gives a code.
   - A `queued` row, or a `starting` row with no live child, settles with 125 if its status is unreadable.
   - A lease with an unreadable status ends with reason `corrupted`.
@@ -64,7 +64,8 @@ Each keeps the guards of the write it stands in for, and refuses a healthy row o
 Each of these matches main unless noted. They are listed under "Remaining work":
 
 - **Stop the tick for every job:** undecodable task JSON, which stops every read of unfinished jobs and prints an error every 100 ms. An agreeing `running` row with an unverifiable worker also does this.
-- **Stall adaptive mode:** `schedulingPermit` and `heldLeases` still fail on an unreadable row, so a job in adaptive mode gets 125. A corrupted row that reads as waiting can end a scheduling pass.
+- **Stall adaptive mode:** `schedulingPermit` and `heldLeases` still fail on an unreadable row. With a valid grant a job in adaptive mode gets 125, as on main. With an expired grant `LeaseCapacity` now passes and the permit returns false, so the worker should wait instead of failing, until the grant is revoked or the job is cancelled; this is the one narrow case that may be worse than main, and it was checked at function level, not end to end. With a manual grant the job should run. A corrupted row that reads as waiting can end a scheduling pass.
+- **Release a slot early:** an unreadable held lease is released while its owner may still be working, so that owner's slot can go to another job, where main kept the slot. This is the deliberate cost of settling it.
 - **Hold a slot:**
   - A corrupted `running` row whose worker can't be verified stays until it can be, and survives restart. Main stopped the tick here.
   - A `starting` row reading a readable wrong status, with no child, stays until a restart or `cancel`.
@@ -85,8 +86,9 @@ A scratch scenario using raw SQL and shared APIs ran on both main (`7b4b27c`) an
 | `queued` with an unreadable status, in `tick` | stops the tick | records 125 |
 | lease with an unreadable status | left alone unless expired, then stops the tick | ends with reason `corrupted` |
 | `outcome` with a bad status | reaches `done` with that bad status | status rewritten to agree; reaches `done` with its exit status |
-| `outcome`, no outcome column, status `Done` | reaches `done` with no column | column filled from the result, which is kept; its end time is rewritten |
+| `outcome`, no outcome column, status `Done` | reaches `done` with no column | column filled from the result's exit code, and a result other than `Success` is rewritten to the same code, so `Killed` becomes `{"Failed":137}`; its end time is rewritten |
 | `running`, disagreeing, worker cannot be verified | stops the whole tick | stays unsettled and is not signalled; the tick continues |
+| `running`, unreadable, no worker recorded | stops the whole tick | records 125 without a signal; the next job runs |
 | any unreadable row, in `LeaseCapacity` | fails every job with 125 | skipped |
 | `cancel` on a `done` row reading `Queued` or `Running` | `Cancel()` times out after 12 s | fails at once with an illegal-transition error |
 | lease with no lease object, granted or ended | panics the daemon | no panic |
@@ -115,7 +117,7 @@ A scratch scenario using raw SQL and shared APIs ran on both main (`7b4b27c`) an
 ## Tests
 
 - `queue_store_transitions_test.go` covers the store's interface on temporary SQLite: both lifecycles, every kind, phase and method combination, stale views, disagreeing rows and atomic enqueue.
-- `queue_corrupted_test.go` covers the daemon through `recover()`, `tick()` and the real client `Cancel()`. `TestRealDaemonJobRunsPastUnreadableRowAtLimitOne` submits a real job at limit 1 after an unreadable row in each phase, in both lease phases, and with a verified live worker. Its healthy-snapshot golden was captured from main.
+- `queue_corrupted_test.go` covers the daemon through `recover()`, `tick()` and the real client `Cancel()`. `TestRealDaemonJobRunsPastUnreadableRowAtLimitOne` submits a real job at limit 1 after an unreadable row in each phase, in both lease phases, and with a verified live worker. Its `starting` subtest restarts the daemon, so `recover()` settles that row; the tick guard for `starting` is covered by tick-level tests. Its healthy-snapshot golden was captured from main.
 
 These raw SQL fixtures stay on purpose:
 
