@@ -761,9 +761,10 @@ func executeWithAttempt(g *Gate, value, attempt string) (int, error) {
 	if boolean(content["resource_managed"]) {
 		marker["resourceManaged"] = true
 	}
+	// Never stopped: a queue worker publishes its outcome after this returns, and Cancel
+	// resends SIGINT until the job is done, so a resend must not kill the worker then.
 	interrupts := make(chan os.Signal, 2)
 	signal.Notify(interrupts, syscall.SIGINT)
-	defer signal.Stop(interrupts)
 	for {
 		select {
 		case <-interrupts:

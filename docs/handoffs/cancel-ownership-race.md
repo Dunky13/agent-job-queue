@@ -11,11 +11,11 @@ The old error text named no members and the job log is gone, so the CI run canno
 1. **Stale read.** The worker publishes and exits, and a repeat cancel read the row as running before that, then lists processes after it.
 2. **The repeat cancel kills the worker.** `executeWithAttempt` stopped handling SIGINT on return, before the outcome was published, so a resend in that gap killed the worker with nothing written. The row stays running until the daemon's wait settles it, and a cancel in that interval refuses. The job also reported the wrong status. An independent review forced this with injected delays and got the CI error text in 5 of 5 runs, and 0 of 5 with the handler held. A natural refusal also needs the daemon's goroutine to stall about 200 ms, and its natural rate was not measured.
 
-How the first path is known:
+What the evidence supports, for either path:
 
 - A capture of the failure in `docs/handoffs/process-census.md` showed the group holding only the `sleep` descendant while the recorded members had exited.
 - The refusal cannot come from cleanup. `WaitCleanup` never returns the daemon's cleanup error and waits 12s, while the failure came 2.9s after the test began. So it came from the daemon's `cancel` reply.
-- The focused test below reproduces the state and fails on unfixed code with `compared group N, recorded members [N@...], current members [N+1@...]`.
+- The focused test below builds the state and fails on unfixed code with `compared group N, recorded members [N@...], current members [N+1@...]`. It does not show which path produced the state in CI.
 
 Ruled out:
 
@@ -31,7 +31,7 @@ Ruled out:
 
 - `VerifyGroupIdentity` ends in a named error, `errGroupOwnershipUnverified`, and its message now states the group, the recorded members and the current members it compared (`pid@birth`). A recurrence names its cause.
 - `queueStore.settledAttempt` re-reads the row. If the same attempt and worker has published its outcome, the unverified group is no longer a reason to refuse: there is no worker to signal, and the settled job's cleanup, which uses the marker, owns what is left.
-- `ExecuteAttempt` keeps a SIGINT registration until the worker exits, so a resend cannot kill it before it publishes. This closes the second path.
+- `executeWithAttempt` no longer stops its SIGINT handling on return, so a resend cannot kill the worker before it publishes. This closes the second path. A resend after the command has ended is discarded, which costs nothing because the command's status is already known. An earlier version of this fix registered a separate channel in `ExecuteAttempt`, before anything read it, and that lost an acknowledged cancel arriving before the command started. A review forced that with an injected 800ms delay: the command ran and exited 5, where it should have exited 130. The window measured 43-72ms over 8 runs, and it needs the client to be gone, because a live client resends every 200ms.
 - Used by `queueDaemon.signal`, the daemon `tick` for an adopted running row, and the three handover readers in `queue_handover.go` that already re-read the row when the group was gone. They now do so for the unverified error too.
 - Not changed: a still-running row with no recorded member left keeps refusing, and nothing is ever signalled on unverified ownership. `Cleanup`, which uses the marker with all members, and `install_runtime_generations.go`, which retains on any error, are unchanged.
 
@@ -43,9 +43,9 @@ Ruled out:
 | Same test with the fix | passes |
 | Backend tests matching `Queue\|Handover\|Cancel\|Ownership\|Group\|Lease\|Signal\|Census\|Corrupt\|RealDaemon`, queue job | pass, 138s |
 | `go build ./... && go vet ./...` | pass |
-| Race-built `TestRealDaemonCancellationRemovesDescendants` plus the new test, 120 runs under `taskpolicy -c background`, before the second path was closed | pass |
-| `TestRealDaemonWorkerSurvivesInterruptsWhilePublishing` with the registration removed | fails: the job reports 125 instead of the command's 7 |
-| `TestSettledAttemptKeysOnTheSameAttempt` with each part of the key removed | fails |
+| Race-built `TestRealDaemonCancellationRemovesDescendants` plus the new test, 120 runs under `taskpolicy -c background`, at `2a5f930`, before the second path was closed | pass |
+| `TestRealDaemonWorkerSurvivesInterruptsWhilePublishing` with the handling stopped on return | fails: the job reports 125 instead of the command's 7 |
+| `TestSettledAttemptKeysOnTheSameAttempt` with each part of the key, or either settled phase, removed | fails |
 
 Not reproduced: the intermittent failure of the real test. It was 1 in 390 on main under throttling with `-race`, so 120 passes do not show the fix removes it. The focused test shows the refusal state and that the fix handles it.
 
@@ -56,6 +56,7 @@ Not reproduced: the intermittent failure of the real test. It was 1 in 390 on ma
 - The full backend suite and hosted CI on this branch.
 - Intel hardware. The reproduction and probes ran on arm64.
 - `managedHeldByApp` reading a healthy lock holder as unowned on Intel. No link was found: the CI failure with "An unowned queue process holds its lifetime lock" comes from `managedDrain` in `install_managed.go`, which inspects locks and does not use process group ownership.
+- A regression test for the lost cancel before the command starts. The window cannot be forced without a production hook, so nothing pins the registration staying in `executeWithAttempt`.
 - The `tick` change and the three handover readers have no focused test for this path, because a stale snapshot cannot be forced without a hook. Removing the check at any of them passes every test.
 
 ## Remaining work

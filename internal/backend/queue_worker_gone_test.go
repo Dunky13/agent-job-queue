@@ -116,4 +116,14 @@ func TestSettledAttemptKeysOnTheSameAttempt(t *testing.T) {
 			t.Fatalf("a different %s must not count as settled: %v %v", name, settled, err)
 		}
 	}
+	outcome, err := s.job(stale.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.retire(outcome); err != nil {
+		t.Fatal(err)
+	}
+	if current, settled, err := s.settledAttempt(stale); err != nil || !settled || current.phase != "done" {
+		t.Fatalf("a retired row stays settled for its attempt: %v %v %v", current.phase, settled, err)
+	}
 }
