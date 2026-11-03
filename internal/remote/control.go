@@ -28,6 +28,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Dunky13/agent-job-queue/internal/appservices"
+	"github.com/Dunky13/agent-job-queue/internal/census"
 	"github.com/Dunky13/agent-job-queue/internal/lifeline"
 	"github.com/caddyserver/caddy/v2"
 	"golang.org/x/crypto/bcrypt"
@@ -398,22 +399,37 @@ func (c *controller) allowedHosts() ([]string, error) {
 	return hosts, nil
 }
 
+// darwinMaxPID is the largest PID macOS ps accepts; the kernel assigns less.
+const darwinMaxPID = 99999
+
 func (c *controller) processBirth(pid int) (string, error) {
 	if pid <= 1 {
 		return "", nil
 	}
-	output, err := c.command([]string{"/bin/ps", "-p", strconv.Itoa(pid), "-o", "lstart=,stat="}, nil, 5*time.Second, false)
+	// macOS ps refuses the whole command for a PID it could never assign, so a
+	// corrupt record must read as exited rather than as a failed listing.
+	if runtime.GOOS == "darwin" && pid > darwinMaxPID {
+		return "", nil
+	}
+	// Listing the observer as well tells a process that exited apart from a
+	// listing that failed: with it listed, ps exits 0 whether or not pid exists,
+	// so a nonzero exit is always a failed listing.
+	observer := census.Self()
+	output, err := c.command([]string{"/bin/ps", "-p", strconv.Itoa(pid) + "," + strconv.Itoa(observer.PID), "-o", census.Columns}, nil, 5*time.Second, true)
 	if err != nil {
 		return "", err
 	}
-	value := strings.TrimSpace(string(output))
-	boundary := strings.LastIndexAny(value, " \t")
-	if boundary < 0 || strings.HasPrefix(value[boundary+1:], "Z") {
+	table, err := census.Parse(string(output), observer)
+	if err != nil {
+		return "", errors.New("Could not establish process identity")
+	}
+	process, present := table[pid]
+	if !present || census.IsZombie(process.State) {
 		return "", nil
 	}
 	// Keep ps's internal spacing so pre-migration Python process records remain
 	// recognizable during an upgrade and can be stopped safely.
-	return strings.TrimSpace(value[:boundary]), nil
+	return process.RawBirth, nil
 }
 
 func (c *controller) bootIdentity() (string, error) {
@@ -427,8 +443,8 @@ func (c *controller) bootIdentity() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	value := strings.ToLower(strings.TrimSpace(string(output)))
-	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`).MatchString(value) {
+	value, valid := census.ParseBootIdentity(string(output))
+	if !valid {
 		return "", errors.New("Could not establish boot identity")
 	}
 	return value, nil

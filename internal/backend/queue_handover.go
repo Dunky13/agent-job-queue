@@ -12,11 +12,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/Dunky13/agent-job-queue/internal/census"
 	"github.com/google/uuid"
 )
 
@@ -157,47 +157,30 @@ func decodeQueueHandoverIdentity(value any) (*queueHandoverDaemon, error) {
 	return &identity, nil
 }
 
-type queueHandoverProcess struct {
-	PGID         int
-	Birth, State string
-}
 type queueHandoverProcesses struct {
 	Boot      string
-	Processes map[int]queueHandoverProcess
+	Processes census.Table
+}
+
+var queueHandoverCensusWording = census.Wording{
+	Truncated:  "Incomplete handover process snapshot",
+	Invalid:    "Invalid handover process snapshot",
+	Ambiguous:  "Ambiguous handover process snapshot",
+	Incomplete: "Incomplete handover process snapshot",
 }
 
 func queueHandoverProcessSnapshot() (queueHandoverProcesses, error) {
-	result := queueHandoverProcesses{Processes: map[int]queueHandoverProcess{}}
+	result := queueHandoverProcesses{Processes: census.Table{}}
 	boot, err := BootIdentity()
 	if err != nil {
 		return result, err
 	}
 	result.Boot = boot
-	output, err := identityCommand("/bin/ps", "-axo", "pid=,pgid=,stat=,lstart=")
+	processes, err := identityCensus(queueHandoverCensusWording)
 	if err != nil {
 		return result, err
 	}
-	observer := false
-	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 8 {
-			return result, errors.New("Incomplete handover process snapshot")
-		}
-		pid, pidErr := strconv.Atoi(fields[0])
-		pgid, pgidErr := strconv.Atoi(fields[1])
-		if pidErr != nil || pgidErr != nil || pid <= 0 || pgid < 0 {
-			return result, errors.New("Invalid handover process snapshot")
-		}
-		state := queueHandoverProcess{PGID: pgid, Birth: strings.Join(fields[3:], " "), State: fields[2]}
-		if _, duplicate := result.Processes[pid]; duplicate {
-			return result, errors.New("Ambiguous handover process snapshot")
-		}
-		result.Processes[pid] = state
-		observer = observer || pid == os.Getpid() && pgid == syscall.Getpgrp() && !strings.HasPrefix(state.State, "Z")
-	}
-	if !observer {
-		return result, errors.New("Incomplete handover process snapshot")
-	}
+	result.Processes = processes
 	return result, nil
 }
 func (snapshot queueHandoverProcesses) alive(identity queueHandoverDaemon) (bool, error) {
@@ -207,17 +190,17 @@ func (snapshot queueHandoverProcesses) alive(identity queueHandoverDaemon) (bool
 	if snapshot.Boot != identity.BootUUID {
 		return false, errors.New("Queue handover belongs to another boot")
 	}
-	state, present := snapshot.Processes[identity.PID]
-	if !present {
+	state, liveness := snapshot.Processes.Identify(identity.PID, identity.Birth)
+	if liveness == census.Absent {
 		return false, nil
 	}
-	if state.Birth != strings.Join(strings.Fields(identity.Birth), " ") {
+	if liveness == census.Reused {
 		return false, errors.New("Queue handover process identity was reused")
 	}
 	if state.PGID != identity.PGID {
 		return false, errors.New("Queue handover process left its recorded process group")
 	}
-	return !strings.HasPrefix(state.State, "Z"), nil
+	return liveness == census.Alive, nil
 }
 func queueHandoverDaemonAlive(identity queueHandoverDaemon) (bool, error) {
 	snapshot, err := queueHandoverProcessSnapshot()
@@ -386,8 +369,8 @@ func queueHandoverAttempts(store *queueStore) ([]queueHandoverAttempt, error) {
 		if job.phase == "done" {
 			// Historical process identifiers can legitimately be reused or
 			// belong to a previous boot. Those original callers have exited.
-			state, present := processes.Processes[caller.PID]
-			if caller.BootUUID != processes.Boot || !present || state.Birth != strings.Join(strings.Fields(caller.Birth), " ") || strings.HasPrefix(state.State, "Z") {
+			_, liveness := processes.Processes.Identify(caller.PID, caller.Birth)
+			if caller.BootUUID != processes.Boot || liveness != census.Alive {
 				continue
 			}
 		}

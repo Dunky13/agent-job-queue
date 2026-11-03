@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/Dunky13/agent-job-queue/internal/census"
 )
 
 func jsonEqual(a, b any) bool {
@@ -43,33 +43,47 @@ func BootIdentity() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	id, err := uuid.Parse(strings.TrimSpace(value))
-	if err != nil {
+	id, valid := census.ParseBootIdentity(value)
+	if !valid {
 		return "", errors.New("Invalid boot identity; shared slot retained")
 	}
-	return id.String(), nil
+	return id, nil
 }
-func ProcessGroupMembers(pgid int) ([]Object, error) {
-	output, err := identityCommand("/bin/ps", "-axo", "pid=,pgid=,lstart=")
+
+// identityCensus is the backend's complete process table. A rejected listing is
+// an error in the caller's words, so no caller can read it as an exited process.
+func identityCensus(wording census.Wording) (census.Table, error) {
+	output, err := identityCommand("/bin/ps", "-axo", census.Columns)
 	if err != nil {
 		return nil, err
 	}
-	members := []Object{}
-	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 7 {
-			return nil, errors.New("Invalid process identity listing; shared slot retained")
-		}
-		pid, e1 := strconv.Atoi(fields[0])
-		group, e2 := strconv.Atoi(fields[1])
-		if e1 != nil || e2 != nil || pid < 1 || group < 0 {
-			return nil, errors.New("Invalid process identity listing; shared slot retained")
-		}
-		if group == pgid {
-			members = append(members, Object{"pid": pid, "birth": strings.Join(fields[2:], " ")})
-		}
+	table, err := census.Parse(output, census.Self())
+	if err != nil {
+		return nil, wording.Of(err)
 	}
-	return members, nil
+	return table, nil
+}
+func groupMemberObjects(table census.Table, pgid int) []Object {
+	members := []Object{}
+	for _, process := range table.Group(pgid) {
+		members = append(members, Object{"pid": process.PID, "birth": process.Birth})
+	}
+	return members
+}
+
+var processIdentityWording = census.Wording{
+	Truncated:  "Invalid process identity listing; shared slot retained",
+	Invalid:    "Invalid process identity listing; shared slot retained",
+	Ambiguous:  "Ambiguous process identity listing; shared slot retained",
+	Incomplete: "Incomplete process identity listing; shared slot retained",
+}
+
+func ProcessGroupMembers(pgid int) ([]Object, error) {
+	table, err := identityCensus(processIdentityWording)
+	if err != nil {
+		return nil, err
+	}
+	return groupMemberObjects(table, pgid), nil
 }
 
 type groupState struct {
@@ -77,34 +91,22 @@ type groupState struct {
 	Birth, State string
 }
 
+var processStateWording = census.Wording{
+	Truncated:  "Invalid process state listing; shared slot retained",
+	Invalid:    "Invalid process state listing; shared slot retained",
+	Ambiguous:  "Ambiguous process state listing; shared slot retained",
+	Incomplete: "Incomplete process state listing; shared slot retained",
+}
+
 func processGroupStates(pgid int) ([]groupState, error) {
-	output, err := identityCommand("/bin/ps", "-axo", "pid=,pgid=,stat=,lstart=")
+	table, err := identityCensus(processStateWording)
 	if err != nil {
 		return nil, err
 	}
 	members := []groupState{}
-	observer := false
-	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 8 {
-			return nil, errors.New("Invalid process state listing; shared slot retained")
-		}
-		pid, e1 := strconv.Atoi(fields[0])
-		group, e2 := strconv.Atoi(fields[1])
-		if e1 != nil || e2 != nil {
-			return nil, errors.New("Invalid process state listing; shared slot retained")
-		}
-		if pid == os.Getpid() && group == syscall.Getpgrp() && !strings.HasPrefix(fields[2], "Z") {
-			observer = true
-		}
-		if group == pgid {
-			members = append(members, groupState{pid, strings.Join(fields[3:], " "), fields[2]})
-		}
+	for _, process := range table.Group(pgid) {
+		members = append(members, groupState{process.PID, process.Birth, process.State})
 	}
-	if !observer {
-		return nil, errors.New("Incomplete process state listing; shared slot retained")
-	}
-	sort.Slice(members, func(i, j int) bool { return members[i].PID < members[j].PID })
 	return members, nil
 }
 func GroupExists(pgid int) (bool, error) {
@@ -134,7 +136,7 @@ func groupExistsWith(pgid int, probe func(int, syscall.Signal) error, snapshot f
 		}
 		zombies := len(initial) > 0
 		for _, entry := range initial {
-			zombies = zombies && strings.HasPrefix(entry.State, "Z")
+			zombies = zombies && census.IsZombie(entry.State)
 		}
 		if zombies {
 			again := probe(-pgid, 0)
@@ -171,7 +173,7 @@ func retainedZombieSubset(initial, current []groupState) bool {
 	}
 	known := make(map[int]string, len(initial))
 	for _, entry := range initial {
-		if entry.PID <= 1 || entry.Birth == "" || !strings.HasPrefix(entry.State, "Z") {
+		if entry.PID <= 1 || entry.Birth == "" || !census.IsZombie(entry.State) {
 			return false
 		}
 		if _, duplicate := known[entry.PID]; duplicate {
@@ -181,7 +183,7 @@ func retainedZombieSubset(initial, current []groupState) bool {
 	}
 	seen := make(map[int]bool, len(current))
 	for _, entry := range current {
-		if entry.PID <= 1 || entry.Birth == "" || !strings.HasPrefix(entry.State, "Z") || known[entry.PID] != entry.Birth || seen[entry.PID] {
+		if entry.PID <= 1 || entry.Birth == "" || !census.IsZombie(entry.State) || known[entry.PID] != entry.Birth || seen[entry.PID] {
 			return false
 		}
 		seen[entry.PID] = true
@@ -453,7 +455,7 @@ func VerifyGroupIdentity(marker Object) (bool, error) {
 			known := obj(raw)
 			pid, _ := integer(member["pid"])
 			knownPID, _ := integer(known["pid"])
-			if pid == knownPID && strings.Join(strings.Fields(text(member["birth"])), " ") == strings.Join(strings.Fields(text(known["birth"])), " ") {
+			if pid == knownPID && census.NormalizeBirth(text(member["birth"])) == census.NormalizeBirth(text(known["birth"])) {
 				return true, nil
 			}
 		}

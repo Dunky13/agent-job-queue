@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Dunky13/agent-job-queue/internal/census"
 )
 
 const MaxSampleInterval = 10.0
@@ -168,7 +168,7 @@ func (s *ResourceSampler) Host() (Object, error) {
 }
 func (s *ResourceSampler) ForgetGroup(pgid int) { delete(s.groups, pgid) }
 func memberKey(member Object) string {
-	return fmt.Sprintf("%v\x00%s", member["pid"], strings.Join(strings.Fields(text(member["birth"])), " "))
+	return fmt.Sprintf("%v\x00%s", member["pid"], census.NormalizeBirth(text(member["birth"])))
 }
 func memberSet(members []Object) map[string]bool {
 	result := map[string]bool{}
@@ -316,7 +316,7 @@ func (s *ResourceSampler) Group(pgid int, expected []Object) (Object, error) {
 func resourceProcessListing(pgid int) ([]Object, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, "/bin/ps", "-axo", "pid=,pgid=,lstart=")
+	command := exec.CommandContext(ctx, "/bin/ps", "-axo", census.Columns)
 	command.Env = []string{"PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL=C"}
 	command.WaitDelay = time.Second
 	output := &boundedOutput{limit: 8 * 1024 * 1024}
@@ -325,33 +325,20 @@ func resourceProcessListing(pgid int) ([]Object, error) {
 	if e := command.Run(); e != nil || output.exceeded {
 		return nil, fmt.Errorf("Process resource identities are unavailable")
 	}
-	return parseResourceProcessListing(output.String(), pgid, os.Getpid())
+	return parseResourceProcessListing(output.String(), pgid, census.Self())
 }
-func parseResourceProcessListing(output string, pgid, observer int) ([]Object, error) {
-	members := []Object{}
-	seen := map[int]bool{}
-	observerSeen := false
-	for _, line := range strings.Split(strings.TrimSuffix(output, "\n"), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 3 {
-			return nil, fmt.Errorf("Process resource identity listing is invalid")
-		}
-		pid, e1 := strconv.Atoi(fields[0])
-		group, e2 := strconv.Atoi(fields[1])
-		if e1 != nil || e2 != nil || pid <= 0 || group < 0 {
-			return nil, fmt.Errorf("Process resource identity listing is invalid")
-		}
-		if seen[pid] {
-			return nil, fmt.Errorf("Process resource identity listing is inconsistent")
-		}
-		seen[pid] = true
-		observerSeen = observerSeen || pid == observer
-		if group == pgid {
-			members = append(members, Object{"pid": pid, "birth": strings.Join(fields[2:], " ")})
-		}
+
+var resourceCensusWording = census.Wording{
+	Truncated:  "Process resource identity listing is invalid",
+	Invalid:    "Process resource identity listing is invalid",
+	Ambiguous:  "Process resource identity listing is inconsistent",
+	Incomplete: "Process resource identity listing is incomplete",
+}
+
+func parseResourceProcessListing(output string, pgid int, observer census.Observer) ([]Object, error) {
+	table, err := census.Parse(output, observer)
+	if err != nil {
+		return nil, resourceCensusWording.Of(err)
 	}
-	if !observerSeen {
-		return nil, fmt.Errorf("Process resource identity listing is incomplete")
-	}
-	return members, nil
+	return groupMemberObjects(table, pgid), nil
 }
