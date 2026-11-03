@@ -82,9 +82,11 @@ func fixtureGatewayRequestBudget(t *testing.T, p remotePaths, settings *Settings
 	if server == nil || server.WriteTimeout <= 0 {
 		t.Fatal("gateway must define a bounded response deadline")
 	}
-	// Exercise the service's actual response contract. Race instrumentation makes
-	// the unchanged cost-14 bcrypt operation about twelve times slower, so a
-	// separate five-second fixture limit abandoned valid first authentications.
+	// Exercise the service's actual response contract. Race instrumentation of
+	// blowfish makes the unchanged cost-14 bcrypt operation about ten times
+	// slower, so a separate five-second fixture limit abandoned valid first
+	// authentications. The repository test drivers therefore do not instrument
+	// that one arithmetic package; see CONTRIBUTING.md.
 	return time.Duration(server.WriteTimeout)
 }
 

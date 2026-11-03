@@ -81,6 +81,9 @@ func TestAuthAdmissionRealCaddyCacheAndDistinctGuesses(t *testing.T) {
 	var assets sync.WaitGroup
 	start := make(chan struct{})
 	started := time.Now()
+	var rejected atomic.Int64
+	var firstRejection sync.Once
+	var inFlight string
 	for i := range limits.Burst {
 		assets.Add(1)
 		go func() {
@@ -89,12 +92,18 @@ func TestAuthAdmissionRealCaddyCacheAndDistinctGuesses(t *testing.T) {
 			r := admissionRequest("192.0.2.10:1234", "antitiming")
 			r.URL.Path = fmt.Sprintf("/asset-%d.js", i)
 			if err := a.ServeHTTP(httptest.NewRecorder(), r, next); err != nil {
-				t.Error("cold initial asset burst rejected", err)
+				rejected.Add(1)
+				firstRejection.Do(func() {
+					inFlight = fmt.Sprintf("%v after %s with %d/%d authentication slots held and %d/%d requests queued", err, time.Since(started), len(a.slots), cap(a.slots), len(a.waiting), cap(a.waiting))
+				})
 			}
 		}()
 	}
 	close(start)
 	assets.Wait()
+	if rejected.Load() != 0 {
+		t.Fatalf("cold initial asset burst rejected %d of %d requests; first: %s (%d real bcrypt comparisons, %s admission wait limit)", rejected.Load(), limits.Burst, inFlight, counter.calls.Load(), gatewayResponseTimeout)
+	}
 	t.Logf("Cold asset burst: %d requests, %d real bcrypt comparisons, %s elapsed, %s admission wait limit", limits.Burst, counter.calls.Load(), time.Since(started), gatewayResponseTimeout)
 	if counter.calls.Load() != 1 {
 		t.Fatal("cached polls recomputed bcrypt", counter.calls.Load())
