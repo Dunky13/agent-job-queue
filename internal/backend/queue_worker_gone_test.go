@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // orphanedWorker is a worker record whose only recorded member, the group
@@ -69,9 +70,7 @@ func TestSignalFromAStaleRowAfterTheWorkerExited(t *testing.T) {
 			t.Fatalf("the refusal must say what it compared (%q): %v", want, err)
 		}
 	}
-	if err = syscall.Kill(-pgid, 0); err != nil {
-		t.Fatalf("the refusal signalled the group: %v", err)
-	}
+	requireGroupNotSignalled(t, pgid, "the refusal")
 
 	if err = s.recordOutcome(stale, 130); err != nil {
 		t.Fatal(err)
@@ -79,7 +78,42 @@ func TestSignalFromAStaleRowAfterTheWorkerExited(t *testing.T) {
 	if err = d.signal(stale, syscall.SIGTERM); err != nil {
 		t.Fatalf("a settled row has nothing to signal: %v", err)
 	}
-	if err = syscall.Kill(-pgid, 0); err != nil {
-		t.Fatalf("an unverified group was signalled: %v", err)
+	requireGroupNotSignalled(t, pgid, "a settled row")
+}
+
+// A signalled sleep takes a moment to exit, so look after that. Waiting can only
+// miss a signal, never invent one.
+func requireGroupNotSignalled(t *testing.T, pgid int, by string) {
+	t.Helper()
+	time.Sleep(300 * time.Millisecond)
+	if err := syscall.Kill(-pgid, 0); err != nil {
+		t.Fatalf("%s signalled an unverified group: %v", by, err)
+	}
+}
+
+// Only the attempt and worker that read the row may count as settled by it.
+func TestSettledAttemptKeysOnTheSameAttempt(t *testing.T) {
+	_, s, _, _ := corruptedDaemon(t)
+	worker, _ := orphanedWorker(t)
+	stale := runningWithWorker(t, s, 0, worker)
+	if _, settled, err := s.settledAttempt(stale); err != nil || settled {
+		t.Fatalf("a running row is not settled: %v %v", settled, err)
+	}
+	if err := s.recordOutcome(stale, 130); err != nil {
+		t.Fatal(err)
+	}
+	if _, settled, err := s.settledAttempt(stale); err != nil || !settled {
+		t.Fatalf("the same attempt published its outcome: %v %v", settled, err)
+	}
+	for name, change := range map[string]func(j *queueJob){
+		"token":   func(j *queueJob) { j.token = "other" },
+		"attempt": func(j *queueJob) { j.attempt = "other" },
+		"worker":  func(j *queueJob) { j.worker = Object{"pid": -1} },
+	} {
+		other := stale
+		change(&other)
+		if _, settled, err := s.settledAttempt(other); err != nil || settled {
+			t.Fatalf("a different %s must not count as settled: %v %v", name, settled, err)
+		}
 	}
 }

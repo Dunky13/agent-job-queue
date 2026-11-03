@@ -324,6 +324,32 @@ func TestRealDaemonCancellationRemovesDescendants(t *testing.T) {
 		return state == "" || strings.HasPrefix(state, "Z")
 	})
 }
+
+// Cancel resends SIGINT until the job is done, so one can land after the command
+// has ended. It must not kill the worker before it publishes the real status.
+func TestRealDaemonWorkerSurvivesInterruptsWhilePublishing(t *testing.T) {
+	f := daemonAcceptance(t)
+	client := f.launch("/bin/sh", "-c", `trap '' INT; echo $PPID > worker; while [ ! -f go ]; do sleep .01; done; exit 7`)
+	var worker int
+	fixtureUntil(t, 8*time.Second, func() bool {
+		body, err := os.ReadFile(filepath.Join(f.root, "worker"))
+		if err != nil {
+			return false
+		}
+		worker, _ = strconv.Atoi(strings.TrimSpace(string(body)))
+		return worker > 1
+	})
+	go func() {
+		// Stops at ESRCH, so it cannot reach a later process that reuses the pid.
+		for syscall.Kill(worker, syscall.SIGINT) == nil {
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+	if err := os.WriteFile(filepath.Join(f.root, "go"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	client.wait(t, 7)
+}
 func TestRealDaemonBackgroundChildCannotOutliveLease(t *testing.T) {
 	f := daemonAcceptance(t)
 	client := f.launch("/bin/sh", "-c", "sleep 60 & echo $! > background; echo final")

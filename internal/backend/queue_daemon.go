@@ -1125,6 +1125,10 @@ func ExecuteAttempt(g *Gate, id int, value, attempt string) (code int, err error
 		return 125, e
 	}
 	code = 125
+	// Cancel resends SIGINT until the job is done, and executeWithAttempt stops its
+	// own handling on return. This registration, which lasts until the worker exits,
+	// keeps a resend from killing it before the outcome below is published.
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGINT)
 	defer func() {
 		j, e := s.job(id)
 		if e != nil {
