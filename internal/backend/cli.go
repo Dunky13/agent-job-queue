@@ -186,34 +186,35 @@ func dispatch(g *Gate, args []string) (int, error) {
 		if len(rest) == 1 {
 			return 0, json.NewEncoder(os.Stdout).Encode(data)
 		}
-		queue := obj(data["queue"])
-		scheduler := obj(data["scheduler"])
-		fmt.Printf("Queue %s: %v running, %v waiting; limit %v\n", text(queue["status"]), queue["running"], queue["waiting"], queue["limit"])
-		fmt.Printf("Scheduling %s: %s\n", text(scheduler["mode"]), text(scheduler["reason"]))
-		for _, raw := range list(data["jobs"]) {
-			job := obj(raw)
-			context := text(job["project"])
-			if text(job["branch"]) != "" {
-				context += " / " + text(job["branch"])
+		var limit any
+		if data.Queue.Limit != nil {
+			limit = *data.Queue.Limit
+		}
+		fmt.Printf("Queue %s: %v running, %v waiting; limit %v\n", data.Queue.Status, data.Queue.Running, data.Queue.Waiting, limit)
+		fmt.Printf("Scheduling %s: %s\n", data.Scheduler.Mode, data.Scheduler.Reason)
+		for _, job := range data.Jobs {
+			context := job.Project
+			if job.Branch != "" {
+				context += " / " + job.Branch
 			}
 			suffix := ""
-			if job["queuePosition"] != nil {
-				suffix += fmt.Sprintf("; queue #%v", job["queuePosition"])
+			if job.QueuePosition != nil {
+				suffix += fmt.Sprintf("; queue #%v", *job.QueuePosition)
 			}
-			if job["exitCode"] != nil {
-				suffix += fmt.Sprintf("; exit=%v", job["exitCode"])
+			if job.ExitCode != nil {
+				suffix += fmt.Sprintf("; exit=%v", *job.ExitCode)
 			}
-			if job["kind"] == "lease" {
-				fmt.Printf("  lease %v: %s | %s | lane %s%s\n", job["id"], text(job["phase"]), text(job["title"]), text(job["lane"]), suffix)
+			if job.Kind == "lease" {
+				fmt.Printf("  lease %v: %s | %s | lane %s%s\n", job.ID, job.Phase, job.Title, job.Lane, suffix)
 				continue
 			}
-			if lane := text(job["lane"]); lane != "" && lane != defaultLaneName {
-				suffix += "; lane " + lane
+			if job.Lane != "" && job.Lane != defaultLaneName {
+				suffix += "; lane " + job.Lane
 			}
-			fmt.Printf("  job %v: %s | %s | %s%s\n", job["id"], text(job["phase"]), text(job["title"]), context, suffix)
+			fmt.Printf("  job %v: %s | %s | %s%s\n", job.ID, job.Phase, job.Title, context, suffix)
 		}
 		occupied := "no"
-		if boolean(queue["legacyOccupied"]) {
+		if data.Queue.LegacyOccupied {
 			occupied = "yes"
 		}
 		fmt.Println("Exclusive legacy owner:", occupied)

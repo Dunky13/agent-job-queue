@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Dunky13/agent-job-queue/internal/wire"
 	"github.com/google/shlex"
 )
 
@@ -270,33 +272,33 @@ func LegacyOccupied(g *Gate) bool {
 	manifest, err := SharedManifest(g)
 	return err != nil || manifest == nil
 }
-func StatusData(g *Gate) (Object, error) {
+func StatusData(g *Gate) (wire.Snapshot, error) {
 	if err := g.Prepare(); err != nil {
-		return nil, err
+		return wire.Snapshot{}, err
 	}
 	snapshot, err := g.Snapshot()
 	if err != nil {
-		return nil, err
+		return wire.Snapshot{}, err
 	}
 	scheduling, err := SchedulingView(g)
 	if err != nil {
-		return nil, err
+		return wire.Snapshot{}, err
 	}
-	jobs := []Object{}
+	jobs := []wire.Job{}
 	doneEntries := []Object{}
 	entries := []Object{}
 	for key, raw := range obj(snapshot["tasks"]) {
 		id, err := strconv.Atoi(key)
 		if err != nil || id < 0 {
-			return nil, errors.New("Invalid task ID")
+			return wire.Snapshot{}, errors.New("Invalid task ID")
 		}
 		task := obj(raw)
 		if task == nil {
-			return nil, errors.New("Invalid task")
+			return wire.Snapshot{}, errors.New("Invalid task")
 		}
 		name, details, err := TaskStatus(task)
 		if err != nil {
-			return nil, err
+			return wire.Snapshot{}, err
 		}
 		entry := Object{"id": id, "task": task, "end": details["end"]}
 		if name == "Done" {
@@ -321,16 +323,20 @@ func StatusData(g *Gate) (Object, error) {
 		task := obj(entry["task"])
 		name, details, err := TaskStatus(task)
 		if err != nil {
-			return nil, err
+			return wire.Snapshot{}, err
 		}
 		if taskIsLease(task) {
-			jobs = append(jobs, leaseStatusJob(id, task, details, scheduling))
+			job, err := leaseStatusJob(id, task, details, scheduling)
+			if err != nil {
+				return wire.Snapshot{}, err
+			}
+			jobs = append(jobs, job)
 			continue
 		}
 		state := strings.ToLower(name)
 		receipt, err := g.Receipt(id)
 		if err != nil {
-			return nil, err
+			return wire.Snapshot{}, err
 		}
 		value := CommandToken(task)
 		resources := obj(obj(scheduling["jobs"])[value])
@@ -356,34 +362,33 @@ func StatusData(g *Gate) (Object, error) {
 			valid := false
 			priority, valid = integer(raw)
 			if !valid {
-				return nil, errors.New("Queue returned an invalid priority")
+				return wire.Snapshot{}, errors.New("Queue returned an invalid priority")
 			}
 		}
 		description, err := DescribeTask(g, task, state)
 		if err != nil {
-			return nil, err
+			return wire.Snapshot{}, err
 		}
-		job := Object{"id": id, "state": state, "priority": priority, "queuePosition": nil, "submittedAt": task["created_at"], "startedAt": details["start"], "finishedAt": details["end"], "exitCode": nil, "logPath": g.LogPathFromTask(id, task), "canReorder": name == "Queued" || ownedWaiting, "canStart": name == "Queued" || ownedWaiting, "canCancel": name == "Queued" || name == "Stashed" || name == "Running" || name == "Paused", "phase": phase}
-		for k, v := range description {
-			job[k] = v
-		}
+		job := wire.Job{ID: id, State: state, Priority: priority, SubmittedAt: nullableText(task["created_at"]), StartedAt: nullableText(details["start"]), FinishedAt: nullableText(details["end"]), LogPath: g.LogPathFromTask(id, task), CanReorder: name == "Queued" || ownedWaiting, CanStart: name == "Queued" || ownedWaiting, CanCancel: name == "Queued" || name == "Stashed" || name == "Running" || name == "Paused", Phase: phase, Project: text(description["project"]), Branch: text(description["branch"]), Directory: text(description["directory"]), Title: text(description["title"]), Executable: text(description["executable"]), Lane: taskLane(task), Kind: "command"}
 		if name == "Done" {
 			code, err := ResultCode(details["result"])
 			if err != nil {
-				return nil, err
+				return wire.Snapshot{}, err
 			}
-			job["exitCode"] = code
+			job.ExitCode = &code
 		}
 		if resources != nil {
-			job["resources"] = resources
+			value, err := decodeWire[wire.Resources](resources)
+			if err != nil {
+				return wire.Snapshot{}, err
+			}
+			job.Resources = &value
 		}
-		job["lane"] = taskLane(task)
-		job["kind"] = "command"
 		jobs = append(jobs, job)
 	}
-	active, waiting, done := []Object{}, []Object{}, []Object{}
+	active, waiting, done := []wire.Job{}, []wire.Job{}, []wire.Job{}
 	for _, job := range jobs {
-		switch job["state"] {
+		switch job.State {
 		case "running", "paused", "held":
 			active = append(active, job)
 		case "done", "released", "expired", "dropped":
@@ -392,93 +397,128 @@ func StatusData(g *Gate) (Object, error) {
 			waiting = append(waiting, job)
 		}
 	}
-	lanePriority := func(job Object) int {
-		priority, _ := integer(obj(lanes[text(job["lane"])])["priority"])
+	lanePriority := func(job wire.Job) int {
+		priority, _ := integer(obj(lanes[job.Lane])["priority"])
 		return priority
 	}
-	sort.Slice(active, func(i, j int) bool { a, _ := integer(active[i]["id"]); b, _ := integer(active[j]["id"]); return a < b })
+	sort.Slice(active, func(i, j int) bool { return active[i].ID < active[j].ID })
 	sort.Slice(waiting, func(i, j int) bool {
 		if a, b := lanePriority(waiting[i]), lanePriority(waiting[j]); a != b {
 			return a > b
 		}
-		a, _ := integer(waiting[i]["priority"])
-		b, _ := integer(waiting[j]["priority"])
-		if a != b {
+		if a, b := waiting[i].Priority, waiting[j].Priority; a != b {
 			return a > b
 		}
-		a, _ = integer(waiting[i]["id"])
-		b, _ = integer(waiting[j]["id"])
-		return a < b
+		return waiting[i].ID < waiting[j].ID
 	})
 	position := 0
 	lanePositions := map[string]int{}
-	for _, job := range waiting {
-		if job["state"] == "queued" {
+	for index := range waiting {
+		job := &waiting[index]
+		if job.State == "queued" {
 			position++
-			job["queuePosition"] = position
-			lanePositions[text(job["lane"])]++
-			if job["kind"] == "lease" {
-				job["position"] = lanePositions[text(job["lane"])]
+			job.QueuePosition = new(position)
+			lanePositions[job.Lane]++
+			if job.Kind == "lease" {
+				job.Lease.Position = new(lanePositions[job.Lane])
 			}
 		}
 	}
 	sort.Slice(done, func(i, j int) bool {
-		a, b := text(done[i]["finishedAt"]), text(done[j]["finishedAt"])
+		a, b := pointerText(done[i].FinishedAt), pointerText(done[j].FinishedAt)
 		if a != b {
 			return a > b
 		}
-		ai, _ := integer(done[i]["id"])
-		bi, _ := integer(done[j]["id"])
-		return ai > bi
+		return done[i].ID > done[j].ID
 	})
 	all := append(append(active, waiting...), done...)
-	group := obj(obj(snapshot["groups"])["default"])
-	scheduler := Object{}
-	for _, key := range []string{"mode", "available", "reason", "updatedAt", "host"} {
-		scheduler[key] = scheduling[key]
+	group := defaultGroup(snapshot)
+	limit, err := decodeWire[*int](group["parallel_tasks"])
+	if err != nil {
+		return wire.Snapshot{}, err
+	}
+	scheduler, err := decodeWire[wire.Scheduler](scheduling)
+	if err != nil {
+		return wire.Snapshot{}, err
 	}
 	status := strings.ToLower(text(group["status"]))
 	if status == "" {
 		status = "unknown"
 	}
-	return Object{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": Object{"status": status, "limit": group["parallel_tasks"], "running": len(active), "waiting": len(waiting), "legacyOccupied": LegacyOccupied(g)}, "jobs": all, "scheduler": scheduler, "lanes": statusLanes(snapshot, active, waiting), "plugins": statusPlugins(snapshot)}, nil
+	statusLaneList, err := statusLanes(snapshot, limit, len(active), len(waiting))
+	if err != nil {
+		return wire.Snapshot{}, err
+	}
+	plugins, err := statusPlugins(snapshot)
+	if err != nil {
+		return wire.Snapshot{}, err
+	}
+	return wire.Snapshot{UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano), Queue: wire.Queue{Status: status, Limit: limit, Running: len(active), Waiting: len(waiting), LegacyOccupied: LegacyOccupied(g)}, Jobs: all, Scheduler: &scheduler, Lanes: statusLaneList, Plugins: plugins}, nil
+}
+
+// decodeWire converts a value the daemon or resource controller owns into its
+// wire type. Keys the wire type does not declare are not published.
+func decodeWire[T any](value any) (T, error) {
+	var result T
+	data, err := json.Marshal(value)
+	if err != nil {
+		return result, err
+	}
+	if err = json.Unmarshal(data, &result); err != nil {
+		return result, fmt.Errorf("Queue returned invalid status data: %w", err)
+	}
+	return result, nil
+}
+
+func nullableText(value any) *string {
+	if result, ok := value.(string); ok {
+		return &result
+	}
+	return nil
+}
+
+func pointerText(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 // statusLanes lists every lane in priority order. A daemon that predates lanes
 // publishes none; its queue is reported as the default lane alone.
-func statusLanes(snapshot Object, active, waiting []Object) []Object {
+func statusLanes(snapshot Object, limit *int, running, waiting int) ([]wire.Lane, error) {
 	published := obj(snapshot["lanes"])
 	if published == nil {
-		limit := obj(obj(snapshot["groups"])["default"])["parallel_tasks"]
-		published = Object{defaultLaneName: Object{"name": defaultLaneName, "label": "Default", "plugin": nil, "concurrency": limit, "priority": 0, "sharesLimit": true, "running": len(active), "held": 0, "waiting": len(waiting)}}
+		return []wire.Lane{{Name: defaultLaneName, Label: "Default", Concurrency: limit, SharesLimit: true, Running: running, Waiting: waiting}}, nil
 	}
-	lanes := []Object{}
+	lanes := []wire.Lane{}
 	for _, lane := range sortedLanes(published) {
-		value := Object{}
-		for _, key := range []string{"name", "label", "plugin", "concurrency", "priority", "sharesLimit", "running", "held", "waiting"} {
-			value[key] = lane[key]
-		}
-		if lane["removed"] == true {
-			value["removed"] = true
+		value, err := decodeWire[wire.Lane](lane)
+		if err != nil {
+			return nil, err
 		}
 		lanes = append(lanes, value)
 	}
-	return lanes
+	return lanes, nil
 }
 
-func statusPlugins(snapshot Object) []Object {
-	plugins := []Object{}
+func statusPlugins(snapshot Object) ([]wire.Plugin, error) {
+	plugins := []wire.Plugin{}
 	for _, raw := range list(snapshot["plugins"]) {
 		if plugin := obj(raw); plugin != nil {
-			plugins = append(plugins, plugin)
+			value, err := decodeWire[wire.Plugin](plugin)
+			if err != nil {
+				return nil, err
+			}
+			plugins = append(plugins, value)
 		}
 	}
-	return plugins
+	return plugins, nil
 }
 
 // leaseStatusJob keeps every field existing status consumers require, with
 // empty project and log values: a lease has neither a command nor output.
-func leaseStatusJob(id int, task, details, scheduling Object) Object {
+func leaseStatusJob(id int, task, details, scheduling Object) (wire.Job, error) {
 	fields := leaseFields(id, task, nil)
 	state := text(fields["state"])
 	phase := map[string]string{"queued": "Waiting for lane capacity", "held": "Held", "released": "Released", "expired": "Expired", "dropped": "Dropped"}[state]
@@ -495,13 +535,11 @@ func leaseStatusJob(id int, task, details, scheduling Object) Object {
 		title = "Lease"
 	}
 	priority, _ := integer(task["priority"])
-	job := Object{"id": id, "title": DisplayText(title, 120), "project": "", "branch": "", "directory": "", "executable": "", "priority": priority, "queuePosition": nil, "submittedAt": task["created_at"], "startedAt": details["start"], "finishedAt": details["end"], "exitCode": nil, "logPath": "", "canReorder": state == "queued", "canStart": state == "queued", "canCancel": state == "queued" || state == "held", "phase": phase, "kind": "lease"}
-	for key, value := range fields {
-		if key != "id" {
-			job[key] = value
-		}
+	lease, err := decodeWire[wire.Lease](fields)
+	if err != nil {
+		return wire.Job{}, err
 	}
-	return job
+	return wire.Job{ID: id, State: state, Title: DisplayText(title, 120), Priority: priority, SubmittedAt: nullableText(task["created_at"]), StartedAt: nullableText(details["start"]), FinishedAt: nullableText(details["end"]), CanReorder: state == "queued", CanStart: state == "queued", CanCancel: state == "queued" || state == "held", Phase: phase, Kind: "lease", Lane: text(fields["lane"]), Lease: &lease}, nil
 }
 func ValidateLimit(value int) error {
 	if value < 1 || value > MaxParallel {

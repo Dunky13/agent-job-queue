@@ -156,9 +156,15 @@ agent-heavy plugins reload
 Additive only. `agent-heavy status --json` gains:
 
 - per job: `lane` (string, `"default"` when absent) and `kind` (`"command"` or `"lease"`); leases also carry the lease fields above (no `outcome`/log fields).
-- top level: `lanes`: array of `{name, label, plugin, concurrency, priority, sharesLimit, running, held, waiting}` including `default`, in priority order; `plugins`: array of `{name, loaded, error, lanes}`.
+- top level: `lanes`: array of `{name, label, plugin, concurrency, priority, sharesLimit, running, held, waiting}` including `default`, in priority order; `plugins`: array of `{name, loaded, error, warning, lanes}`.
 
-Every consumer is updated together: Swift decoders and fixtures (`native/tests/fixtures/queue.json`), the dashboard schema (`remote/static/schema.mjs` and its tests), and the live handover payload.
+The Go types in `internal/wire` are the contract. `agent-heavy status --json` and the simulated dashboard both produce them, and the daemon's private state is a separate shape. `native/tests/fixtures/queue.json` and `status-variants.json` are generated from the real producer, and a Go test fails when they are stale. The Swift decoder tests, the dashboard schema tests and the browser tests read those files. The Swift and Zod consumer types stay in their own languages.
+
+After changing the contract, regenerate the fixtures and update every consumer together: the Swift decoders in `native/AgentQueue.swift`, the dashboard schema in `remote/static/schema.mjs`, and the live handover payload.
+
+```sh
+go test -p 2 ./internal/backend -run '^TestStatusContractGolden$' -update
+```
 
 ### Status details
 

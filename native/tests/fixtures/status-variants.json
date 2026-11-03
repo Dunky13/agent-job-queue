@@ -1,0 +1,827 @@
+{
+  "daemonWithoutLanes": {
+    "jobs": [
+      {
+        "branch": "main",
+        "canCancel": true,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "/example/project",
+        "executable": "python3",
+        "exitCode": null,
+        "finishedAt": null,
+        "id": 1,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/1.log",
+        "phase": "Running",
+        "priority": 0,
+        "project": "Example",
+        "queuePosition": null,
+        "startedAt": "2026-10-18T21:07:00.000001+02:00",
+        "state": "running",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Fixture validation"
+      },
+      {
+        "branch": "main",
+        "canCancel": true,
+        "canReorder": true,
+        "canStart": true,
+        "directory": "/example/project",
+        "executable": "python3",
+        "exitCode": null,
+        "finishedAt": null,
+        "id": 2,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/2.log",
+        "phase": "Queued",
+        "priority": 5,
+        "project": "Example",
+        "queuePosition": 1,
+        "startedAt": null,
+        "state": "queued",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Fixture validation"
+      },
+      {
+        "branch": "",
+        "canCancel": true,
+        "canReorder": true,
+        "canStart": true,
+        "directory": "/example/project",
+        "executable": "",
+        "exitCode": null,
+        "finishedAt": null,
+        "id": 3,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/3.log",
+        "phase": "Queued",
+        "priority": 2,
+        "project": "project",
+        "queuePosition": 2,
+        "startedAt": null,
+        "state": "queued",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Validation batch"
+      }
+    ],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 1,
+        "sharesLimit": true,
+        "waiting": 2
+      }
+    ],
+    "plugins": [],
+    "queue": {
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 1,
+      "status": "running",
+      "waiting": 2
+    },
+    "scheduler": {
+      "available": false,
+      "host": null,
+      "mode": "fixed",
+      "reason": "Resource controller is unavailable; adaptive jobs remain waiting",
+      "updatedAt": null
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  },
+  "doneResults": {
+    "jobs": [
+      {
+        "branch": "",
+        "canCancel": true,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "/example/project",
+        "executable": "",
+        "exitCode": null,
+        "finishedAt": null,
+        "id": 4,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/4.log",
+        "phase": "Paused",
+        "priority": -3,
+        "project": "project",
+        "queuePosition": null,
+        "startedAt": null,
+        "state": "paused",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Validation batch"
+      },
+      {
+        "branch": "",
+        "canCancel": true,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "/example/project",
+        "executable": "",
+        "exitCode": null,
+        "finishedAt": null,
+        "id": 5,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/5.log",
+        "phase": "Stashed",
+        "priority": 0,
+        "project": "project",
+        "queuePosition": null,
+        "startedAt": null,
+        "state": "stashed",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Validation batch"
+      },
+      {
+        "branch": "",
+        "canCancel": false,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "/example/project",
+        "executable": "",
+        "exitCode": 125,
+        "finishedAt": "2026-10-18T21:09:00Z",
+        "id": 2,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/2.log",
+        "phase": "Done",
+        "priority": 0,
+        "project": "project",
+        "queuePosition": null,
+        "startedAt": null,
+        "state": "done",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Validation batch"
+      },
+      {
+        "branch": "",
+        "canCancel": false,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "/example/project",
+        "executable": "",
+        "exitCode": 137,
+        "finishedAt": "2026-10-18T21:09:00Z",
+        "id": 1,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/1.log",
+        "phase": "Done",
+        "priority": 0,
+        "project": "project",
+        "queuePosition": null,
+        "startedAt": null,
+        "state": "done",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Validation batch"
+      },
+      {
+        "branch": "",
+        "canCancel": false,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "/example/project",
+        "executable": "",
+        "exitCode": 0,
+        "finishedAt": null,
+        "id": 3,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/3.log",
+        "phase": "Done",
+        "priority": 0,
+        "project": "project",
+        "queuePosition": null,
+        "startedAt": null,
+        "state": "done",
+        "submittedAt": null,
+        "title": "Line break \u003cb\u003e\u0026\u003c/b\u003e"
+      }
+    ],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 1,
+        "sharesLimit": true,
+        "waiting": 1
+      }
+    ],
+    "plugins": [],
+    "queue": {
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 1,
+      "status": "running",
+      "waiting": 1
+    },
+    "scheduler": {
+      "available": false,
+      "host": null,
+      "mode": "fixed",
+      "reason": "Resource controller is unavailable; adaptive jobs remain waiting",
+      "updatedAt": null
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  },
+  "empty": {
+    "jobs": [],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 0,
+        "sharesLimit": true,
+        "waiting": 0
+      }
+    ],
+    "plugins": [],
+    "queue": {
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 0,
+      "status": "running",
+      "waiting": 0
+    },
+    "scheduler": {
+      "available": false,
+      "host": null,
+      "mode": "fixed",
+      "reason": "Resource controller is unavailable; adaptive jobs remain waiting",
+      "updatedAt": null
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  },
+  "leaseStates": {
+    "jobs": [
+      {
+        "branch": "",
+        "canCancel": true,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "",
+        "executable": "",
+        "exitCode": null,
+        "expiresAt": "2026-10-29T10:15:00Z",
+        "finishedAt": null,
+        "grantedAt": "2026-10-29T09:59:01Z",
+        "id": 5,
+        "kind": "lease",
+        "label": "QA session",
+        "lane": "qa",
+        "logPath": "",
+        "meta": {},
+        "ownerAlive": true,
+        "ownerPid": 4242,
+        "phase": "Held",
+        "position": null,
+        "priority": 0,
+        "project": "",
+        "queuePosition": null,
+        "queuedAt": "2026-10-29T09:59:00Z",
+        "reason": null,
+        "renewedAt": "2026-10-29T10:00:00Z",
+        "startedAt": "2026-10-29T09:59:01Z",
+        "state": "held",
+        "submittedAt": "2026-10-29T09:59:00Z",
+        "title": "QA session"
+      },
+      {
+        "branch": "",
+        "canCancel": true,
+        "canReorder": true,
+        "canStart": true,
+        "directory": "",
+        "executable": "",
+        "exitCode": null,
+        "expiresAt": null,
+        "finishedAt": null,
+        "grantedAt": null,
+        "id": 6,
+        "kind": "lease",
+        "label": "QA session",
+        "lane": "qa",
+        "logPath": "",
+        "meta": {
+          "ticket": "WM-123"
+        },
+        "ownerAlive": false,
+        "ownerPid": 4242,
+        "phase": "Lane reservation exceeds this machine's budget",
+        "position": 1,
+        "priority": 0,
+        "project": "",
+        "queuePosition": 1,
+        "queuedAt": "2026-10-29T09:59:00Z",
+        "reason": null,
+        "renewedAt": null,
+        "startedAt": null,
+        "state": "queued",
+        "submittedAt": "2026-10-29T09:59:00Z",
+        "title": "QA session"
+      },
+      {
+        "branch": "",
+        "canCancel": true,
+        "canReorder": true,
+        "canStart": true,
+        "directory": "",
+        "executable": "",
+        "exitCode": null,
+        "expiresAt": null,
+        "finishedAt": null,
+        "grantedAt": null,
+        "id": 7,
+        "kind": "lease",
+        "label": "QA session",
+        "lane": "qa",
+        "logPath": "",
+        "meta": {
+          "ticket": "WM-123"
+        },
+        "ownerAlive": null,
+        "ownerPid": null,
+        "phase": "Waiting for lane capacity",
+        "position": 2,
+        "priority": 0,
+        "project": "",
+        "queuePosition": 2,
+        "queuedAt": "2026-10-29T09:59:00Z",
+        "reason": null,
+        "renewedAt": null,
+        "startedAt": null,
+        "state": "queued",
+        "submittedAt": "2026-10-29T09:59:00Z",
+        "title": "QA session"
+      },
+      {
+        "branch": "",
+        "canCancel": false,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "",
+        "executable": "",
+        "exitCode": null,
+        "expiresAt": null,
+        "finishedAt": "2026-10-29T10:03:00Z",
+        "grantedAt": null,
+        "id": 8,
+        "kind": "lease",
+        "label": "QA session",
+        "lane": "qa",
+        "logPath": "",
+        "meta": {
+          "ticket": "WM-123"
+        },
+        "ownerAlive": true,
+        "ownerPid": 4242,
+        "phase": "Released (released)",
+        "position": null,
+        "priority": 0,
+        "project": "",
+        "queuePosition": null,
+        "queuedAt": "2026-10-29T09:59:00Z",
+        "reason": "released",
+        "renewedAt": null,
+        "startedAt": null,
+        "state": "released",
+        "submittedAt": "2026-10-29T09:59:00Z",
+        "title": "QA session"
+      },
+      {
+        "branch": "",
+        "canCancel": false,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "",
+        "executable": "",
+        "exitCode": null,
+        "expiresAt": null,
+        "finishedAt": "2026-10-29T10:02:00Z",
+        "grantedAt": null,
+        "id": 10,
+        "kind": "lease",
+        "label": "QA session",
+        "lane": "qa",
+        "logPath": "",
+        "meta": {
+          "ticket": "WM-123"
+        },
+        "ownerAlive": true,
+        "ownerPid": 4242,
+        "phase": "Dropped (owner exited)",
+        "position": null,
+        "priority": 0,
+        "project": "",
+        "queuePosition": null,
+        "queuedAt": "2026-10-29T09:59:00Z",
+        "reason": "owner-exited",
+        "renewedAt": null,
+        "startedAt": null,
+        "state": "dropped",
+        "submittedAt": "2026-10-29T09:59:00Z",
+        "title": "QA session"
+      },
+      {
+        "branch": "",
+        "canCancel": false,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "",
+        "executable": "",
+        "exitCode": null,
+        "expiresAt": null,
+        "finishedAt": "2026-10-29T10:02:00Z",
+        "grantedAt": null,
+        "id": 9,
+        "kind": "lease",
+        "label": "QA session",
+        "lane": "qa",
+        "logPath": "",
+        "meta": {
+          "ticket": "WM-123"
+        },
+        "ownerAlive": true,
+        "ownerPid": 4242,
+        "phase": "Expired (ttl expired)",
+        "position": null,
+        "priority": 0,
+        "project": "",
+        "queuePosition": null,
+        "queuedAt": "2026-10-29T09:59:00Z",
+        "reason": "ttl-expired",
+        "renewedAt": null,
+        "startedAt": null,
+        "state": "expired",
+        "submittedAt": "2026-10-29T09:59:00Z",
+        "title": "QA session"
+      }
+    ],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 1,
+        "label": "QA",
+        "name": "qa",
+        "plugin": "qa-plugin",
+        "priority": 50,
+        "running": 0,
+        "sharesLimit": false,
+        "waiting": 2
+      },
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 0,
+        "sharesLimit": true,
+        "waiting": 0
+      },
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "gone",
+        "name": "gone",
+        "plugin": null,
+        "priority": 0,
+        "removed": true,
+        "running": 0,
+        "sharesLimit": false,
+        "waiting": 0
+      }
+    ],
+    "plugins": [
+      {
+        "error": null,
+        "lanes": [
+          "qa"
+        ],
+        "loaded": true,
+        "name": "qa-plugin",
+        "warning": "2 hook events were dropped because 4 hooks were already running"
+      }
+    ],
+    "queue": {
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 1,
+      "status": "running",
+      "waiting": 2
+    },
+    "scheduler": {
+      "available": true,
+      "host": {
+        "availableMemoryBytes": 4294967296,
+        "complete": false,
+        "cpuBusyCores": 2.5,
+        "cpuCores": 8,
+        "diskFreeBytes": 21474836480,
+        "machine": "arm64",
+        "memoryPressure": "warning",
+        "sampledAt": 1792404000,
+        "swapInBytesPerSecond": 0,
+        "swapOutBytesPerSecond": 0,
+        "swapUsedBytes": 1073741824,
+        "totalMemoryBytes": 17179869184
+      },
+      "mode": "adaptive",
+      "reason": "Fixture resource controller",
+      "updatedAt": "2026-10-19T10:00:00Z"
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  },
+  "olderController": {
+    "jobs": [
+      {
+        "branch": "main",
+        "canCancel": true,
+        "canReorder": true,
+        "canStart": true,
+        "directory": "/example/project",
+        "executable": "python3",
+        "exitCode": null,
+        "finishedAt": null,
+        "id": 2,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/2.log",
+        "phase": "Waiting for resource admission",
+        "priority": 0,
+        "project": "Example",
+        "queuePosition": 1,
+        "resources": {
+          "decision": null,
+          "observed": null,
+          "prediction": {
+            "confidence": "high",
+            "cpuCores": 1.25,
+            "durationSeconds": 10.5,
+            "memoryBytes": 1073741824,
+            "samples": 12,
+            "source": "variant"
+          }
+        },
+        "startedAt": null,
+        "state": "queued",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Fixture validation"
+      }
+    ],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 0,
+        "sharesLimit": true,
+        "waiting": 1
+      }
+    ],
+    "plugins": [],
+    "queue": {
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 0,
+      "status": "running",
+      "waiting": 1
+    },
+    "scheduler": {
+      "available": true,
+      "host": {
+        "availableMemoryBytes": 4294967296,
+        "complete": false,
+        "cpuBusyCores": 0,
+        "cpuCores": 8,
+        "diskFreeBytes": 21474836480,
+        "machine": "arm64",
+        "memoryPressure": "warning",
+        "sampledAt": 1792404000,
+        "swapInBytesPerSecond": 0,
+        "swapOutBytesPerSecond": 0,
+        "swapUsedBytes": 1073741824,
+        "totalMemoryBytes": 17179869184
+      },
+      "mode": "adaptive",
+      "reason": "Fixture resource controller",
+      "updatedAt": "2026-10-19T10:00:00Z"
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  },
+  "pausedWithPublishedLanes": {
+    "jobs": [],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 0,
+        "sharesLimit": true,
+        "waiting": 0
+      }
+    ],
+    "plugins": [],
+    "queue": {
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 0,
+      "status": "paused",
+      "waiting": 0
+    },
+    "scheduler": {
+      "available": false,
+      "host": null,
+      "mode": "fixed",
+      "reason": "Resource controller is unavailable; adaptive jobs remain waiting",
+      "updatedAt": null
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  },
+  "receiptPhases": {
+    "jobs": [
+      {
+        "branch": "main",
+        "canCancel": true,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "/example/project",
+        "executable": "python3",
+        "exitCode": null,
+        "finishedAt": null,
+        "id": 1,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/1.log",
+        "phase": "Waiting for shared validation slot",
+        "priority": 0,
+        "project": "Example",
+        "queuePosition": null,
+        "startedAt": "2026-10-18T21:07:00.000001+02:00",
+        "state": "running",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Fixture validation"
+      },
+      {
+        "branch": "main",
+        "canCancel": false,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "/example/project",
+        "executable": "python3",
+        "exitCode": 0,
+        "finishedAt": "2026-10-18T21:09:00Z",
+        "id": 3,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/3.log",
+        "phase": "Finishing cleanup",
+        "priority": 0,
+        "project": "Example",
+        "queuePosition": null,
+        "startedAt": null,
+        "state": "done",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Fixture validation"
+      }
+    ],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 1,
+        "sharesLimit": true,
+        "waiting": 0
+      }
+    ],
+    "plugins": [],
+    "queue": {
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 1,
+      "status": "running",
+      "waiting": 0
+    },
+    "scheduler": {
+      "available": false,
+      "host": null,
+      "mode": "fixed",
+      "reason": "Resource controller is unavailable; adaptive jobs remain waiting",
+      "updatedAt": null
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  },
+  "shadowLearning": {
+    "jobs": [
+      {
+        "branch": "main",
+        "canCancel": true,
+        "canReorder": true,
+        "canStart": true,
+        "directory": "/example/project",
+        "executable": "python3",
+        "exitCode": null,
+        "finishedAt": null,
+        "id": 2,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/2.log",
+        "phase": "Queued",
+        "priority": 0,
+        "project": "Example",
+        "queuePosition": 1,
+        "resources": {
+          "decision": null,
+          "observed": null,
+          "prediction": {
+            "confidence": "unknown",
+            "cpuCores": 2,
+            "durationSeconds": null,
+            "familySamples": 0,
+            "memoryBytes": 1073741824,
+            "samples": 0,
+            "source": "prior"
+          }
+        },
+        "startedAt": null,
+        "state": "queued",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Fixture validation"
+      }
+    ],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 0,
+        "sharesLimit": true,
+        "waiting": 1
+      }
+    ],
+    "plugins": [],
+    "queue": {
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 0,
+      "status": "running",
+      "waiting": 1
+    },
+    "scheduler": {
+      "available": true,
+      "host": {
+        "availableMemoryBytes": 4294967296,
+        "complete": false,
+        "cpuBusyCores": 2.5,
+        "cpuCores": 8,
+        "diskFreeBytes": 21474836480,
+        "machine": "arm64",
+        "memoryPressure": "warning",
+        "sampledAt": 1792404000,
+        "swapInBytesPerSecond": 0,
+        "swapOutBytesPerSecond": 0,
+        "swapUsedBytes": 1073741824,
+        "totalMemoryBytes": 17179869184
+      },
+      "mode": "shadow",
+      "reason": "Fixture resource controller",
+      "updatedAt": "2026-10-19T10:00:00Z"
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  }
+}

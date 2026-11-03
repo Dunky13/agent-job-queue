@@ -358,6 +358,10 @@ func (g *Gate) Snapshot() (Object, error) {
 	return g.QueueControl("snapshot", nil)
 }
 
+// defaultGroup reads the default queue from the daemon's private state. That
+// shape is not the status wire snapshot in internal/wire.
+func defaultGroup(snapshot Object) Object { return obj(obj(snapshot["groups"])["default"]) }
+
 func (g *Gate) operationContext() context.Context {
 	if g.controlContext != nil {
 		return g.controlContext

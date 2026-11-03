@@ -416,7 +416,7 @@ func snapshotTaskByID(snapshot Object, id int) Object {
 }
 
 func schedulingGroup(snapshot Object) (Object, int, error) {
-	group := obj(obj(snapshot["groups"])["default"])
+	group := defaultGroup(snapshot)
 	limit, ok := schedulingInteger(group["parallel_tasks"])
 	if !ok || limit < 1 || limit > MaxParallel {
 		return nil, 0, fmt.Errorf("Invalid queue parallel job limit")

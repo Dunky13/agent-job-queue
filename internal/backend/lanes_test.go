@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Dunky13/agent-job-queue/internal/wire"
 )
 
 func (f *daemonFixture) writePlugin(name, manifest string) {
@@ -210,16 +212,16 @@ func TestRealDaemonLanePriorityAgainstDefaultLane(t *testing.T) {
 		t.Fatal(err)
 	}
 	order := []string{}
-	for _, raw := range status["jobs"].([]Object) {
-		if raw["queuePosition"] != nil {
-			order = append(order, text(raw["lane"]))
+	for _, job := range status.Jobs {
+		if job.QueuePosition != nil {
+			order = append(order, job.Lane)
 		}
 	}
 	if strings.Join(order, ",") != "high,default,low" {
 		t.Fatalf("status queue order: %v", order)
 	}
-	lanes := status["lanes"].([]Object)
-	if len(lanes) != 3 || lanes[0]["name"] != "high" || lanes[1]["name"] != defaultLaneName || lanes[2]["name"] != "low" {
+	lanes := status.Lanes
+	if len(lanes) != 3 || lanes[0].Name != "high" || lanes[1].Name != defaultLaneName || lanes[2].Name != "low" {
 		t.Fatalf("lanes are not in priority order: %v", lanes)
 	}
 	acceptanceRelease(t, filepath.Join(f.root, "release"))
@@ -277,8 +279,8 @@ func TestRealDaemonBrokenPluginsLeaveDefaultLaneWorking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(status["plugins"].([]Object)) != 7 || len(status["lanes"].([]Object)) != 1 {
-		t.Fatalf("status plugins and lanes: %v %v", status["plugins"], status["lanes"])
+	if len(status.Plugins) != 7 || len(status.Lanes) != 1 {
+		t.Fatalf("status plugins and lanes: %v %v", status.Plugins, status.Lanes)
 	}
 	if code, _ := f.lane("acquire", "same", "--owner-pid", strconv.Itoa(os.Getpid())); code != laneExitUsage {
 		t.Fatalf("acquired a disabled colliding lane: %d", code)
@@ -326,21 +328,21 @@ func TestRealDaemonLeaseCLIWaitsOwnersAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var held Object
-	for _, job := range status["jobs"].([]Object) {
-		if job["id"] == mustInteger(first["id"]) {
-			held = job
+	var held *wire.Job
+	for index, job := range status.Jobs {
+		if job.ID == mustInteger(first["id"]) {
+			held = &status.Jobs[index]
 		}
 	}
-	if held == nil || held["kind"] != "lease" || held["lane"] != "qa" || held["state"] != "held" || held["title"] != "QA session" || held["logPath"] != "" || held["exitCode"] != nil || held["ownerAlive"] != true || obj(held["meta"])["ticket"] != "WM-123" || held["canCancel"] != true || held["canStart"] != false {
+	if held == nil || held.Kind != "lease" || held.Lane != "qa" || held.State != "held" || held.Title != "QA session" || held.LogPath != "" || held.ExitCode != nil || held.OwnerAlive == nil || !*held.OwnerAlive || held.Meta["ticket"] != "WM-123" || !held.CanCancel || held.CanStart {
 		t.Fatalf("held lease in status: %v", held)
 	}
-	queue := obj(status["queue"])
-	if queue["running"] != 1 || queue["waiting"] != 2 {
+	queue := status.Queue
+	if queue.Running != 1 || queue.Waiting != 2 {
 		t.Fatalf("queue summary: %v", queue)
 	}
-	qa := status["lanes"].([]Object)[0]
-	if qa["name"] != "qa" || mustInteger(qa["held"]) != 1 || mustInteger(qa["waiting"]) != 2 || qa["plugin"] != "qa-plugin" || qa["sharesLimit"] != false {
+	qa := status.Lanes[0]
+	if qa.Name != "qa" || qa.Held != 1 || qa.Waiting != 2 || qa.Plugin == nil || *qa.Plugin != "qa-plugin" || qa.SharesLimit {
 		t.Fatalf("lane summary: %v", qa)
 	}
 	if code, refused := f.lane("release", secondID); code != laneExitRefused || !strings.Contains(text(refused["error"]), "--force") {
@@ -405,9 +407,9 @@ func TestRealDaemonAdaptiveLeasesUseLaneReservations(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		for _, job := range status["jobs"].([]Object) {
-			if job["id"] == mustInteger(heavy["id"]) {
-				return job["phase"] == "Lane reservation exceeds this machine's budget"
+		for _, job := range status.Jobs {
+			if job.ID == mustInteger(heavy["id"]) {
+				return job.Phase == "Lane reservation exceeds this machine's budget"
 			}
 		}
 		return false

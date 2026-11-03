@@ -190,7 +190,7 @@ func (d *queueDaemon) snapshot() (Object, error) {
 	if err != nil {
 		return nil, err
 	}
-	limit, _ := integer(obj(obj(snapshot["groups"])["default"])["parallel_tasks"])
+	limit, _ := integer(defaultGroup(snapshot)["parallel_tasks"])
 	usage := laneUsage(jobs)
 	lanes := Object{}
 	add := func(lane queueLane) {
