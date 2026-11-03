@@ -100,7 +100,7 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
             let backend = ResumeUIBackend(snapshot)
             // Only this store opts out of CLI fixtures, with both providers injected.
             // All global settings stores retain --fixture and cannot reach live controllers.
-            let store = QueueStore(statusLoader: { try await backend.load() }, command: { try await backend.command($0) }, arguments: [])
+            let store = QueueStore(statusLoader: { try await backend.load() }, command: { try await backend.command($0.arguments) }, arguments: [])
             try check(AppRuntime.store.fixtureMode && AppRuntime.remoteStore.fixtureMode,
                       "\(name): global controllers remain inert")
             await store.refresh()

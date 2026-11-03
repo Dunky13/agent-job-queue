@@ -214,30 +214,54 @@ private final class QueueReadCancellation: @unchecked Sendable {
 
 enum QueueClient {
     enum Controller: String, Sendable { case heavy = "agent-heavy", remote = "agent-remote" }
-    enum Budget: Sendable { case normal, updates, setup }
-    // Private executable/deadline injection keeps transport tests off installed state.
+    // Private executable injection keeps transport tests off installed state and
+    // lets setup run its selected installer. A timeout overrides the command's own.
     struct Transport: Sendable {
         let executable: URL
-        let timeout: TimeInterval
+        var timeout: TimeInterval? = nil
     }
 
-    static func run(_ arguments: [String], controller: Controller = .heavy, input: Data? = nil,
-                    budget: Budget = .normal, transport: Transport? = nil,
+    /// One controller invocation and its whole policy. Call sites name a factory
+    /// below; nothing downstream reads argv to decide how the command behaves.
+    struct Command: Equatable, Sendable {
+        enum Cancellation: Sendable {
+            /// An accepted change finishes and returns its original response.
+            case retain
+            /// A known read ends its private child and throws CancellationError.
+            case discard
+            /// Automatic setup asks the backend to stop; only a reported wait ends as cancelled.
+            case stopWhileWaiting
+        }
+        /// Output bounds and the wording of deadline and failure errors.
+        enum Reporting: Sendable { case queue, updates, setup }
+
+        var controller = Controller.heavy
+        var arguments: [String]
+        var input: Data? = nil
+        var timeout: TimeInterval = 25
+        var cancellation = Cancellation.retain
+        var reporting = Reporting.queue
+        /// Decode `{"error": ...}` from a failed controller instead of showing its raw output.
+        var decodesStructuredErrors = false
+    }
+
+    /// `install` target. Only an absolute path earns a discardable or unbounded setup policy.
+    struct InstallTarget: Equatable, Sendable {
+        enum Option: String, Sendable { case appBundle = "--app-bundle", payload = "--payload" }
+        let option: Option
+        let path: String
+        fileprivate var arguments: [String] { ["install", option.rawValue, path] }
+        fileprivate var isExactPath: Bool { path.hasPrefix("/") && !path.contains("\0") }
+    }
+
+    static func run(_ command: Command, transport: Transport? = nil,
                     onOutput: (@Sendable (Data) -> Void)? = nil) async throws -> Data {
-        // Known reads are discardable. Automatic setup can stop only while its
-        // controller reports a wait; its pending identity and custody survive.
-        // Other accepted changes retain their original response and deadline.
-        let automaticSetup = input == nil && controller == .heavy && budget == .setup && isAutomaticSetup(arguments)
-        let discardable = input == nil && (arguments.first == "status" ||
-            (controller == .heavy && arguments.first == "profiles" &&
-                ["list", "show"].contains(arguments.dropFirst().first ?? "")) ||
-            (controller == .heavy && (isSetupPreflight(arguments) || isNativeServiceStatus(arguments)))) || automaticSetup
-        let cancellation = discardable ? QueueReadCancellation() : nil
+        let cancellation = command.cancellation == .retain ? nil : QueueReadCancellation()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 DispatchQueue.global(qos: .utility).async {
-                    do { continuation.resume(returning: try runBlocking(arguments, controller: controller,
-                        input: input, budget: budget, cancellation: cancellation, transport: transport, onOutput: onOutput)) }
+                    do { continuation.resume(returning: try runBlocking(command, cancellation: cancellation,
+                        transport: transport, onOutput: onOutput)) }
                     catch { continuation.resume(throwing: error) }
                 }
             }
@@ -246,49 +270,61 @@ enum QueueClient {
         }
     }
 
-    private static func isSetupPreflight(_ arguments: [String]) -> Bool {
-        // Only the complete read-only form is discardable. Additional recovery
-        // options can mutate state and must retain their accepted response.
-        arguments.count == 5 && arguments[0] == "install" &&
-            ["--app-bundle", "--payload"].contains(arguments[1]) &&
-            arguments[2].hasPrefix("/") && !arguments[2].contains("\0") &&
-            Array(arguments.suffix(2)) == ["--preflight", "--json"]
-    }
-
-    private static func isAutomaticSetup(_ arguments: [String]) -> Bool {
-        arguments.count == 4 && arguments[0] == "install" &&
-            ["--app-bundle", "--payload"].contains(arguments[1]) &&
-            arguments[2].hasPrefix("/") && !arguments[2].contains("\0") && arguments[3] == "--repair-and-continue"
-    }
-
-    private static func isNativeServiceStatus(_ arguments: [String]) -> Bool {
-        arguments.count == 3 && arguments[0] == "--service-management" && arguments[1] == "status" &&
-            ["queue", "resources", "remote", "login"].contains(arguments[2])
-    }
-
-    static func timeout(for arguments: [String], controller: Controller = .heavy, budget: Budget = .normal) -> TimeInterval {
-        if controller == .heavy && isNativeServiceStatus(arguments) { return 5 }
-        // A verified update includes a bounded download and signature checks. The
-        // backend has a 120-second aggregate deadline; normal queue I/O is unchanged.
-        if budget == .updates && controller == .heavy && arguments.first == "updates" { return 130 }
-        if budget == .setup {
-            // The backend bounds each inspection and mutation independently.
-            // Waiting for existing work to drain has no aggregate deadline.
-            if controller == .heavy && arguments.count == 4 && arguments[0] == "install" &&
-                ["--app-bundle", "--payload"].contains(arguments[1]) &&
-                arguments[2].hasPrefix("/") && arguments[3] == "--repair-and-continue" { return .infinity }
-            return 330
-        }
-        // Phone lifecycle owns up to 120 seconds for native stop/start and
-        // readiness. Its caller must allow startup and result delivery too.
-        return arguments.first == "status" ? 8 : (controller == .remote ? 125 : 25)
-    }
-
-    private static func runBlocking(_ arguments: [String], controller: Controller, input: Data?, budget: Budget,
-                                    cancellation: QueueReadCancellation?, transport: Transport?,
+    /// Applies one command's policy to the byte-level process runner beneath it.
+    private static func runBlocking(_ command: Command, cancellation: QueueReadCancellation?, transport: Transport?,
                                     onOutput: (@Sendable (Data) -> Void)?) throws -> Data {
         try cancellation?.check()
-        guard (input?.count ?? 0) <= 16_384 else { throw ClientError.message("Controller input exceeds the private-pipe limit.") }
+        guard (command.input?.count ?? 0) <= 16_384 else { throw ClientError.message("Controller input exceeds the private-pipe limit.") }
+        let executable = try transport?.executable ?? installedExecutable(command.controller)
+        let timeout = transport?.timeout ?? command.timeout
+        let result: (status: Int32, output: Data)
+        do {
+            result = try runProcess(executable: executable, arguments: command.arguments, input: command.input, timeout: timeout,
+                capture: command.reporting == .setup ? .tail(32_768) : .rejectingOverflow(2_097_152),
+                cancellation: cancellation,
+                gracefulStop: command.cancellation != .stopWhileWaiting ? nil : GracefulStop(signal: SIGUSR1) {
+                    QueueSetupProgress.parse(String(decoding: $0, as: UTF8.self)).isWaiting
+                }, onOutput: onOutput)
+        } catch ProcessRunnerFailure.deadline(let partial) {
+            throw command.deadlineError(timeout: timeout, partial: partial)
+        } catch ProcessRunnerFailure.overflow {
+            throw ClientError.message("The queue response exceeds the 2 MB display limit.")
+        } catch ProcessRunnerFailure.stopSignal {
+            throw ClientError.message("Could not ask setup to stop waiting. Its installation evidence is preserved.")
+        }
+        guard result.status == 0 else { throw command.failure(output: result.output, status: result.status) }
+        return result.output
+    }
+
+    private static func installedExecutable(_ controller: Controller) throws -> URL {
+        guard Bundle.main.object(forInfoDictionaryKey: "AgentQueueServiceManagement") as? Bool == true else {
+            return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/\(controller.rawValue)")
+        }
+        let app = Bundle.main.bundleURL
+        let executable = app.appendingPathComponent("Contents/MacOS/\(controller.rawValue)")
+        guard try QueueBootstrapFiles.safeExecutable(executable, scope: .init(root: app, bundled: true)) else {
+            throw ClientError.message("The bundled controller is missing or unsafe. Download Agent Queue again and drag it into Applications.")
+        }
+        return executable
+    }
+
+    private enum Capture {
+        case rejectingOverflow(Int)
+        case tail(Int)
+    }
+    private enum ProcessRunnerFailure: Error {
+        case deadline(partial: Data), overflow, stopSignal
+    }
+    /// Keeps a cancelled child running until it exits; cancellation then applies
+    /// only if the output read so far says stopping was safe.
+    private struct GracefulStop {
+        let signal: Int32
+        let isStoppable: @Sendable (Data) -> Bool
+    }
+
+    private static func runProcess(executable: URL, arguments: [String], input: Data?, timeout: TimeInterval, capture: Capture,
+                                   cancellation: QueueReadCancellation?, gracefulStop: GracefulStop?,
+                                   onOutput: (@Sendable (Data) -> Void)?) throws -> (status: Int32, output: Data) {
         let output = Pipe()
         defer {
             try? output.fileHandleForReading.close()
@@ -298,18 +334,7 @@ enum QueueClient {
             throw ClientError.message("Could not prepare the private controller output pipe.")
         }
         let process = Process()
-        if let transport {
-            process.executableURL = transport.executable
-        } else if Bundle.main.object(forInfoDictionaryKey: "AgentQueueServiceManagement") as? Bool == true {
-            let app = Bundle.main.bundleURL
-            let executable = app.appendingPathComponent("Contents/MacOS/\(controller.rawValue)")
-            guard try QueueBootstrapFiles.safeExecutable(executable, scope: .init(root: app, bundled: true)) else {
-                throw ClientError.message("The bundled controller is missing or unsafe. Download Agent Queue again and drag it into Applications.")
-            }
-            process.executableURL = executable
-        } else {
-            process.executableURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/\(controller.rawValue)")
-        }
+        process.executableURL = executable
         process.arguments = arguments
         let inputPipe = input == nil ? nil : Pipe()
         if let inputPipe {
@@ -344,51 +369,42 @@ enum QueueClient {
         try inputPipe?.fileHandleForReading.close()
         var inputOffset = 0
         var inputClosed = inputPipe == nil
-        let timeout = transport?.timeout ?? timeout(for: arguments, controller: controller, budget: budget)
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
         var response = Data()
-        let captureLimit = budget == .setup ? 32_768 : 2_097_152
         var lastOutputDelivery = 0.0
         var pendingOutputDelivery = false
         var buffer = [UInt8](repeating: 0, count: 16_384)
         var observedChildExit = false
-        let automaticSetup = controller == .heavy && budget == .setup && isAutomaticSetup(arguments)
-        var setupIsWaiting = false
-        var requestedSetupStop = false
+        var stoppable = false
+        var requestedStop = false
         while true {
             // Progress can lag a mutation. The backend, rather than this cached
             // display state, decides when a stop request is safe to honor.
-            if automaticSetup {
-                if !requestedSetupStop, cancellation?.isCancelled == true, process.isRunning {
-                    guard kill(process.processIdentifier, SIGUSR1) == 0 || errno == ESRCH else {
-                        throw ClientError.message("Could not ask setup to stop waiting. Its installation evidence is preserved.")
+            if let gracefulStop {
+                if !requestedStop, cancellation?.isCancelled == true, process.isRunning {
+                    guard kill(process.processIdentifier, gracefulStop.signal) == 0 || errno == ESRCH else {
+                        throw ProcessRunnerFailure.stopSignal
                     }
-                    requestedSetupStop = true
+                    requestedStop = true
                 }
             } else { try cancellation?.check() }
-            if ProcessInfo.processInfo.systemUptime >= deadline {
-                if budget == .setup {
-                    throw ClientError.message("Setup did not finish within \(Int(timeout)) seconds. Quit and reopen Agent Queue, or retry setup.\n" + String(decoding: response.suffix(8_000), as: UTF8.self))
-                }
-                if budget == .updates {
-                    throw ClientError.message("The update operation did not finish within \(Int(timeout)) seconds. Check your Downloads folder, then check for updates before retrying.")
-                }
-                throw ClientError.message("The queue did not respond within \(Int(timeout)) seconds. Jobs continue independently. Refresh to check whether the change was applied.")
-            }
+            if ProcessInfo.processInfo.systemUptime >= deadline { throw ProcessRunnerFailure.deadline(partial: response) }
             // Bound each read, including the one that detects overflow. No output
             // is written to disk and retained response bytes never exceed the cap.
-            let count = read(output.fileHandleForReading.fileDescriptor, &buffer,
-                             budget == .setup ? buffer.count : min(buffer.count, captureLimit - response.count + 1))
+            let readLimit: Int
+            switch capture {
+            case .tail: readLimit = buffer.count
+            case .rejectingOverflow(let limit): readLimit = min(buffer.count, limit - response.count + 1)
+            }
+            let count = read(output.fileHandleForReading.fileDescriptor, &buffer, readLimit)
             let readError = count < 0 ? errno : 0
             if count > 0 {
-                guard budget == .setup || count <= captureLimit - response.count else {
-                    throw ClientError.message("The queue response exceeds the 2 MB display limit.")
+                if case .rejectingOverflow(let limit) = capture, count > limit - response.count {
+                    throw ProcessRunnerFailure.overflow
                 }
                 response.append(contentsOf: buffer.prefix(count))
-                if automaticSetup {
-                    setupIsWaiting = QueueSetupProgress.parse(String(decoding: response, as: UTF8.self)).isWaiting
-                }
-                if response.count > captureLimit { response.removeFirst(response.count - captureLimit) }
+                if let gracefulStop { stoppable = gracefulStop.isStoppable(response) }
+                if case .tail(let limit) = capture, response.count > limit { response.removeFirst(response.count - limit) }
                 pendingOutputDelivery = true
             } else if count < 0 && readError != EAGAIN && readError != EINTR {
                 throw ClientError.message("Could not read the private controller response.")
@@ -438,17 +454,9 @@ enum QueueClient {
                 Thread.sleep(forTimeInterval: 0.01)
             }
         }
-        if !automaticSetup || setupIsWaiting { try cancellation?.check() }
+        if gracefulStop == nil || stoppable { try cancellation?.check() }
         onOutput?(response)
-        guard process.terminationStatus == 0 else {
-            if arguments.first == "profiles", let failure = try? JSONDecoder().decode(QueueControllerFailure.self, from: response) {
-                throw ClientError.message(failure.error)
-            }
-            let message = String(decoding: budget == .setup ? Data(response.suffix(8_000)) : Data(response.prefix(1_000)), as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            throw ClientError.message(message.isEmpty ? "Queue command failed (\(process.terminationStatus))." : message)
-        }
-        return response
+        return (process.terminationStatus, response)
     }
 
     static func logTail(_ path: String) async throws -> String {
@@ -463,6 +471,104 @@ enum QueueClient {
             if start > 0 { return "[Showing the latest 64 KB]\n\n" + text }
             return text.isEmpty ? "No output yet." : text
         }.value
+    }
+}
+
+extension QueueClient.Command {
+    fileprivate func deadlineError(timeout: TimeInterval, partial: Data) -> ClientError {
+        switch reporting {
+        case .setup:
+            .message("Setup did not finish within \(Int(timeout)) seconds. Quit and reopen Agent Queue, or retry setup.\n" + String(decoding: partial.suffix(8_000), as: UTF8.self))
+        case .updates:
+            .message("The update operation did not finish within \(Int(timeout)) seconds. Check your Downloads folder, then check for updates before retrying.")
+        case .queue:
+            .message("The queue did not respond within \(Int(timeout)) seconds. Jobs continue independently. Refresh to check whether the change was applied.")
+        }
+    }
+
+    fileprivate func failure(output: Data, status: Int32) -> ClientError {
+        if decodesStructuredErrors, let failure = try? JSONDecoder().decode(QueueControllerFailure.self, from: output) {
+            return .message(failure.error)
+        }
+        let message = String(decoding: reporting == .setup ? Data(output.suffix(8_000)) : Data(output.prefix(1_000)), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return .message(message.isEmpty ? "Queue command failed (\(status))." : message)
+    }
+
+    // Queue. A snapshot is a discardable read; accepted changes keep the 25-second default.
+    static let status = Self(arguments: ["status", "--json"], timeout: 8, cancellation: .discard)
+    static func jobAction(_ action: String, id: Int) -> Self { .init(arguments: [action, String(id)]) }
+    static let resume = Self(arguments: ["resume"])
+    static func limit(_ limit: Int) -> Self { .init(arguments: ["limit", String(limit)]) }
+    static func scheduling(_ mode: SchedulingMode) -> Self { .init(arguments: ["scheduling", mode.rawValue]) }
+    static let version = Self(arguments: ["version", "--json"])
+
+    // Agent instructions. Their status read is not discardable.
+    static let agentsStatus = Self(arguments: ["agents", "status", "--json"])
+    static func agents(_ action: String, runner: String) -> Self {
+        .init(arguments: ["agents", action, "--runner", runner, "--json"])
+    }
+
+    // Learning. Reads are discardable; every profiles command reports structured errors.
+    private static func profilesRead(_ arguments: [String]) -> Self {
+        .init(arguments: ["profiles"] + arguments + ["--json"], cancellation: .discard, decodesStructuredErrors: true)
+    }
+    static func profilesList(offset: Int, limit: Int, query: String) -> Self {
+        profilesRead(["list", "--offset", String(offset), "--limit", String(limit), "--query", query])
+    }
+    static func profilesShow(_ id: String) -> Self { profilesRead(["show", id]) }
+    static func profilesShow(_ id: String, family: String) -> Self { profilesRead(["show", id, "--family", family]) }
+    static func profilesShow(_ id: String, membersQuery: String, membersOffset: Int) -> Self {
+        profilesRead(["show", id, "--members-query", membersQuery, "--members-offset", String(membersOffset)])
+    }
+    static func profilesChange(_ operation: String, _ id: String, payload: Data) -> Self {
+        .init(arguments: ["profiles", operation, id, "--json"], input: payload, decodesStructuredErrors: true)
+    }
+
+    // A verified update includes a bounded download and signature checks. The
+    // backend has a 120-second aggregate deadline; normal queue I/O is unchanged.
+    static let updatesCheck = Self(arguments: ["updates", "check", "--json"], timeout: 130, reporting: .updates)
+    static func updatesDownload(build: Int) -> Self {
+        .init(arguments: ["updates", "download", "--build", String(build), "--json"], timeout: 130, reporting: .updates)
+    }
+
+    // Phone lifecycle owns up to 120 seconds for native stop/start and
+    // readiness. Its caller must allow startup and result delivery too.
+    static let remoteStatus = Self(controller: .remote, arguments: ["status", "--json"], timeout: 8, cancellation: .discard)
+    static func remoteEnabled(_ enabled: Bool) -> Self {
+        .init(controller: .remote, arguments: [enabled ? "enable" : "disable"], timeout: 125)
+    }
+    static func remoteConfigure(_ input: Data) -> Self {
+        .init(controller: .remote, arguments: ["configure"], input: input, timeout: 125)
+    }
+
+    // Setup. The backend bounds each inspection and mutation independently.
+    /// Any setup argv without a named read or wait policy stays finite and retained.
+    static func setup(_ arguments: [String], timeout: TimeInterval = 330, cancellation: Cancellation = .retain) -> Self {
+        .init(arguments: arguments, timeout: timeout, cancellation: cancellation, reporting: .setup)
+    }
+    static func install(_ target: QueueClient.InstallTarget) -> Self { setup(target.arguments) }
+    /// Only the complete read-only form is discardable. Additional recovery
+    /// options can mutate state and must retain their accepted response.
+    static func installPreflight(_ target: QueueClient.InstallTarget) -> Self {
+        setup(target.arguments + ["--preflight", "--json"], cancellation: target.isExactPath ? .discard : .retain)
+    }
+    /// Waiting for existing work to drain has no aggregate deadline. It can stop
+    /// only while its controller reports a wait; pending identity and custody survive.
+    static func installRepairAndContinue(_ target: QueueClient.InstallTarget) -> Self {
+        let arguments = target.arguments + ["--repair-and-continue"]
+        return target.isExactPath ? setup(arguments, timeout: .infinity, cancellation: .stopWhileWaiting) : setup(arguments)
+    }
+    static func installDisablingPhoneAccess(_ target: QueueClient.InstallTarget) -> Self {
+        setup(target.arguments + ["--disable-phone-access"])
+    }
+    static func installRecovery(_ target: QueueClient.InstallTarget, action: String, jobID: Int? = nil,
+                                expectedRevision: String? = nil) -> Self {
+        setup(target.arguments + ["--recover", action] + (jobID.map { ["--job-id", String($0)] } ?? [])
+            + (expectedRevision.map { ["--expected-revision", $0] } ?? []))
+    }
+    static func serviceStatus(_ service: QueueServiceManagement.Service) -> Self {
+        setup(["--service-management", "status", service.rawValue], timeout: 5, cancellation: .discard)
     }
 }
 
@@ -519,7 +625,7 @@ final class QueueStore: ObservableObject {
     private(set) var visibleSurfaces = 0
     private var pollTask: Task<Void, Never>?
     private let statusLoader: @Sendable () async throws -> Data
-    private let command: @Sendable ([String]) async throws -> Data
+    private let command: @Sendable (QueueClient.Command) async throws -> Data
     private let snapshotPreparer: @Sendable (Data, QueueSnapshot?) async throws -> PreparedQueueSnapshot?
     private var refreshInFlight = false
     private var refreshRequested = false
@@ -528,8 +634,8 @@ final class QueueStore: ObservableObject {
     private(set) var fixtureRecorder: FixtureDispatchRecorder?
 
     init(statusLoader: @escaping @Sendable () async throws -> Data = {
-        try await QueueClient.run(["status", "--json"])
-    }, command: @escaping @Sendable ([String]) async throws -> Data = { try await QueueClient.run($0) },
+        try await QueueClient.run(.status)
+    }, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = { try await QueueClient.run($0) },
          snapshotPreparer: @escaping @Sendable (Data, QueueSnapshot?) async throws -> PreparedQueueSnapshot? = {
              try await PreparedQueueSnapshot.decode($0, comparedTo: $1)
          }, arguments: [String] = CommandLine.arguments) {
@@ -629,7 +735,7 @@ final class QueueStore: ObservableObject {
             return
         }
         do {
-            _ = try await command([action, String(job.id)])
+            _ = try await command(.jobAction(action, id: job.id))
             switch action {
             case "next": notice = "Job #\(job.id) will run next."
             case "last": notice = "Job #\(job.id) moved to the end."
@@ -655,7 +761,7 @@ final class QueueStore: ObservableObject {
         notice = nil
         return Task {
             do {
-                _ = try await command(["resume"])
+                _ = try await command(.resume)
                 notice = "Queue resumed."
                 error = nil
             } catch {
@@ -681,7 +787,7 @@ final class QueueStore: ObservableObject {
 
     private func completeLimit(_ limit: Int) async {
         do {
-            _ = try await command(["limit", String(limit)])
+            _ = try await command(.limit(limit))
             notice = "Parallel job limit changed to \(limit)."
             error = nil
         } catch {
@@ -701,7 +807,7 @@ final class QueueStore: ObservableObject {
         notice = nil
         return Task {
             do {
-                _ = try await command(["scheduling", mode.rawValue])
+                _ = try await command(.scheduling(mode))
                 notice = "Scheduling changed to \(mode.label)."
                 error = nil
             } catch {
@@ -739,9 +845,11 @@ final class RemoteAccessStore: ObservableObject {
     let fixtureMode: Bool
     /// Runs `agent-remote serve` as a child of the app. Nil for fixtures and unmanaged launches.
     var supervisor: QueueHelperSupervisor?
+    private let command: @Sendable (QueueClient.Command) async throws -> Data
 
-    init(fixtureMode: Bool) {
+    init(fixtureMode: Bool, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = { try await QueueClient.run($0) }) {
         self.fixtureMode = fixtureMode
+        self.command = command
         if fixtureMode {
             let stopFailure = CommandLine.arguments.contains("--snapshot-remote-stop-failure")
                 || CommandLine.arguments.contains("--verify-remote-stop-state")
@@ -780,7 +888,7 @@ final class RemoteAccessStore: ObservableObject {
         defer { isRefreshing = false }
         do {
             status = try JSONDecoder().decode(RemoteStatus.self,
-                from: await QueueClient.run(["status", "--json"], controller: .remote))
+                from: await command(.remoteStatus))
             error = status?.error
         } catch { self.error = error.localizedDescription }
     }
@@ -793,7 +901,7 @@ final class RemoteAccessStore: ObservableObject {
         Task {
             defer { isBusy = false }
             do {
-                let data = try await QueueClient.run([enabled ? "enable" : "disable"], controller: .remote)
+                let data = try await command(.remoteEnabled(enabled))
                 self.status = try JSONDecoder().decode(RemoteStatus.self, from: data)
                 if enabled { supervisor?.start(.remote) } else { await supervisor?.stop(.remote) }
                 error = self.status?.error
@@ -830,11 +938,11 @@ final class RemoteAccessStore: ObservableObject {
                 // The password is JSON-encoded directly into a private stdin pipe.
                 // It is never an argument, environment variable, log, or disk file.
                 let input = try JSONEncoder().encode(RemoteConfiguration(password: password))
-                let data = try await QueueClient.run(["configure"], controller: .remote, input: input)
+                let data = try await command(.remoteConfigure(input))
                 status = try JSONDecoder().decode(RemoteStatus.self, from: data)
                 if enable {
                     status = try JSONDecoder().decode(RemoteStatus.self,
-                        from: await QueueClient.run(["enable"], controller: .remote))
+                        from: await command(.remoteEnabled(true)))
                     supervisor?.start(.remote)
                 }
                 error = status?.error

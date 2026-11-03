@@ -142,7 +142,7 @@ struct RefreshTests {
         let commandGate = StatusFixture(Data())
         let resumeFixture = ResumeFixture(status: resumeStatus, commandGate: commandGate)
         let resumable = QueueStore(statusLoader: { try await resumeStatus.load() },
-                                   command: { try await resumeFixture.command($0) })
+                                   command: { try await resumeFixture.command($0.arguments) })
         try check(resumable.dispatchResume() == nil, "An unknown queue cannot be resumed")
         await resumable.refresh()
         await commandGate.holdNextRead()
@@ -179,7 +179,7 @@ struct RefreshTests {
                 swapOutBytesPerSecond: 0, diskFreeBytes: 21_474_836_480, machine: "arm64", complete: false))
         let schedulingFixture = StatusFixture(try JSONEncoder().encode(telemetry))
         let scheduling = QueueStore(statusLoader: { try await schedulingFixture.load() },
-            command: { try await schedulingFixture.command($0) })
+            command: { try await schedulingFixture.command($0.arguments) })
         await scheduling.refresh()
         try check(scheduling.snapshot?.scheduler?.host?.summary.contains("Collecting rates") == true,
                   "Cold telemetry explicitly collects rates")

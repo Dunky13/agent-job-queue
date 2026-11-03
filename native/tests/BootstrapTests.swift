@@ -251,7 +251,7 @@ struct BootstrapTests {
         let decision = try fresh.environment.inspect()
         if case let .install(request, _) = decision {
             try check(request.executable == fresh.environment.source.appendingPathComponent("bin/agent-heavy") &&
-                request.arguments == ["install", "--app-bundle", fresh.environment.app.path],
+                request.plain.arguments == ["install", "--app-bundle", fresh.environment.app.path],
                 "Explicit setup selects its own bundled installer targeting the supplied app")
         } else { throw ClientError.message("Fresh package did not require setup") }
         try check(!FileManager.default.fileExists(atPath: fresh.environment.root.path), "Inspection makes no backend changes")

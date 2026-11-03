@@ -175,10 +175,10 @@ final class LearningStore: ObservableObject {
     private var selectionTask: Task<Void, Never>?
     private var memberGeneration = 0
     private var memberTask: Task<Void, Never>?
-    private let command: @Sendable ([String], Data?) async throws -> Data
+    private let command: @Sendable (QueueClient.Command) async throws -> Data
 
-    init(fixtureMode: Bool = false, command: @escaping @Sendable ([String], Data?) async throws -> Data = {
-        try await QueueClient.run($0, input: $1)
+    init(fixtureMode: Bool = false, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
+        try await QueueClient.run($0)
     }) {
         self.fixtureMode = fixtureMode
         self.command = command
@@ -319,7 +319,7 @@ final class LearningStore: ObservableObject {
                 await previous?.value
                 try Task.checkCancellation()
                 let next = try JSONDecoder().decode(LearningDetail.self, from: try await command(
-                    ["profiles", "show", sourceID, "--family", family, "--json"], nil))
+                    .profilesShow(sourceID, family: family)))
                 try Task.checkCancellation()
                 guard next.profile.id == sourceID, next.inspectedFamily == family,
                       next.members.count == 1, next.members.first?.family == family else {
@@ -357,7 +357,7 @@ final class LearningStore: ObservableObject {
                 await previous?.value
                 try Task.checkCancellation()
                 let next = try JSONDecoder().decode(LearningDetail.self, from: try await command(
-                    ["profiles", "show", sourceID, "--members-query", query, "--members-offset", String(max(0, offset)), "--json"], nil))
+                    .profilesShow(sourceID, membersQuery: query, membersOffset: max(0, offset))))
                 try Task.checkCancellation()
                 guard next.profile.id == sourceID, next.revision == revision else {
                     throw ClientError.message("This group changed. Reload it to review the latest members; your draft is preserved.")
@@ -503,7 +503,7 @@ final class LearningStore: ObservableObject {
         return Task {
             defer { isMutating = false }
             do {
-                let response = try await command(["profiles", operation, sourceID, "--json"], payload)
+                let response = try await command(.profilesChange(operation, sourceID, payload: payload))
                 let result = try JSONDecoder().decode(LearningDetail.self, from: response)
                 guard changesSelection || result.profile.id == sourceID,
                       expectedTarget == nil || result.profile.id == expectedTarget,
@@ -528,10 +528,10 @@ final class LearningStore: ObservableObject {
 
     private func readCatalog(offset: Int, query: String) async throws -> LearningCatalog {
         try JSONDecoder().decode(LearningCatalog.self, from: try await command(
-            ["profiles", "list", "--offset", String(offset), "--limit", String(pageSize), "--query", query, "--json"], nil))
+            .profilesList(offset: offset, limit: pageSize, query: query)))
     }
     private func readDetail(_ id: String) async throws -> LearningDetail {
-        try JSONDecoder().decode(LearningDetail.self, from: try await command(["profiles", "show", id, "--json"], nil))
+        try JSONDecoder().decode(LearningDetail.self, from: try await command(.profilesShow(id)))
     }
     private func apply(_ next: LearningDetail) { closeMember(); detail = next; memberQuery = next.memberPage?.query ?? ""; restoreDraft(next) }
     private func clearDraft() { draftLabel = ""; draftMemory = ""; draftCPU = "" }
