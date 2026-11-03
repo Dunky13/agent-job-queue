@@ -106,6 +106,7 @@ final class QueueUpdateStore: ObservableObject {
         self.fixtureMode = fixtureMode
         self.running = fixtureMode ? RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100) : running
         self.command = command
+        #if AGENT_QUEUE_TEST_HOOKS
         if fixtureMode {
             let preview = InstalledQueueVersion(version: "1.0.0", build: 100, bundleBuild: "100", commit: nil,
                 tracked: true, displayVersion: "1.0.0 (build 100)")
@@ -115,6 +116,7 @@ final class QueueUpdateStore: ObservableObject {
                     tag: "build-101", url: "https://github.com/Dunky13/agent-job-queue/releases/tag/build-101"),
                 comparison: .available, canDownload: true, message: "Version 1.0.1 (build 101) is available.")
         }
+        #endif
     }
 
     var isBusy: Bool { operation != nil }

@@ -1,3 +1,4 @@
+@testable import AgentQueueCore
 import Foundation
 
 actor UpdateFixture {

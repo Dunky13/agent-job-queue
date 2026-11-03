@@ -182,6 +182,7 @@ final class LearningStore: ObservableObject {
     }) {
         self.fixtureMode = fixtureMode
         self.command = command
+        #if AGENT_QUEUE_TEST_HOOKS
         if fixtureMode {
             let preview = Self.previewDetail()
             catalog = LearningCatalog(revision: preview.revision, profiles: [preview.profile], total: 1, offset: 0, limit: 50,
@@ -190,6 +191,7 @@ final class LearningStore: ObservableObject {
             detail = preview
             restoreDraft(preview)
         }
+        #endif
     }
 
     var canSave: Bool { !fixtureMode && !isLoading && !isMutating && !isMemberPageLoading && detail != nil }
@@ -555,6 +557,7 @@ final class LearningStore: ObservableObject {
         return value.formatted(.number.grouping(.never).precision(.fractionLength(0...12)))
     }
 
+    #if AGENT_QUEUE_TEST_HOOKS
     nonisolated static func previewDetail() -> LearningDetail {
         let family = String(repeating: "b", count: 64)
         let variant = String(repeating: "c", count: 64)
@@ -576,6 +579,7 @@ final class LearningStore: ObservableObject {
             truncated: LearningTruncation(members: false, variants: false, runs: false),
             controllerAppliedRevision: 4, controllerStatus: "applied")
     }
+    #endif
 }
 
 private enum LearningConfirmation: Identifiable {

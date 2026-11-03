@@ -1,3 +1,4 @@
+@testable import AgentQueueCore
 import AppKit
 import Foundation
 import SwiftUI
