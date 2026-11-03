@@ -122,21 +122,24 @@ func tickingForClient(t *testing.T, d *queueDaemon) func() {
 	return ticksFrom(d, start)
 }
 
-// tickingAfterCancel holds ticks until the daemon has taken a cancel. A tick that
-// came first would settle a row whose worker has exited with 125, before any cancel.
-func tickingAfterCancel(t *testing.T, d *queueDaemon) func() {
-	t.Helper()
-	taken := make(chan struct{})
-	var once sync.Once
-	control := d.g.queueControl
-	d.g.queueControl = func(op string, payload Object) (Object, error) {
-		reply, err := control(op, payload)
-		if op == "cancel" {
-			once.Do(func() { close(taken) })
+// tickingAfter holds ticks until the daemon has replied to op, or to anything when
+// op is empty. A tick that came first would settle a row whose worker has exited
+// with 125, before Cancel has read it or sent a cancel.
+func tickingAfter(op string) func(*testing.T, *queueDaemon) func() {
+	return func(t *testing.T, d *queueDaemon) func() {
+		t.Helper()
+		replied := make(chan struct{})
+		var once sync.Once
+		control := d.g.queueControl
+		d.g.queueControl = func(name string, payload Object) (Object, error) {
+			reply, err := control(name, payload)
+			if op == "" || name == op {
+				once.Do(func() { close(replied) })
+			}
+			return reply, err
 		}
-		return reply, err
+		return ticksFrom(d, replied)
 	}
-	return ticksFrom(d, taken)
 }
 
 func ticksFrom(d *queueDaemon, start <-chan struct{}) func() {
@@ -369,11 +372,11 @@ func TestCorruptedRowsCancelThroughClient(t *testing.T) {
 		{"running reading Queued", func(t *testing.T, s *queueStore) queueJob {
 			runningWithWorker(t, s, 0, exitedWorker(t))
 			return corruptStatus(t, s, 0, queued)
-		}, 130, 130, tickingAfterCancel},
+		}, 130, 130, tickingAfter("cancel")},
 		{"running reading Done keeps main's reported code", func(t *testing.T, s *queueStore) queueJob {
 			runningWithWorker(t, s, 0, exitedWorker(t))
 			return corruptStatus(t, s, 0, failed)
-		}, 125, 7, tickingForClient},
+		}, 125, 7, tickingAfter("")},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			d, s, _, _ := corruptedDaemon(t)
