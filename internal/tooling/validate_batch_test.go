@@ -37,16 +37,25 @@ func TestValidateBatchRunsTheCIGoPartitions(t *testing.T) {
 	}
 	var scopes []string
 	var shards []int
+	runtime := regexp.MustCompile(`^bash scripts/test-go-runtime\.sh (\S+)$`)
+	tooling := regexp.MustCompile(`^bash scripts/test-go-tooling\.sh (\d+)$`)
 	for _, line := range strings.Split(string(batch), "\n") {
-		if m := regexp.MustCompile(`^bash scripts/test-go-runtime\.sh (\S+)$`).FindStringSubmatch(line); m != nil {
-			scopes = append(scopes, m[1])
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
 		}
-		if m := regexp.MustCompile(`^bash scripts/test-go-tooling\.sh (\d+)$`).FindStringSubmatch(line); m != nil {
+		if m := runtime.FindStringSubmatch(line); m != nil {
+			scopes = append(scopes, m[1])
+			continue
+		}
+		if m := tooling.FindStringSubmatch(line); m != nil {
 			shard, _ := strconv.Atoi(m[1])
 			shards = append(shards, shard)
+			continue
 		}
-		if regexp.MustCompile(`^go test .*(\./internal/|\./cmd/)`).MatchString(line) {
-			t.Fatalf("validate.sh must use the partition drivers, not %q", line)
+		// Any other form, such as a direct go test, a driver with no selector or
+		// one wrapped in a condition, can bring back the over-limit single run.
+		if strings.Contains(line, "go test") || strings.Contains(line, "test-go-runtime") || strings.Contains(line, "test-go-tooling") {
+			t.Fatalf("validate.sh must run each partition as a plain driver line, not %q", line)
 		}
 	}
 	if want := workflow.Jobs["macos-tests"].Strategy.Matrix.Scope; len(want) == 0 || !reflect.DeepEqual(scopes, want) {
