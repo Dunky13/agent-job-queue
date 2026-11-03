@@ -12,6 +12,13 @@ case "$scope" in
   *) printf 'Usage: %s [all|core|core-1|core-2|https|installer]\n' "$0" >&2; exit 1 ;;
 esac
 
+# Race instrumentation makes cost-14 bcrypt about ten times slower, which pushes
+# one first authentication or password hash past the gateway's 30-second and the
+# fixtures' 35-second budgets on slower hosts. Blowfish is sequential arithmetic
+# on local state with no goroutines, so it alone is built without the detector;
+# every other package, including the admission and gateway code, stays instrumented.
+bcrypt_flags=(-gcflags='golang.org/x/crypto/blowfish=-race=false')
+
 # Keep the original CI scope dynamic, and stop before testing on list errors.
 packages=$(go list -p 2 ./cmd/... ./internal/... ./packaging/homebrew ./remote/static)
 module=github.com/Dunky13/agent-job-queue
@@ -152,8 +159,8 @@ if [[ "$scope" == core || "$scope" == core-1 || "$scope" == core-2 ]]; then
     if [[ "$package" != "$backend" ]]; then other+=("$package"); fi
   done
   if [[ ${#other[@]} -gt 0 ]]; then
-    go test -p 2 -parallel 2 -race "${other[@]}" -timeout 12m
+    go test -p 2 -parallel 2 -race "${bcrypt_flags[@]}" "${other[@]}" -timeout 12m
   fi
   exit
 fi
-go test -p 2 -parallel 2 -race "${runtime[@]}" -timeout 12m
+go test -p 2 -parallel 2 -race "${bcrypt_flags[@]}" "${runtime[@]}" -timeout 12m
