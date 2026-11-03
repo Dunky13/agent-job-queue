@@ -13,34 +13,41 @@ The receipt binds a handover to one exact executable, build T, so only T's bundl
 3. `pendingInstallation` points the installer at T's app and payload, so `validatePayload` makes the identity T and N's code passes the resume identity check as a non-supervised app bundle.
 4. T completes and its journal is removed. N then relocates once T's adopted jobs finish.
 
-N dragged over T at the same path has replaced T's app, so it has no such route.
+N dragged over T at the same path has replaced T's app, so it has no such route. A released receipt cannot finish after a reboot on any build; see follow-up 1.
 
 ## Which receipts bind custody
 
 | Receipt | Binds? | Why |
 |---|---|---|
 | Missing, cancelled, expired | No | No transfer is in progress. |
+| Another handover's token | No | Verified across the only shipped `beginManagedLive` (`2c1bac6` through `7b4b27c`): it writes the journal before `prepare-handover`, and replaces an earlier journal only after removing one that was finished or void. So this journal never took custody. Its receipt is left in place. |
 | Prepared or committed, daemon alive | Yes | That daemon holds the freeze. A prepared lease expires after two minutes. |
-| Prepared or committed, daemon gone | No | Traced: a restarted daemon sees a non-released phase, adopts nothing and runs ordinary crash recovery. Followers get nothing from these phases once the daemon is gone. |
-| Released | Yes | Every daemon but T's refuses to start, and workers may be following it. Spent only if a newer build completed. |
+| Prepared or committed, daemon gone | No | Traced: a restarted daemon sees a non-released phase, adopts nothing and runs ordinary crash recovery. Followers get nothing from these phases once the daemon is gone. A changed process birth counts as gone only if `queue-daemon.lock` is free, because `lstart` follows the system time zone. |
+| Released | Yes | Every daemon but T's refuses to start, and workers may be following it. Spent only if a newer build completed. After a reboot, T cannot adopt it either. |
 | Consumed, consumer alive | Yes | The queue runs under that daemon. Another build refuses only until T has completed; after that it is the finished build's own daemon. |
 | Consumed, consumer gone | No | The next daemon runs ordinary crash recovery. |
 
 `retireSpentLive` removes a journal only when it binds nothing, under the install locks, using `managedRemoveFile`'s byte comparison. It never removes a receipt.
 
-## Findings still open
+## Follow-ups, not fixed here
 
-1. **A stale released receipt stops a later daemon.** If T is released and the user removes the app, the drained removal path lets N install. The journal is now spent and removed, but the receipt stays, and `queueAdoptHandover` refuses N's daemon because its digest differs. Found by reading the code, not reproduced end to end. Fixing it means changing what a daemon does with an unadoptable receipt, which is larger and riskier than the fixes here, so I stopped on it.
-2. **A journal with another handover's receipt still refuses.** An older release wrote the journal before preparing, so an interruption there can pair it with an earlier handover's receipt. Setup fails closed with "Daemon handover differs". The journal's own token bound nothing, so this could arguably be removed, but it is outside the cases decided so far.
-3. **Busy-lock race.** A job's caller cleaning up can hold a lock between setup's inspection and installation, which returns a busy error. A test using a full wait loop hit this once. I restructured the test instead, and did not investigate how the app surfaces it.
-4. **Payload path behaviour change.** It previously took a handover when a job was done but its caller was still reading output. It now treats that queue as drained, so that caller can see a transport error during the outage. App bundles never had this protection.
+1. **A released receipt from an earlier boot stops every daemon.** The exact target's daemon exits 125 with "Queue handover belongs to another boot", T's resume fails the same way, and another build is refused and told to fetch T, which cannot finish either. Fix: check the boot before the digest in `queueAdoptHandover`, and treat a released receipt from an earlier boot as not adoptable. That also lets a reboot clear follow-up 2.
+2. **T released, then the app removed.** The drained removal path lets N install, and the leftover receipt then leaves a daemon that exits 125 and restarts every 10 s with "The new daemon executable does not match queue handover custody".
+   - **Likelihood is narrow.** Removal requires every job `done`, and a job finishing after release stays at `outcome`. So it needs a handover whose jobs were all `done`, a caller still reading, an interruption at released, then removal, and only older payload installers can start that.
+   - **This PR makes one thing slightly worse.** The second setup used to refuse visibly. It now succeeds and removes the journal, so the main sign left is in `daemon.log`.
+   - **A caller on a job in that receipt never returns,** from reading `execution.go:65`, not from a run.
+3. **Busy lock during installation.** `execute` with `scheduling.lock` held returns "Another installer or queue change is running", which is a failure with Retry in the app. A test hit this once and I restructured the test. The holder is unverified. Fix later by treating it as a wait in the repair loop.
+4. **Misleading caller message.** A caller whose job is still running can print "Queue daemon unavailable; command was not run directly" (`queue_daemon.go:67,79`), which reads as if the job never ran. This PR does not change that code, and #64 touches nearby behaviour.
+5. **A finished journal with an unreadable receipt refuses.** `7b4b27c` skipped reading the receipt there. A daemon cannot start on such a receipt in either version, so setup now shows the problem earlier.
+6. **Payload path behaviour change.** It previously took a handover when a job was done but its caller was still reading output. It now treats that queue as drained, so that caller can see a transport error during the outage. App bundles never had this protection.
 
 ## Fixed along the way
 
 - **Finished journals.** Beginning a handover was the only code that removed journals that no longer bound anything. Left in place, they refused later upgrades.
-- **Stranding.** A journal's target being older than the completed build, a receipt that binds nothing, a moved app and a dead daemon's prepared receipt no longer block setup.
+- **Stranding.** A journal's target being older than the completed build, a receipt that binds nothing, a moved app and a dead daemon's prepared receipt no longer block setup. One exception remains: a finished journal with a live consumer, opened from a moved app of the same build, can still get "Invalid retained live-upgrade custody". That clears when the consumer exits or the app moves back.
+- **Retirement errors.** Where resume is skipped, preflight never assessed the journal, so a journal setup cannot assess is kept with a message on stderr rather than failing a run preflight reported as clear.
 - **Refusal.** It names the build through `installPendingError`, and preflight reports `pending-installation` with the release history and reveal actions.
-- **Cleanup repair race.** `recoverManagedCleanup` failed setup if a job's caller finished cleaning first. Already clean now counts as success, and the repair loop inspects again.
+- **Cleanup repair race.** `recoverManagedCleanup` failed setup if the job had been cleaned since inspection. Already clean now counts as success, and the repair loop inspects again.
 
 ## Deleted
 
@@ -83,7 +90,11 @@ Only the in-tree daemon acting as a handover's source: fresh prepare from a new 
 
 Also: `TestRealDaemonPreparedReceiptBindsNothingOnceItsDaemonRestarts` shows the receipt state against a real daemon restart. Expired, missing-receipt, unknown-phase, different-token and dead-process states use hand-written receipts in the `TestManagedLive*` unit tests.
 
-The in-tree daemons are built from this tree. The independent review separately drove a real `7b4b27c` binary through the phase scenarios.
+Limits of this coverage:
+
+- The in-tree daemons are built from this tree. The independent review separately drove a real `7b4b27c` binary through the phase scenarios.
+- The live fixture uses one binary for every build, so it cannot show a digest refusal.
+- `TestManagedLiveJournalOlderThanCompletedBuildCannotStrandUpgrades/phase-released` uses a fake daemon, so it passes in the exact state where a real daemon will not start (follow-up 2). It proves setup proceeds, not that the queue comes up.
 
 ## Evidence
 
@@ -93,5 +104,5 @@ Validation results are recorded in the PR description, pinned to its head.
 
 1. Independent re-review and hosted CI on the new head.
 2. Merge per the owner's authorization once both pass.
-3. Owner decision on open findings 1 and 2.
+3. Follow-ups above, starting with 1, which also clears 2 after a reboot.
 4. The stacked follow-up removing `--payload` and the unmarked install path.

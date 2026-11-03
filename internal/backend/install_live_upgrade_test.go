@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -375,15 +377,156 @@ func TestManagedLiveResumeSelectsOnlyActivePhases(t *testing.T) {
 			t.Fatal("an unknown handover phase was accepted")
 		}
 	})
-	t.Run("different token fails closed", func(t *testing.T) {
+	t.Run("changed target under the same token fails closed", func(t *testing.T) {
 		m, live := liveResumeFixture(t)
 		other := *live
-		other.Token = token()
+		other.TargetSHA256 = strings.Repeat("f", 64)
 		liveResumeReceipt(t, m.installer, &other, "prepared")
 		if _, err := m.installer.planManaged(context.Background()); err == nil {
-			t.Fatal("another daemon receipt authorized this journal")
+			t.Fatal("a receipt for another target authorized this journal")
 		}
 	})
+}
+
+// A journal is always written before its token is prepared, so another token on
+// the receipt proves it never took custody, whatever that receipt itself binds.
+func TestManagedLiveJournalWithForeignReceiptNeverTookCustody(t *testing.T) {
+	foreign := func(t *testing.T, i *installer, live *managedLiveUpgrade) []byte {
+		t.Helper()
+		other := *live
+		other.Token = token()
+		liveResumeReceipt(t, i, &other, "prepared")
+		raw, err := os.ReadFile(queueHandoverPath(&Gate{State: i.state}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	requireReceipt := func(t *testing.T, i *installer, raw []byte) {
+		t.Helper()
+		if current, err := os.ReadFile(queueHandoverPath(&Gate{State: i.state})); err != nil || string(current) != string(raw) {
+			t.Fatal("retiring a journal changed another handover's receipt", err)
+		}
+	}
+	t.Run("same build", func(t *testing.T) {
+		m, live := liveResumeFixture(t)
+		foreign(t, m.installer, live)
+		if plan, err := m.installer.planManaged(context.Background()); err != nil || plan.live != nil {
+			t.Fatal("a journal that never took custody was resumed", plan, err)
+		}
+	})
+	t.Run("newer build with a finished journal", func(t *testing.T) {
+		m, live := liveResumeFixture(t)
+		i := m.installer
+		i.queueControl = nil
+		raw := foreign(t, i, live)
+		managedCandidate(t, m, "124")
+		if err := m.run(t); err != nil {
+			t.Fatal("a foreign receipt refused a newer build", err)
+		}
+		requireLiveJournalGone(t, i)
+		requireReceipt(t, i, raw)
+	})
+	t.Run("reinstall after removal", func(t *testing.T) {
+		m, live := liveResumeFixture(t)
+		i := m.installer
+		i.queueControl = nil
+		liveResumeSetTarget(t, i, live, "124")
+		payload := i.payload
+		managedRemovalTarget(i)
+		if err := m.run(t); err != nil {
+			t.Fatal("removal", err)
+		}
+		raw := foreign(t, i, live)
+		i.unregisterServices, i.appBundle, i.payload = false, false, payload
+		managedCandidate(t, m, "125")
+		if report := i.preflight(context.Background()); len(report.Issues) != 0 {
+			t.Fatalf("a journal that never took custody blocked preflight: %+v", report.Issues)
+		}
+		if err := m.run(t); err != nil {
+			t.Fatal("a foreign receipt failed the reinstall", err)
+		}
+		requireLiveJournalGone(t, i)
+		requireReceipt(t, i, raw)
+	})
+}
+
+// Preflight does not assess a journal where resume is skipped, so an unreadable
+// one must not fail a run that preflight reported as clear.
+func TestManagedUnassessableJournalDoesNotFailReinstall(t *testing.T) {
+	m, live := liveResumeFixture(t)
+	i := m.installer
+	i.queueControl = nil
+	liveResumeSetTarget(t, i, live, "124")
+	payload := i.payload
+	managedRemovalTarget(i)
+	if err := m.run(t); err != nil {
+		t.Fatal("removal", err)
+	}
+	liveResumeReceipt(t, i, live, "prepared")
+	path := queueHandoverPath(&Gate{State: i.state})
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	integrationTestWrite(t, path, []byte(strings.Replace(string(raw), `"prepared"`, `"mystery"`, 1)))
+	i.unregisterServices, i.appBundle, i.payload = false, false, payload
+	managedCandidate(t, m, "125")
+	if report := i.preflight(context.Background()); len(report.Issues) != 0 {
+		t.Fatalf("expected no issues for a skipped journal: %+v", report.Issues)
+	}
+	if err := m.run(t); err != nil {
+		t.Fatal("an unassessable journal failed the reinstall", err)
+	}
+	requireLiveJournalKept(t, i)
+}
+
+// lstart follows the system's time zone, so the same running process can present
+// another birth. Only a free daemon lock may turn that into proof of PID reuse.
+func TestManagedLiveJournalSurvivesTimeZoneChange(t *testing.T) {
+	m, live := liveResumeFixture(t)
+	i := m.installer
+	daemon, err := queueHandoverIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	birth := func(zone string) string {
+		command := exec.Command("/bin/ps", "-o", "lstart=", "-p", strconv.Itoa(daemon.PID))
+		command.Env = []string{"PATH=/usr/bin:/bin", "LC_ALL=C"}
+		if zone != "" {
+			command.Env = append(command.Env, "TZ="+zone)
+		}
+		raw, err := command.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(strings.Fields(string(raw)), " ")
+	}
+	// Whatever the host's zone, one of these renders the birth differently from it.
+	daemon.Birth = birth("Asia/Tokyo")
+	if daemon.Birth == birth("") {
+		daemon.Birth = birth("America/New_York")
+	}
+	liveResumeProcessReceipt(t, i, live, "prepared", daemon)
+	lock, err := installLock(i.state, "queue-daemon.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, spent, err := i.liveJournalState(live); err != nil || spent {
+		lock.Close()
+		t.Fatal("a zone change made the running daemon read as gone", spent, err)
+	}
+	if err := i.retireSpentLive(); err != nil {
+		lock.Close()
+		t.Fatal(err)
+	}
+	requireLiveJournalKept(t, i)
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, spent, err := i.liveJournalState(live); err != nil || !spent {
+		t.Fatal("a free lock did not prove the PID was reused", spent, err)
+	}
 }
 
 func TestManagedLiveResumeTakesDaemonAttemptsWhenLastCallerFinished(t *testing.T) {

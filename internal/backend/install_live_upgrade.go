@@ -162,8 +162,10 @@ func (install *installer) liveReceipt(live *managedLiveUpgrade) (Object, error) 
 }
 
 // liveProcessAlive differs from queueHandoverDaemonAlive only in treating an
-// earlier boot or a reused PID as proof that the recorded process has gone.
-func liveProcessAlive(identity queueHandoverDaemon) (bool, error) {
+// earlier boot or a reused PID as proof that the recorded process has gone. A
+// birth renders in the system's time zone, so a changed birth alone can be a zone
+// change on the same process: only a free lifetime lock proves the PID was reused.
+func (install *installer) liveProcessAlive(identity queueHandoverDaemon) (bool, error) {
 	snapshot, err := queueHandoverProcessSnapshot()
 	if err != nil {
 		return false, err
@@ -172,7 +174,7 @@ func liveProcessAlive(identity queueHandoverDaemon) (bool, error) {
 		return false, nil
 	}
 	if state, present := snapshot.Processes[identity.PID]; present && state.Birth != strings.Join(strings.Fields(identity.Birth), " ") {
-		return false, nil
+		return installInspectLock(install.state, "queue-daemon.lock")
 	}
 	return snapshot.alive(identity)
 }
@@ -202,7 +204,12 @@ func (install *installer) liveJournalState(live *managedLiveUpgrade) (string, bo
 	if err != nil {
 		return "", false, err
 	}
-	if receipt.Token != live.Token || receipt.TargetSHA256 != live.TargetSHA256 {
+	// Older releases always wrote the journal before preparing, and replaced it
+	// before preparing another token, so this journal never took custody.
+	if receipt.Token != live.Token {
+		return "", true, nil
+	}
+	if receipt.TargetSHA256 != live.TargetSHA256 {
 		return "", false, errors.New("Daemon handover differs from the retained installer custody")
 	}
 	var process queueHandoverDaemon
@@ -219,7 +226,7 @@ func (install *installer) liveJournalState(live *managedLiveUpgrade) (string, bo
 	default:
 		return "", false, errors.New("Unrecognized daemon handover phase; live replacement refused")
 	}
-	alive, err := liveProcessAlive(process)
+	alive, err := install.liveProcessAlive(process)
 	if err != nil || alive {
 		return receipt.Phase, false, err
 	}

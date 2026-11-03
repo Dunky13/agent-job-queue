@@ -1610,8 +1610,12 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		return err
 	}
 	if p.live == nil && !install.prepareReplacement && !install.unregisterServices {
+		// Where resume was skipped, preflight never saw this journal and it blocks nothing.
 		if err := install.retireSpentLive(); err != nil {
-			return err
+			if liveAllowed(install, p) {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "Agent Queue kept a live-upgrade journal it could not assess: %v\n", err)
 		}
 	}
 	if install.automaticSetup {
