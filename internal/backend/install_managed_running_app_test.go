@@ -516,6 +516,32 @@ func TestManagedRemovalRefusalAfterTheQuitSaysToReopen(t *testing.T) {
 	}
 }
 
+// A helper that outlives the quit is named, not reported as another installer.
+func TestManagedRemovalHeldLifetimeLockNamesIt(t *testing.T) {
+	a := runningAppFixture(t, true)
+	i := a.installer
+	original := i.command
+	i.command = func(ctx context.Context, args []string) ([]byte, error) {
+		output, err := original(ctx, args)
+		if len(args) == 3 && args[1] == "--prepare-app-replacement" && a.quits == 1 {
+			lock, lockErr := installLock(i.state, "queue-daemon.lock")
+			if lockErr != nil {
+				t.Fatal(lockErr)
+			}
+			t.Cleanup(func() { lock.Close() })
+		}
+		return output, err
+	}
+	managedRemovalTarget(i)
+	err := i.execute(removalContext(t))
+	if err == nil || !strings.Contains(err.Error(), "it still holds queue-daemon.lock") || !strings.Contains(err.Error(), "Run removal again") {
+		t.Fatal("a held lifetime lock was not named", err)
+	}
+	if strings.Contains(err.Error(), "Another installer") {
+		t.Fatal("a held lifetime lock was blamed on another installer", err)
+	}
+}
+
 // A refused quit leaves the app running and in charge, so it must not look
 // incomplete to the updater or to phone access in the meantime.
 func TestManagedRemovalRefusedQuitLeavesARunningAppComplete(t *testing.T) {

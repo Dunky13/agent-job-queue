@@ -348,8 +348,12 @@ func TestManagedRemovalRefusesLoginItemItCannotVerify(t *testing.T) {
 			}
 			return original(ctx, args)
 		}
-		if err := m.run(t); err == nil || !strings.Contains(err.Error(), "cannot be verified") {
+		err := m.run(t)
+		if err == nil || !strings.Contains(err.Error(), "cannot be verified") {
 			t.Fatal("the final check passed on no evidence about the login item", err)
+		}
+		if strings.Contains(err.Error(), "Run removal again") {
+			t.Fatal("a refusal with its own route also got the general guidance", err)
 		}
 		for _, filename := range []string{filepath.Join(i.root, "installation.json"), filepath.Join(i.home, ".local/bin/agent-heavy")} {
 			if _, err := os.Lstat(filename); err != nil {
@@ -357,6 +361,48 @@ func TestManagedRemovalRefusesLoginItemItCannotVerify(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A service that changes under the final check may settle, so its refusal says to
+// retry rather than to reopen.
+func TestManagedRemovalFinalCheckRefusalsSayToRetry(t *testing.T) {
+	for _, test := range []struct {
+		name, service, status, want string
+	}{
+		// Unregistering reads the login item back once; a later read is the final check.
+		{"still registered", "login", "enabled", "is still registered"},
+		{"notFound but still loaded", "queue", "notFound", "notFound but still loaded"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := managedTestFixture(t)
+			if err := m.run(t); err != nil {
+				t.Fatal(err)
+			}
+			i := m.installer
+			managedRemovalTarget(i)
+			original := i.command
+			reads, loaded := 0, false
+			i.command = func(ctx context.Context, args []string) ([]byte, error) {
+				if loaded && slices.Equal(args, []string{"launchctl", "print", i.domain() + "/io.went.agent-heavy"}) {
+					return []byte("state = running\n"), nil
+				}
+				if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" {
+					if args[3] == "login" && m.statuses["login"] == "notRegistered" {
+						reads++
+					}
+					if args[3] == test.service && reads > 0 && (test.service != "login" || reads == 2) {
+						m.statuses[test.service] = test.status
+						loaded = test.service == "queue"
+					}
+				}
+				return original(ctx, args)
+			}
+			err := m.run(t)
+			if err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "Run removal again") {
+				t.Fatal("the final check refusal gave the wrong guidance", err)
+			}
+		})
+	}
 }
 
 // managedAction requires notRegistered straight after unregistering, so a miss at

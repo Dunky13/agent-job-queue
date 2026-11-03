@@ -679,7 +679,7 @@ func (install *installer) managedLoaded(raw []byte, label, app string) error {
 	if managedLoadedBundleProgram(raw, executable, helper, command) {
 		return nil
 	}
-	return errors.New("Loaded service differs from the canonical managed helper; no process was stopped")
+	return errors.New("Loaded service differs from the canonical managed helper; it was left running")
 }
 
 // Newer launchd prints a bundle-relative "program identifier" for Service
@@ -883,7 +883,9 @@ func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan)
 	// finished. Taking a lock never authorizes killing an uncertain process.
 	for _, name := range []string{"queue-daemon.lock", "resource-controller.lock"} {
 		lock, err := installLock(install.state, name)
-		if err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return fmt.Errorf("Old service has not stopped: it still holds %s: %w", name, unix.EWOULDBLOCK)
+		} else if err != nil {
 			return fmt.Errorf("Old service has not stopped: %w", err)
 		}
 		lock.Close()
@@ -1014,7 +1016,7 @@ func (install *installer) managedWrappers() (map[string][]byte, error) {
 		// Exact wrappers shipped before the Go migration (452f076's parent).
 		python := []byte("#!/bin/sh\nset -eu\nroot=\"${HOME:?}/.local/share/agent-heavy\"\nexec \"$root/.venv/bin/python\" \"$root/" + pythonModule + "\" \"$@\"\n")
 		if !bytes.Equal(raw, install.managedWrapper(name)) && !bytes.Equal(raw, legacy) && !bytes.Equal(raw, python) && !bytes.Equal(raw, recorded[name]) {
-			return nil, fmt.Errorf("CLI wrapper %s is customized; no service was stopped", name)
+			return nil, fmt.Errorf("CLI wrapper %s is customized; it was left in place", name)
 		}
 		wrappers[filename] = raw
 	}
@@ -1121,6 +1123,9 @@ func managedRemovalGuidance(err error) error {
 		return err // It names its own route.
 	case errors.Is(err, errInstallStoppedQueueUnfinished), errors.Is(err, errInstallPhoneCleanupIncomplete):
 		return fmt.Errorf("%w. Open Agent Queue, then run removal again", err)
+	}
+	if strings.HasSuffix(err.Error(), ".") {
+		return fmt.Errorf("%w Run removal again. If it refuses the same way, open Agent Queue first", err)
 	}
 	return fmt.Errorf("%w. Run removal again. If it refuses the same way, open Agent Queue first", err)
 }

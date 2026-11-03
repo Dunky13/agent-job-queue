@@ -67,14 +67,17 @@ The check runs twice, the second time under `scheduling.lock`. `agent-heavy run`
 
 What clears each one differs, so `managedRemovalGuidance` says so:
 
-- **An unfinished job or a stuck phone record:** retrying cannot clear these, because nothing is left running. The refusal, and an unfinished stopped store found while planning, say "Open Agent Queue, then run removal again". Opening the app does clear it: preflight is empty, setup succeeds and removes the marker. `TestManagedRemovalRefusalAfterTheQuitSaysToReopen` holds that.
-- **Anything else after the quit,** including `notFound` straight after an unregister and a failed status read: the refusal says to run removal again, and to open the app first only if it refuses the same way. A plain retry finishes those.
+- **An unfinished job or a stuck phone record:** retrying cannot clear these, because nothing is left running. The refusal, and an unfinished stopped store found while planning, say "Open Agent Queue, then run removal again". Opening the app clears an unfinished job: preflight is empty, setup succeeds and removes the marker. `TestManagedRemovalRefusalAfterTheQuitSaysToReopen` holds that. A phone record differs. With phone access on, supervisor startup reconciles it (`internal/remote/control.go`), which is traced but not run. With phone access off, `serve` returns before any cleanup, so reopening does not clear it: a probe got `disable phone access` on the next removal, and disabling it cleans up.
+- **Anything else after the quit,** including `notFound` straight after an unregister and a failed status read: the refusal says to run removal again, and to open the app first only if it refuses the same way. A plain retry finishes `notFound` on a helper service, and a failed status read once the read answers. A login item still `notFound` then refuses with its own route, and a held lifetime lock refuses until the helper exits.
 - **A login item it cannot verify:** the refusal names its own route, described above.
 
 **Known limits:**
 
 - A helper not parented by the new app, or a wrong loaded launchd label, also refuses setup after reopening, so opening the app does not clear those.
 - An app opened in the very short window between `managedStopMenu` and the marker write takes the `.ready` path. The chance is very low.
+- A helper still holding its lifetime lock refuses removal and, after reopening, setup. The first refusal names the lock (`Old service has not stopped`), and the retry says `An unowned queue process holds its lifetime lock`, which is the same cause in different words. Removal finishes once the lock is released.
+- Returns after the final status check (wrappers, custody, backup cleanup, metadata) keep their own text and add no guidance. They report a change made during removal, and nothing here shows what clears each one. A wrapper edited during removal also refuses a retry and setup until it is restored.
+- Planning's refusal under the lock (`managedRemovalGuidance` in `removeManaged`) has no test of its guidance, because reaching it needs a race.
 
 **Preflight had the same check.** Run from outside against a healthy running app, it reported "An unowned queue process holds its lifetime lock", from the same `managedDrain` branch. It and setup now report `app-running` and `errInstallAppRunning`, and change nothing. Setup still cannot run beside the app's helpers.
 
@@ -112,11 +115,11 @@ Steps, once this PR's head is final:
 
 1. In a checkout of the tap's `tap` branch, read the current build from the `version` and `url` lines of `Casks/agent-job-queue.rb`. It is `build-222-03fcbd2` as I write this, but **the target moves**: the tap's scheduled refresh can publish a newer build at any time, rendered by its old template and so drifting the same way, and builds 229 and 232 are already out.
 2. `gh release download TAG --repo Dunky13/agent-job-queue --pattern agent-job-queue.rb --clobber --dir Casks`, using that build's tag, and copy the other files above.
-3. Run `go test -p 2 refresh.go refresh_test.go`, `go vet refresh.go` and `HOMEBREW_DEVELOPER=1 go run -p 2 refresh.go` with Go 1.26 or later, `gh` and `brew`. The last one is the only one that reads the cask and publishes nothing. It must exit 0 with `Validated ...; publication disabled`. With the cask unchanged it exits 1 with `Current tap cask differs from its historical published release`. The variable is required, as the tap's `refresh.yml` already sets it: without it the command exits 1 with `Required brew operation failed` even with the right cask, hiding brew's `Homebrew requires casks to be in a tap, rejecting`.
+3. Run `go test -p 2 refresh.go refresh_test.go`, `go vet refresh.go` and `HOMEBREW_DEVELOPER=1 go run -p 2 refresh.go` with Go 1.26 or later, `gh` and `brew`. Only the last one reads the cask, and it publishes nothing. It must exit 0 with `Validated ...; publication disabled`, or with `Published build verified; template change awaits a newer app release` if the tap is already on the latest release. With the cask unchanged it exits 1 with `Current tap cask differs from its historical published release`. The variable is required, as the tap's `refresh.yml` already sets it: without it the command exits 1 with `Required brew operation failed` even with the right cask, hiding brew's `Homebrew requires casks to be in a tap, rejecting`.
 4. Open a PR against `tap` with signed, DCO-signed-off commits.
 5. Just before merging, re-read the tap's head. If its build moved, repeat from step 1 against the new build. Then merge.
 6. Dispatch `refresh.yml` on the `tap` branch and confirm it succeeds. If the schedule moved the tap in that gap, it fails with the error above; repeat from step 1.
-7. Only then merge this PR, and do it promptly. The dispatch in step 6 publishes the latest release with the new caveat, "It quits the app and removes its login item", before any build has that behaviour. A Homebrew user in that gap is told something untrue until this PR's build ships.
+7. Only then merge this PR, and do it promptly. The dispatch in step 6 publishes the latest release with the new caveat, "It quits the app and removes its login item", before any build has that behaviour. A Homebrew user in that gap is told something untrue until this PR's build ships. If the tap was already on the latest release, the dispatch publishes nothing and the caveat arrives with the next release.
 
 **Dispatch has been dead since build 162.** Per the final review, logs for builds 166, 212, 220, 222, 229 and 232 all show `Tap tooling differs: refresh.go` and `exit status 1`, and all report success. The tap's `*/15` cron is active but fires every 2.9 to 10.2 hours, which looks like GitHub schedule throttling, so Homebrew gets new builds only at that pace.
 
@@ -203,8 +206,8 @@ Some legacy preflight tests now seed phone access or a blocked older install, be
 
 | | Added | Removed | Net |
 |---|---|---|---|
-| Production | 531 | 1725 | -1194 |
-| Tests | 2154 | 2144 | --10 |
+| Production | 538 | 1728 | -1190 |
+| Tests | 2271 | 2142 | +129 |
 
 This is one PR rather than two: with `--payload` gone, the small shape is what remains.
 
