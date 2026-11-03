@@ -93,15 +93,17 @@ child ever launches under either policy.
 - The stub's `mutation` and `profile-failure` scenarios now drain stdin. Otherwise
   a child could exit before a row's input was written and fail with EPIPE.
 
-Three assertions were restated because the type no longer accepts the old inputs:
+Five assertions were restated because the type no longer accepts the old inputs:
 
 | Old assertion | New assertion |
 | --- | --- |
 | `timeout(for: ["status"], budget: .updates) == 8` | `.status.timeout == 8` |
 | `timeout(for: ["updates", "download"]) == 25` | `.version.timeout == 25`, the app's only non-`updates` command in that store |
 | Malformed `--service-management` argv yields 330 s | `.setup(argv)` yields 330 s and retained; `.serviceStatus` accepts only the `Service` enum |
+| Ambiguous setup argv (`--repair-and-continue` plus `--preflight --json`) yields 330 s, `TransportTests.swift:33` | `.setup(argv)` yields 330 s. **This no longer tests classification:** `.setup` is finite and retained by construction, and no factory can build this form, so it now only pins the `.setup` default. |
+| Preflight argv plus an extra option keeps its accepted operation, `TransportTests.swift:136` | `.installRecovery` and `.installDisablingPhoneAccess`, the real forms for two of the three options, still run through the real runner with no discard. `--unexpected` has no factory, so it uses `.setup(argv)`, which is retained by construction and pins only that default. |
 
-One existing assertion was changed because it was flaky on the base commit too:
+Two existing assertions were changed because they were flaky on the base commit too:
 
 "Read finishes after its direct child exits while an independent daemon holds
 inherited output" required the read to finish within 0.5 s. That limit includes
@@ -115,9 +117,20 @@ base and 0.47 to 0.52 s on the branch, so the refactor did not slow this path.
 
 "Deadline and cleanup survive ... controller I/O" also failed on the base commit,
 in 2 of 8 runs. At the 0.15 s test deadline a child can be killed before it writes
-its marker, and the check treated the missing marker as a failure. It now requires
-reaping only when the marker exists. The runner's `defer` still reaps every child,
-and the cancellation checks still require the marker and a reaped child.
+its marker, and the check treated the missing marker as a failure. With a marker,
+it still requires that exact child to be gone. With or without one, it now requires
+`proc_listchildpids` to list no direct child, including zombies. Under a scratch
+mutation with no marker and no teardown, this check fails, while the earlier
+marker-only version passed the whole run.
+
+The stub now writes its marker with `.atomic`, so a child killed mid-write cannot
+leave an empty marker. A killed atomic write can leave a temporary file beside the
+marker, so the selection checks now ask whether any file names a live child.
+
+`run-resume-ui-tests.sh` builds `ResumeUITests.swift` against the historical sources
+at `--before-ref`, where the store injects `[String]`. Its `before` build now adapts
+that one closure, the way it already shims the historical `QueueStore`. The
+reference itself is unchanged.
 
 ## Evidence
 
@@ -131,6 +144,7 @@ around 10 to 13.
 | The `validate.sh` lines after `go test`: Go build, web and browser tests, native tests, universal app build, installer and DMG | 2810 | PASS, exit 0 |
 | `run-menu-bar-ui-tests.sh`, base and branch | 2802 | PASS on both: 32 passed, 0 failed, 8 skipped |
 | `run-menu-bar-ui-tests.sh`, branch, earlier run | 2788 | FAIL on `singleClickShowsRealPopoverImmediately`, which allows 0.03 s after the click |
+| `run-resume-ui-tests.sh --before-ref 2295abe`, both builds | 2818 | PASS, exit 0: `before` 4 of 4 capture checks, `after` 10 of 10 |
 | `run-bootstrap-ui-tests.sh`, base and branch | 2780 | FAIL on both, at the same check in the first scenario |
 | Bootstrap UI with one condition relaxed in scratch, branch | 2794 | PASS, all 12 scenarios, 92 PASS lines |
 
@@ -146,12 +160,14 @@ unchanged, so they have local evidence even though the script as a whole failed.
 
 ### Bootstrap UI runner
 
-The committed runner cannot pass on this host. Its neutral-startup check allows
-only the app's own status bar window to be visible, but a second visible
-`NSStatusBarWindow` at `(0, -33)` is present on base and branch alike. The cause of
-that window is not established, so the committed check is unchanged. To exercise
-the later scenarios, a scratch copy allowed any `NSStatusBarWindow`; that change is
-not in this PR.
+The committed runner cannot pass on this OS, and that is not caused by this PR. A
+bare accessory app with one status item shows the same extra visible
+`NSStatusBarWindow` at `(0, -33)` on macOS 27.0.1. It comes from AppKit on this OS,
+and `NSApp.windows` is per-process, so no other app causes it.
+`BootstrapUITests.swift:172` allows only the item's own window, which is wrong for
+this OS on base and branch alike. It needs its own fix and is not part of this PR.
+To exercise the later scenarios, a scratch copy allowed any `NSStatusBarWindow`;
+that change is not in this PR.
 
 These fixtures inject the setup executor. They verify setup and quit flows and the
 argv the model sends, but do not launch a real installer. Real process behaviour
@@ -167,10 +183,11 @@ is covered by `TransportTests`. No check here ran against the installed queue.
 
 1. Independent Standards and Spec review of the draft PR.
 2. Check hosted CI, especially the Go partitions that did not finish locally.
-3. Separately, find out why the second `NSStatusBarWindow` appears, then decide
-   whether the bootstrap UI check should change.
+3. Separately, fix `BootstrapUITests.swift:172` for the extra AppKit status bar
+   window on macOS 27.
 4. Separately, consider a causal check for the 0.03 s popover settle, which is
    load-sensitive.
 5. Separately, the `agent-heavy run` client exits with 125 on a transient daemon
    socket timeout while its job stays queued.
-6. Merge and release need separate authorization.
+6. The owner has authorized merge once review and CI pass. Release needs separate
+   authorization.

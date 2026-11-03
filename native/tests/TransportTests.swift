@@ -131,16 +131,22 @@ struct TransportTests {
             try check(childIsGone(marker), "Cancelling \(target.rawValue) setup preflight reaps its private read controller")
             try FileManager.default.removeItem(at: marker)
         }
-        for (index, extra) in [["--recover", "repair-service"], ["--disable-phone-access"], ["--unexpected"]].enumerated() {
+        // The app cannot combine preflight with other options. Its real mutating
+        // forms, and any setup argv without a named policy, keep their response.
+        let retainedForms: [(QueueClient.InstallTarget) -> QueueClient.Command] = [
+            { .installRecovery($0, action: "repair-service") }, { .installDisablingPhoneAccess($0) },
+            { .setup(["install", "--app-bundle", $0.path, "--preflight", "--json", "--unexpected"]) },
+        ]
+        for (index, form) in retainedForms.enumerated() {
             let marker = temporary.appendingPathComponent("preflight-mutation-\(index)")
-            let mutation = Task { try await QueueClient.run(.setup(["install", "--app-bundle", marker.path, "--preflight", "--json"] + extra),
-                transport: transport) }
+            let command = form(.init(option: .appBundle, path: marker.path))
+            let mutation = Task { try await QueueClient.run(command, transport: transport) }
             try await waitForFile(marker)
             mutation.cancel()
             let response = try await mutation.value
             try check(String(decoding: response, as: UTF8.self) == "accepted" &&
                 FileManager.default.fileExists(atPath: marker.appendingPathExtension("done").path),
-                "Preflight syntax with additional options retains its accepted operation")
+                "Setup forms other than the exact preflight retain their accepted operation")
         }
 
         let setupWaitMarker = temporary.appendingPathComponent("automatic-wait")
@@ -438,9 +444,23 @@ struct TransportTests {
         return kill(pid, 0) == -1 && errno == ESRCH
     }
 
-    // A child killed at a very short deadline may not have written its marker yet.
+    // A stray temporary file from a killed atomic marker write names no child.
+    private static func childIsAlive(_ marker: URL) -> Bool {
+        guard let text = try? String(contentsOf: marker, encoding: .utf8), let pid = Int32(text) else { return false }
+        return kill(pid, 0) == 0 || errno != ESRCH
+    }
+
+    // A child killed at a very short deadline may not have written its marker yet,
+    // so reaping is also checked without one. Controller runs here are sequential.
     private static func reapedAfterShortDeadline(_ marker: URL) -> Bool {
-        !FileManager.default.fileExists(atPath: marker.path) || childIsGone(marker)
+        (!FileManager.default.fileExists(atPath: marker.path) || childIsGone(marker)) && directChildren().isEmpty
+    }
+
+    // Includes zombies, so a child that exited without being reaped is still listed.
+    private static func directChildren() -> [pid_t] {
+        var children = [pid_t](repeating: 0, count: 64)
+        let count = proc_listchildpids(getpid(), &children, Int32(children.count * MemoryLayout<pid_t>.size))
+        return Array(children.prefix(max(0, Int(count))))
     }
 
     private static func openHandleCount() -> Int {
@@ -470,7 +490,7 @@ struct TransportTests {
         await latest?.value
         let markers = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         try check(store.selectedID == "latest" && store.detail?.profile.id == "latest" && store.error == nil &&
-                  !store.isDetailLoading && markers.allSatisfy(childIsGone),
+                  !store.isDetailLoading && !markers.contains(where: childIsAlive),
                   "Rapid real-process selections publish only the current detail and reap all read children")
         // Each child checks all predecessors on entry. Overlap creates this sentinel.
         try check(!FileManager.default.fileExists(atPath: directory.appendingPathComponent("overlap").path),
@@ -487,11 +507,12 @@ struct TransportTests {
         if scenario == "resist" { signal(SIGTERM, SIG_IGN) }
         if scenario == "detail" {
             let others = try FileManager.default.contentsOfDirectory(at: marker.deletingLastPathComponent(), includingPropertiesForKeys: nil)
-            for other in others where !childIsGone(other) {
+            for other in others where childIsAlive(other) {
                 try Data().write(to: marker.deletingLastPathComponent().appendingPathComponent("overlap"))
             }
         }
-        try Data(String(getpid()).utf8).write(to: marker)
+        // Atomic, so a child killed here cannot leave an empty marker that names no process.
+        try Data(String(getpid()).utf8).write(to: marker, options: .atomic)
         let bytes = Data(repeating: 65, count: 16_384)
         switch scenario {
         case "empty": return

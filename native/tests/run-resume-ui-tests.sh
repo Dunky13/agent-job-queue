@@ -14,6 +14,7 @@ trap 'rm -rf -- "$temporary"' EXIT
 build_fixture() {
   local source=$1 name=$2
   local queue_source="$source/AgentQueue.swift"
+  local test_source="$root/native/tests/ResumeUITests.swift"
   if [[ "$name" == before ]]; then
     # Supply the same injected-provider argument seam to the historical store.
     # This changes no baseline view code and keeps fixture badges/controls equal.
@@ -30,6 +31,9 @@ build_fixture() {
       { print }
     ' "$queue_source" > "$temporary/before-injected.swift"
     queue_source="$temporary/before-injected.swift"
+    # The historical store injects argv where the current one injects a typed command.
+    sed 's/\(backend\.command(.0\)\.arguments)/\1)/' "$test_source" > "$temporary/before-ResumeUITests.swift"
+    test_source="$temporary/before-ResumeUITests.swift"
   fi
   sed '/^@main$/d' "$queue_source" > "$temporary/$name-AgentQueue.swift"
   local sources=("$source/QueueBrand.swift" "$temporary/$name-AgentQueue.swift"
@@ -38,7 +42,7 @@ build_fixture() {
   if [[ -f "$source/AgentSupervisor.swift" ]]; then sources+=("$source/AgentSupervisor.swift"); fi
   xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone \
     -target "$(uname -m)-apple-macos15.0" -framework SwiftUI -framework AppKit -framework ServiceManagement \
-    "${sources[@]}" "$root/native/tests/ResumeUITests.swift" -o "$temporary/$name-tests"
+    "${sources[@]}" "$test_source" -o "$temporary/$name-tests"
 }
 
 if [[ $# == 3 ]]; then
