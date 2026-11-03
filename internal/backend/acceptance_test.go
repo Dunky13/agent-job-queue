@@ -47,6 +47,23 @@ type queueClient struct {
 	done        chan error
 }
 
+// stderrHas waits until the client's stderr contains text, which proves the
+// client reached the state that prints it.
+func (c *queueClient) stderrHas(t *testing.T, text string) {
+	t.Helper()
+	fixtureUntil(t, 10*time.Second, func() bool { return strings.Contains(c.errors.String(), text) })
+}
+
+// stillRunning fails the test if the client has already ended.
+func (c *queueClient) stillRunning(t *testing.T) {
+	t.Helper()
+	select {
+	case err := <-c.done:
+		t.Fatalf("caller ended while it had to stay: %v out=%q err=%q", err, c.out.String(), c.errors.String())
+	default:
+	}
+}
+
 func fixtureUntil(t *testing.T, timeout time.Duration, predicate func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -157,14 +174,29 @@ func daemonAcceptance(t *testing.T) *daemonFixture {
 }
 func (f *daemonFixture) launch(args ...string) *queueClient {
 	f.t.Helper()
+	return f.cli(append([]string{"run", "--"}, args...)...)
+}
+
+// cli starts the test binary as the agent-heavy command line with exactly args.
+func (f *daemonFixture) cli(args ...string) *queueClient {
+	f.t.Helper()
+	return f.cliWithStdin(nil, args...)
+}
+
+// cliWithStdin is cli with a pipe the test controls as the command's stdin.
+func (f *daemonFixture) cliWithStdin(stdin *os.File, args ...string) *queueClient {
+	f.t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		f.t.Fatal(err)
 	}
 	client := &queueClient{done: make(chan error, 1)}
-	client.command = exec.Command(executable, append([]string{"run", "--"}, args...)...)
+	client.command = exec.Command(executable, args...)
 	client.command.Env = f.environment
 	client.command.Dir = f.root
+	if stdin != nil {
+		client.command.Stdin = stdin
+	}
 	client.command.Stdout = &client.out
 	client.command.Stderr = &client.errors
 	client.command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

@@ -21,9 +21,17 @@ Setup never starts a live handover. If a queue daemon is still running, as one r
 Quitting the app stops its daemon without stopping independent jobs, so a normal upgrade at the same location has no daemon to wait for. What happens next differs by who is watching:
 
 - A running job keeps running. Its outcome is recorded, and it runs exactly once.
-- Its attached `agent-heavy run` caller loses the daemon and exits with status 125 within about a second, so that exit status is not the job's outcome.
-- A queued job's caller also exits with status 125. The job stays queued.
-- If jobs were running, the next daemon comes up paused under the unclean-restart rule above, and queued jobs run after `agent-heavy resume` with no caller attached.
+- Its attached `agent-heavy run` caller keeps retrying for about two minutes while the daemon is away. If the daemon is still gone it exits with status 125 (the job "may still be running"), so that exit status is not the job's outcome, unless the queue store shows the job finished, in which case it reports the job's own exit status.
+- A queued job's caller ends the same way after the same budget. The job stays queued.
+- If jobs were running, the next daemon comes up paused under the unclean-restart rule above, and queued jobs run after `agent-heavy resume`. Without a drain they have no caller attached; during a drain their callers stay attached (see below).
+
+To keep callers attached, close intake first. The upgrade flow is:
+
+1. `agent-heavy drain` (optionally `--wait` to let the queue empty, or `--cancel-queued` and `--cancel-running` when you cannot wait).
+2. Quit Agent Queue, drag the new version over the old one and choose **Replace**, then open it.
+3. Wait until the queue is up (`agent-heavy status` answers), then run `agent-heavy undrain`. It resumes the queue and removes the drain, which also ends the pause a restarted queue starts with and any pause you set yourself. If the daemon is not up it refuses, keeps the drain and exits 1 so that waiting callers stay attached; `agent-heavy undrain --force` drops the drain anyway and those callers then exit 125. Run `undrain` before the drain expires: a waiting caller whose drain expires while the queue is paused exits 125 with the paused-queue message.
+
+While the drain is active, new `agent-heavy run` calls wait with no job created (or follow `--on-drain fail|direct`), and callers of running or queued jobs wait through the restart instead of giving up after the two-minute budget. A running job returns its real exit status exactly once, even when it finished while no daemon was running; a queued job runs after `undrain`. The drain expires by itself (default 4 h, at most 24 h; `drain` without `--for` keeps an active drain's expiry and `--for` replaces it), after which the ordinary two-minute budget applies to a lost daemon, counted from the moment the drain ended. A daemon or caller from before this feature ignores the drain, so it protects the upgrade after the one that ships it. A held lease keeps the queue from emptying until it is released or `--cancel-running` is used. Two limitations remain from older behaviour: after a SIGKILL of a job during slot teardown, a caller attached across a daemon gap can exit 125 and later jobs can fail until the slot is cleared by hand; and in adaptive mode a job started with **Start now** that is still waiting for the shared validation slot after its grant expires can wait until it is cancelled.
 
 ## Finishing a handover from an older release
 

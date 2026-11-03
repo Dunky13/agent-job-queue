@@ -361,6 +361,9 @@ func (d *queueDaemon) acquireLease(p Object) (Object, error) {
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
+	if err = d.refuseDraining(); err != nil {
+		return nil, err
+	}
 	name := text(p["lane"])
 	lane, ok := d.plugins.lanes[name]
 	if !ok {

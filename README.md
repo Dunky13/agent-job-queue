@@ -36,7 +36,7 @@ The app is self-contained: the menu app, the `agent-heavy` and `agent-remote` co
 
 Opening the app immediately adds its menu-bar icon, which shows "Starting…" while setup finishes in the background and the queue comes up, on both first launch and upgrades. There is no setup wizard or progress window. Setup wording, diagnostics and **Retry** appear in the menu only if something actually fails. macOS may show a "Background Items Added" notification for the login item; approving it in **System Settings > General > Login Items** only decides whether Agent Queue opens at login and never delays the queue. Setup also unregisters any queue, resource or phone-access background services that older versions registered with macOS, including ones stuck waiting for approval. Only the explicit `--setup` diagnostic mode opens a recovery window.
 
-To upgrade, quit Agent Queue, drag the new version over the old one and choose **Replace**, then open it. Queue history, settings, credentials and certificates are kept. Running jobs keep going after you quit, but any terminal attached to a job through `agent-heavy run` loses it and exits with status 125 within about a second, including for queued jobs. The new version records each running job's outcome and replays nothing. If jobs were running, its queue starts paused, and queued jobs then run after `agent-heavy resume` with no caller attached. If a queue daemon from an older version is still running, setup waits for its running and queued jobs to finish before replacing it. See [upgrade recovery](docs/upgrade-recovery.md).
+To upgrade, quit Agent Queue, drag the new version over the old one and choose **Replace**, then open it. Queue history, settings, credentials and certificates are kept. Running jobs keep going after you quit. A terminal attached to a job through `agent-heavy run` keeps retrying for about two minutes while the daemon is away. A quit, drag and reopen usually takes longer, so it then exits with status 125 ("may still be running", for jobs that are running or queued), unless the queue store shows that the job finished, in which case it reports the job's own exit status. Run `agent-heavy drain` first and the caller waits through the whole restart instead (see [Drain the queue](#drain-the-queue)). The new version records each running job's outcome and replays nothing. If jobs were running, its queue starts paused, and queued jobs then run after `agent-heavy resume`; with no drain they have no caller attached, while during a drain their callers stay attached. If a queue daemon from an older version is still running, setup waits for its running and queued jobs to finish before replacing it. See [upgrade recovery](docs/upgrade-recovery.md).
 
 If you move the app between `/Applications` and `~/Applications`, delete or replace the old copy first. Setup refuses to adopt a second copy while the recorded one still exists.
 
@@ -46,7 +46,7 @@ To remove Agent Queue, finish queued and running jobs, then run this command and
 agent-heavy install --app-bundle "/Applications/Agent Queue.app" --unregister-services
 ```
 
-Use the app's actual location if it differs. Private data under `~/.local/share/agent-heavy`, `~/.local/state/agent-heavy` and `~/.config/agent-heavy` is preserved.
+Use the app's actual location if it differs. Private data under `~/.local/share/agent-heavy`, `~/.local/state/agent-heavy` and `~/.config/agent-heavy` is preserved. That includes a drain: if you ran `agent-heavy drain`, run `agent-heavy undrain` before you remove the app (or after a reinstall; it removes a stale drain file even without a daemon). Otherwise the preserved `drain.json` keeps new `agent-heavy run` calls waiting until it expires.
 
 ### Homebrew
 
@@ -126,7 +126,7 @@ Use the same shared queue across repositories and worktrees. Keep each tool's
 internal worker count conservative. Run small focused checks directly.
 ```
 
-The Go queue daemon owns submitted jobs independently of the calling terminal. The menu bar app starts and supervises the daemon, so the queue is available while the app is running; without it, `agent-heavy` reports that the queue daemon is unavailable instead of running the command directly. Closing the window does not stop jobs. Quitting the app stops the daemon, but running job processes keep running (see below). Abruptly losing a submitter leaves its accepted job visible until it finishes or is explicitly cancelled.
+The Go queue daemon owns submitted jobs independently of the calling terminal. The menu bar app starts and supervises the daemon, so the queue is available while the app is running; without it, `agent-heavy` reports that the queue daemon is unavailable instead of running the command directly. While a drain is active the daemon is not needed to decide what happens: the default `wait` caller waits, `--on-drain fail` exits 75, and only the explicit `--on-drain direct` choice runs the command outside the queue (see [Drain the queue](#drain-the-queue)). Closing the window does not stop jobs. Quitting the app stops the daemon, but running job processes keep running (see below). Abruptly losing a submitter leaves its accepted job visible until it finishes or is explicitly cancelled.
 
 ## View and manage jobs
 
@@ -147,6 +147,37 @@ agent-heavy cancel 17
 ```
 
 Replace `17` with a real job ID. The default parallel limit is one, adjustable from one through eight. Lowering the limit lets active jobs finish and holds future jobs. **Start now** starts one selected job alongside active work without changing the limit. Cancellation targets that job's positively identified owned processes.
+
+### Drain the queue
+
+A steady stream of submissions can keep the queue from ever emptying. `agent-heavy drain` closes intake without stopping the queue, and also lets callers survive an app restart:
+
+```sh
+agent-heavy drain [--for DURATION] [--wait] [--cancel-queued] [--cancel-running]
+agent-heavy undrain [--force]
+```
+
+- `drain` writes a private `drain.json` with an expiry. `--for` sets it (at least 1s, at most 24h) and replaces any existing expiry; without `--for` a new drain lasts 4h, while an already active drain keeps its expiry, so `drain --wait` or `drain --cancel-queued` can never shorten it. It needs no daemon unless a cancel flag or `--wait` is used, and it prints the expiry. If the daemon is down or lost for one of those flags, the error says intake stays closed until the expiry and how to reopen it. A queued or running job continues exactly as before, at the normal limit. A pause stays independent of a drain.
+- `--cancel-queued` cancels, in one pass inside the daemon, every job and lease that has not started; their callers exit 130. A job that has started is never touched by it, even if it started a moment before. With both cancel flags the queued pass runs first, so no queued job starts in the place of one you cancel. `--cancel-running` cancels running jobs and releases held leases, and alone it leaves queued jobs in place, which then start as slots free up; add `--cancel-queued` to cancel those too. Neither is ever implied.
+- `--wait` returns 0 once every job is done and its cleanup has finished. It prints progress about every 15 s, names a held lease that blocks it (release it or use `--cancel-running`) and says when the queue is paused, because queued jobs then do not start until `agent-heavy resume` or `undrain`. If the drain expires first it exits 1 and says intake has reopened. On a signal it exits 128 plus the signal and leaves the drain in place.
+- `undrain` reopens intake. With an active drain and a running daemon it resumes the queue first and removes the drain afterwards (if the resume fails the drain stays). That also ends a pause you set with `agent-heavy pause` or the pause after an unclean restart, and it says so when the queue was paused. With an active drain and no daemon it keeps the drain, exits 1 and tells you to open the app, wait until the queue is up and run it again, so that waiting callers stay attached; `undrain --force` drops the drain anyway and those callers then exit 125. With no active drain (none, expired or invalid file) it removes any stale file and changes nothing else, and in particular does not resume a paused queue.
+
+While a drain is active a new `agent-heavy run` follows the caller's `--on-drain` choice:
+
+| `--on-drain` | Behaviour |
+|---|---|
+| `wait` (default) | No job is created. The caller prints a notice every 15 s and waits until the drain ends, then submits normally if the queue is running. If the drain expires while the queue is paused the caller exits 125 with the usual paused-queue message, so run `undrain` before the drain expires. |
+| `fail` | Exits 75 at once. No job is created, nothing is left behind. |
+| `direct` | Runs the command in the caller, outside the queue, once, with stdin EOF, the same environment filtering and Go resource defaults, and nesting still refused. Refused with exit 2 for a non-default `--lane`, because lanes protect exclusive resources. |
+
+`agent-heavy lane acquire` (including `--no-wait`) is refused with exit 1 during a drain. `agent-heavy status` shows `Queue running, draining until HH:MM` and `status --json` adds `queue.drainUntil`. If the drain file is invalid or unsafe, intake stays closed (callers fail closed with exit 125), the status line says `intake closed by an invalid drain file` and `queue.drainError` carries the reason; `agent-heavy undrain` removes it.
+
+While a drain is active, a caller or a worker waiting for the shared slot does not exit 125 when the daemon disappears; it keeps waiting and returns the job's real exit status once a daemon is back, even if the job finished meanwhile. A queued job stays attached and starts after `undrain`. A drain does not spend the caller's outage budget (without a drain the caller gives up after about two minutes, as described above); if the drain ends during an outage, the ordinary budget starts at that moment. A signal to such a caller detaches it at once (exit 128 plus the signal) and never cancels the job: it prints `job N stays in the queue, use agent-heavy cancel N`. When the job already finished and only its cleanup waits for the daemon, the signal ends the wait and the caller reports the job's own exit status with a note, as it does for any unconfirmed cleanup. The same applies if the daemon disappears just as the signal arrives. A caller signalled while its job was finishing can take up to 12 s to detach, because it first waits for the job's cleanup. A `run` whose earlier submit was lost with the daemon says `submission outcome unknown` instead of `no job created yet`, and a signal then tells you the job may still exist, so check `agent-heavy status`. A `--on-drain direct` command runs in its own session and process group, so signals (SIGINT, SIGTERM, SIGHUP and SIGQUIT) reach its descendants and it has no controlling terminal. `drain --wait` and `drain --cancel-running` refuse to run inside a queued command, because they would wait for or cancel their own job. While the daemon is away during a drain, a waiting `run` whose submit may have been committed keeps retrying the same request: if the daemon then knows the job it attaches to it, and if it refuses because of the drain the caller goes back to the ordinary wait. A daemon and callers from before this feature ignore the drain, so it applies from the upgrade after the one that ships it. Once a drain expires, a lost daemon is handled by the ordinary budget: about two minutes of retries, then status 125 unless the queue store shows the job finished.
+
+Known limitations that the drain does not change:
+
+- If a job is killed with SIGKILL while its shared validation slot is being torn down, the slot can be left half removed. A caller attached across a daemon gap can then exit 125, and later jobs can fail until the slot is cleared by hand.
+- In adaptive mode, a job started with **Start now** that is still waiting for the shared validation slot after its admission grant expires can wait until it is cancelled. This is existing behaviour.
 
 The queue limits how many wrapped commands can run. A command may still create many workers or use substantial memory, so configure worker limits within your build and test tools too. There is no host memory quota, and persistent agent processes are not controlled by this queue.
 

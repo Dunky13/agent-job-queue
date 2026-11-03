@@ -25,7 +25,7 @@ func TestMain(m *testing.M) {
 			os.Exit(fixtureSuperviseHelpers(os.Args[2], os.Args[3:]...))
 		case fixturePhoneService:
 			os.Exit(fixtureHoldPhoneService(os.Args[2]))
-		case "daemon", "pause", "resume", "execute-attempt", "execute", "cleanup", "run", "status", "cancel", "limit", "next", "last", "priority", "start", "scheduler", "scheduling", "profiles", "agents", "updates", "version", "install":
+		case "daemon", "pause", "resume", "drain", "undrain", "execute-attempt", "execute", "cleanup", "run", "status", "cancel", "limit", "next", "last", "priority", "start", "scheduler", "scheduling", "profiles", "agents", "updates", "version", "install":
 			os.Exit(Main(os.Args[1:]))
 		}
 	}

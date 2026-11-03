@@ -46,7 +46,7 @@ func WaitCleanup(g *Gate, id int) error {
 	if err != nil {
 		return err
 	}
-	return waitCleanupWithToken(g, id, text(receipt["token"]))
+	return waitCleanupWithToken(g, id, text(receipt["token"]), nil)
 }
 
 // queueCleanupWindow is how long a finished job may wait for the daemon to
@@ -68,7 +68,12 @@ func (e *queueCleanupUnconfirmed) Error() string {
 }
 func (e *queueCleanupUnconfirmed) Unwrap() error { return e.cause }
 
-func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
+// waitCleanupWithToken waits for a finished job's receipt to go. While a drain
+// holds, a caller that passes signals keeps waiting through a daemon outage, as
+// it does in the follow loop, and a signal ends the wait with a note that the
+// job finished. Without signals (Cancel, WaitCleanup) the wait stays bounded,
+// because nothing else could end it during a long drain.
+func waitCleanupWithToken(g *Gate, id int, expectedToken string, signals <-chan os.Signal) error {
 	deadline := time.Now().Add(queueCleanupWindow)
 	waitingForHandover := false
 	for {
@@ -86,7 +91,7 @@ func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
 				if handoverError != nil {
 					return handoverError
 				}
-				if allowed {
+				if allowed || signals != nil && drainHolds(g) {
 					waitingForHandover = true
 					deadline = time.Now().Add(400 * time.Millisecond)
 					continue
@@ -107,7 +112,16 @@ func waitCleanupWithToken(g *Gate, id int, expectedToken string) error {
 			}
 			return fmt.Errorf("Job %d finished but cleanup did not complete; shared slot retained%s", id, causeSuffix(rpcError))
 		}
-		time.Sleep(100 * time.Millisecond)
+		// A drain lets a signal end the wait; elsewhere it stays for the caller.
+		var interrupts <-chan os.Signal
+		if drainHolds(g) {
+			interrupts = signals
+		}
+		select {
+		case <-interrupts:
+			return &queueCleanupUnconfirmed{fmt.Sprintf("Detaching while a drain waits for the queue daemon: job %d finished, and its cleanup completes when the daemon answers", id), nil}
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
@@ -184,6 +198,28 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		if errors.As(cause, &unconfirmed) {
 			cause = unconfirmed.cause // the end message says it once
 		}
+		if drainHolds(g) {
+			// A drain lets the app restart, so the outage neither spends the budget
+			// nor ends the run; the ordinary budget starts when the drain is over.
+			// An interrupt leaves the job queued instead of cancelling it, unless a
+			// cancellation was already acknowledged, which only the daemon can finish.
+			if pendingSignal != nil && cancelSentAt.IsZero() {
+				announceDetach(id)
+				return true, signalExit(pendingSignal), nil
+			}
+			outage.hold(cause)
+			select {
+			case sig := <-signals:
+				if pendingSignal != nil {
+					code, err = end(interruptedAgain(" while the queue daemon was not answering"), cause)
+					return true, code, err
+				}
+				announceDetach(id)
+				return true, signalExit(sig), nil
+			case <-time.After(outage.delay()):
+			}
+			return false, 0, nil
+		}
 		if !outage.lose(cause) {
 			prefix := fmt.Sprintf("Lost contact with the queue daemon for %s", outage.elapsed())
 			if pendingSignal != nil {
@@ -256,7 +292,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			if err != nil {
 				return 125, err
 			}
-			if err = cleanupNote(waitCleanupWithToken(g, id, expectedToken), code); err != nil {
+			if err = cleanupNote(waitCleanupWithToken(g, id, expectedToken, signals), code); err != nil {
 				return 125, err
 			}
 			_, err = Drain(path, offset)
@@ -296,7 +332,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			if !ok || code < 0 || code > 255 {
 				return 125, errors.New("Invalid cancellation result")
 			}
-			if err = cleanupNote(waitCleanupWithToken(g, id, expectedToken), code); err != nil {
+			if err = cleanupNote(waitCleanupWithToken(g, id, expectedToken, signals), code); err != nil {
 				return 125, err
 			}
 			_, err = Drain(path, offset)
@@ -351,6 +387,12 @@ func announcePausedQueue(g *Gate, id int) (shown, answered bool) {
 	}
 	fmt.Fprintf(os.Stderr, "agent-heavy: the queue is paused; job %d will not start until the queue is resumed\n", id)
 	return true, true
+}
+
+// announceDetach says what an interrupted caller leaves behind when a drain
+// keeps it waiting for the daemon: the job stays queued and cancelling is explicit.
+func announceDetach(id int) {
+	fmt.Fprintf(os.Stderr, "agent-heavy: detaching; job %d stays in the queue, use agent-heavy cancel %d\n", id, id)
 }
 
 func causeSuffix(err error) string {
@@ -535,6 +577,12 @@ func Run(g *Gate, argv []string, label string) (code int, err error) {
 
 // RunInLane is Run in a plugin lane. Without a lane it is exactly Run.
 func RunInLane(g *Gate, argv []string, label, lane string) (code int, err error) {
+	return RunInLaneOnDrain(g, argv, label, lane, drainWait)
+}
+
+// RunInLaneOnDrain is RunInLane with the caller's choice (wait, fail or direct)
+// for a submission that meets an active drain.
+func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code int, err error) {
 	if lane == defaultLaneName {
 		lane = ""
 	}
@@ -555,32 +603,22 @@ func RunInLane(g *Gate, argv []string, label, lane string) (code int, err error)
 	if err = g.Prepare(); err != nil {
 		return 125, err
 	}
-	snapshot, err := g.Snapshot()
+	signals := make(chan os.Signal, 8)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(signals)
+	// Before the snapshot: a drain needs no daemon, and no job exists yet.
+	until, draining, err := drainUntil(g)
 	if err != nil {
 		return 125, err
 	}
-	group := defaultGroup(snapshot)
-	limit, ok := integer(group["parallel_tasks"])
-	if !ok {
-		return 125, errors.New("Invalid parallel limit")
-	}
-	if err = ValidateLimit(limit); err != nil {
-		return 125, err
-	}
-	if group["status"] != "Running" {
-		return 125, errors.New("Dedicated default queue must be Running; no command was submitted")
-	}
-	if lane != "" {
-		// An older daemon ignores unknown submission fields; refuse before it
-		// could run the command in the default lane.
-		if obj(snapshot["lanes"]) == nil {
-			fmt.Fprintln(os.Stderr, "agent-heavy:", errLanesUnsupported)
-			return laneExitUsage, nil
+	if draining {
+		if code, done, err := applyDrainPolicy(g, onDrain, argv, lane, until, signals); done || err != nil {
+			return code, err
 		}
-		if definition := snapshotLane(snapshot, lane); definition == nil || definition["removed"] == true {
-			fmt.Fprintln(os.Stderr, "agent-heavy:", unknownLaneError(snapshot, lane))
-			return laneExitUsage, nil
-		}
+	}
+	snapshot, code, err := submissionPrecheck(g, lane)
+	if code != 0 || err != nil {
+		return code, err
 	}
 	jobToken := token()
 	path, _ := g.PayloadPath(jobToken)
@@ -602,12 +640,7 @@ func RunInLane(g *Gate, argv []string, label, lane string) (code int, err error)
 	if err = WritePrivate(filepath.Join(g.State, "workloads", jobToken+".json"), identity); err != nil {
 		return 125, err
 	}
-	forwarded := map[string]string{}
-	for k, v := range envMap() {
-		if !strings.HasPrefix(k, "AGENT_HEAVY_") && !strings.HasPrefix(k, "PUEUE_") {
-			forwarded[k] = v
-		}
-	}
+	forwarded := forwardedEnvironment()
 	caller, err := queueHandoverIdentity()
 	if err != nil {
 		return 125, err
@@ -616,48 +649,126 @@ func RunInLane(g *Gate, argv []string, label, lane string) (code int, err error)
 	if err = WriteJobPayload(path, content); err != nil {
 		return 125, err
 	}
-	signals := make(chan os.Signal, 8)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(signals)
 	id := -1
 	submitted := false
+	discard := func() {
+		_ = removeMissing(path)
+		_ = removeMissing(filepath.Join(g.State, "workloads", jobToken+".json"))
+		_ = removeMissing(filepath.Join(g.Metadata, jobToken+".json"))
+	}
 	defer func() {
 		if id < 0 && !submitted {
-			_ = removeMissing(path)
+			discard()
 		}
 	}()
-	unlock, err := LockPrivate(g, "scheduling.lock")
-	if err != nil {
-		return 125, err
-	}
-	_, err = SchedulingSettings(g)
-	if err != nil {
-		unlock()
-		return 125, err
-	}
-	submitted = true
 	// Lane submissions use their own operation, which an older daemon rejects
 	// outright instead of queueing the command in the default lane.
 	operation, request := "submit", Object{"token": jobToken}
 	if lane != "" {
 		operation, request = "submit-lane", Object{"token": jobToken, "lane": lane}
 	}
-	added, err := g.QueueControl(operation, request)
-	// A lost response does not establish whether submission committed. Reconcile
-	// using the same immutable token; the daemon returns the original identity.
-	for retry := 0; err != nil && !errors.Is(err, errQueueHandoverBusy) && !errors.Is(err, errQueueUnknownLane) && retry < 2; retry++ {
-		added, err = g.QueueControl(operation, request)
+	// The signal handler has been registered since before the drain check, so a
+	// signal that arrived during preparation must not turn into a job now.
+	select {
+	case sig := <-signals:
+		return signalExit(sig), nil
+	default:
+	}
+	var unlock func()
+	var added Object
+	lostNotice := time.Time{}
+	// responseLost records that some attempt ended without a definite answer, so
+	// that an earlier attempt may have committed. From then on the files stay,
+	// whatever a later attempt is told.
+	responseLost := false
+	attempt := func() (Object, error) {
+		result, e := g.QueueControl(operation, request)
+		var answered *queueAnsweredError
+		if e != nil && !errors.As(e, &answered) && !errors.Is(e, errQueueHandoverBusy) && !errors.Is(e, errQueueUnknownLane) && !errors.Is(e, errQueueDraining) {
+			responseLost = true
+		}
+		return result, e
+	}
+	unknown := func(e error) error {
+		if responseLost {
+			return fmt.Errorf("%w; the outcome of the earlier submission is unknown, so a job may already exist, check agent-heavy status", e)
+		}
+		return e
+	}
+	for {
+		if unlock, err = LockPrivate(g, "scheduling.lock"); err != nil {
+			return 125, unknown(err)
+		}
+		if _, err = SchedulingSettings(g); err != nil {
+			unlock()
+			return 125, unknown(err)
+		}
+		submitted = true
+		added, err = attempt()
+		// A lost response does not establish whether submission committed. Reconcile
+		// using the same immutable token; the daemon returns the original identity.
+		for retry := 0; err != nil && !errors.Is(err, errQueueHandoverBusy) && !errors.Is(err, errQueueUnknownLane) && !errors.Is(err, errQueueDraining) && retry < 2; retry++ {
+			added, err = attempt()
+		}
+		// A drain began after the check above: the daemon refused before it
+		// recorded the token, so nothing is submitted and the token stays usable.
+		refused := errors.Is(err, errQueueDraining)
+		// A wait caller keeps retrying the same token while the daemon is away
+		// during a drain: the token lookup runs before the drain refusal, so an id
+		// means the earlier submit committed and a refusal means it did not.
+		// Fail and direct never run on an unknown outcome.
+		lost := err != nil && !refused && onDrain == drainWait && errors.Is(err, errQueueTransportUnavailable) && drainHolds(g)
+		if !refused && !lost {
+			break
+		}
+		unlock()
+		if lost {
+			if time.Since(lostNotice) >= drainNoticePeriod {
+				until, _, _ := drainUntil(g)
+				fmt.Fprintf(os.Stderr, "agent-heavy: queue draining until %s; submission outcome unknown; retrying the same request when the queue returns (a job may already exist, check agent-heavy status)\n", drainClock(until))
+				lostNotice = time.Now()
+			}
+			select {
+			case sig := <-signals:
+				fmt.Fprintln(os.Stderr, "agent-heavy: stopped before the submission outcome was known; the job may still exist, check agent-heavy status")
+				return signalExit(sig), nil
+			case <-time.After(500 * time.Millisecond):
+			}
+			continue
+		}
+		submitted = false
+		// The token lookup precedes the refusal, so no earlier attempt committed.
+		responseLost = false
+		if until, draining, err = drainUntil(g); err != nil {
+			return 125, err
+		}
+		if draining {
+			if onDrain != drainWait {
+				discard()
+			}
+			if c, done, e := applyDrainPolicy(g, onDrain, argv, lane, until, signals); done || e != nil {
+				return c, e
+			}
+		}
+		// The queue may have changed while we waited: check it again before submitting.
+		if snapshot, code, err = submissionPrecheck(g, lane); code != 0 || err != nil {
+			return code, err
+		}
 	}
 	if err != nil {
 		unlock()
-		if errors.Is(err, errQueueHandoverBusy) || errors.Is(err, errQueueUnknownLane) {
+		var answered *queueAnsweredError
+		// A daemon that answered the first attempt with an error refused the
+		// request, so nothing was created and the files can go. After any lost
+		// response a later answer proves nothing about the earlier attempt.
+		if errors.Is(err, errQueueHandoverBusy) || errors.Is(err, errQueueUnknownLane) || errors.As(err, &answered) && !responseLost {
 			submitted = false
 		}
 		if errors.Is(err, errQueueUnknownLane) {
 			fmt.Fprintln(os.Stderr, "agent-heavy:", unknownLaneError(snapshot, lane))
 			return laneExitUsage, nil
 		}
-		return 125, err
+		return 125, unknown(err)
 	}
 	var acknowledged bool
 	id, acknowledged = integer(added["id"])
@@ -669,6 +780,85 @@ func RunInLane(g *Gate, argv []string, label, lane string) (code int, err error)
 	unlock()
 	fmt.Fprintf(os.Stderr, "agent-heavy: job %d queued\n", id)
 	return followWithToken(g, id, signals, jobToken)
+}
+
+// forwardedEnvironment is the caller's environment without queue control variables.
+func forwardedEnvironment() map[string]string {
+	forwarded := map[string]string{}
+	for k, v := range envMap() {
+		if !strings.HasPrefix(k, "AGENT_HEAVY_") && !strings.HasPrefix(k, "PUEUE_") {
+			forwarded[k] = v
+		}
+	}
+	return forwarded
+}
+
+// queueCommandEnvironment marks the command as queued (so nesting is refused)
+// and applies the Go resource defaults a queued command gets.
+func queueCommandEnvironment(forwarded map[string]string, active string) map[string]string {
+	forwarded["AGENT_HEAVY_ACTIVE"] = active
+	for k, v := range map[string]string{"GOMAXPROCS": "2", "GOMEMLIMIT": "512MiB", "GOGC": "50"} {
+		if _, ok := forwarded[k]; !ok {
+			forwarded[k] = v
+		}
+	}
+	return forwarded
+}
+
+// commandExitCode maps the result of running a command to its exit status. A
+// non-nil error is a failure that is not the command's own.
+func commandExitCode(err error) (int, error) {
+	if err == nil {
+		return 0, nil
+	}
+	if exit, ok := err.(*exec.ExitError); ok {
+		if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			return 128 + int(status.Signal()), nil
+		}
+		return exit.ExitCode(), nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintln(os.Stderr, "agent-heavy: command executable or working directory does not exist")
+		return 127, nil
+	}
+	if errors.Is(err, os.ErrPermission) {
+		fmt.Fprintln(os.Stderr, "agent-heavy: command executable or working directory is inaccessible")
+		return 126, nil
+	}
+	return 0, err
+}
+
+// submissionPrecheck refuses before anything is submitted. A non-zero code ends
+// the call with that exit status.
+func submissionPrecheck(g *Gate, lane string) (Object, int, error) {
+	snapshot, err := g.Snapshot()
+	if err != nil {
+		return nil, 125, err
+	}
+	group := defaultGroup(snapshot)
+	limit, ok := integer(group["parallel_tasks"])
+	if !ok {
+		return nil, 125, errors.New("Invalid parallel limit")
+	}
+	if err = ValidateLimit(limit); err != nil {
+		return nil, 125, err
+	}
+	if group["status"] != "Running" {
+		return nil, 125, errors.New("Dedicated default queue must be Running; no command was submitted")
+	}
+	if lane != "" {
+		// An older daemon ignores unknown submission fields; refuse before it
+		// could run the command in the default lane.
+		if obj(snapshot["lanes"]) == nil {
+			fmt.Fprintln(os.Stderr, "agent-heavy:", errLanesUnsupported)
+			return snapshot, laneExitUsage, nil
+		}
+		if definition := snapshotLane(snapshot, lane); definition == nil || definition["removed"] == true {
+			fmt.Fprintln(os.Stderr, "agent-heavy:", unknownLaneError(snapshot, lane))
+			return snapshot, laneExitUsage, nil
+		}
+	}
+	return snapshot, 0, nil
 }
 func Execute(g *Gate, value string) (int, error) {
 	return executeWithAttempt(g, value, "")
@@ -787,7 +977,7 @@ func executeWithAttempt(g *Gate, value, attempt string) (int, error) {
 			if handoverErr != nil {
 				return 125, handoverErr
 			}
-			if !allowed {
+			if !allowed && !drainHolds(g) {
 				return 125, err
 			}
 		}
@@ -802,30 +992,9 @@ func executeWithAttempt(g *Gate, value, attempt string) (int, error) {
 		return 130, nil
 	default:
 	}
-	forwarded["AGENT_HEAVY_ACTIVE"] = value
-	for k, v := range map[string]string{"GOMAXPROCS": "2", "GOMEMLIMIT": "512MiB", "GOGC": "50"} {
-		if _, ok := forwarded[k]; !ok {
-			forwarded[k] = v
-		}
-	}
-	err = runExecutableForEnvironment(argv, cwd, forwarded, os.Stdout, os.Stderr)
-	code := 0
+	code, err := commandExitCode(runExecutableForEnvironment(argv, cwd, queueCommandEnvironment(forwarded, value), os.Stdout, os.Stderr))
 	if err != nil {
-		if exit, ok := err.(*exec.ExitError); ok {
-			if status, ok := exit.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-				code = 128 + int(status.Signal())
-			} else {
-				code = exit.ExitCode()
-			}
-		} else if errors.Is(err, os.ErrNotExist) {
-			fmt.Fprintln(os.Stderr, "agent-heavy: command executable or working directory does not exist")
-			code = 127
-		} else if errors.Is(err, os.ErrPermission) {
-			fmt.Fprintln(os.Stderr, "agent-heavy: command executable or working directory is inaccessible")
-			code = 126
-		} else {
-			return 125, err
-		}
+		return 125, err
 	}
 	members, err = ProcessGroupMembers(pgid)
 	if err != nil {

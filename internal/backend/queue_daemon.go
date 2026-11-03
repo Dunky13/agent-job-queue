@@ -93,7 +93,7 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 		return g.queueControl(operation, payload)
 	}
 	if e := safeQueueSocket(queueSocket(g)); e != nil {
-		return nil, fmt.Errorf("Queue daemon unavailable; command was not run directly: %w", queueTransportError(e))
+		return nil, fmt.Errorf("Queue daemon unavailable; nothing runs outside the queue: %w", queueTransportError(e))
 	}
 	deadline := time.Now().Add(15 * time.Second)
 	if !g.ControlDeadline.IsZero() && g.ControlDeadline.Before(deadline) {
@@ -105,7 +105,7 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 	dialer := net.Dialer{Deadline: deadline}
 	conn, e := dialer.DialContext(ctx, "unix", queueSocket(g))
 	if e != nil {
-		return nil, fmt.Errorf("Queue daemon unavailable; command was not run directly: %w", queueTransportError(e))
+		return nil, fmt.Errorf("Queue daemon unavailable; nothing runs outside the queue: %w", queueTransportError(e))
 	}
 	defer conn.Close()
 	stopCancellation := context.AfterFunc(ctx, func() { _ = conn.Close() })
@@ -129,6 +129,8 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 		switch response.ErrorCode {
 		case "handover-busy":
 			return nil, errQueueHandoverBusy
+		case "queue-draining":
+			return nil, queueCodedError(errQueueDraining, response.Error)
 		case "lane-full":
 			return nil, queueCodedError(errQueueLaneFull, response.Error)
 		case "lane-unknown":
@@ -138,7 +140,7 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 		case "lease-owner":
 			return nil, queueCodedError(errQueueLeaseOwner, response.Error)
 		}
-		return nil, errors.New(response.Error)
+		return nil, &queueAnsweredError{response.Error}
 	}
 	if response.Result == nil {
 		return nil, errors.New("Empty queue daemon response")
@@ -188,6 +190,12 @@ type queueDaemon struct {
 	logOutput    io.Writer
 }
 
+// queueAnsweredError is an error the daemon itself returned. It refused the
+// request, so nothing the request would have created exists.
+type queueAnsweredError struct{ message string }
+
+func (e *queueAnsweredError) Error() string { return e.message }
+
 // queueCodedError keeps the daemon's message while restoring the sentinel the
 // caller branches on; the transport only carries strings.
 func queueCodedError(sentinel error, message string) error {
@@ -201,6 +209,8 @@ func queueErrorCode(err error) string {
 	switch {
 	case errors.Is(err, errQueueHandoverBusy):
 		return "handover-busy"
+	case errors.Is(err, errQueueDraining):
+		return "queue-draining"
 	case errors.Is(err, errQueueLaneFull):
 		return "lane-full"
 	case errors.Is(err, errQueueUnknownLane):
@@ -510,11 +520,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	case "submit":
 		return d.submit(p)
 	case "submit-lane":
-		lane := text(p["lane"])
-		if _, ok := d.plugins.lanes[lane]; !ok {
-			return nil, fmt.Errorf("%w %q", errQueueUnknownLane, lane)
-		}
-		return d.submitLane(p, lane)
+		return d.submitLane(p, text(p["lane"]))
 	case "lease-acquire":
 		return d.acquireLease(p)
 	case "lease-renew":
@@ -556,6 +562,9 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 			return nil, e
 		}
 		return d.store.settings()
+	}
+	if op == "cancel-queued" {
+		return d.cancelQueued()
 	}
 	id, ok := integer(p["id"])
 	if !ok || id < 0 {
@@ -688,6 +697,35 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	}
 	return d.snapshot()
 }
+
+// cancelQueued cancels every job and lease that has not started, in one pass
+// under the daemon lock: a job cannot start between two cancellations, and a
+// started job is never touched. Each job moves through the store's own
+// transitions, exactly as cancel on a queued job does.
+func (d *queueDaemon) cancelQueued() (Object, error) {
+	jobs, e := d.store.unfinishedJobs()
+	if e != nil {
+		return nil, e
+	}
+	cancelled := 0
+	for _, j := range jobs {
+		if j.phase != "queued" {
+			continue
+		}
+		if taskIsLease(j.task) {
+			e = d.endLease(j, "cancelled")
+		} else {
+			if e = d.markCancelled(j); e == nil {
+				e = d.finish(j, 130)
+			}
+		}
+		if e != nil {
+			return nil, e
+		}
+		cancelled++
+	}
+	return Object{"cancelled": cancelled}, nil
+}
 func (d *queueDaemon) submit(p Object) (Object, error) {
 	return d.submitLane(p, defaultLaneName)
 }
@@ -701,6 +739,14 @@ func (d *queueDaemon) submitLane(p Object, lane string) (Object, error) {
 		return Object{"id": existing}, nil
 	}
 	if !errors.Is(e, sql.ErrNoRows) {
+		return nil, e
+	}
+	// After the token lookup, so that a retried token still finds its job when
+	// the lane was removed in the meantime.
+	if _, ok := d.plugins.lanes[lane]; !ok && lane != defaultLaneName {
+		return nil, fmt.Errorf("%w %q", errQueueUnknownLane, lane)
+	}
+	if e = d.refuseDraining(); e != nil {
 		return nil, e
 	}
 	settings, e := d.store.settings()
