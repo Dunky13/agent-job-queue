@@ -14,7 +14,10 @@ The test waited 8 seconds for the `started` file of a job submitted by a real
    and fsynced private writes (description, workload identity, job payload).
 2. The daemon's 100 ms dispatch tick and one worker process start.
 
-Evidence, from two hosted Intel runs of the scenarios that failed in CI:
+Evidence, from two temporary diagnostic runs on the hosted Intel runner (GitHub Actions
+runs 41568662224 unstressed and 41571805471 stressed, from a scratch branch since deleted).
+The original hosted failures (for example run 41548654243) were never instrumented, so
+the mechanism below comes from the stressed reproduction, whose signature matched them:
 
 - Without load, 16 of 16 starts took 0.78 to 2.7 s. The failure does not occur
   on an idle runner.
@@ -40,7 +43,7 @@ Test only, in `internal/backend/install_live_runtime_test.go`:
   start (blocker, active job, and the finish-pending caller) with the two
   conditions that precede the file: the daemon lists the job, then the command
   creates `started`.
-- The first stage ends on the daemon's acceptance, not on a clock. If the caller
+- The first stage ends on the daemon's acceptance, not on a new clock. If the caller
   exits first the test fails at once with its exit error and output instead of
   eight seconds later. The scenario's existing 60 s (3 min for finish-pending)
   context still bounds a wedged caller.
