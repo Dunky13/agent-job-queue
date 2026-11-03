@@ -114,7 +114,7 @@ func (install *installer) managedMayUnregisterPending(service string) bool {
 }
 
 func (install *installer) managedVerify(ctx context.Context, app string) error {
-	if err := installValidatePayloadTree(app, true); err != nil {
+	if err := installValidatePayloadTree(app); err != nil {
 		return err
 	}
 	if err := appservices.ValidateBundle(app); err != nil {
@@ -181,7 +181,7 @@ func (install *installer) managedLegacyDefinition(label string, value Object) er
 		// An explicit Finder target can differ from the old canonical app. The
 		// old menu command remains owned; never reinterpret it as the new target.
 		if args[2] != install.app && args[2] != filepath.Join(install.home, "Applications/Agent Queue.app") && args[2] != "/Applications/Agent Queue.app" {
-			raw, err := installReadPayload(args[2], filepath.Join(args[2], "Contents/Info.plist"), 16384, true)
+			raw, err := installReadPayload(args[2], filepath.Join(args[2], "Contents/Info.plist"), 16384)
 			if err != nil {
 				return err
 			}
@@ -219,23 +219,36 @@ func (install *installer) managedSnapshot(ctx context.Context) (Object, error) {
 }
 
 func (install *installer) managedDrain(ctx context.Context, p *managedPlan) error {
+	appRunning := false
 	for name, label := range map[string]string{"queue-daemon.lock": "io.went.agent-heavy", "resource-controller.lock": "io.went.agent-resources"} {
 		busy, err := installInspectLock(install.state, name)
 		if err != nil {
 			return err
 		}
 		if busy && !p.loaded[label] {
-			return errors.New("An unowned queue process holds its lifetime lock; setup refused before service mutation")
+			if err := install.managedHeldByApp(ctx, p.serviceApp(install.app), filepath.Join(install.state, name), "agent-heavy"); err != nil {
+				return fmt.Errorf("An unowned queue process holds its lifetime lock; setup refused before service mutation: %w", err)
+			}
+			appRunning = true
 		}
 	}
 	busy, err := installInspectLock(filepath.Join(install.state, "remote"), "supervisor.lock")
 	if err != nil {
 		return err
 	}
+	remoteRunning := false
 	if busy && !p.loaded["io.went.agent-remote"] {
-		return errors.New("An unowned phone access process holds its lifetime lock; setup refused before service mutation")
+		if err := install.managedHeldByApp(ctx, p.serviceApp(install.app), filepath.Join(install.state, "remote/supervisor.lock"), "agent-remote"); err != nil {
+			return fmt.Errorf("An unowned phone access process holds its lifetime lock; setup refused before service mutation: %w", err)
+		}
+		appRunning, remoteRunning = true, true
 	}
-	if (install.prepareReplacement || install.unregisterServices) && !p.loaded["io.went.agent-remote"] {
+	if appRunning && !install.unregisterServices {
+		return errInstallAppRunning
+	}
+	// A phone service the app supervises legitimately holds these records until
+	// the app stops it. managedStopped checks them again after that.
+	if install.unregisterServices && !p.loaded["io.went.agent-remote"] && !remoteRunning {
 		cleanup, err := install.disabledRemoteCleanup(ctx)
 		if err != nil {
 			return err
@@ -243,6 +256,9 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		if cleanup {
 			return errors.New("Phone access has retained process ownership records without an owned loaded service; disable phone access before retrying")
 		}
+	}
+	if appRunning {
+		return install.managedRunningAppDrained(ctx)
 	}
 	if p.pueue {
 		return nil
@@ -271,7 +287,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		// The owned resource controller may still run: it never writes the
 		// queue store, and app-bundle setup quiesces it and repeats the
 		// complete offline drain before any mutation.
-		if busy, lockErr := installInspectLock(install.state, "queue-daemon.lock"); install.appBundle && lockErr == nil && !busy && exists {
+		if busy, lockErr := installInspectLock(install.state, "queue-daemon.lock"); lockErr == nil && !busy && exists {
 			return install.managedOfflineDrainHolding(ctx, p, "queue-daemon.lock")
 		}
 		return fmt.Errorf("Cannot verify the installed queue is drained; no service was changed: %w", err)
@@ -286,15 +302,72 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 	return install.requireLegacyCleanup()
 }
 
-// Inspect a stopped queue using private copies. SQLite may create sidecars even
-// in read-only mode, so never open the user's live database during preflight.
-func (install *installer) managedOfflineDrain(ctx context.Context) error {
-	return install.managedOfflineDrainHolding(ctx, nil, "queue-daemon.lock", "resource-controller.lock")
+// managedHeldByApp checks that every process holding a lifetime lock is app's own
+// helper, running as a child of app. launchd knows nothing of those, so each
+// process's exec path and parent are the evidence. An exec path names what was
+// run, not the file there now, so a moved or replaced bundle does not change it.
+// Anything else, including no evidence, leaves the holder unowned, and the error
+// says which evidence was missing.
+func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helper string) error {
+	output, err := install.run(ctx, "/usr/sbin/lsof", "-nP", "-t", "--", lock)
+	if err != nil {
+		return err
+	}
+	holders := strings.Fields(string(output))
+	for _, holder := range holders {
+		pid, err := strconv.Atoi(holder)
+		if err != nil || pid <= 1 {
+			return fmt.Errorf("holder %q is not a process", holder)
+		}
+		executable, err := installProcessExecutable(pid)
+		if err != nil {
+			return fmt.Errorf("holder %d cannot be read: %w", pid, err)
+		} else if executable != filepath.Join(app, "Contents/MacOS", helper) {
+			return fmt.Errorf("holder %d runs %s", pid, executable)
+		}
+		parent, err := installProcessParent(pid)
+		if err != nil {
+			return fmt.Errorf("holder %d has no readable parent: %w", pid, err)
+		} else if parent <= 1 {
+			return fmt.Errorf("holder %d has parent %d", pid, parent)
+		}
+		executable, err = installProcessExecutable(parent)
+		if err != nil {
+			return fmt.Errorf("parent %d of holder %d cannot be read: %w", parent, pid, err)
+		} else if executable != filepath.Join(app, "Contents/MacOS/AgentQueue") {
+			return fmt.Errorf("parent %d of holder %d runs %s", parent, pid, executable)
+		}
+	}
+	if len(holders) == 0 {
+		return errors.New("no holder found")
+	}
+	return nil
+}
+
+// managedRunningAppDrained asks the running daemon, because removal may only quit
+// the app when that strands nothing. It changes nothing either way.
+func (install *installer) managedRunningAppDrained(ctx context.Context) error {
+	snapshot, err := install.managedSnapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("Cannot verify that the running queue is drained. The app was left running and nothing was changed: %w", err)
+	}
+	tasks := obj(snapshot["tasks"])
+	if tasks == nil {
+		return errors.New("Cannot verify that the running queue is drained: invalid queue snapshot. The app was left running and nothing was changed")
+	}
+	var drain *installDrainPendingError
+	if err := installRequireDrained(tasks); errors.As(err, &drain) {
+		drain.removal = true
+		return drain
+	} else if err != nil {
+		return err
+	}
+	return install.requireLegacyCleanup()
 }
 
 // Each named lifetime lock must be free; its owner could still change the store.
-// Payload setup requires the stopped store to be drained. A supervised app
-// bundle recovering at the same location does not: the app stops its daemon
+// A supervised app bundle recovering at the same location does not need the
+// stopped store to be drained: the app stops its daemon
 // when it quits, and only the app can start the daemon whose
 // dirty-restart recovery pauses and re-adopts unfinished jobs. A drain wait
 // could therefore never end. Only a running launchd daemon, which unregistering
@@ -347,7 +420,7 @@ func (install *installer) managedOfflineDrainHolding(ctx context.Context, p *man
 	// Only recovery at the same app location can preserve unfinished work for
 	// the supervised daemon to reconcile. Removal and relocation retire custody
 	// that its original callers and workers may still need.
-	if p != nil && install.managedSupervised(p) && !install.unregisterServices && !install.prepareReplacement && p.relocation == nil {
+	if p != nil && install.managedSupervised(p) && !install.unregisterServices && p.relocation == nil {
 		return install.requireLegacyCleanup()
 	}
 	tasks, err := stoppedQueueTasks(ctx, db, filepath.Join(temporary, "queue.sqlite3"))
@@ -412,7 +485,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 			p.node = nil
 		}
 	}
-	if err := install.validateServices(); err != nil {
+	if install.serviceSlot, err = install.validateServices(); err != nil {
 		return nil, err
 	}
 	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-queue"} {
@@ -478,41 +551,31 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	// Inspect registrations even for a first install: a Finder-copied bundle may
 	// already own services. Status is read-only; denied approval is never retried.
 	statusApp := p.serviceApp(install.app)
-	if !install.appBundle {
-		if exists, err := updateExists(install.app); err != nil {
-			return nil, err
-		} else if !exists {
-			statusApp = ""
-		}
+	raw, err := installReadPayload(statusApp, filepath.Join(statusApp, "Contents/Info.plist"), 16384)
+	if err != nil {
+		return nil, err
 	}
-	if statusApp != "" {
-		raw, err := installReadPayload(statusApp, filepath.Join(statusApp, "Contents/Info.plist"), 16384, true)
-		if err != nil {
+	var info Object
+	if _, err := plist.Unmarshal(raw, &info); err != nil {
+		return nil, err
+	}
+	if info["AgentQueueServiceManagement"] == true {
+		if err := install.managedVerify(ctx, statusApp); err != nil {
 			return nil, err
 		}
-		var info Object
-		if _, err := plist.Unmarshal(raw, &info); err != nil {
-			return nil, err
-		}
-		if info["AgentQueueServiceManagement"] == true {
-			if err := install.managedVerify(ctx, statusApp); err != nil {
+		for _, service := range []string{"queue", "resources", "remote", "login"} {
+			status, err := install.managedStatus(ctx, statusApp, service)
+			if err != nil {
 				return nil, err
 			}
-			for _, service := range []string{"queue", "resources", "remote", "login"} {
-				status, err := install.managedStatus(ctx, statusApp, service)
-				if err != nil {
+			// Setup migrates registrations awaiting approval and never waits for
+			// the login item.
+			if status == "notFound" && install.unregisterServices {
+				if err := install.managedRemovalNotFound(ctx, service); err != nil {
 					return nil, err
 				}
-				// App-bundle setup migrates registrations awaiting approval and never
-				// waits for the login item. The payload path still pauses for approval.
-				if status == "requiresApproval" && !install.unregisterServices && !install.appBundle {
-					return nil, &installApprovalError{service: service}
-				}
-				if status == "notFound" && (install.prepareReplacement || install.unregisterServices) {
-					return nil, fmt.Errorf("The %s service is %s; resolve it before retrying setup", service, status)
-				}
-				p.statuses[service] = status
 			}
+			p.statuses[service] = status
 		}
 	}
 	if p.previous != nil {
@@ -592,7 +655,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 // location record naming a missing app. Once no service runs from that app and
 // no retained backup sits beside it, the record owns nothing.
 func (install *installer) managedStaleInstallation(ctx context.Context, previous *appservices.Installation) (bool, error) {
-	if !install.appBundle || install.prepareReplacement || install.unregisterServices || previous == nil || previous.App == install.app {
+	if install.unregisterServices || previous == nil || previous.App == install.app {
 		return false, nil
 	}
 	if exists, err := updateExists(previous.App); err != nil || exists {
@@ -626,7 +689,7 @@ func (install *installer) managedLoaded(raw []byte, label, app string) error {
 	if managedLoadedBundleProgram(raw, executable, helper, command) {
 		return nil
 	}
-	return errors.New("Loaded service differs from the canonical managed helper; no process was stopped")
+	return errors.New("Loaded service differs from the canonical managed helper; it was left running")
 }
 
 // Newer launchd prints a bundle-relative "program identifier" for Service
@@ -830,7 +893,9 @@ func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan)
 	// finished. Taking a lock never authorizes killing an uncertain process.
 	for _, name := range []string{"queue-daemon.lock", "resource-controller.lock"} {
 		lock, err := installLock(install.state, name)
-		if err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return fmt.Errorf("Old service has not stopped: it still holds %s: %w", name, unix.EWOULDBLOCK)
+		} else if err != nil {
 			return fmt.Errorf("Old service has not stopped: %w", err)
 		}
 		lock.Close()
@@ -855,7 +920,7 @@ func managedBundleDigest(app string) ([32]byte, error) {
 		if !entry.Type().IsRegular() {
 			return errors.New("Unsafe bundle entry")
 		}
-		raw, err := installReadPayload(app, path, updateMaxArchive, true)
+		raw, err := installReadPayload(app, path, updateMaxArchive)
 		if err != nil {
 			return err
 		}
@@ -869,10 +934,9 @@ func managedBundleDigest(app string) ([32]byte, error) {
 }
 
 // Shared Applications is a system-owned parent, never a private directory to
-// chmod. Refuse a payload replacement this account cannot finish before stopping
-// services; immutable root-owned bundles remain supported for explicit setup.
+// chmod. Setup copies no code, so it only needs write access to finish or retire
+// a publication an older release left retained beside the app.
 func (install *installer) managedPublicationAccess() error {
-	parent := filepath.Dir(install.app)
 	publication, err := install.managedPublicationParent(false)
 	if err != nil {
 		return err
@@ -881,221 +945,36 @@ func (install *installer) managedPublicationAccess() error {
 	if err := install.managedLifecycleCustody(); err != nil {
 		return err
 	}
-	if install.appBundle {
-		if err := install.managedBackupAccess(); err != nil {
-			return err
-		}
-		if exists, err := updateExists(install.managedPreviousPath()); err != nil {
-			return err
-		} else if exists {
-			if err := unix.Faccessat(int(publication.Fd()), ".", unix.W_OK|unix.X_OK, 0); err != nil {
-				return errors.New("Completing the retained publication requires write access to its application directory; no services were changed")
-			}
-		}
-		return nil // No publication writes are required when no backup is retained.
-	}
-	if install.prepareReplacement || install.unregisterServices {
-		return nil // These operations preserve app bundles rather than publish them.
-	}
 	if err := install.managedBackupAccess(); err != nil {
 		return err
-	}
-	if err := install.managedStagingAccess(publication); err != nil {
-		return err
-	}
-	if err := managedCopySourceAccess(filepath.Join(install.payload, "Agent Queue.app")); err != nil {
-		return err
-	}
-	if exists, err := updateExists(parent); err != nil {
-		return err
-	} else if exists {
-		if err := unix.Access(parent, unix.W_OK|unix.X_OK); err != nil {
-			return errors.New("Application directory is not writable by this account; no services were changed")
-		}
-	}
-	if exists, err := updateExists(install.app); err != nil {
-		return err
-	} else if !exists {
-		return nil
-	}
-	if err := installValidatePayloadTree(install.app, false); err != nil {
-		return fmt.Errorf("Application cannot be replaced by this account; no services were changed: %w", err)
-	}
-	return filepath.WalkDir(install.app, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		access := uint32(unix.W_OK)
-		if entry.IsDir() {
-			access |= unix.X_OK
-		}
-		if err := unix.Access(path, access); err != nil {
-			return errors.New("Application code is not writable by this account; no services were changed")
-		}
-		return nil
-	})
-}
-
-// Publish a verified candidate before registration, retaining the previous
-// bundle until the entire installation has become ready and published identity.
-func (install *installer) publishManaged(ctx context.Context) (result error) {
-	if err := install.validatePayload(); err != nil {
-		return err
-	}
-	expected := install.identity
-	if err := install.managedPublicationAccess(); err != nil {
-		return err
-	}
-	if install.appBundle {
-		before, err := managedCaptureBundle(install.app)
-		if err != nil {
-			return err
-		}
-		if err := install.managedVerify(ctx, install.app); err != nil {
-			return err
-		}
-		if err := install.managedValidateExpected(expected); err != nil {
-			return err
-		}
-		return managedRequireBundle(install.app, before)
-	}
-	parent, err := install.managedPublicationParent(true)
-	if err != nil {
-		return err
-	}
-	defer parent.Close()
-	source := filepath.Join(install.payload, "Agent Queue.app")
-	selected, err := managedCaptureBundle(source)
-	if err != nil {
-		return err
-	}
-	if !selected.Build.Equal(expected) {
-		return errors.New("Managed source differs from the expected pending candidate")
-	}
-	var old *managedBundleIdentity
-	if exists, err := updateExists(install.app); err != nil {
-		return err
-	} else if exists {
-		current, err := managedCaptureBundle(install.app)
-		if err != nil {
-			return err
-		}
-		old = &current
-		// The backup/receipt gate above also applies to this retry shortcut.
-		if selected.Digest == current.Digest {
-			if err := install.managedVerify(ctx, install.app); err != nil {
-				return err
-			}
-			if err := install.managedValidateExpected(expected); err != nil {
-				return err
-			}
-			if err := managedRequireBundle(source, selected); err != nil {
-				return err
-			}
-			return managedRequireBundle(install.app, current)
-		}
 	}
 	if exists, err := updateExists(install.managedPreviousPath()); err != nil {
 		return err
 	} else if exists {
-		return errors.New("A previous application is retained from incomplete setup; retry that exact installer before another replacement")
-	}
-	staging := filepath.Join(filepath.Dir(install.app), ".Agent Queue.installing-"+token()+".app")
-	if err := install.managedCopyApp(ctx, source, staging); err != nil {
-		return err
-	}
-	// Hold the actual stage root until cleanup so inode recycling cannot turn a
-	// replacement directory into one of our owned objects.
-	stage, err := installPayloadParent(staging, filepath.Join(staging, ".custody-probe"), true)
-	if err != nil {
-		return err
-	}
-	defer stage.Close()
-	var ownedReceipt []byte
-	defer func() {
-		if _, err := os.Lstat(staging); errors.Is(err, os.ErrNotExist) {
-			return
+		if err := unix.Faccessat(int(publication.Fd()), ".", unix.W_OK|unix.X_OK, 0); err != nil {
+			return errors.New("Completing the retained publication requires write access to its application directory; no services were changed")
 		}
-		if err := managedCopyNamed(parent, filepath.Base(staging), stage); err != nil {
-			result = errors.Join(result, fmt.Errorf("Staged application custody changed; evidence preserved: %w", err))
-			return
-		}
-		if old == nil && ownedReceipt != nil {
-			if exists, err := updateExists(install.app); err != nil || exists {
-				result = errors.Join(result, errors.New("Publication target appeared before stage cleanup; receipt and stage preserved"), err)
-				return
-			}
-			if err := install.managedRemoveFile(install.managedReceiptPath(), ownedReceipt); err != nil {
-				result = errors.Join(result, err)
-				return
-			}
-		}
-		root, err := os.OpenRoot(filepath.Dir(staging))
-		if err != nil {
-			result = errors.Join(result, err)
-			return
-		}
-		result = errors.Join(result, root.RemoveAll(filepath.Base(staging)))
-		root.Close()
-	}()
-	candidate, err := managedCaptureBundle(staging)
-	if err != nil {
-		return err
 	}
-	if candidate.Digest != selected.Digest || !candidate.Build.Equal(expected) {
-		return errors.New("Managed staged candidate differs from the expected pending build")
-	}
-	// Source, pending identity, target ordering and exact old object are checked
-	// again after all staging/signature work, immediately before either rename.
-	if err := install.managedValidateExpected(expected); err != nil {
-		return err
-	}
-	if err := managedRequireBundle(source, selected); err != nil {
-		return err
-	}
+	return nil
+}
+
+// verifyManagedBundle confirms the bundle setup runs from is still the selected
+// build. Setup never replaces it: Finder, the DMG or Homebrew put it in place.
+func (install *installer) verifyManagedBundle(ctx context.Context, expected BuildInfo) error {
 	if err := install.managedPublicationAccess(); err != nil {
 		return err
 	}
-	if err := install.managedCheckPublicationParent(parent); err != nil {
-		return err
-	}
-	if old != nil {
-		if err := managedRequireBundle(install.app, *old); err != nil {
-			return err
-		}
-	} else if exists, err := updateExists(install.app); err != nil {
-		return err
-	} else if exists {
-		return errors.New("Managed publication target appeared during staging; evidence preserved")
-	}
-	if err := managedRequireBundle(staging, candidate); err != nil {
-		return err
-	}
-	receipt := managedPublicationReceipt{SchemaVersion: 1, App: install.app, Pending: expected, Candidate: candidate, Backup: old}
-	raw, err := json.Marshal(receipt)
+	before, err := managedCaptureBundle(install.app)
 	if err != nil {
 		return err
 	}
-	ownedReceipt = append(raw, '\n')
-	if err := installAtomic(install.managedReceiptPath(), ownedReceipt, 0600); err != nil {
-		ownedReceipt = nil
+	if err := install.managedVerify(ctx, install.app); err != nil {
 		return err
 	}
-	if old != nil {
-		if err := unix.Renameat(int(parent.Fd()), filepath.Base(install.app), int(parent.Fd()), filepath.Base(install.managedPreviousPath())); err != nil {
-			return err
-		}
-		if err := parent.Sync(); err != nil {
-			return err // Receipt and last good backup remain recovery evidence.
-		}
-	}
-	if err := unix.Renameat(int(parent.Fd()), filepath.Base(staging), int(parent.Fd()), filepath.Base(install.app)); err != nil {
-		return err // Recovery uses the exact durable receipt, never a blind restore.
-	}
-	if err := parent.Sync(); err != nil {
+	if err := install.managedValidateExpected(expected); err != nil {
 		return err
 	}
-	return managedRequireBundle(install.app, candidate)
+	return managedRequireBundle(install.app, before)
 }
 
 func (install *installer) managedSupport() error {
@@ -1125,7 +1004,7 @@ func (install *installer) managedWrappers() (map[string][]byte, error) {
 	// A wrapper generated for the recorded location is also owned, so a Finder
 	// move between Applications folders can rewrite it for the adopted bundle.
 	recorded := map[string][]byte{}
-	if previous, err := appservices.Load(install.home); err == nil && previous != nil && install.appBundle {
+	if previous, err := appservices.Load(install.home); err == nil && previous != nil {
 		for _, name := range []string{"agent-heavy", "agent-remote"} {
 			recorded[name] = managedWrapperFor(previous.App, name)
 		}
@@ -1147,7 +1026,7 @@ func (install *installer) managedWrappers() (map[string][]byte, error) {
 		// Exact wrappers shipped before the Go migration (452f076's parent).
 		python := []byte("#!/bin/sh\nset -eu\nroot=\"${HOME:?}/.local/share/agent-heavy\"\nexec \"$root/.venv/bin/python\" \"$root/" + pythonModule + "\" \"$@\"\n")
 		if !bytes.Equal(raw, install.managedWrapper(name)) && !bytes.Equal(raw, legacy) && !bytes.Equal(raw, python) && !bytes.Equal(raw, recorded[name]) {
-			return nil, fmt.Errorf("CLI wrapper %s is customized; no service was stopped", name)
+			return nil, fmt.Errorf("CLI wrapper %s is customized; it was left in place", name)
 		}
 		wrappers[filename] = raw
 	}
@@ -1194,12 +1073,12 @@ func (install *installer) managedRemovalIdentity() (BuildInfo, error) {
 	return identity, nil
 }
 
-func (install *installer) managedStopMenu(ctx context.Context, source string) error {
+func (install *installer) managedStopMenu(ctx context.Context) error {
 	exists, err := updateExists(install.app)
 	if err != nil || !exists {
 		return err
 	}
-	output, err := install.run(ctx, filepath.Join(source, "Contents/MacOS/AgentQueue"), "--prepare-app-replacement", install.app)
+	output, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/AgentQueue"), "--prepare-app-replacement", install.app)
 	if err != nil {
 		return fmt.Errorf("The previous menu app could not quit; preserve its bundle and retry after quitting: %w", err)
 	}
@@ -1211,15 +1090,67 @@ func (install *installer) managedStopMenu(ctx context.Context, source string) er
 	return nil
 }
 
-// Preparation is an explicit mutation, separate from read-only preflight. The
-// cask may move/delete its app artifact only after this operation succeeds.
-func (install *installer) prepareManaged(ctx context.Context) error {
+// A service nothing ever registered reads as notFound, which is already what
+// removal wants. The lookup miss proves nothing about launchd, so a label that is
+// still loaded keeps refusing. The login item has no launchd label, so nothing
+// can show that a miss means it is gone, and it refuses until the lookup answers.
+func (install *installer) managedRemovalNotFound(ctx context.Context, service string) error {
+	label := map[string]string{"queue": "io.went.agent-heavy", "resources": "io.went.agent-resources", "remote": "io.went.agent-remote"}[service]
+	if label == "" {
+		return fmt.Errorf("%w. Quit Agent Queue if it is running, register it again with agent-heavy install --app-bundle %s, then run removal again", errInstallLoginUnverified, installQuote(install.app))
+	}
+	if _, loaded, err := install.inspectService(ctx, label); err != nil {
+		return err
+	} else if loaded {
+		return fmt.Errorf("The %s service is notFound but still loaded; application must be preserved", service)
+	}
+	return nil
+}
+
+// managedRemovalSchedulingLock gives a busy lock the bound LockPrivate gives
+// everyone else, because a running app's helpers take it during normal work.
+func (install *installer) managedRemovalSchedulingLock(ctx context.Context) (*os.File, error) {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		lock, err := installLock(install.state, "scheduling.lock")
+		if err == nil || !errors.Is(err, unix.EWOULDBLOCK) || time.Now().After(deadline) {
+			return lock, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// managedRemovalGuidance says what clears a refusal once the app has quit. Nothing
+// is left running to finish a row or release a phone record, so retrying cannot
+// clear those and opening the app does. Anything else may clear on a retry.
+func managedRemovalGuidance(err error) error {
+	switch {
+	case errors.Is(err, errInstallLoginUnverified):
+		return err // It names its own route.
+	case errors.Is(err, errInstallStoppedQueueUnfinished), errors.Is(err, errInstallPhoneCleanupIncomplete):
+		return fmt.Errorf("%w. Open Agent Queue, then run removal again", err)
+	}
+	if strings.HasSuffix(err.Error(), ".") {
+		return fmt.Errorf("%w Run removal again. If it refuses the same way, open Agent Queue first", err)
+	}
+	return fmt.Errorf("%w. Run removal again. If it refuses the same way, open Agent Queue first", err)
+}
+
+// Removal is an explicit mutation, separate from read-only preflight. The app
+// may be deleted only after this operation succeeds.
+func (install *installer) removeManaged(ctx context.Context) error {
 	for _, directory := range []string{install.root, install.state, install.config, install.launch, filepath.Join(install.home, ".local/bin"), filepath.Join(install.state, "remote")} {
 		if err := installInspectDirectory(directory); err != nil {
 			return err
 		}
 	}
-	for _, entry := range []struct{ directory, name string }{{install.state, "install.lock"}, {install.state, "scheduling.lock"}, {filepath.Join(install.state, "remote"), "control.lock"}} {
+	// A running app's helpers hold scheduling.lock for moments at a time, so that
+	// one is only waited for below.
+	for _, entry := range []struct{ directory, name string }{{install.state, "install.lock"}, {filepath.Join(install.state, "remote"), "control.lock"}} {
 		busy, err := installInspectLock(entry.directory, entry.name)
 		if err != nil {
 			return err
@@ -1228,26 +1159,24 @@ func (install *installer) prepareManaged(ctx context.Context) error {
 			return errors.New("Another installer or queue change is running; finish it before trying again")
 		}
 	}
-	source := install.app
-	if !install.appBundle {
-		source = filepath.Join(install.payload, "Agent Queue.app")
-	}
-	if err := install.managedVerify(ctx, source); err != nil {
+	if err := install.managedVerify(ctx, install.app); err != nil {
 		return err
 	}
 	if _, err := install.managedWrappers(); err != nil {
 		return err
 	}
-	if install.unregisterServices {
-		if _, err := install.managedRemovalIdentity(); err != nil {
-			return err
-		}
+	if _, err := install.managedRemovalIdentity(); err != nil {
+		return err
 	}
-	if _, err := install.planManaged(ctx); err != nil {
+	if _, err := install.planManaged(ctx); errors.Is(err, errInstallStoppedQueueUnfinished) {
+		return managedRemovalGuidance(err)
+	} else if err != nil {
 		return err
 	}
 	// The first complete inspection above creates no files. Recheck under all
-	// three locks, retaining scheduling.lock through drain and daemon shutdown.
+	// three locks, retaining scheduling.lock through drain and daemon shutdown:
+	// agent-heavy run and lane acquire wait for it, so they add no work after the
+	// check below.
 	for _, directory := range []string{install.root, install.state, filepath.Join(install.state, "remote")} {
 		exists, err := updateExists(directory)
 		if err != nil {
@@ -1266,7 +1195,7 @@ func (install *installer) prepareManaged(ctx context.Context) error {
 		return err
 	}
 	defer lock.Close()
-	scheduling, err := installLock(install.state, "scheduling.lock")
+	scheduling, err := install.managedRemovalSchedulingLock(ctx)
 	if err != nil {
 		return err
 	}
@@ -1276,10 +1205,12 @@ func (install *installer) prepareManaged(ctx context.Context) error {
 		return err
 	}
 	defer remote.Close()
-	if err := install.validatePayload(); err != nil {
+	identity, err := install.validateBundle()
+	if err != nil {
 		return err
 	}
-	if err := install.managedVerify(ctx, source); err != nil {
+	install.identity = identity
+	if err := install.managedVerify(ctx, install.app); err != nil {
 		return err
 	}
 	wrappers, err := install.managedWrappers()
@@ -1287,42 +1218,45 @@ func (install *installer) prepareManaged(ctx context.Context) error {
 		return err
 	}
 	p, err := install.planManaged(ctx)
-	if err != nil {
+	if errors.Is(err, errInstallStoppedQueueUnfinished) {
+		return managedRemovalGuidance(err)
+	} else if err != nil {
 		return err
 	}
-	identity := install.identity
-	if install.unregisterServices {
-		identity, err = install.managedRemovalIdentity()
-		if err != nil {
-			return err
-		}
+	identity, err = install.managedRemovalIdentity()
+	if err != nil {
+		return err
 	}
 	raw, err := json.MarshalIndent(identity, "", "  ")
 	if err != nil {
 		return err
 	}
 	raw = append(raw, '\n')
+	// A running app must quit first: only that stops the helpers it supervises,
+	// which quiesceManaged requires, and it replies only once they have stopped.
+	// A refused quit leaves it running, so nothing may mark it incomplete before.
+	if err := install.managedStopMenu(ctx); err != nil {
+		return err
+	}
 	marker := filepath.Join(install.root, "install-in-progress.json")
 	if err := installAtomic(marker, raw, 0600); err != nil {
 		return err
 	}
 	if err := install.quiesceManaged(ctx, p); err != nil {
-		return err
-	}
-	if err := install.managedStopMenu(ctx, source); err != nil {
-		return err
+		return managedRemovalGuidance(err)
 	}
 	for service := range p.statuses {
 		status, err := install.managedStatus(ctx, install.app, service)
 		if err != nil {
-			return err
+			return managedRemovalGuidance(err)
 		}
-		if status != "notRegistered" {
-			return fmt.Errorf("Service %s is still registered; application must be preserved", service)
+		if status == "notFound" {
+			if err := install.managedRemovalNotFound(ctx, service); err != nil {
+				return managedRemovalGuidance(err)
+			}
+		} else if status != "notRegistered" {
+			return managedRemovalGuidance(fmt.Errorf("Service %s is still registered; application must be preserved", service))
 		}
-	}
-	if !install.unregisterServices {
-		return nil
 	}
 	// Confirm every wrapper again before retiring any metadata. Keep private
 	// queue state, credentials, configuration, history and retained apps intact.
@@ -1386,13 +1320,13 @@ func (install *installer) managedStopped(ctx context.Context) error {
 			return errors.New("Service still holds its lifetime lock; application must be preserved")
 		}
 	}
-	if install.prepareReplacement || install.unregisterServices {
+	if install.unregisterServices {
 		cleanup, err := install.disabledRemoteCleanup(ctx)
 		if err != nil {
 			return err
 		}
 		if cleanup {
-			return errors.New("Phone access process cleanup is incomplete; application must be preserved")
+			return errInstallPhoneCleanupIncomplete
 		}
 	}
 	return nil
@@ -1509,15 +1443,8 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err := install.managedPublicationAccess(); err != nil {
 		return err
 	}
-	if err := install.recoverManagedPublication(ctx); err != nil {
-		return err
-	}
 	// All safety and drain checks precede private-directory/lock creation.
-	source := install.app
-	if !install.appBundle {
-		source = filepath.Join(install.payload, "Agent Queue.app")
-	}
-	if err := install.managedVerify(ctx, source); err != nil {
+	if err := install.managedVerify(ctx, install.app); err != nil {
 		return err
 	}
 	if _, err := install.planManaged(ctx); err != nil {
@@ -1558,7 +1485,7 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
 			return err
 		}
-		if _, err := install.run(ctx, filepath.Join(source, "Contents/MacOS/agent-remote"), "disable"); err != nil {
+		if _, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-remote"), "disable"); err != nil {
 			return err
 		}
 		if _, err := install.planManaged(ctx); err != nil {
@@ -1569,13 +1496,6 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		if err := installDirectory(directory); err != nil {
 			return err
 		}
-	}
-	if !install.appBundle && filepath.Dir(install.app) != "/Applications" {
-		parent, err := integrationParent(install.app, true)
-		if err != nil {
-			return err
-		}
-		parent.Close() // Existing publication-directory modes are never changed.
 	}
 	lock, err := installLock(install.state, "install.lock")
 	if err != nil {
@@ -1592,9 +1512,11 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		return err
 	}
 	defer remote.Close()
-	if err := install.validatePayload(); err != nil {
+	identity, err := install.validateBundle()
+	if err != nil {
 		return err
 	}
+	install.identity = identity
 	p, err := install.planManaged(ctx)
 	if err != nil {
 		return err
@@ -1602,7 +1524,7 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err := install.managedRetireSupersededReceipt(); err != nil {
 		return err
 	}
-	if p.live == nil && !install.prepareReplacement && !install.unregisterServices {
+	if p.live == nil {
 		// Where resume was skipped, preflight never saw this journal, so it does not
 		// block this run. A journal kept here still refuses the next upgrade.
 		if err := install.retireSpentLive(); err != nil {
@@ -1637,13 +1559,8 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err := install.quiesceManaged(ctx, p); err != nil {
 		return err
 	}
-	if !install.appBundle {
-		if err := install.managedStopMenu(ctx, source); err != nil {
-			return err
-		}
-	}
 	expected := install.identity
-	if err := install.publishManaged(ctx); err != nil {
+	if err := install.verifyManagedBundle(ctx, expected); err != nil {
 		return err
 	}
 	published, err := managedCaptureBundle(install.app)
@@ -1778,24 +1695,16 @@ func (install *installer) executeManaged(ctx context.Context) error {
 			return err
 		}
 	}
-	// mainApp registration only arranges subsequent logins. This one-shot,
-	// explicit installer launch runs after durable completion, never as an agent.
-	if !install.testing && !install.appBundle {
-		if _, err := install.run(ctx, "/usr/bin/open", "-a", install.app); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
-// managedSupervised reports whether the menu bar app supervises the helpers.
-// The payload path registers them with Service Management instead, and so does
-// an app bundle resuming a live handover an older release left behind, whose
-// replacement daemon runs under launchd and must be waited for. Setup no longer
-// begins a live handover, so that bundle is the retained build finished by a newer
-// app (see finishPendingInstallation).
+// managedSupervised reports whether the menu bar app supervises the helpers. An
+// app bundle resuming a live handover an older release left behind registers them
+// with Service Management instead: its replacement daemon runs under launchd and
+// must be waited for. Setup no longer begins a live handover, so that bundle is
+// the retained build finished by a newer app (see finishPendingInstallation).
 func (install *installer) managedSupervised(p *managedPlan) bool {
-	return install.appBundle && p.live == nil
+	return p.live == nil
 }
 
 // managedActivate registers what the installed build needs. A supervised app
@@ -1925,100 +1834,6 @@ func (install *installer) managedVerifyRegistrations(ctx context.Context, remote
 	return nil
 }
 
-// A crash can leave the last good app renamed but no candidate at the public
-// path. Restore only that identity-checked owned backup, under installation and
-// scheduling locks and after the same drained-queue gate used for replacement.
-func (install *installer) recoverManagedPublication(ctx context.Context) error {
-	if install.appBundle {
-		return nil
-	}
-	if err := install.managedPublicationAccess(); err != nil {
-		return err
-	}
-	if exists, err := updateExists(install.app); err != nil || exists {
-		return err
-	}
-	previous := install.managedPreviousPath()
-	if exists, err := updateExists(previous); err != nil || !exists {
-		return err
-	}
-	lock, err := installLock(install.state, "install.lock")
-	if err != nil {
-		return err
-	}
-	defer lock.Close()
-	scheduling, err := installLock(install.state, "scheduling.lock")
-	if err != nil {
-		return err
-	}
-	defer scheduling.Close()
-	remote, err := installLock(filepath.Join(install.state, "remote"), "control.lock")
-	if err != nil {
-		return err
-	}
-	defer remote.Close()
-	if err := install.managedBackupAccess(); err != nil {
-		return err
-	}
-	receipt, raw, err := install.managedReadReceipt()
-	if err != nil {
-		return err
-	}
-	if receipt == nil || receipt.Backup == nil {
-		return errors.New("Retained application has no exact owned publication receipt; evidence preserved")
-	}
-	if err := installValidatePayloadTree(previous, false); err != nil {
-		return err
-	}
-	if _, err := install.run(ctx, "/usr/bin/codesign", "--verify", "--strict", "--verbose=2", previous); err != nil {
-		return fmt.Errorf("Retained application signature verification failed: %w", err)
-	}
-	p := &managedPlan{loaded: map[string]bool{}}
-	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-remote"} {
-		output, loaded, err := install.inspectService(ctx, label)
-		if err != nil {
-			return err
-		}
-		if loaded {
-			if err := install.managedLoaded(output, label, install.app); err != nil {
-				return err
-			}
-		}
-		p.loaded[label] = loaded
-	}
-	if err := install.managedDrain(ctx, p); err != nil {
-		return err
-	}
-	parent, err := install.managedPublicationParent(true)
-	if err != nil {
-		return err
-	}
-	defer parent.Close()
-	// Recheck after signature commands and drain inspection. Never overwrite a
-	// target that appeared while recovery was checking the retained evidence.
-	if err := install.managedBackupAccess(); err != nil {
-		return err
-	}
-	if exists, err := updateExists(install.app); err != nil {
-		return err
-	} else if exists {
-		return errors.New("Managed recovery target appeared during inspection; evidence preserved")
-	}
-	if err := managedRequireBundle(previous, *receipt.Backup); err != nil {
-		return err
-	}
-	if err := unix.Renameat(int(parent.Fd()), filepath.Base(previous), int(parent.Fd()), filepath.Base(install.app)); err != nil {
-		return err
-	}
-	if err := parent.Sync(); err != nil {
-		return err
-	}
-	if err := managedRequireBundle(install.app, *receipt.Backup); err != nil {
-		return err
-	}
-	return install.managedRemoveFile(install.managedReceiptPath(), raw)
-}
-
 func (install *installer) preflightManaged(ctx context.Context, report installPreflightReport) installPreflightReport {
 	for _, directory := range []string{install.root, install.state, install.config, install.launch, filepath.Join(install.home, ".local/bin")} {
 		if err := installInspectDirectory(directory); err != nil {
@@ -2034,12 +1849,8 @@ func (install *installer) preflightManaged(ctx context.Context, report installPr
 			report.add("installer-busy", "Another queue operation is running", "Wait for that operation to finish.", "", "wait")
 		}
 	}
-	source := install.app
-	if !install.appBundle {
-		source = filepath.Join(install.payload, "Agent Queue.app")
-	}
-	if err := install.managedVerify(ctx, source); err != nil {
-		report.add("payload-invalid", "Review the signed application package", err.Error(), source, "download-release", "reveal")
+	if err := install.managedVerify(ctx, install.app); err != nil {
+		report.add("payload-invalid", "Review the signed application package", err.Error(), install.app, "download-release", "reveal")
 		return report
 	}
 	if missing, err := install.missingServiceDefinitions(ctx); err == nil && len(missing) > 0 {
@@ -2047,14 +1858,14 @@ func (install *installer) preflightManaged(ctx context.Context, report installPr
 		return report
 	}
 	if _, err := install.planManaged(ctx); err != nil {
-		var approval *installApprovalError
 		var drain *installDrainPendingError
 		var pending *installPendingError
 		switch {
+		case errors.Is(err, errInstallAppRunning):
+			// Only the user can clear this, so automatic setup stops and says so.
+			report.add("app-running", "Agent Queue is running", err.Error(), "")
 		case errors.As(err, &pending):
 			report.addPendingInstallation(err.Error(), install.liveJournalPath(), "download-release", "reveal")
-		case errors.As(err, &approval):
-			report.add("service-approval", "Allow Agent Queue background services", err.Error(), "", "wait")
 		case errors.Is(err, errInstallPendingCleanup):
 			if previous, loadErr := appservices.Load(install.home); loadErr == nil && previous != nil {
 				snapshot, readErr := install.managedSnapshot(ctx)

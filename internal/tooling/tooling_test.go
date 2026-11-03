@@ -76,7 +76,7 @@ func TestHomebrewManifestAndCaskContracts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{manifest.SHA256, "Agent-Queue-0.1.0-universal.zip\"", "\n  app \"Agent Queue.app\"\n", "\n  uninstall quit: \"io.went.agent-queue\"\n", "Open Agent Queue from Applications to use its menu bar.", "--unregister-services", "Preserve quarantine so macOS can assess the notarized release."} {
+	for _, expected := range []string{manifest.SHA256, "Agent-Queue-0.1.0-universal.zip\"", "\n  app \"Agent Queue.app\"\n", "\n  uninstall quit: \"io.went.agent-queue\"\n", "Open Agent Queue from Applications to use its menu bar.", "It quits the app and removes its login item", "--unregister-services", "Preserve quarantine so macOS can assess the notarized release."} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("missing %s", expected)
 		}

@@ -373,6 +373,7 @@ jobs:
           repositories: homebrew-agent-job-queue
           permission-actions: write
       - name: Dispatch and verify the published Homebrew build
+        shell: bash
         env:
           GH_TOKEN: ${{ steps.tap-token.outputs.token }}
           SOURCE_GH_TOKEN: ${{ github.token }}

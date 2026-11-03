@@ -18,6 +18,8 @@ func TestInstallerPreflightCleanupDiagnosticIncludesRunningWork(t *testing.T) {
 				status = Object{"Done": Object{"result": "Success"}}
 			}
 			f.tasks = Object{"7": Object{"id": 7, "label": "Fixture work", "status": status}}
+			// Blocking phone access sends this legacy queue to the detailed review.
+			integrationTestWrite(t, filepath.Join(f.installer.config, "remote.json"), []byte(`{"enabled":true}`))
 			if kind == "running-external-marker" {
 				integrationTestWrite(t, filepath.Join(f.installer.state, "legacy-slot.json"), mustMetadataJSON(t, Object{"slot": filepath.Join(filepath.Dir(f.installer.home), "external-slot")}))
 			}

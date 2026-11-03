@@ -169,7 +169,7 @@ func updateRegisteredApp() (string, error) {
 	}
 	// This opens but never creates or changes the app directory. It rejects
 	// symlinks in the full path, including the Applications parent.
-	bundle, err := installPayloadParent(args[2], filepath.Join(args[2], ".version-probe"), true)
+	bundle, err := installPayloadParent(args[2], filepath.Join(args[2], ".version-probe"))
 	if err != nil {
 		return "", err
 	}
@@ -181,7 +181,7 @@ func updateRegisteredApp() (string, error) {
 
 func updateReadApp(app, filename string) ([]byte, error) {
 	if installValidateAppPath(integrationHome(), app) == nil {
-		return installReadPayload(app, filename, 16384, true)
+		return installReadPayload(app, filename, 16384)
 	}
 	// Explicit development and archive paths retain their current-owner policy.
 	return updateReadOwned(filename, 16384)

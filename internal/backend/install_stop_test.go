@@ -42,15 +42,12 @@ func TestManagedSetupStopRetainsAcceptedMutation(t *testing.T) {
 }
 
 func TestManagedSetupStopReachesNestedPendingDrainWait(t *testing.T) {
-	m := managedTestFixture(t)
-	m.nativeFailure = "register resources"
-	if err := m.run(t); err == nil {
-		t.Fatal("expected an interrupted retained candidate")
-	}
+	m, _ := managedRelocationFixture(t, true)
 	i := m.installer
-	pending := i.identity
-	managedCandidate(t, m, "124")
-	m.nativeFailure = ""
+	pending, err := installReadInfo(filepath.Join(i.root, "install-in-progress.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Recovery of the retained candidate waits inside its own nested loop for
 	// running jobs; stopping must reach that wait.
 	m.tasks["7"] = Object{"id": 7, "status": Object{"Running": Object{}}}

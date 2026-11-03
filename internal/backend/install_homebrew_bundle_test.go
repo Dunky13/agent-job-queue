@@ -13,20 +13,10 @@ func TestInstallerHomebrewMovedAppAvoidsSharedStagingParents(t *testing.T) {
 		t.Run(prefix, func(t *testing.T) {
 			f := installTestFixture(t)
 			install := f.installer
-			originalPayload := install.payload
-			f.appBundle(t)
-			base := filepath.Dir(originalPayload)
-			brewPrefix := filepath.Join(base, prefix)
+			brewPrefix := filepath.Join(filepath.Dir(install.home), prefix)
 			caskroom := filepath.Join(brewPrefix, "Caskroom")
-			stagedPayload := filepath.Join(caskroom, "agent-job-queue/0.1.0,123/payload")
-			if err := os.MkdirAll(filepath.Dir(stagedPayload), 0700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Rename(originalPayload, stagedPayload); err != nil {
-				t.Fatal(err)
-			}
-			stagedApp := filepath.Join(stagedPayload, "Agent Queue.app")
-			if err := os.RemoveAll(stagedApp); err != nil {
+			stagedApp := filepath.Join(caskroom, "agent-job-queue/0.1.0,123/Agent Queue.app")
+			if err := os.MkdirAll(filepath.Dir(stagedApp), 0700); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.Rename(install.app, stagedApp); err != nil {
@@ -39,7 +29,7 @@ func TestInstallerHomebrewMovedAppAvoidsSharedStagingParents(t *testing.T) {
 			}
 			// Keep the rejection that exposed the incident: shared Homebrew
 			// ancestors must not become trusted private payload parents.
-			_, err := installReadPayload(stagedPayload, filepath.Join(stagedPayload, "source/build-info.json"), 16384, false)
+			_, err := installReadPayload(stagedApp, filepath.Join(stagedApp, "Contents/Resources/build-info.json"), 16384)
 			if err == nil || !strings.Contains(err.Error(), "unsafe parent ownership or permissions") {
 				t.Fatalf("shared staging read did not fail closed: %v", err)
 			}

@@ -24,13 +24,13 @@
 
 <p>The first launch completes setup. Opening the app from Applications writes the <code>agent-heavy</code> and <code>agent-remote</code> wrappers to <code>~/.local/bin</code>, migrates state and unregisters any queue, resource or phone-access services that older versions registered. The app then starts and supervises its own queue processes; only its login item is registered with Service Management. A later <code>brew upgrade</code> replaces the app, and the next launch completes the upgrade. Normal app launch only reads installation and authorization state until setup runs; it never deletes executable code.</p>
 
-<p>Homebrew uninstall asks a running app to quit, which stops its queue processes while running job processes continue, then removes the app. Services, jobs, history and credentials are removed only by the app&#39;s ownership-checked service-removal command, which the cask caveats name and which must run before deleting the app:</p>
+<p>Homebrew uninstall asks a running app to quit, which stops its queue processes while running job processes continue, then removes the app. Services, jobs, history and credentials are removed only by the app&#39;s ownership-checked service-removal command, which the cask caveats name and which must run before deleting the app. It asks a running app&#39;s queue whether it is drained and then quits the app. With active jobs it refuses and leaves the app running:</p>
 
 <pre>~/.local/bin/agent-heavy install --app-bundle "/Applications/Agent Queue.app" --unregister-services</pre>
 
 <p>No destructive <code>zap</code> action is supplied. Private history, configuration and credentials remain retained.</p>
 
-<p>Setup waits for a running queue daemon's active and queued jobs before replacing it, and never starts a live handover. After a normal quit no daemon remains: running jobs continue and their outcomes are recorded without replay, attached <code>agent-heavy run</code> callers exit with status 125 within about a second, and if jobs were running the next daemon comes up paused, so queued jobs run after <code>agent-heavy resume</code> with no caller attached. Original callers keep their outcomes and exit statuses only when finishing a handover an older release left behind, using that exact build's bundle. Uncertain attempts or ownership fail closed. Removal and external app-replacement preparation still require drain.</p>
+<p>Setup waits for a running queue daemon's active and queued jobs before replacing it, and never starts a live handover. After a normal quit no daemon remains: running jobs continue and their outcomes are recorded without replay, attached <code>agent-heavy run</code> callers exit with status 125 within about a second, and if jobs were running the next daemon comes up paused, so queued jobs run after <code>agent-heavy resume</code> with no caller attached. Original callers keep their outcomes and exit statuses only when finishing a handover an older release left behind, using that exact build's bundle. Uncertain attempts or ownership fail closed. Removal still requires a drained queue.</p>
 
 <p>Whole previous signed app generations remain visible under <code>~/Applications/Agent Queue Runtimes</code>, bound to exact filesystem and attempt identities. Only a later setup operation can reclaim them after verifying terminal attempts and dead original callers and owned workers.</p>
 
@@ -51,11 +51,15 @@
 <ol><li>
 <p>From <code>packaging/homebrew/</code>, copy <code>refresh.go</code>, <code>refresh_test.go</code>, <code>test-cask.rb</code> and <code>.github/workflows/refresh.yml</code> into the tap checkout, together with the root <code>LICENSE</code>. Keep them byte-identical to this source revision; do not copy <code>SEED.txt</code>.</p>
 </li><li>
-<p>In the tap checkout, run <code>go test -p 2 refresh.go refresh_test.go</code> and <code>go vet refresh.go</code> (Go 1.26 or later).</p>
+<p>When the cask template changes, also set <code>Casks/agent-job-queue.rb</code> to the <code>agent-job-queue.rb</code> release asset of the tap&#39;s current build, byte for byte. Otherwise, a tap cask that drifted from that asset passes only while the old template still renders it, and every refresh then fails with <code>Current tap cask differs from its historical published release</code>.</p>
 </li><li>
-<p>Open a PR against the tap&#39;s <code>tap</code> branch with signed, DCO-signed-off commits, and merge it.</p>
+<p>In the tap checkout, run <code>go test -p 2 refresh.go refresh_test.go</code>, <code>go vet refresh.go</code> and <code>HOMEBREW_DEVELOPER=1 go run -p 2 refresh.go</code> (Go 1.26 or later, with <code>gh</code> and <code>brew</code>). The tests do not read the cask, so only the last command shows this failure. It publishes nothing and must exit 0, printing <code>Validated ...; publication disabled</code>, or <code>Published build verified; template change awaits a newer app release</code> if the tap is already on the latest release. The variable is required: without it, brew rejects a cask outside a tap and the command fails with <code>Required brew operation failed</code> even when the cask is right.</p>
 </li><li>
-<p>Only then merge the source change. The delivery job compares the tap&#39;s helpers byte for byte (<code>internal/delivery/sync.go</code>), so a missing or stale sync fails delivery visibly.</p>
+<p>Open a PR against the tap&#39;s <code>tap</code> branch with signed, DCO-signed-off commits. Before merging, check that the tap&#39;s scheduled refresh has not moved to a newer build, and repeat from step 2 if it has. Then merge.</p>
+</li><li>
+<p>Dispatch <code>refresh.yml</code> on the <code>tap</code> branch and confirm it succeeds.</p>
+</li><li>
+<p>Only then merge the source change. The delivery job compares the tap&#39;s helpers byte for byte (<code>internal/delivery/sync.go</code>), so a missing or stale sync fails <code>Verify Homebrew delivery</code> visibly, before it dispatches a refresh. Nothing depends on that job and the release is already published by then, so publishing continues through the tap&#39;s scheduled refresh, but every distribution run stays red until the tap catches up. A failed job is also retried automatically (<code>scripts/distribution-recover.sh</code>): a red <code>Verify Homebrew delivery</code> with signing and acceptance green is classed as <code>delivery</code> and rerun, first immediately and then at least 15 minutes apart, up to attempt 48 or 7 days for each run. A mismatch stops before dispatch, in about 20 seconds per retry, but a failure after dispatch starts a macOS tap run on each retry. The observer requests at most five reruns per pass and reaches older builds first, so five or more red runs can delay an Apple signing continuation on a newer build. Once the tap catches up, a rerun should turn green within that budget.</p>
 </li></ol>
 
 <h2 id="one-time-github-app-setup">One-time GitHub App setup<span><a href="#one-time-github-app-setup">&para;</a> <a href="#top">&uarr;</a></span></h2>
@@ -84,7 +88,7 @@
 
 <pre>gh run list --repo Dunky13/homebrew-agent-job-queue --workflow refresh.yml --limit 5</pre>
 
-<p>Changes to the trusted tap files need a reviewed companion tap PR. Copy the standalone <code>refresh.go</code>, <code>refresh_test.go</code>, <code>test-cask.rb</code>, and <code>.github/workflows/refresh.yml</code> from <code>packaging/homebrew/</code>, together with the root <code>LICENSE</code>. The tap helper uses only the Go standard library and never downloads application source or dependencies to execute. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated <code>Casks/</code> files manually or execute arbitrary code from a release to repair drift.</p>
+<p>Changes to the trusted tap files need a reviewed companion tap PR. Copy the standalone <code>refresh.go</code>, <code>refresh_test.go</code>, <code>test-cask.rb</code>, and <code>.github/workflows/refresh.yml</code> from <code>packaging/homebrew/</code>, together with the root <code>LICENSE</code>. The tap helper uses only the Go standard library and never downloads application source or dependencies to execute. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated <code>Casks/</code> files manually or execute arbitrary code from a release to repair drift. The one exception is the reset a template change needs, which restores the exact bytes of a published release asset.</p>
 
 <p>After verified delivery, Homebrew users can upgrade normally:</p>
 

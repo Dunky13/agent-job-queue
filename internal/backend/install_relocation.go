@@ -20,14 +20,14 @@ type managedRelocation struct {
 var errInstallRelocationWaiting = errors.New("Waiting for original job callers and retained runtimes before changing application locations; their outcomes and executable custody are preserved")
 
 func (install *installer) planManagedRelocation(ctx context.Context, previous *appservices.Installation) (*managedRelocation, error) {
-	if !install.appBundle || install.prepareReplacement || install.unregisterServices {
+	if install.unregisterServices {
 		return nil, errors.New("Open the new Agent Queue app from Applications to continue setup at its new location")
 	}
 	if err := appservices.ValidateApp(install.home, previous.App); err != nil {
 		return nil, err
 	}
 	old := *install
-	old.app, old.payload = previous.App, filepath.Join(previous.App, "Contents/Resources/payload")
+	old.app = previous.App
 	// A retained publication must be completed by its exact candidate first.
 	if err := old.managedBackupAccess(); err != nil {
 		return nil, err
@@ -94,7 +94,6 @@ func (install *installer) cleanupRelocationRuntimes(ctx context.Context, relocat
 	}
 	old := *install
 	old.app = relocation.previous.App
-	old.payload = filepath.Join(old.app, "Contents/Resources/payload")
 	if err := old.cleanupManagedRuntimes(ctx); err != nil {
 		return err
 	}

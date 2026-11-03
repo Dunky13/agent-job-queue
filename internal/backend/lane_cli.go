@@ -347,12 +347,19 @@ func laneAcquire(g *Gate, snapshot Object, options laneOptions, out laneOutput) 
 	if options.label != nil {
 		payload["label"] = *options.label
 	}
+	// Removal holds this through its last drain check and the app's quit, so new
+	// work waits for it, as job submission does. Not held while a lease waits.
+	unlock, err := LockPrivate(g, "scheduling.lock")
+	if err != nil {
+		return out.failure(laneExit(err), err, nil)
+	}
 	lease, err := g.QueueControl("lease-acquire", payload)
 	// A lost response does not establish whether the lease was created; the
 	// same token returns the original lease.
 	for retry := 0; err != nil && errors.Is(err, errQueueTransportUnavailable) && retry < 2; retry++ {
 		lease, err = g.QueueControl("lease-acquire", payload)
 	}
+	unlock()
 	if err != nil {
 		return out.failure(laneExit(err), err, nil)
 	}

@@ -52,10 +52,9 @@ type installPreflightReport struct {
 }
 
 type installOptions struct {
-	target             []string
+	app                string
 	preflight          bool
 	disablePhoneAccess bool
-	prepareReplacement bool
 	unregisterServices bool
 	repairAndContinue  bool
 	recovery           string
@@ -65,11 +64,11 @@ type installOptions struct {
 
 func installParseOptions(args []string) (installOptions, error) {
 	options := installOptions{}
-	usage := errors.New("Usage: agent-heavy install (--payload ABSOLUTE_PAYLOAD | --app-bundle ABSOLUTE_APP_PATH) [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access | --repair-and-continue | --prepare-replacement (payload only) | --unregister-services (app-bundle only)]")
-	if len(args) < 2 || (args[0] != "--payload" && args[0] != "--app-bundle") || !integrationValidPath(args[1]) || filepath.Clean(args[1]) != args[1] {
+	usage := errors.New("Usage: agent-heavy install --app-bundle ABSOLUTE_APP_PATH [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access | --repair-and-continue | --unregister-services]")
+	if len(args) < 2 || args[0] != "--app-bundle" || !integrationValidPath(args[1]) || filepath.Clean(args[1]) != args[1] {
 		return options, usage
 	}
-	options.target = append([]string{}, args[:2]...)
+	options.app = args[1]
 	seen := map[string]bool{}
 	for i := 2; i < len(args); i++ {
 		flag := args[i]
@@ -83,8 +82,6 @@ func installParseOptions(args []string) (installOptions, error) {
 		case "--json":
 		case "--disable-phone-access":
 			options.disablePhoneAccess = true
-		case "--prepare-replacement":
-			options.prepareReplacement = true
 		case "--unregister-services":
 			options.unregisterServices = true
 		case "--repair-and-continue":
@@ -114,15 +111,10 @@ func installParseOptions(args []string) (installOptions, error) {
 			return options, usage
 		}
 	}
-	if options.prepareReplacement || options.unregisterServices {
-		if len(args) != 3 || options.prepareReplacement && args[0] != "--payload" || options.unregisterServices && args[0] != "--app-bundle" {
+	if options.unregisterServices {
+		home, err := os.UserHomeDir()
+		if len(args) != 3 || err != nil || installValidateAppPath(home, args[1]) != nil {
 			return options, usage
-		}
-		if options.unregisterServices {
-			home, err := os.UserHomeDir()
-			if err != nil || installValidateAppPath(home, args[1]) != nil {
-				return options, usage
-			}
 		}
 	}
 	if options.preflight != seen["--json"] || options.preflight && (options.recovery != "" || options.disablePhoneAccess) || options.recovery != "" && options.disablePhoneAccess || options.recovery == "" && (options.jobID != nil || options.revision != "") {
@@ -373,11 +365,8 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 		report.add("platform-unsupported", "macOS is required", "Agent Queue installation requires macOS.", "")
 		return report
 	}
-	if err := install.resolvePayloadApp(); err != nil {
-		report.add("installation-invalid", "Review the recorded application location", err.Error(), install.root, "reveal")
-		return report
-	}
-	if err := install.validatePayload(); err != nil {
+	identity, err := install.validateBundle()
+	if err != nil {
 		var pending *installPendingError
 		if errors.As(err, &pending) {
 			actions := []string{"download-release", "reveal"}
@@ -388,15 +377,17 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 			return report
 		}
 		actions := []string{"download-release", "reveal"}
-		if install.appBundle && installValidateAppPath(install.home, install.app) != nil {
+		if installValidateAppPath(install.home, install.app) != nil {
 			actions = []string{"move-app", "reveal"}
 		}
 		report.add("payload-invalid", "Review the application package", err.Error(), install.app, actions...)
+		if install.validateMarkedBundle() != nil {
+			// Nothing in this bundle can be trusted yet, including its helpers.
+			return install.preflightLegacy(ctx, report)
+		}
 	}
-	if install.managed {
-		return install.preflightManaged(ctx, report)
-	}
-	return install.preflightLegacy(ctx, report)
+	install.identity = identity
+	return install.preflightManaged(ctx, report)
 }
 
 func (report *installPreflightReport) addPendingInstallation(detail, path string, actions ...string) {
@@ -462,7 +453,9 @@ func (install *installer) preflightLegacy(ctx context.Context, report installPre
 		report.add("service-definitions-missing", "Restore missing background service files", "Background services are still running, but their LaunchAgent files are missing. Restore standard definitions from verified loaded commands and environment. Lost custom service options cannot be recovered. Running services and jobs will not be restarted or stopped.", install.launch, "reveal", installRestoreServices)
 	}
 	servicesSafe := true
-	if err := install.validateServices(); err != nil {
+	if slot, err := install.validateServices(); err == nil {
+		install.serviceSlot = slot
+	} else {
 		servicesSafe = false
 		report.add("service-configuration", "Review background service configuration", err.Error()+" Custom settings require an explicit reviewed repair.", install.launch, "review-configuration", "reveal")
 	}
@@ -847,9 +840,11 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 	if action == installFinishPending {
 		return install.finishPendingInstallation(ctx)
 	}
-	if err := install.validatePayload(); err != nil {
+	identity, err := install.validateBundle()
+	if err != nil {
 		return err
 	}
+	install.identity = identity
 	for _, directory := range []string{install.root, filepath.Join(install.root, "bin"), install.state, filepath.Join(install.state, "pueue"), install.config, install.launch} {
 		if err := installInspectDirectory(directory); err != nil {
 			return err
@@ -869,13 +864,13 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 		return err
 	}
 	defer scheduling.Close()
-	if err := install.validateServices(); err != nil {
+	if install.serviceSlot, err = install.validateServices(); err != nil {
 		return err
 	}
 	if action == installRestoreServices {
 		return install.restoreServiceDefinitions(ctx)
 	}
-	if action == "cleanup-job" && install.managed {
+	if action == "cleanup-job" {
 		previous, err := appservices.Load(install.home)
 		if err != nil {
 			return err
@@ -927,7 +922,7 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
 			return err
 		}
-		_, err = install.run(ctx, filepath.Join(install.payload, "source/bin/agent-remote"), "disable")
+		_, err = install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-remote"), "disable")
 		return err
 	case "repair-service":
 		if !install.embeddedDefinition() {
@@ -941,7 +936,7 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 		if ready, err := install.installedExecutableReady(); err != nil {
 			return err
 		} else if !ready {
-			return errors.New("The installed backend needs payload repair before its service can start")
+			return errors.New("The installed backend is not executable; setup retires it instead of starting its service")
 		}
 		_, err = install.run(ctx, "launchctl", "bootstrap", install.domain(), filepath.Join(install.launch, "io.went.agent-heavy.plist"))
 		return err

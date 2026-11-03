@@ -16,10 +16,7 @@ import (
 // Only an older release writes this journal now, so each test seeds it directly.
 func liveResumeFixture(t *testing.T) (*managedFixture, *managedLiveUpgrade) {
 	t.Helper()
-	m := managedTestFixture(t)
-	if err := m.run(t); err != nil {
-		t.Fatal(err)
-	}
+	m := managedOlderRegistration(t)
 	i := m.installer
 	digest, err := i.liveTargetDigest()
 	if err != nil {
@@ -92,24 +89,16 @@ func requireLiveJournalKept(t *testing.T, i *installer) {
 }
 
 func TestManagedUpgradeWaitsForActiveJobsWithoutHandover(t *testing.T) {
-	for _, kind := range []string{"upgrade", "remove", "external-replacement"} {
+	for _, kind := range []string{"upgrade", "remove"} {
 		t.Run(kind, func(t *testing.T) {
-			m := managedTestFixture(t)
-			if err := m.run(t); err != nil {
-				t.Fatal(err)
-			}
+			m := managedOlderRegistration(t)
 			i := m.installer
 			m.tasks = Object{"7": Object{"id": 7, "token": strings.Repeat("a", 32), "status": Object{"Running": Object{}}}}
 			i.queueControl = func(_ context.Context, operation string, _ Object) (Object, error) {
 				t.Error("setup offered a live handover:", operation)
 				return nil, errors.New("unexpected queue control")
 			}
-			switch kind {
-			case "remove":
-				i.unregisterServices = true
-			case "external-replacement":
-				i.prepareReplacement = true
-			}
+			i.unregisterServices = kind == "remove"
 			before := installTreeWitness(t, i.home)
 			m.calls = nil
 			var drain *installDrainPendingError
@@ -124,27 +113,19 @@ func TestManagedUpgradeWaitsForActiveJobsWithoutHandover(t *testing.T) {
 	}
 }
 
-// Removal and external replacement never resume, even with a journal on disk.
+// Removal never resumes, even with a journal on disk.
 func TestManagedLiveResumeRetainsExplicitRemovalGates(t *testing.T) {
-	for _, kind := range []string{"remove", "external-replacement"} {
-		t.Run(kind, func(t *testing.T) {
-			m, live := liveResumeFixture(t)
-			i := m.installer
-			liveResumeReceipt(t, i, live, "prepared")
-			m.tasks = Object{"7": Object{"id": 7, "token": strings.Repeat("a", 32), "status": Object{"Running": Object{}}}}
-			if kind == "remove" {
-				i.unregisterServices = true
-			} else {
-				i.prepareReplacement = true
-			}
-			var drain *installDrainPendingError
-			if _, err := i.planManaged(context.Background()); !errors.As(err, &drain) {
-				t.Fatal("a journal bypassed the removal drain gate", err)
-			}
-			if _, err := os.Stat(i.liveJournalPath()); err != nil {
-				t.Fatal("refusal lost journal evidence", err)
-			}
-		})
+	m, live := liveResumeFixture(t)
+	i := m.installer
+	liveResumeReceipt(t, i, live, "prepared")
+	m.tasks = Object{"7": Object{"id": 7, "token": strings.Repeat("a", 32), "status": Object{"Running": Object{}}}}
+	i.unregisterServices = true
+	var drain *installDrainPendingError
+	if _, err := i.planManaged(context.Background()); !errors.As(err, &drain) {
+		t.Fatal("a journal bypassed the removal drain gate", err)
+	}
+	if _, err := os.Stat(i.liveJournalPath()); err != nil {
+		t.Fatal("refusal lost journal evidence", err)
 	}
 }
 
@@ -255,13 +236,12 @@ func TestManagedLiveJournalSurvivingRemovalCannotStrandReinstall(t *testing.T) {
 	i := m.installer
 	i.queueControl = nil
 	liveResumeSetTarget(t, i, live, "124")
-	payload := i.payload
 	managedRemovalTarget(i)
 	if err := m.run(t); err != nil {
 		t.Fatal("removal", err)
 	}
 	requireLiveJournalKept(t, i)
-	i.unregisterServices, i.appBundle, i.payload = false, false, payload
+	i.unregisterServices = false
 	for _, build := range []string{"125", "126"} {
 		managedCandidate(t, m, build)
 		if err := m.run(t); err != nil {
@@ -284,11 +264,13 @@ func TestManagedRetireSpentLiveKeepsJournalBindingCustody(t *testing.T) {
 			}
 			requireLiveJournalKept(t, i)
 			managedCandidate(t, m, "124")
-			if err := i.validatePayload(); err != nil {
+			identity, err := i.validateBundle()
+			if err != nil {
 				t.Fatal(err)
 			}
+			i.identity = identity
 			var pending *installPendingError
-			_, err := i.planManaged(context.Background())
+			_, err = i.planManaged(context.Background())
 			if phase == "consumed" {
 				// That running daemon belongs to the finished build, and only delays removal.
 				if err != nil {
@@ -432,13 +414,12 @@ func TestManagedLiveJournalWithForeignReceiptNeverTookCustody(t *testing.T) {
 		i := m.installer
 		i.queueControl = nil
 		liveResumeSetTarget(t, i, live, "124")
-		payload := i.payload
 		managedRemovalTarget(i)
 		if err := m.run(t); err != nil {
 			t.Fatal("removal", err)
 		}
 		raw := foreign(t, i, live)
-		i.unregisterServices, i.appBundle, i.payload = false, false, payload
+		i.unregisterServices = false
 		managedCandidate(t, m, "125")
 		if report := i.preflight(context.Background()); len(report.Issues) != 0 {
 			t.Fatalf("a journal that never took custody blocked preflight: %+v", report.Issues)
@@ -458,7 +439,6 @@ func TestManagedUnassessableJournalDoesNotFailReinstall(t *testing.T) {
 	i := m.installer
 	i.queueControl = nil
 	liveResumeSetTarget(t, i, live, "124")
-	payload := i.payload
 	managedRemovalTarget(i)
 	if err := m.run(t); err != nil {
 		t.Fatal("removal", err)
@@ -470,7 +450,7 @@ func TestManagedUnassessableJournalDoesNotFailReinstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	integrationTestWrite(t, path, []byte(strings.Replace(string(raw), `"prepared"`, `"mystery"`, 1)))
-	i.unregisterServices, i.appBundle, i.payload = false, false, payload
+	i.unregisterServices = false
 	managedCandidate(t, m, "125")
 	if report := i.preflight(context.Background()); len(report.Issues) != 0 {
 		t.Fatalf("expected no issues for a skipped journal: %+v", report.Issues)

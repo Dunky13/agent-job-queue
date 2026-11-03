@@ -799,7 +799,8 @@ struct BootstrapTests {
 
         let unknownWait = QueueBootstrapIssue(id: "unknown-ownership", title: "Unknown service", detail: "Ownership cannot be verified.",
             actions: [.init(id: "wait", title: "Wait", destructive: false)])
-        for unsafeIssue in [configIssue, unknownWait,
+        let runningCopy = QueueBootstrapIssue(id: "app-running", title: "Agent Queue is running", detail: "Quit it, then try setup again.", actions: [])
+        for unsafeIssue in [configIssue, unknownWait, runningCopy,
             .init(id: "legacy-jobs", title: "Cancel job", detail: "Only cancellation is offered.",
                   actions: [.init(id: "cancel-job", title: "Cancel job", destructive: false)], jobs: jobIssue.jobs),
             .init(id: "pending-cleanup", title: "Cleanup", detail: "No eligible job is listed.",
@@ -811,7 +812,10 @@ struct BootstrapTests {
             }) { approvedCompletions += 1 }
             await unsafe.start()?.value
             try check(!unsafe.canRepairAndContinue && unsafe.repairAndContinue(confirmed: true) == nil,
-                "Aggregate approval excludes unknown ownership, callback replacement, job cancellation and ineligible cleanup")
+                "Aggregate approval excludes unknown ownership, a running copy, callback replacement, job cancellation and ineligible cleanup")
+            let unsafeInstalls = await unsafeExecutor.installations
+            try check(unsafe.phase == .reviewing && unsafeInstalls == 0,
+                "A requirement that automatic setup cannot clear stops for review without installing")
         }
 
         for changesBeforeApproval in [true, false] {

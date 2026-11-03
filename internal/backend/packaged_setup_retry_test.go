@@ -81,6 +81,39 @@ func TestPackagedSetupNeverRetriesMutationOrUncertainHistory(t *testing.T) {
 	}
 }
 
+func TestPackagedSetupRetriesBusyOnlyOverASeededMarkerOnce(t *testing.T) {
+	f := installTestFixture(t)
+	pending := filepath.Join(f.installer.root, "install-in-progress.json")
+	integrationTestWrite(t, pending, []byte("seeded pending identity"))
+	f.seededPending = true
+	calls := 0
+	retries, err := runPackagedSetup(context.Background(), f, func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return syscall.EAGAIN
+		}
+		return nil
+	})
+	if err != nil || retries != 1 || calls != 2 {
+		t.Fatal("a proven unaccepted refusal over a seeded marker was not retried", retries, calls, err)
+	}
+	// After that setup the marker may be its own, so it is uncertain history again.
+	calls = 0
+	if _, err := runPackagedSetup(context.Background(), f, func(context.Context) error { calls++; return syscall.EAGAIN }); err == nil || calls != 1 {
+		t.Fatal("a later setup treated the marker as seeded", calls, err)
+	}
+	// Seeding never excuses a mutation.
+	f.seededPending = true
+	calls = 0
+	if _, err := runPackagedSetup(context.Background(), f, func(context.Context) error {
+		calls++
+		integrationTestWrite(t, pending, []byte("changed pending identity"))
+		return syscall.EAGAIN
+	}); err == nil || calls != 1 {
+		t.Fatal("a mutation over a seeded marker was repeated", calls, err)
+	}
+}
+
 func TestPackagedSetupPreservesFailureBoundsAndCancellation(t *testing.T) {
 	for _, failure := range []error{io.EOF, errors.New("Another installer or queue change is running")} {
 		f := installTestFixture(t)

@@ -32,7 +32,7 @@ type managedPublicationReceipt struct {
 
 func managedCaptureBundle(app string) (managedBundleIdentity, error) {
 	var result managedBundleIdentity
-	parent, err := installPayloadParent(app, filepath.Join(app, ".custody-probe"), true)
+	parent, err := installPayloadParent(app, filepath.Join(app, ".custody-probe"))
 	if err != nil {
 		return result, err
 	}
@@ -41,7 +41,7 @@ func managedCaptureBundle(app string) (managedBundleIdentity, error) {
 	if err := unix.Fstat(int(parent.Fd()), &before); err != nil {
 		return result, err
 	}
-	if err := installValidatePayloadTree(app, true); err != nil {
+	if err := installValidatePayloadTree(app); err != nil {
 		return result, err
 	}
 	result.Device, result.Inode = uint64(before.Dev), before.Ino
@@ -49,7 +49,7 @@ func managedCaptureBundle(app string) (managedBundleIdentity, error) {
 	if err != nil {
 		return result, err
 	}
-	raw, err := installReadPayload(app, filepath.Join(app, "Contents/Info.plist"), 16384, true)
+	raw, err := installReadPayload(app, filepath.Join(app, "Contents/Info.plist"), 16384)
 	if err != nil {
 		return result, err
 	}
@@ -62,7 +62,7 @@ func managedCaptureBundle(app string) (managedBundleIdentity, error) {
 		files = append(files, "Contents/Resources/payload/source/build-info.json")
 	}
 	for index, name := range files {
-		raw, err := installReadPayload(app, filepath.Join(app, name), 16384, true)
+		raw, err := installReadPayload(app, filepath.Join(app, name), 16384)
 		if err != nil {
 			return result, err
 		}
@@ -168,7 +168,7 @@ func (install *installer) managedReadReceipt() (*managedPublicationReceipt, []by
 // When setup adopts a bundle the user placed with Finder, a candidate-only
 // receipt without pending setup or a retained backup guards nothing.
 func (install *installer) managedReceiptSuperseded(receipt *managedPublicationReceipt) (bool, error) {
-	if !install.appBundle || install.prepareReplacement || install.unregisterServices || receipt.SchemaVersion != 1 || receipt.Backup != nil ||
+	if install.unregisterServices || receipt.SchemaVersion != 1 || receipt.Backup != nil ||
 		receipt.Candidate.Inode == 0 || receipt.Candidate.Digest == [32]byte{} {
 		return false, nil
 	}
@@ -234,7 +234,7 @@ func (install *installer) managedBackupAccess() error {
 	}
 	if !present {
 		if exists {
-			return nil // Recovery checks the same receipt under locks before rename.
+			return nil // Planning refuses a missing app with a retained backup, and keeps both.
 		}
 		return errors.New("Publication receipt has neither its candidate nor its backup; evidence preserved")
 	}
@@ -248,11 +248,10 @@ func (install *installer) managedBackupAccess() error {
 	return errors.New("Installed application differs from retained publication custody; evidence preserved")
 }
 
-// Preparation authorizes an external bundle move, which would invalidate an
-// exact candidate receipt. Removal may retire candidate-only custody, but must
-// preserve a retained last-good app until its pending publication is completed.
+// Removal may retire candidate-only custody, but must preserve a retained
+// last-good app until its pending publication is completed.
 func (install *installer) managedLifecycleCustody() error {
-	if !install.prepareReplacement && !install.unregisterServices {
+	if !install.unregisterServices {
 		return nil
 	}
 	if err := install.managedBackupAccess(); err != nil {
@@ -262,42 +261,21 @@ func (install *installer) managedLifecycleCustody() error {
 	if err != nil || receipt == nil {
 		return err
 	}
-	if install.prepareReplacement || receipt.Backup != nil {
-		return errors.New("Complete the exact pending publication through explicit setup before preparing replacement or removing an app with a retained backup; preserve its receipt and application bundles")
+	if receipt.Backup != nil {
+		return errors.New("Complete the exact pending publication through explicit setup before removing an app with a retained backup; preserve its receipt and application bundles")
 	}
 	return nil
 }
 
 func (install *installer) managedValidateExpected(expected BuildInfo) error {
-	// validatePayload rechecks source, pending and target build ordering. Never
+	// validateBundle rechecks source, pending and target build ordering. Never
 	// allow its identity refresh to replace the already selected candidate.
-	err := install.validatePayload()
-	current := install.identity
-	install.identity = expected
+	current, err := install.validateBundle()
 	if err != nil {
 		return err
 	}
 	if !current.Equal(expected) {
 		return errors.New("Managed installer source changed from the expected pending build")
-	}
-	return nil
-}
-
-func (install *installer) managedCheckPublicationParent(parent *os.File) error {
-	current, err := install.managedPublicationParent(true)
-	if err != nil {
-		return err
-	}
-	defer current.Close()
-	var named, held unix.Stat_t
-	if err := unix.Fstat(int(current.Fd()), &named); err != nil {
-		return err
-	}
-	if err := unix.Fstat(int(parent.Fd()), &held); err != nil {
-		return err
-	}
-	if named.Dev != held.Dev || named.Ino != held.Ino {
-		return errors.New("Managed publication parent changed; evidence preserved")
 	}
 	return nil
 }

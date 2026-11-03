@@ -8,9 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/Dunky13/agent-job-queue/internal/census"
 )
@@ -584,5 +587,75 @@ func TestStatusWithoutLanesReportsDefaultLaneOnly(t *testing.T) {
 	}
 	if job.Lease != nil {
 		t.Fatal("ordinary jobs gained a lease position")
+	}
+}
+
+// Removal holds scheduling.lock through its last drain check and the app's quit.
+// A lease that skipped it could start after that check and strand the removal.
+func TestLaneAcquireWaitsForSchedulingLock(t *testing.T) {
+	d, _ := laneDaemon(t, 8, map[string]string{"qa": laneManifest("qa", `{"name":"qa","concurrency":1}`)})
+	g := d.g
+	held, err := installLock(g.State, "scheduling.lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	acquired := make(chan bool, 1)
+	g.queueControl = func(operation string, payload Object) (Object, error) {
+		if operation == "lease-acquire" {
+			acquired <- schedulingLockBusy(t, g)
+		}
+		return d.control(operation, payload)
+	}
+	done := make(chan int, 1)
+	go func() {
+		var stdout, stderr bytes.Buffer
+		done <- LaneMain(g, []string{"acquire", "qa", "--owner-pid", strconv.Itoa(os.Getpid()), "--no-wait", "--json"}, &stdout, &stderr)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("a lease was requested while removal held the lock")
+	case code := <-done:
+		t.Fatal("lane acquire did not wait for the lock", code)
+	case <-time.After(300 * time.Millisecond):
+	}
+	held.Close()
+	select {
+	case busy := <-acquired:
+		if !busy {
+			t.Fatal("the lease request did not hold scheduling.lock")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("lane acquire never requested the lease")
+	}
+	if code := <-done; code != 0 {
+		t.Fatal("lane acquire", code)
+	}
+	if schedulingLockBusy(t, g) {
+		t.Fatal("lane acquire kept scheduling.lock")
+	}
+}
+
+func schedulingLockBusy(t *testing.T, g *Gate) bool {
+	t.Helper()
+	probe, err := installLock(g.State, "scheduling.lock")
+	if err == nil {
+		probe.Close()
+		return false
+	}
+	return errors.Is(err, unix.EWOULDBLOCK)
+}
+
+// The drain check removal relies on has to see a held lease.
+func TestHeldLeaseFailsTheRemovalDrainCheck(t *testing.T) {
+	d, _ := laneDaemon(t, 8, map[string]string{"qa": laneManifest("qa", `{"name":"qa","concurrency":1}`)})
+	acquireTestLease(t, d, "qa", nil)
+	snapshot, err := d.control("snapshot", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var drain *installDrainPendingError
+	if err := installRequireDrained(obj(snapshot["tasks"])); !errors.As(err, &drain) {
+		t.Fatal("a held lease looked drained", err)
 	}
 }

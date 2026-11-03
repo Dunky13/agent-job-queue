@@ -26,24 +26,24 @@ import (
 	"howett.net/plist"
 )
 
+// installer acts on the one app bundle at app. Every invocation is setup of that
+// bundle unless InstallMain resolved unregisterServices for removal, or
+// pendingInstallation pointed a copy at a retained build with pendingIdentity.
 type installer struct {
-	home, payload, root, state, config, launch, app, path string
-	identity                                              BuildInfo
-	pendingIdentity                                       *BuildInfo
-	pendingBundle                                         *managedBundleIdentity
-	setupStop                                             <-chan struct{}
-	serviceSlot                                           string
-	testing                                               bool
-	appBundle                                             bool
-	managed                                               bool
-	queueSnapshot                                         func(context.Context) (Object, error)
-	queueControl                                          func(context.Context, string, Object) (Object, error)
-	disablePhoneAccess                                    bool
-	prepareReplacement                                    bool
-	unregisterServices                                    bool
-	automaticSetup                                        bool
-	command                                               func(context.Context, []string) ([]byte, error)
-	notice                                                func(string)
+	home, root, state, config, launch, app, path string
+	identity                                     BuildInfo
+	pendingIdentity                              *BuildInfo
+	pendingBundle                                *managedBundleIdentity
+	setupStop                                    <-chan struct{}
+	serviceSlot                                  string
+	testing                                      bool
+	queueSnapshot                                func(context.Context) (Object, error)
+	queueControl                                 func(context.Context, string, Object) (Object, error)
+	disablePhoneAccess                           bool
+	unregisterServices                           bool
+	automaticSetup                               bool
+	command                                      func(context.Context, []string) ([]byte, error)
+	notice                                       func(string)
 }
 
 // announce reports an informational line that never changes setup's outcome.
@@ -60,9 +60,20 @@ var errInstallServiceNotLoaded = errors.New("Launch service is not loaded")
 var errInstallPendingCleanup = errors.New("Queue migration must wait for queue work and cleanup to finish. Retained receipts or owned lease markers may still belong to running jobs. Existing files were preserved.")
 var errInstallCustomCallback = errors.New("Custom cleanup callback cannot be retained by managed migration; it will be backed up before replacement")
 
-type installDrainPendingError struct{ tasks Object }
+var errInstallStoppedQueueUnfinished = errors.New("Managed setup requires a drained queue; stopped queue has unfinished jobs or attempts")
+var errInstallPhoneCleanupIncomplete = errors.New("Phone access process cleanup is incomplete; application must be preserved")
+var errInstallLoginUnverified = errors.New("The login service is notFound, so its registration cannot be verified; application must be preserved")
+var errInstallAppRunning = errors.New("Agent Queue is running and owns its queue processes. Quit it, then try setup again. Removal with --unregister-services quits it once its queue is drained")
+
+type installDrainPendingError struct {
+	tasks   Object
+	removal bool
+}
 
 func (err *installDrainPendingError) Error() string {
+	if err.removal {
+		return "Agent Queue still has active or queued jobs. Finish or cancel them, then run removal again. The app was left running and nothing was changed"
+	}
 	return "Queue migration requires a drained queue. Finish or cancel all queued, stashed, running, and paused jobs, then open Agent Queue again"
 }
 
@@ -194,8 +205,8 @@ func (install *installer) commandEnvironment(args []string) []string {
 	environment := envMap()
 	environment["PATH"] = install.path
 	environment["HOMEBREW_NO_AUTO_UPDATE"] = "1"
-	managedRemote := len(args) == 2 && (args[1] == "disable" || args[1] == "migrate") && (args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote") || args[0] == filepath.Join(install.payload, "Agent Queue.app/Contents/MacOS/agent-remote"))
-	if managedRemote || slices.Equal(args, []string{filepath.Join(install.payload, "source/bin/agent-remote"), "disable"}) || len(args) > 0 && args[0] == "pueue" {
+	managedRemote := len(args) == 2 && (args[1] == "disable" || args[1] == "migrate") && args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote")
+	if managedRemote || len(args) > 0 && args[0] == "pueue" {
 		// Recovery targets this installation, including when launched from a
 		// developer shell with private remote-controller fixture overrides.
 		for key := range environment {
@@ -205,7 +216,7 @@ func (install *installer) commandEnvironment(args []string) []string {
 		}
 		environment["HOME"] = install.home
 	}
-	replacement := len(args) == 3 && args[1] == "--prepare-app-replacement" && args[2] == install.app && (args[0] == filepath.Join(install.app, "Contents/MacOS/AgentQueue") || args[0] == filepath.Join(install.payload, "Agent Queue.app/Contents/MacOS/AgentQueue"))
+	replacement := len(args) == 3 && args[1] == "--prepare-app-replacement" && args[2] == install.app && args[0] == filepath.Join(install.app, "Contents/MacOS/AgentQueue")
 	if replacement || slices.Equal(args, []string{filepath.Join(install.root, "bin/agent-heavy"), "status", "--json"}) || slices.Equal(args, []string{filepath.Join(install.app, "Contents/MacOS/agent-heavy"), "status", "--json"}) || len(args) > 1 && args[0] == filepath.Join(install.app, "Contents/MacOS/AgentQueue") && args[1] == "--service-management" {
 		// Installation always targets this user's installed state. An ambient
 		// developer queue override must never establish readiness for that target.
@@ -274,10 +285,6 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 	return output.Bytes(), nil
 }
 
-func installRemoteServiceAbsent(output []byte, exitCode int) bool {
-	return installServiceAbsent(output, exitCode, "io.went.agent-remote")
-}
-
 func installServiceAbsent(output []byte, exitCode int, label string) bool {
 	return appservices.LaunchServiceAbsent(output, exitCode, label)
 }
@@ -288,36 +295,37 @@ func (install *installer) loaded(ctx context.Context, label string) bool {
 	return err == nil
 }
 
-func (install *installer) validateServices() error {
+// validateServices returns the legacy lease slot the existing definitions name.
+func (install *installer) validateServices() (string, error) {
 	configuredSlot, err := install.configuredSlot()
 	if err != nil {
-		return err
+		return "", err
 	}
 	serviceSlot := ""
 	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
 		filename := filepath.Join(install.launch, label+".plist")
 		exists, err := updateExists(filename)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if !exists {
 			continue
 		}
 		value, err := updatePlist(filename)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if value["Label"] != label {
-			return errors.New("Existing launch agent has an unexpected service identity")
+			return "", errors.New("Existing launch agent has an unexpected service identity")
 		}
 		args, err := stringsFrom(value["ProgramArguments"])
 		if err != nil {
-			return err
+			return "", err
 		}
 		if raw, present := value["Program"]; present {
 			program, valid := raw.(string)
 			if !valid || len(args) == 0 || program != args[0] {
-				return errors.New("Existing launch agent Program differs from its expected executable; preserve its behavior before opening Agent Queue again")
+				return "", errors.New("Existing launch agent Program differs from its expected executable; preserve its behavior before opening Agent Queue again")
 			}
 		}
 		valid := false
@@ -327,20 +335,20 @@ func (install *installer) validateServices() error {
 			valid = (len(args) == 2 && args[0] == filepath.Join(install.root, "bin/agent-heavy") && args[1] == "scheduler") || (len(args) == 3 && args[0] == filepath.Join(install.root, ".venv/bin/python") && args[1] == filepath.Join(install.root, "agent_heavy.py") && args[2] == "scheduler")
 		}
 		if !valid {
-			return errors.New("Existing launch agent is customized; preserve its behavior before opening Agent Queue again")
+			return "", errors.New("Existing launch agent is customized; preserve its behavior before opening Agent Queue again")
 		}
 		environment := Object{}
 		if raw, present := value["EnvironmentVariables"]; present {
 			environment = obj(raw)
 			if environment == nil {
-				return errors.New("Existing launch agent environment is invalid")
+				return "", errors.New("Existing launch agent environment is invalid")
 			}
 		}
 		for key, expected := range map[string]string{"HOME": install.home, "AGENT_HEAVY_STATE": install.state, "AGENT_HEAVY_CONFIG": filepath.Join(install.config, "pueue.yml")} {
 			if raw, present := environment[key]; present {
 				actual, valid := raw.(string)
 				if !valid || actual != expected {
-					return fmt.Errorf("Existing launch agent %s differs from the installation target; preserve its configuration before opening Agent Queue again", key)
+					return "", fmt.Errorf("Existing launch agent %s differs from the installation target; preserve its configuration before opening Agent Queue again", key)
 				}
 			}
 		}
@@ -348,20 +356,19 @@ func (install *installer) validateServices() error {
 		if raw, present := environment["AGENT_HEAVY_LEGACY_SLOT"]; present {
 			actual, valid := raw.(string)
 			if !valid || !integrationValidPath(actual) {
-				return errors.New("Existing launch agent AGENT_HEAVY_LEGACY_SLOT must name a valid absolute path")
+				return "", errors.New("Existing launch agent AGENT_HEAVY_LEGACY_SLOT must name a valid absolute path")
 			}
 			slot = actual
 		}
 		if serviceSlot != "" && serviceSlot != slot {
-			return errors.New("Existing queue and resource controller use different legacy slots; reconcile their configuration before opening Agent Queue again")
+			return "", errors.New("Existing queue and resource controller use different legacy slots; reconcile their configuration before opening Agent Queue again")
 		}
 		serviceSlot = slot
 	}
 	if serviceSlot == "" {
 		serviceSlot = configuredSlot
 	}
-	install.serviceSlot = serviceSlot
-	return nil
+	return serviceSlot, nil
 }
 
 func (install *installer) configuredSlot() (string, error) {
@@ -386,33 +393,6 @@ func installReadInfo(filename string) (BuildInfo, error) {
 	return ValidateBuildInfo(raw)
 }
 
-// A downloaded payload replaces the recorded installation, including shared
-// Applications and renamed bundles. An explicit app-bundle target stays explicit
-// so an ownership-checked relocation never redirects the caller to the old app.
-func (install *installer) resolvePayloadApp() error {
-	if install.appBundle {
-		return nil
-	}
-	metadata, err := appservices.Load(install.home)
-	if err != nil {
-		return err
-	}
-	if metadata != nil {
-		install.app = metadata.App
-	}
-	return nil
-}
-
-func (install *installer) validateAppPath() error {
-	if err := installValidateAppPath(install.home, install.app); err != nil {
-		return err
-	}
-	if install.payload != filepath.Join(install.app, "Contents/Resources/payload") {
-		return errors.New("App bundle payload must be embedded in Contents/Resources/payload")
-	}
-	return nil
-}
-
 func installValidateAppPath(home, app string) error {
 	if !integrationValidPath(app) || filepath.Clean(app) != app || !strings.HasSuffix(filepath.Base(app), ".app") {
 		return errors.New("App bundle must be a direct application in /Applications or your home Applications directory")
@@ -427,7 +407,7 @@ func installValidateAppPath(home, app string) error {
 // Open every parent without following symlinks. Root ownership is permitted only
 // for immutable bundle resources, never for installed private state or locks.
 // /Applications is an Apple-managed shared parent and must not be chmodded.
-func installPayloadParent(root, filename string, bundled bool) (*os.File, error) {
+func installPayloadParent(root, filename string) (*os.File, error) {
 	if !integrationValidPath(root) || filepath.Clean(root) != root || !integrationValidPath(filename) || filepath.Clean(filename) != filename || !strings.HasPrefix(filename, root+string(filepath.Separator)) {
 		return nil, errors.New("Installer read escapes its canonical payload boundary")
 	}
@@ -450,7 +430,7 @@ func installPayloadParent(root, filename string, bundled bool) (*os.File, error)
 			return nil, err
 		}
 		inside := current == root || strings.HasPrefix(current, root+"/")
-		owner := info.Uid == uint32(os.Getuid()) || (info.Uid == 0 && (!inside || bundled))
+		owner := info.Uid == uint32(os.Getuid()) || info.Uid == 0
 		sharedTemporary := !inside && info.Uid == 0 && uint32(info.Mode)&unix.S_ISVTX != 0
 		sharedApplications := !inside && current == "/Applications" && info.Uid == 0 && uint32(info.Mode)&0002 == 0
 		if !owner || (uint32(info.Mode)&0022 != 0 && !sharedTemporary && !sharedApplications) {
@@ -461,8 +441,8 @@ func installPayloadParent(root, filename string, bundled bool) (*os.File, error)
 	return os.NewFile(uintptr(fd), filepath.Dir(filename)), nil
 }
 
-func installReadPayload(root, filename string, limit int64, bundled bool) ([]byte, error) {
-	parent, err := installPayloadParent(root, filename, bundled)
+func installReadPayload(root, filename string, limit int64) ([]byte, error) {
+	parent, err := installPayloadParent(root, filename)
 	if err != nil {
 		return nil, err
 	}
@@ -477,7 +457,7 @@ func installReadPayload(root, filename string, limit int64, bundled bool) ([]byt
 	if err := unix.Fstat(fd, &info); err != nil {
 		return nil, err
 	}
-	if uint32(info.Mode)&unix.S_IFMT != unix.S_IFREG || (info.Uid != uint32(os.Getuid()) && !(bundled && info.Uid == 0)) || uint32(info.Mode)&0022 != 0 || info.Nlink != 1 {
+	if uint32(info.Mode)&unix.S_IFMT != unix.S_IFREG || (info.Uid != uint32(os.Getuid()) && info.Uid != 0) || uint32(info.Mode)&0022 != 0 || info.Nlink != 1 {
 		return nil, errors.New("Installer payload has unsafe ownership, permissions, or file type")
 	}
 	before := integrationStatIdentity(&info)
@@ -498,14 +478,10 @@ func installReadPayload(root, filename string, limit int64, bundled bool) ([]byt
 }
 
 func (install *installer) readPayload(filename string, limit int64) ([]byte, error) {
-	root := install.payload
-	if install.appBundle {
-		root = install.app
-	}
-	return installReadPayload(root, filename, limit, install.appBundle)
+	return installReadPayload(install.app, filename, limit)
 }
 
-func installValidatePayloadTree(root string, bundled bool) error {
+func installValidatePayloadTree(root string) error {
 	count := 0
 	var total int64
 	return filepath.WalkDir(root, func(filename string, entry os.DirEntry, err error) error {
@@ -517,7 +493,7 @@ func installValidatePayloadTree(root string, bundled bool) error {
 			return errors.New("Application payload exceeds its file limit")
 		}
 		if entry.IsDir() {
-			parent, err := installPayloadParent(root, filepath.Join(filename, ".installer-probe"), bundled)
+			parent, err := installPayloadParent(root, filepath.Join(filename, ".installer-probe"))
 			if err != nil {
 				return err
 			}
@@ -526,7 +502,7 @@ func installValidatePayloadTree(root string, bundled bool) error {
 		if !entry.Type().IsRegular() {
 			return errors.New("Application payload contains a symlink or special file")
 		}
-		parent, err := installPayloadParent(root, filename, bundled)
+		parent, err := installPayloadParent(root, filename)
 		if err != nil {
 			return err
 		}
@@ -536,7 +512,7 @@ func installValidatePayloadTree(root string, bundled bool) error {
 		if err != nil {
 			return err
 		}
-		if uint32(info.Mode)&unix.S_IFMT != unix.S_IFREG || (info.Uid != uint32(os.Getuid()) && !(bundled && info.Uid == 0)) || uint32(info.Mode)&0022 != 0 || info.Nlink != 1 {
+		if uint32(info.Mode)&unix.S_IFMT != unix.S_IFREG || (info.Uid != uint32(os.Getuid()) && info.Uid != 0) || uint32(info.Mode)&0022 != 0 || info.Nlink != 1 {
 			return errors.New("Installer payload has unsafe ownership, permissions, or file type")
 		}
 		total += info.Size
@@ -547,38 +523,21 @@ func installValidatePayloadTree(root string, bundled bool) error {
 	})
 }
 
-func (install *installer) validatePayload() error {
-	if !install.appBundle {
-		// Classic installer sources may have a system alias above the payload
-		// (for example macOS temporary storage). Establish its canonical boundary
-		// first; every path inside that boundary still rejects symlinks.
-		if !integrationValidPath(install.payload) {
-			return errors.New("Installer payload must be an absolute path without traversal")
-		}
-		payload, err := filepath.EvalSymlinks(install.payload)
-		if err != nil {
-			return err
-		}
-		install.payload = payload
-	}
-	app := filepath.Join(install.payload, "Agent Queue.app")
-	boundary := install.payload
-	if install.appBundle {
-		if err := install.validateAppPath(); err != nil {
-			return err
-		}
-		app = install.app
-		boundary = app
-		if exists, err := updateExists(filepath.Join(install.payload, "Agent Queue.app")); err != nil {
-			return err
-		} else if exists {
-			return errors.New("App bundle payload must not contain a recursive Agent Queue.app")
-		}
-	}
-	if err := installValidatePayloadTree(boundary, install.appBundle); err != nil {
+// validateMarkedBundle establishes that app is a marked bundle in an allowed
+// location, before validateBundle trusts anything inside it.
+func (install *installer) validateMarkedBundle() error {
+	if err := installValidateAppPath(install.home, install.app); err != nil {
 		return err
 	}
-	metadata, err := install.readPayload(filepath.Join(app, "Contents/Info.plist"), 16384)
+	if exists, err := updateExists(filepath.Join(install.app, "Contents/Resources/payload/Agent Queue.app")); err != nil {
+		return err
+	} else if exists {
+		return errors.New("App bundle payload must not contain a recursive Agent Queue.app")
+	}
+	if err := installValidatePayloadTree(install.app); err != nil {
+		return err
+	}
+	metadata, err := install.readPayload(filepath.Join(install.app, "Contents/Info.plist"), 16384)
 	if err != nil {
 		return err
 	}
@@ -586,146 +545,124 @@ func (install *installer) validatePayload() error {
 	if _, err := plist.Unmarshal(metadata, &packaging); err != nil {
 		return err
 	}
-	install.managed = false
-	if marker, present := packaging["AgentQueueServiceManagement"]; present {
-		if marker != true {
-			return errors.New("Invalid service management packaging marker")
-		}
-		install.managed = true
-		if err := appservices.ValidateBundle(app); err != nil {
-			return err
-		}
+	marker, present := packaging["AgentQueueServiceManagement"]
+	if !present {
+		return errors.New("App bundle lacks the service management packaging marker")
 	}
-	executables := []string{filepath.Join(app, "Contents/MacOS/AgentQueue")}
-	if !install.managed || !install.appBundle {
-		executables = append(executables, filepath.Join(install.payload, "source/bin/agent-heavy"), filepath.Join(install.payload, "source/bin/agent-remote"))
+	if marker != true {
+		return errors.New("Invalid service management packaging marker")
 	}
-	for _, filename := range executables {
-		if _, err := install.readPayload(filename, updateMaxArchive); err != nil {
-			return err
-		}
-		info, err := os.Lstat(filename)
-		if err != nil || !info.Mode().IsRegular() {
-			return errors.New("Incomplete installer payload")
-		}
-		if info.Mode().Perm()&0111 == 0 {
-			return errors.New("Installer backend binaries must be executable")
-		}
+	return nil
+}
+
+// validateBundle returns the build identity of the bundle at app. It changes
+// nothing, so its callers decide when that identity becomes the selected one.
+func (install *installer) validateBundle() (BuildInfo, error) {
+	if err := install.validateMarkedBundle(); err != nil {
+		return BuildInfo{}, err
 	}
-	raw, err := install.readPayload(filepath.Join(install.payload, "source/build-info.json"), 16384)
+	app := install.app
+	if err := appservices.ValidateBundle(app); err != nil {
+		return BuildInfo{}, err
+	}
+	filename := filepath.Join(app, "Contents/MacOS/AgentQueue")
+	if _, err := install.readPayload(filename, updateMaxArchive); err != nil {
+		return BuildInfo{}, err
+	}
+	stat, err := os.Lstat(filename)
+	if err != nil || !stat.Mode().IsRegular() {
+		return BuildInfo{}, errors.New("Incomplete installer payload")
+	}
+	if stat.Mode().Perm()&0111 == 0 {
+		return BuildInfo{}, errors.New("Installer backend binaries must be executable")
+	}
+	raw, err := install.readPayload(filepath.Join(app, "Contents/Resources/payload/source/build-info.json"), 16384)
 	if err != nil {
-		return err
+		return BuildInfo{}, err
 	}
 	identity, err := ValidateBuildInfo(raw)
 	if err != nil {
-		return err
+		return BuildInfo{}, err
 	}
 	if install.pendingIdentity != nil && !identity.Equal(*install.pendingIdentity) {
-		return errors.New("The retained app changed from the exact pending build; recovery stopped")
+		return BuildInfo{}, errors.New("The retained app changed from the exact pending build; recovery stopped")
 	}
 	if install.pendingIdentity != nil {
 		pending, err := installReadInfo(filepath.Join(install.root, "install-in-progress.json"))
 		if err != nil || !pending.Equal(*install.pendingIdentity) {
-			return errors.New("The pending installation changed; recovery stopped")
+			return BuildInfo{}, errors.New("The pending installation changed; recovery stopped")
 		}
 	}
 	if install.pendingBundle != nil {
 		if err := managedRequireBundle(install.app, *install.pendingBundle); err != nil {
-			return err
+			return BuildInfo{}, err
 		}
 	}
-	install.identity = identity
 	raw, err = install.readPayload(filepath.Join(app, "Contents/Resources/build-info.json"), 16384)
 	if err != nil {
-		return err
+		return BuildInfo{}, err
 	}
 	bundled, err := ValidateBuildInfo(raw)
 	if err != nil {
-		return err
+		return BuildInfo{}, err
 	}
 	if !identity.Equal(bundled) {
-		return errors.New("Installer app and support build identities differ")
-	}
-	if install.managed {
-		raw, err := install.readPayload(filepath.Join(app, "Contents/Resources/payload/source/build-info.json"), 16384)
-		if err != nil {
-			return err
-		}
-		embedded, err := ValidateBuildInfo(raw)
-		if err != nil {
-			return err
-		}
-		if !identity.Equal(embedded) {
-			return errors.New("Managed app and embedded support identities differ")
-		}
+		return BuildInfo{}, errors.New("Installer app and support build identities differ")
 	}
 	raw, err = install.readPayload(filepath.Join(app, "Contents/Info.plist"), 16384)
 	if err != nil {
-		return err
+		return BuildInfo{}, err
 	}
 	var info map[string]any
 	if _, err := plist.Unmarshal(raw, &info); err != nil {
-		return errors.New("Installer app metadata is invalid")
+		return BuildInfo{}, errors.New("Installer app metadata is invalid")
 	}
 	build := "0"
 	if identity.Build != nil {
 		build = strconv.Itoa(*identity.Build)
 	}
 	if info["CFBundleIdentifier"] != "io.went.agent-queue" || info["CFBundleShortVersionString"] != identity.Version || info["CFBundleVersion"] != build {
-		return errors.New("Installer app version differs from its build identity")
+		return BuildInfo{}, errors.New("Installer app version differs from its build identity")
 	}
-	markers := []string{filepath.Join(install.root, "build-info.json"), filepath.Join(install.root, "install-in-progress.json")}
-	if !install.appBundle {
-		markers = append(markers, filepath.Join(install.app, "Contents/Resources/build-info.json"))
-	}
-	for _, marker := range markers {
+	for _, marker := range []string{filepath.Join(install.root, "build-info.json"), filepath.Join(install.root, "install-in-progress.json")} {
 		exists, err := updateExists(marker)
 		if err != nil {
-			return err
+			return BuildInfo{}, err
 		}
 		if !exists {
 			continue
 		}
-		var installed BuildInfo
-		if strings.HasPrefix(marker, install.app+"/") {
-			data, readErr := installReadPayload(install.app, marker, 16384, true)
-			if readErr != nil {
-				return readErr
-			}
-			installed, err = ValidateBuildInfo(data)
-		} else {
-			installed, err = installReadInfo(marker)
-		}
+		installed, err := installReadInfo(marker)
 		if err != nil {
-			return err
+			return BuildInfo{}, err
 		}
 		if install.unregisterServices {
 			// Removal verifies identities but never activates code. An installed
 			// old app can still be removed after preparation of a newer candidate.
 			continue
 		}
-		if install.managed && installed.Build != nil && identity.Build == nil {
-			return errors.New("Refusing to replace a tracked completed or pending installation with an untracked build")
+		if installed.Build != nil && identity.Build == nil {
+			return BuildInfo{}, errors.New("Refusing to replace a tracked completed or pending installation with an untracked build")
 		}
 		if identity.Build != nil && installed.Build != nil {
 			if *identity.Build < *installed.Build {
-				return errors.New("Refusing to install an older tracked build over a newer installation")
+				return BuildInfo{}, errors.New("Refusing to install an older tracked build over a newer installation")
 			}
 			if *identity.Build == *installed.Build && !identity.Equal(installed) {
-				return errors.New("The same tracked build number has a different commit or version")
+				return BuildInfo{}, errors.New("The same tracked build number has a different commit or version")
 			}
 		}
-		if install.managed && marker == filepath.Join(install.root, "install-in-progress.json") && !identity.Equal(installed) {
+		if marker == filepath.Join(install.root, "install-in-progress.json") && !identity.Equal(installed) {
 			superseded, err := install.managedPendingSuperseded(identity, installed)
 			if err != nil {
-				return err
+				return BuildInfo{}, err
 			}
 			if !superseded {
-				return &installPendingError{identity: installed}
+				return BuildInfo{}, &installPendingError{identity: installed}
 			}
 		}
 	}
-	return nil
+	return identity, nil
 }
 
 func installLock(state, name string) (*os.File, error) {
@@ -825,7 +762,7 @@ func (install *installer) standardCleanupCallback(callback string) bool {
 	if slices.Contains(installCallbackPathSpellings(filepath.Join(install.root, "bin/agent-heavy")), invocation) {
 		return true
 	}
-	if install.managed && slices.Contains(installCallbackPathSpellings(filepath.Join(install.home, ".local/bin/agent-heavy")), invocation) {
+	if slices.Contains(installCallbackPathSpellings(filepath.Join(install.home, ".local/bin/agent-heavy")), invocation) {
 		return true
 	}
 	// The legacy installer used a venv and Homebrew Python 3.12. Retain only
@@ -1589,206 +1526,6 @@ func (install *installer) stopLegacy(ctx context.Context, node *yaml.Node) error
 	return nil
 }
 
-func (install *installer) copyFile(source, destination string, mode os.FileMode) error {
-	raw, err := install.readPayload(source, updateMaxArchive)
-	if err != nil {
-		return err
-	}
-	return installAtomic(destination, raw, mode)
-}
-
-func installCopyTree(source, destination string) error {
-	return installCopyPayloadTree(source, destination, source, false)
-}
-
-func installCopyPayloadTree(source, destination, boundary string, bundled bool) error {
-	if err := installDirectory(destination); err != nil {
-		return err
-	}
-	count := 0
-	var total int64
-	return filepath.WalkDir(source, func(filename string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		count++
-		if count > 10000 {
-			return errors.New("Application payload exceeds its file limit")
-		}
-		relative, err := filepath.Rel(source, filename)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(destination, relative)
-		if entry.IsDir() {
-			return installDirectory(target)
-		}
-		if !entry.Type().IsRegular() {
-			return errors.New("Application payload contains a symlink or special file")
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		total += info.Size()
-		if info.Size() > updateMaxArchive || total > updateMaxExpanded {
-			return errors.New("Application payload exceeds its size limit")
-		}
-		raw, err := installReadPayload(boundary, filename, updateMaxArchive, bundled)
-		if err != nil {
-			return err
-		}
-		mode := os.FileMode(0600)
-		if info.Mode().Perm()&0111 != 0 {
-			mode = 0700
-		}
-		return installAtomic(target, raw, mode)
-	})
-}
-
-func (install *installer) copyApp(ctx context.Context, source, destination string) error {
-	// Validate every entry with the same bounded, no-symlink copier used by
-	// isolated tests. macOS then preserves the original app's quarantine, ACLs,
-	// resource forks and extended attributes before the atomic app publication.
-	if err := installCopyTree(source, destination); err != nil {
-		return err
-	}
-	if install.testing {
-		return nil
-	}
-	// ditto merges an existing root without copying that root's attributes.
-	// Remove only our validated staging copy so its native copy inherits them.
-	if err := os.RemoveAll(destination); err != nil {
-		return err
-	}
-	_, err := install.run(ctx, "/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", source, destination)
-	return err
-}
-
-func (install *installer) support() error {
-	for _, directory := range []string{"bin", "scripts"} {
-		if err := installDirectory(filepath.Join(install.root, directory)); err != nil {
-			return err
-		}
-	}
-	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		if err := install.copyFile(filepath.Join(install.payload, "source/bin", name), filepath.Join(install.root, "bin", name), 0700); err != nil {
-			return err
-		}
-		wrapper := []byte("#!/bin/sh\nexec \"$HOME/.local/share/agent-heavy/bin/" + name + "\" \"$@\"\n")
-		if err := installAtomic(filepath.Join(install.home, ".local/bin", name), wrapper, 0700); err != nil {
-			return err
-		}
-	}
-	for _, name := range []string{"README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "VERSION", "scripts/install-user.sh"} {
-		filename := filepath.Join(install.payload, "source", name)
-		exists, err := updateExists(filename)
-		if err != nil {
-			return err
-		}
-		if exists {
-			mode := os.FileMode(0600)
-			if strings.HasSuffix(name, ".sh") {
-				mode = 0700
-			}
-			if err := install.copyFile(filename, filepath.Join(install.root, name), mode); err != nil {
-				return err
-			}
-		}
-	}
-	licenses := filepath.Join(install.payload, "source/licenses")
-	if exists, err := updateExists(licenses); err != nil {
-		return err
-	} else if exists {
-		boundary := install.payload
-		if install.appBundle {
-			boundary = install.app
-		}
-		if err := installCopyPayloadTree(licenses, filepath.Join(install.root, "licenses"), boundary, install.appBundle); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (install *installer) writeConfig(node *yaml.Node, migration bool) error {
-	filename := filepath.Join(install.config, "pueue.yml")
-	if node == nil {
-		return nil
-	}
-	if !migration {
-		return nil
-	}
-	callback := installYAMLValue(installYAMLValue(node, "daemon"), "callback")
-	if callback == nil {
-		return errors.New("Missing queue callback")
-	}
-	callback.Value = installQuote(filepath.Join(install.root, "bin/agent-heavy")) + " cleanup {{ id }}"
-	raw, err := yaml.Marshal(node)
-	if err != nil {
-		return err
-	}
-	return installAtomic(filename, raw, 0600)
-}
-
-func (install *installer) writePlist(filename string, value Object) error {
-	raw, err := plist.MarshalIndent(value, plist.XMLFormat, "  ")
-	if err != nil {
-		return err
-	}
-	return installAtomic(filename, raw, 0600)
-}
-
-func (install *installer) serviceDefinitions(migration bool) error {
-	environment := Object{"HOME": install.home, "PATH": ToolPath, "AGENT_HEAVY_STATE": install.state, "AGENT_HEAVY_CONFIG": filepath.Join(install.config, "pueue.yml"), "AGENT_HEAVY_LEGACY_SLOT": install.serviceSlot}
-	queue := filepath.Join(install.launch, "io.went.agent-heavy.plist")
-	if exists, err := updateExists(queue); err != nil {
-		return err
-	} else if !exists || migration {
-		value := Object{"Label": "io.went.agent-heavy", "ProgramArguments": []string{filepath.Join(install.root, "bin/agent-heavy"), "daemon"}, "EnvironmentVariables": environment, "KeepAlive": Object{"SuccessfulExit": false}, "RunAtLoad": true, "StandardErrorPath": filepath.Join(install.state, "daemon.log"), "StandardOutPath": filepath.Join(install.state, "daemon.log"), "ThrottleInterval": 10, "Umask": 077, "WorkingDirectory": install.state}
-		if exists {
-			previous, err := updatePlist(queue)
-			if err != nil {
-				return err
-			}
-			for key, field := range previous {
-				if key != "Program" && key != "ProgramArguments" {
-					value[key] = field
-				}
-			}
-		}
-		value["EnvironmentVariables"] = install.serviceEnvironment(obj(value["EnvironmentVariables"]))
-		if err := install.writePlist(queue, value); err != nil {
-			return err
-		}
-	}
-	controller := filepath.Join(install.launch, "io.went.agent-resources.plist")
-	if exists, err := updateExists(controller); err != nil {
-		return err
-	} else if !exists || migration {
-		value := Object{"Label": "io.went.agent-resources", "ProgramArguments": []string{filepath.Join(install.root, "bin/agent-heavy"), "scheduler"}, "EnvironmentVariables": environment, "KeepAlive": true, "RunAtLoad": true, "ThrottleInterval": 10, "Umask": 077, "StandardErrorPath": filepath.Join(install.state, "resources.log"), "StandardOutPath": filepath.Join(install.state, "resources.log"), "WorkingDirectory": install.state}
-		if exists {
-			previous, err := updatePlist(controller)
-			if err != nil {
-				return err
-			}
-			for key, field := range previous {
-				if key != "Program" && key != "ProgramArguments" {
-					value[key] = field
-				}
-			}
-			if value["Label"] != "io.went.agent-resources" {
-				return errors.New("Unexpected resource controller service identity")
-			}
-		}
-		value["EnvironmentVariables"] = install.serviceEnvironment(obj(value["EnvironmentVariables"]))
-		if err := install.writePlist(controller, value); err != nil {
-			return err
-		}
-	}
-	return install.writePlist(filepath.Join(install.launch, "io.went.agent-queue.plist"), Object{"Label": "io.went.agent-queue", "ProgramArguments": []string{"/usr/bin/open", "-a", install.app}, "RunAtLoad": true, "KeepAlive": false})
-}
-
 func (install *installer) serviceEnvironment(previous Object) Object {
 	environment := Object{}
 	for key, value := range previous {
@@ -1855,346 +1592,38 @@ func (install *installer) removeLegacy() error {
 	return nil
 }
 
-func (install *installer) publishApp(ctx context.Context) error {
-	staging := filepath.Join(install.home, "Applications/.Agent Queue.installing.app")
-	previous := filepath.Join(install.home, "Applications/.Agent Queue.previous.app")
-	for _, directory := range []string{staging, previous} {
-		if exists, err := updateExists(directory); err != nil {
-			return err
-		} else if exists {
-			if err := updatePrivateDirectory(directory); err != nil {
-				return err
-			}
-			if err := os.RemoveAll(directory); err != nil {
-				return err
-			}
-		}
-	}
-	if err := install.copyApp(ctx, filepath.Join(install.payload, "Agent Queue.app"), staging); err != nil {
-		return err
-	}
-	if !install.testing {
-		_, _ = install.run(ctx, "/usr/bin/osascript", "-e", `tell application id "io.went.agent-queue" to quit`)
-	}
-	appExists, err := updateExists(install.app)
-	if err != nil {
-		return err
-	}
-	if appExists {
-		if err := installDirectory(install.app); err != nil {
-			return err
-		}
-		if err := os.Rename(install.app, previous); err != nil {
-			return err
-		}
-	}
-	if err := os.Rename(staging, install.app); err != nil {
-		if appExists {
-			_ = os.Rename(previous, install.app)
-		}
-		return err
-	}
-	if appExists {
-		if err := os.RemoveAll(previous); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (install *installer) execute(ctx context.Context) error {
 	if !install.testing && runtime.GOOS != "darwin" {
 		return errors.New("Agent Job Queue requires macOS")
 	}
-	if err := install.resolvePayloadApp(); err != nil {
-		return err
-	}
-	if err := install.validatePayload(); err != nil {
-		return err
-	}
-	if install.prepareReplacement || install.unregisterServices {
-		if !install.managed || install.prepareReplacement && install.appBundle || install.unregisterServices && !install.appBundle || install.prepareReplacement && install.unregisterServices {
-			return errors.New("Replacement preparation requires a marked managed payload; service removal requires a marked installed app bundle")
-		}
-		return install.prepareManaged(ctx)
-	}
-	if install.managed {
-		return install.executeManaged(ctx)
-	}
-	if metadata, err := appservices.Load(install.home); err != nil {
-		return err
-	} else if metadata != nil {
-		return errors.New("A managed installation cannot be replaced with an unmarked legacy payload")
-	}
-	directories := []string{install.root, install.state, install.config, filepath.Join(install.home, ".local/bin"), install.launch}
-	if !install.appBundle {
-		directories = append(directories, filepath.Join(install.home, "Applications"))
-	}
-	for _, directory := range directories {
-		if err := installDirectory(directory); err != nil {
-			return err
-		}
-	}
-	lock, err := installLock(install.state, "install.lock")
+	identity, err := install.validateBundle()
 	if err != nil {
 		return err
 	}
-	defer lock.Close()
-	// Recover a crash between moving the previous app aside and publishing the
-	// replacement. Never discard the last usable app before its replacement exists.
-	previousApp := filepath.Join(install.home, "Applications/.Agent Queue.previous.app")
-	if appExists, err := updateExists(install.app); err != nil {
-		return err
-	} else if !install.appBundle && !appExists {
-		if backupExists, err := updateExists(previousApp); err != nil {
-			return err
-		} else if backupExists {
-			if err := installDirectory(previousApp); err != nil {
-				return err
-			}
-			if err := os.Rename(previousApp, install.app); err != nil {
-				return err
-			}
-		}
+	install.identity = identity
+	if install.unregisterServices {
+		return install.removeManaged(ctx)
 	}
-	// Identity validation repeats under the kernel lock: a delayed older installer
-	// must not overtake a newer install that completed while it was starting.
-	if err := install.validatePayload(); err != nil {
-		return err
+	return install.executeManaged(ctx)
+}
+
+// installReportFailure writes what the app reads from a failed setup.
+func installReportFailure(output io.Writer, err error) {
+	var approval *installApprovalError
+	if errors.As(err, &approval) {
+		// The app waits for macOS approval, then runs setup again.
+		fmt.Fprintln(output, "AGENT_QUEUE_SETUP_STATE:requires-approval")
 	}
-	scheduling, err := installLock(install.state, "scheduling.lock")
-	if err != nil {
-		return err
+	fmt.Fprintf(output, "Agent Queue setup: %v\n", err)
+	if errors.Is(err, errInstallLegacyPhoneAccess) {
+		fmt.Fprintln(output, installDisablePhoneAccessRecovery)
 	}
-	defer scheduling.Close()
-	var node *yaml.Node
-	exists, err := updateExists(filepath.Join(install.config, "pueue.yml"))
-	if err != nil {
-		return err
-	}
-	if exists {
-		node, err = installConfig(filepath.Join(install.config, "pueue.yml"))
-		if err != nil {
-			return err
-		}
-	}
-	if err := install.validateServices(); err != nil {
-		return err
-	}
-	if err := install.validateLoadedServices(ctx); err != nil {
-		return err
-	}
-	slot := install.serviceSlot
-	migration, err := install.pythonMigration(ctx, node)
-	if errors.Is(err, errInstallLegacyPhoneAccess) && install.disablePhoneAccess {
-		if err := install.validateRetirement(); err != nil {
-			return err
-		}
-		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
-			return err
-		}
-		// The bundled controller understands legacy process ownership. Never
-		// execute the old Python runtime or edit its enabled flag ourselves.
-		// Run before taking control.lock, which the controller acquires itself.
-		if _, err := install.run(ctx, filepath.Join(install.payload, "source/bin/agent-remote"), "disable"); err != nil {
-			return fmt.Errorf("Phone access could not be disabled; setup has not continued: %w", err)
-		}
-		migration, err = install.pythonMigration(ctx, node)
-	}
-	if err != nil {
-		return err
-	}
-	if migration {
-		if err := install.validateRetirement(); err != nil {
-			return err
-		}
-	}
-	queueMigration, err := install.queueMigration(ctx, node)
-	if err != nil {
-		return err
-	}
-	remoteState := filepath.Join(install.state, "remote")
-	if err := installDirectory(remoteState); err != nil {
-		return err
-	}
-	remoteControl, err := installLock(remoteState, "control.lock")
-	if err != nil {
-		return fmt.Errorf("A remote settings operation is running; finish it before opening Agent Queue again: %w", err)
-	}
-	defer remoteControl.Close()
-	// Serialize the last legacy/remote snapshot with publication of the stable
-	// executable. A waiting old control process can only launch the new binary
-	// once this lock is released.
-	if currentMigration, err := install.pythonMigration(ctx, node); err != nil {
-		return err
-	} else if currentMigration != migration {
-		return errors.New("Installed queue migration state changed; open Agent Queue again")
-	}
-	if currentMigration, err := install.queueMigration(ctx, node); err != nil {
-		return err
-	} else if currentMigration != queueMigration {
-		return errors.New("Installed queue migration state changed; open Agent Queue again")
-	}
-	remoteWasEnabled, err := install.remoteEnabled()
-	if err != nil {
-		return err
-	}
-	remoteNeedsCleanup := false
-	if !remoteWasEnabled {
-		remoteNeedsCleanup, err = install.disabledRemoteCleanup(ctx)
-		if err != nil {
-			return err
-		}
-	}
-	if remoteWasEnabled || remoteNeedsCleanup {
-		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
-			return err
-		}
-	}
-	if queueMigration || (migration && !install.embeddedDefinition()) {
-		if err := install.stopLegacy(ctx, node); err != nil {
-			return err
-		}
-	}
-	raw, err := json.MarshalIndent(install.identity, "", "  ")
-	if err != nil {
-		return err
-	}
-	raw = append(raw, '\n')
-	if err := installAtomic(filepath.Join(install.root, "install-in-progress.json"), raw, 0600); err != nil {
-		return err
-	}
-	if queueMigration {
-		snapshot, err := install.legacySnapshot(ctx, node, false)
-		if err != nil {
-			return err
-		}
-		if err := installRequireDrained(obj(snapshot["tasks"])); err != nil {
-			return err
-		}
-		data, err := json.Marshal(snapshot)
-		if err != nil {
-			return err
-		}
-		if err := installAtomic(filepath.Join(install.state, "legacy-queue-import.json"), data, 0600); err != nil {
-			return err
-		}
-	}
-	if slot != "" {
-		settings, _ := json.Marshal(Object{"slot": slot})
-		if err := installAtomic(filepath.Join(install.state, "legacy-slot.json"), settings, 0600); err != nil {
-			return err
-		}
-	}
-	if err := install.support(); err != nil {
-		return err
-	}
-	if err := remoteControl.Close(); err != nil {
-		return err
-	}
-	for _, directory := range []string{filepath.Join(install.state, "run")} {
-		if err := installDirectory(directory); err != nil {
-			return err
-		}
-	}
-	if err := install.writeConfig(node, migration); err != nil {
-		return err
-	}
-	if err := install.serviceDefinitions(migration || queueMigration); err != nil {
-		return err
-	}
-	if !install.loaded(ctx, "io.went.agent-heavy") {
-		if _, err := install.run(ctx, "launchctl", "bootstrap", install.domain(), filepath.Join(install.launch, "io.went.agent-heavy.plist")); err != nil {
-			return err
-		}
-	}
-	ready := false
-	for attempt := 0; attempt < 30; attempt++ {
-		if _, err := install.run(ctx, filepath.Join(install.root, "bin/agent-heavy"), "status", "--json"); err == nil {
-			ready = true
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Second):
-		}
-	}
-	if !ready {
-		return errors.New("The queue daemon did not become ready. Inspect the private daemon log")
-	}
-	if !install.appBundle {
-		if err := install.publishApp(ctx); err != nil {
-			return err
-		}
-	}
-	if migration {
-		if err := install.removeLegacy(); err != nil {
-			return err
-		}
-	}
-	if install.loaded(ctx, "io.went.agent-resources") {
-		if _, err := install.run(ctx, "launchctl", "kickstart", "-k", install.domain()+"/io.went.agent-resources"); err != nil {
-			return err
-		}
-	} else {
-		if _, err := install.run(ctx, "launchctl", "bootstrap", install.domain(), filepath.Join(install.launch, "io.went.agent-resources.plist")); err != nil {
-			return err
-		}
-	}
-	if remoteWasEnabled {
-		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
-			return err
-		}
-		// The new remote executable reconciles recorded process ownership, stops
-		// its old API/gateway/supervisor, and restores enabled access with the
-		// existing credentials and private CA. Never leave an external gateway
-		// running indefinitely after upgrading to the embedded implementation.
-		if _, err := install.run(ctx, filepath.Join(install.root, "bin/agent-remote"), "migrate"); err != nil {
-			return fmt.Errorf("Remote access migration did not finish; retry this installer to preserve enabled access: %w", err)
-		}
-	} else if remoteNeedsCleanup {
-		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
-			return err
-		}
-		if _, err := install.run(ctx, filepath.Join(install.root, "bin/agent-remote"), "migrate"); err != nil {
-			return fmt.Errorf("Disabled remote service cleanup did not finish; retry this installer: %w", err)
-		}
-	}
-	if err := installAtomic(filepath.Join(install.root, "build-info.json"), raw, 0600); err != nil {
-		return err
-	}
-	if err := os.Remove(filepath.Join(install.root, "install-in-progress.json")); err != nil {
-		return err
-	}
-	directory, err := os.Open(install.root)
-	if err != nil {
-		return err
-	}
-	err = directory.Sync()
-	directory.Close()
-	if err != nil {
-		return err
-	}
-	if !install.testing && !install.appBundle {
-		if _, err := install.run(ctx, "/usr/bin/open", "-a", install.app); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func InstallMain(args []string) int {
 	options, optionErr := installParseOptions(args)
 	if optionErr != nil {
 		fmt.Fprintln(os.Stderr, optionErr)
-		return 2
-	}
-	args = options.target
-	disablePhoneAccess := false
-	disablePhoneAccess = options.disablePhoneAccess
-	if len(args) != 2 || (args[0] != "--payload" && args[0] != "--app-bundle") || !filepath.IsAbs(args[1]) {
-		fmt.Fprintln(os.Stderr, "Usage: agent-heavy install --payload DIRECTORY | --app-bundle ABSOLUTE_APP_PATH [--disable-phone-access]")
 		return 2
 	}
 	home, err := os.UserHomeDir()
@@ -2212,14 +1641,7 @@ func InstallMain(args []string) int {
 		}
 		path = tools + string(os.PathListSeparator) + path
 	}
-	install := &installer{home: home, payload: args[1], root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: filepath.Join(home, "Applications/Agent Queue.app"), path: path, testing: testing, disablePhoneAccess: disablePhoneAccess}
-	install.prepareReplacement = options.prepareReplacement
-	install.unregisterServices = options.unregisterServices
-	if args[0] == "--app-bundle" {
-		install.appBundle = true
-		install.app = args[1]
-		install.payload = filepath.Join(install.app, "Contents/Resources/payload")
-	}
+	install := &installer{home: home, root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: options.app, path: path, testing: testing, disablePhoneAccess: options.disablePhoneAccess, unregisterServices: options.unregisterServices}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if options.repairAndContinue {
@@ -2261,20 +1683,8 @@ func InstallMain(args []string) int {
 		err = install.execute(ctx)
 	}
 	if err != nil {
-		var approval *installApprovalError
-		if errors.As(err, &approval) {
-			// The app waits for macOS approval, then runs setup again.
-			fmt.Fprintln(os.Stderr, "AGENT_QUEUE_SETUP_STATE:requires-approval")
-		}
-		fmt.Fprintf(os.Stderr, "Agent Queue setup: %v\n", err)
-		if errors.Is(err, errInstallLegacyPhoneAccess) {
-			fmt.Fprintln(os.Stderr, installDisablePhoneAccessRecovery)
-		}
+		installReportFailure(os.Stderr, err)
 		return 1
-	}
-	if options.prepareReplacement {
-		fmt.Println("Prepared Agent Queue replacement. Services are stopped; the application and CLI wrappers are unchanged.")
-		return 0
 	}
 	if options.unregisterServices {
 		fmt.Println("Unregistered Agent Queue services. The application can now be removed; private data is preserved.")
