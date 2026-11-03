@@ -384,6 +384,12 @@ func (g *Gate) Task(id int) (Object, error) {
 	return value, nil
 }
 
+// errQueueLockTimeout says another process held a coordination lock for the whole wait.
+var errQueueLockTimeout = errors.New("Queue coordination lock did not become available")
+
+// queueLockWait is how long LockPrivate waits for a held lock; tests shorten it.
+var queueLockWait = 10 * time.Second
+
 func LockPrivate(g *Gate, name string) (func(), error) {
 	ctx := g.operationContext()
 	if err := ctx.Err(); err != nil {
@@ -411,7 +417,7 @@ func LockPrivate(g *Gate, name string) (func(), error) {
 		file.Close()
 		return nil, errors.New("Unsafe queue coordination lock")
 	}
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(queueLockWait)
 	for {
 		if err := ctx.Err(); err != nil {
 			file.Close()
@@ -427,7 +433,7 @@ func LockPrivate(g *Gate, name string) (func(), error) {
 		}
 		if time.Now().After(deadline) {
 			file.Close()
-			return nil, errors.New("Queue coordination lock did not become available")
+			return nil, errQueueLockTimeout
 		}
 		select {
 		case <-ctx.Done():

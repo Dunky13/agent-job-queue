@@ -453,7 +453,14 @@ func StatusData(g *Gate) (wire.Snapshot, error) {
 	if err != nil {
 		return wire.Snapshot{}, err
 	}
-	return wire.Snapshot{UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano), Queue: wire.Queue{Status: status, Limit: limit, Running: len(active), Waiting: len(waiting), LegacyOccupied: LegacyOccupied(g)}, Jobs: all, Scheduler: &scheduler, Lanes: statusLaneList, Plugins: plugins}, nil
+	queue := wire.Queue{Status: status, Limit: limit, Running: len(active), Waiting: len(waiting), LegacyOccupied: LegacyOccupied(g)}
+	// Set only while intake is closed, or when the drain file cannot be trusted.
+	if until, draining, err := drainUntil(g); err != nil {
+		queue.DrainError = err.Error()
+	} else if draining {
+		queue.DrainUntil = until.UTC().Format(time.RFC3339)
+	}
+	return wire.Snapshot{UpdatedAt: time.Now().UTC().Format(time.RFC3339Nano), Queue: queue, Jobs: all, Scheduler: &scheduler, Lanes: statusLaneList, Plugins: plugins}, nil
 }
 
 // decodeWire converts a value the daemon or resource controller owns into its

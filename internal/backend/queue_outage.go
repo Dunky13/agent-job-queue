@@ -59,14 +59,32 @@ func (o *queueOutage) lose(cause error) bool {
 	o.lostOnce = true
 	if !o.announced && (o.noticed.IsZero() || time.Since(o.noticed) >= queueOutageNoticeGap) {
 		o.announced, o.noticed = true, time.Now()
-		what := "queue daemon not responding"
-		if errors.Is(cause, errQueueHandoverBusy) {
-			what = "queue handover in progress"
-		}
-		fmt.Fprintf(o.out, "agent-heavy: %s; still waiting for %s %d\n", what, o.noun, o.id)
+		o.say(cause, "")
 	}
 	o.failures++
 	return time.Since(o.since) <= queueOutageBound
+}
+
+// say prints the loss notice; extra qualifies what is lost, such as a drain.
+func (o *queueOutage) say(cause error, extra string) {
+	what := "queue daemon not responding"
+	if errors.Is(cause, errQueueHandoverBusy) {
+		what = "queue handover in progress"
+	}
+	fmt.Fprintf(o.out, "agent-heavy: %s%s; still waiting for %s %d\n", what, extra, o.noun, o.id)
+}
+
+// hold records a loss that a drain explains. It speaks like lose, repeating the
+// notice every drainNoticePeriod because a drain can last hours, but it never
+// starts the bound: that begins with the first loss after the drain is over.
+func (o *queueOutage) hold(cause error) {
+	o.lostOnce = true
+	if !o.announced || time.Since(o.noticed) >= drainNoticePeriod {
+		o.announced, o.noticed = true, time.Now()
+		o.say(cause, " (drain active)")
+	}
+	o.since = time.Time{}
+	o.failures++
 }
 
 // delay is the pause before the next attempt.

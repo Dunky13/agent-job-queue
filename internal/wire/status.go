@@ -21,8 +21,12 @@ type Snapshot struct {
 }
 
 // Queue summarizes the default queue. Limit is null when the daemon publishes no
-// default group.
+// default group. DrainUntil is set only while a drain closes intake, as an RFC
+// 3339 UTC time; DrainError only when the drain file cannot be trusted, in which
+// case intake is closed as well.
 type Queue struct {
+	DrainError     string `json:"drainError,omitempty"`
+	DrainUntil     string `json:"drainUntil,omitempty"`
 	LegacyOccupied bool   `json:"legacyOccupied"`
 	Limit          *int   `json:"limit"`
 	Running        int    `json:"running"`

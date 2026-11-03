@@ -13,6 +13,15 @@ import (
 // cannot have run the command, so another PATH candidate is safe to try. Once a
 // child starts, Wait's result is final, including command exit codes 126 and 127.
 func runExecutableForEnvironment(argv []string, cwd string, environment map[string]string, stdout, stderr io.Writer) error {
+	return runExecutableObserved(argv, cwd, environment, stdout, stderr, nil)
+}
+
+// executableHooks let a caller own its child: prepare runs before each start
+// attempt and started after each child that did start.
+type executableHooks struct{ prepare, started func(*exec.Cmd) }
+
+// runExecutableObserved is runExecutableForEnvironment with optional hooks.
+func runExecutableObserved(argv []string, cwd string, environment map[string]string, stdout, stderr io.Writer, hooks *executableHooks) error {
 	candidates := []string{argv[0]}
 	if !strings.ContainsRune(argv[0], os.PathSeparator) {
 		path, present := environment["PATH"]
@@ -38,6 +47,9 @@ func runExecutableForEnvironment(argv []string, cwd string, environment map[stri
 		cmd.Stdin = nil
 		cmd.Stdout = stdout
 		cmd.Stderr = stderr
+		if hooks != nil && hooks.prepare != nil {
+			hooks.prepare(cmd)
+		}
 		if err := cmd.Start(); err != nil {
 			lastError = err
 			// Python retains the first error other than a missing candidate or
@@ -46,6 +58,9 @@ func runExecutableForEnvironment(argv []string, cwd string, environment map[stri
 				firstError = err
 			}
 			continue
+		}
+		if hooks != nil && hooks.started != nil {
+			hooks.started(cmd)
 		}
 		return cmd.Wait()
 	}

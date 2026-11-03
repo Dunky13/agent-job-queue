@@ -37,6 +37,7 @@ type statusScenario struct {
 	mode      string
 	resources Object
 	receipts  map[int]Object
+	drain     Object // the contents of drain.json, when the scenario has one
 }
 
 func statusGroup(status string) Object {
@@ -133,6 +134,10 @@ func statusScenarios() []statusScenario {
 			"4": statusCommand("", Object{"Paused": Object{}}, -3),
 			"5": statusCommand("", Object{"Stashed": Object{}}, 0),
 		}}},
+		// Intake closed by a drain, and by a drain file that cannot be trusted. Both
+		// add an optional key to queue; older consumers ignore it.
+		{name: "draining", consumer: true, drain: Object{"until": "2099-01-01T00:00:00Z"}, snapshot: Object{"groups": statusGroup("Running"), "tasks": Object{"1": statusCommand(statusRunningToken, running, 0)}}},
+		{name: "invalidDrainFile", consumer: true, drain: Object{"until": "tomorrow"}, snapshot: Object{"groups": statusGroup("Running"), "tasks": Object{}}},
 		{name: "missingDefaultGroup", snapshot: Object{"groups": Object{}, "tasks": Object{"2": statusCommand(statusQueuedToken, queued, 0)}}},
 	}
 }
@@ -149,6 +154,9 @@ func prepareStatusScenario(t *testing.T, scenario statusScenario) *Gate {
 		mustWrite(t, g.ReceiptPath(id), receipt)
 	}
 	fakeQueue(t, g, scenario.snapshot)
+	if scenario.drain != nil {
+		mustWrite(t, drainPath(g), scenario.drain)
+	}
 	if scenario.mode != "" {
 		mustWrite(t, filepath.Join(g.State, "scheduling.json"), Object{"mode": scenario.mode, "generation": "fixture-generation"})
 	}

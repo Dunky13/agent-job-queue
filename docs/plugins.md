@@ -129,6 +129,7 @@ agent-heavy plugins reload
 - `wait <id> --timeout S` blocks until the lease is held (exit 0), the timeout passes (exit 75, still queued), or the lease is gone (exit 1 with the reason: dropped, expired, released, cancelled). It can be called repeatedly without losing queue position. This lets agents wait in bounded tool calls.
 - `release` is accepted from any process of the same user; `--force` is required when the caller's `--owner-pid`/environment does not match the recorded owner (plugins use it for an approved takeover). Releasing a queued lease drops it.
 - `status <id>` reports: `id`, `lane`, `state` (`queued`, `held`, `released`, `expired`, `dropped`), `position` (when queued), `label`, `meta`, `ownerPid`, `ownerAlive`, `queuedAt`, `grantedAt`, `renewedAt`, `expiresAt`.
+- While `agent-heavy drain` is active, `acquire` (including `--no-wait`) is refused with exit status 1 and no lease is created; existing leases keep working, and `--cancel-running` releases held ones.
 - Exit statuses: 0 success, 1 lease gone or refused, 2 usage error, 75 timed out while still queued.
 - `run --lane` behaves like `run` today (waits, streams output, returns the command's exit status) in the given lane. Unknown lane: exit 2 with the list of lanes. Without `--lane`, behaviour is unchanged.
 
@@ -172,6 +173,7 @@ go test -p 2 ./internal/backend -run '^TestStatusContractGolden$' -update
 - Lease entries keep every field existing clients require: `title` is the label (or `Lease`), `project`, `branch`, `directory`, `executable` and `logPath` are empty and `exitCode` is `null`. `state` uses the lease vocabulary. `position` is the lease's position within its lane; `queuePosition` stays the position across all lanes.
 - `phase` describes the lease: `Held`, `Waiting for lane capacity` (or the adaptive decision), or how it ended.
 - Held leases count in `queue.running` and queued leases in `queue.waiting`.
+- `queue.drainUntil` (an RFC 3339 UTC string) is present only while `agent-heavy drain` has closed intake, and `queue.drainError` (a string) only when the drain file cannot be trusted, which also closes intake. Both are absent otherwise. The Swift and dashboard consumers ignore them for now.
 - `lanes` entries add `removed: true` for a removed lane that still has work. `plugins` entries add `warning`, which reports skipped hooks and dropped hook events.
 - Status from a daemon without lane support has no `lanes` or `plugins`; `agent-heavy status --json` then reports the default lane alone.
 - The live handover payload is unchanged (protocol 1). Setup no longer starts a live handover, so it waits for unfinished lane work and queued or held leases to finish or be released, as for any other job.

@@ -241,6 +241,62 @@
     },
     "updatedAt": "2026-10-18T19:44:39.127731+00:00"
   },
+  "draining": {
+    "jobs": [
+      {
+        "branch": "main",
+        "canCancel": true,
+        "canReorder": false,
+        "canStart": false,
+        "directory": "/example/project",
+        "executable": "python3",
+        "exitCode": null,
+        "finishedAt": null,
+        "id": 1,
+        "kind": "command",
+        "lane": "default",
+        "logPath": "/example/state/logs/1.log",
+        "phase": "Running",
+        "priority": 0,
+        "project": "Example",
+        "queuePosition": null,
+        "startedAt": "2026-10-18T21:07:00.000001+02:00",
+        "state": "running",
+        "submittedAt": "2026-10-18T21:06:21.570177+02:00",
+        "title": "Fixture validation"
+      }
+    ],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 1,
+        "sharesLimit": true,
+        "waiting": 0
+      }
+    ],
+    "plugins": [],
+    "queue": {
+      "drainUntil": "2099-01-01T00:00:00Z",
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 1,
+      "status": "running",
+      "waiting": 0
+    },
+    "scheduler": {
+      "available": false,
+      "host": null,
+      "mode": "fixed",
+      "reason": "Resource controller is unavailable; adaptive jobs remain waiting",
+      "updatedAt": null
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  },
   "empty": {
     "jobs": [],
     "lanes": [
@@ -258,6 +314,39 @@
     ],
     "plugins": [],
     "queue": {
+      "legacyOccupied": false,
+      "limit": 1,
+      "running": 0,
+      "status": "running",
+      "waiting": 0
+    },
+    "scheduler": {
+      "available": false,
+      "host": null,
+      "mode": "fixed",
+      "reason": "Resource controller is unavailable; adaptive jobs remain waiting",
+      "updatedAt": null
+    },
+    "updatedAt": "2026-10-18T19:44:39.127731+00:00"
+  },
+  "invalidDrainFile": {
+    "jobs": [],
+    "lanes": [
+      {
+        "concurrency": 1,
+        "held": 0,
+        "label": "Default",
+        "name": "default",
+        "plugin": null,
+        "priority": 0,
+        "running": 0,
+        "sharesLimit": true,
+        "waiting": 0
+      }
+    ],
+    "plugins": [],
+    "queue": {
+      "drainError": "Invalid drain file; run agent-heavy undrain to remove it",
       "legacyOccupied": false,
       "limit": 1,
       "running": 0,

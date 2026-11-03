@@ -558,7 +558,7 @@ func TestLaneCommandUsageErrors(t *testing.T) {
 			t.Errorf("%v: exit %d, want 2", args, code)
 		}
 	}
-	argv, label, lane, err := runLaneArguments([]string{"--lane", "qa", "--label=Check", "--", "sh", "--lane"}, true)
+	argv, label, lane, _, err := runLaneArguments([]string{"--lane", "qa", "--label=Check", "--", "sh", "--lane"}, true)
 	if err != nil || lane != "qa" || label != "Check" || strings.Join(argv, " ") != "sh --lane" {
 		t.Fatalf("run --lane arguments: %v %q %q %v", argv, label, lane, err)
 	}
