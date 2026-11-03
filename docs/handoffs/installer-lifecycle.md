@@ -65,7 +65,16 @@ The check runs twice, the second time under `scheduling.lock`. `agent-heavy run`
 - A Service Management failure after unregistering.
 - A helper still holding its lifetime lock.
 
-Retrying does not clear the first of these, because no daemon is left to finish the row. So refusals after the quit, and an unfinished stopped store found while planning, say "Open Agent Queue, then run removal again". Opening the app does clear it: preflight is empty, setup succeeds and removes the marker. `TestManagedRemovalRefusalAfterTheQuitSaysToReopen` holds that.
+What clears each one differs, so `managedRemovalGuidance` says so:
+
+- **An unfinished job or a stuck phone record:** retrying cannot clear these, because nothing is left running. The refusal, and an unfinished stopped store found while planning, say "Open Agent Queue, then run removal again". Opening the app does clear it: preflight is empty, setup succeeds and removes the marker. `TestManagedRemovalRefusalAfterTheQuitSaysToReopen` holds that.
+- **Anything else after the quit,** including `notFound` straight after an unregister and a failed status read: the refusal says to run removal again, and to open the app first only if it refuses the same way. A plain retry finishes those.
+- **A login item it cannot verify:** the refusal names its own route, described above.
+
+**Known limits:**
+
+- A helper not parented by the new app, or a wrong loaded launchd label, also refuses setup after reopening, so opening the app does not clear those.
+- An app opened in the very short window between `managedStopMenu` and the marker write takes the `.ready` path. The chance is very low.
 
 **Preflight had the same check.** Run from outside against a healthy running app, it reported "An unowned queue process holds its lifetime lock", from the same `managedDrain` branch. It and setup now report `app-running` and `errInstallAppRunning`, and change nothing. Setup still cannot run beside the app's helpers.
 
@@ -103,11 +112,13 @@ Steps, once this PR's head is final:
 
 1. In a checkout of the tap's `tap` branch, read the current build from the `version` and `url` lines of `Casks/agent-job-queue.rb`. It is `build-222-03fcbd2` as I write this, but **the target moves**: the tap's scheduled refresh can publish a newer build at any time, rendered by its old template and so drifting the same way, and builds 229 and 232 are already out.
 2. `gh release download TAG --repo Dunky13/agent-job-queue --pattern agent-job-queue.rb --clobber --dir Casks`, using that build's tag, and copy the other files above.
-3. Run `go test -p 2 refresh.go refresh_test.go`, `go vet refresh.go` and `go run -p 2 refresh.go` with Go 1.26 or later, `gh` and `brew`. The last one must exit 0 and publishes nothing. It is the only one of the three that reads the cask.
+3. Run `go test -p 2 refresh.go refresh_test.go`, `go vet refresh.go` and `HOMEBREW_DEVELOPER=1 go run -p 2 refresh.go` with Go 1.26 or later, `gh` and `brew`. The last one is the only one that reads the cask and publishes nothing. It must exit 0 with `Validated ...; publication disabled`. With the cask unchanged it exits 1 with `Current tap cask differs from its historical published release`. The variable is required, as the tap's `refresh.yml` already sets it: without it the command exits 1 with `Required brew operation failed` even with the right cask, hiding brew's `Homebrew requires casks to be in a tap, rejecting`.
 4. Open a PR against `tap` with signed, DCO-signed-off commits.
 5. Just before merging, re-read the tap's head. If its build moved, repeat from step 1 against the new build. Then merge.
 6. Dispatch `refresh.yml` on the `tap` branch and confirm it succeeds. If the schedule moved the tap in that gap, it fails with the error above; repeat from step 1.
-7. Only then merge this PR.
+7. Only then merge this PR, and do it promptly. The dispatch in step 6 publishes the latest release with the new caveat, "It quits the app and removes its login item", before any build has that behaviour. A Homebrew user in that gap is told something untrue until this PR's build ships.
+
+**Dispatch has been dead since build 162.** Per the final review, logs for builds 166, 212, 220, 222, 229 and 232 all show `Tap tooling differs: refresh.go` and `exit status 1`, and all report success. The tap's `*/15` cron is active but fires every 2.9 to 10.2 hours, which looks like GitHub schedule throttling, so Homebrew gets new builds only at that pace.
 
 **What the delivery check blocks, and the order.** `Verify Homebrew delivery` (`homebrew-sync`) is the last job in `distribution.yml`, and nothing needs it. The release is already published by then, and `ci-required` belongs to a different workflow. A tooling mismatch stops it before it dispatches a refresh, so that run is not dispatched or verified, and the tap's scheduled refresh keeps publishing with the tap's own tooling.
 
@@ -116,7 +127,11 @@ That mismatch exists today and was hidden: run 41625944175 logged `Tap tooling d
 **The companion should land first.**
 
 - **Companion first, as above:** the check goes straight from hidden mismatch to passing when this PR merges. Between the two merges, `main` still lacks the fix, so its runs stay green and mismatched, as they do today.
-- **This PR first:** publishing is not broken, but every distribution run shows red and dispatches nothing until the companion lands.
+- **This PR first:** publishing is not broken, but every distribution run shows red and dispatches nothing until the companion lands, and automatic retries add cost:
+  - `scripts/distribution-recover.sh` classes a red `Verify Homebrew delivery` with signing and acceptance green as `delivery` and reruns it: first immediately, then at least 15 minutes apart, up to attempt 48 or 7 days for each run.
+  - A mismatch stops before dispatch, in about 20 seconds per retry. A failure after dispatch would start a macOS tap run on each retry.
+  - The observer requests at most five reruns per pass and reaches older builds first, so five or more red runs could delay an Apple signing continuation on a newer build.
+  - A rerun after the companion lands should turn green within that budget.
 - **The companion without the cask reset:** this is what does break publishing, so step 2 is not optional.
 
 Anything else in the batch that changes `packaging/homebrew/` needs the same sync.
@@ -139,7 +154,7 @@ Limits of the seeding:
 
 Seeding the marker first caused a flake while porting, in about one run in 12 on a busy host. The fixture's real daemon and scheduler take `scheduling.lock` during normal work, so setup can get the transient refusal in follow-up 3 of `retire-handover-begin.md`. `runPackagedSetup` retries that only when no pending marker predates the call, and on #67 none did. Now `managedOlderPublication` sets `seededPending`, which excuses that one marker for one call. `TestPackagedSetupRetriesBusyOnlyOverASeededMarkerOnce` holds the rule, and the strict case in `TestPackagedSetupNeverRetriesMutationOrUncertainHistory` is unchanged. The finish-pending test now logs the setup error, last phase and daemon log when that wait fails.
 
-Backend top-level tests went from 581 to 577. Tests not listed below keep their names. Many had their setup ported and lost assertions on the launchd definitions that only the tail wrote. Each kept its subject: callback spellings, drain, Pueue import, slot, phone recovery, ownership refusal and so on.
+Backend top-level tests went from 581 to 578. Tests not listed below keep their names. Many had their setup ported and lost assertions on the launchd definitions that only the tail wrote. Each kept its subject: callback spellings, drain, Pueue import, slot, phone recovery, ownership refusal and so on.
 
 | Before | After | Reason |
 |---|---|---|
@@ -160,7 +175,7 @@ Backend top-level tests went from 581 to 577. Tests not listed below keep their 
 | | `TestManagedRemovalAfterUnregisterAcceptsNotFoundOnlyWhenUnloaded`, `TestManagedRemovalOfSupervisedApp` | New, for the removal fix. Both fail with the old checks restored. |
 | | `TestPackagedSetupRetriesBusyOnlyOverASeededMarkerOnce` | New, for the seeded marker above. |
 | | `TestLaneAcquireWaitsForSchedulingLock`, `TestHeldLeaseFailsTheRemovalDrainCheck` | New: a lease cannot start after removal's last check, and a held one fails it. |
-| | `TestManagedRemovalRefusalAfterTheQuitSaysToReopen`, `TestManagedRemovalRefusedQuitLeavesARunningAppComplete` | New, for what follows a refusal. |
+| | `TestManagedRemovalRefusalAfterTheQuitSaysToReopen`, `TestManagedRemovalRefusalGuidanceAfterTheQuit`, `TestManagedRemovalRefusedQuitLeavesARunningAppComplete` | New, for what follows a refusal. |
 | | `TestManagedResumedActivationNotFoundRemoteCannotHideOwnedWork` | Restores the resume-route gate's coverage, which the port lost. |
 | | `TestManagedRemovalRefusesLoginItemItCannotVerify`, `TestManagedRemovalRetryAfterNotFoundFollowsUnregister` | New, for the login item and for retrying. |
 | | `TestInstallerPreflightReviewsStateBesideAnInvalidBundle`, `TestInstallerPreflightLegacyDiagnostics` | New, for the invalid-bundle branch and the diagnostics that lost coverage. |
@@ -188,7 +203,7 @@ Some legacy preflight tests now seed phone access or a blocked older install, be
 
 | | Added | Removed | Net |
 |---|---|---|---|
-| Production | 517 | 1723 | -1206 |
+| Production | 531 | 1725 | -1194 |
 | Tests | 2154 | 2144 | --10 |
 
 This is one PR rather than two: with `--payload` gone, the small shape is what remains.
@@ -203,8 +218,9 @@ This is one PR rather than two: with `--payload` gone, the small shape is what r
 6. **Naming.** `validatePayload`, `prepareManaged` and `install_managed_copy.go` are now `validateBundle`, `removeManaged` and `install_managed_parent.go`. Left to rename: `readPayload`, `installReadPayload`, `installPayloadParent`, `installValidatePayloadTree`, and the `payload-invalid` ID, which the wire contract uses.
 7. **The follow-ups in `retire-handover-begin.md` stand.** Its item 6, the payload path's different drain rule, no longer applies.
 8. **`buildManagedLiveFixtureCLI` has a one-minute build limit,** and a race build was killed at that limit on a busy host, failing the iteration. This predates this PR. Hosted runners have not shown it.
-9. **Removal could unregister a login item that reads `notFound`.** A Swift `mainApp.unregister` attempt might remove the need for the manual route. Not done here, by decision.
-10. **Gaps the independent review listed, all present before this PR:** `validate-skips-pendingBundle`, `pending-skips-retained-backup-access`, `setup-skips-runtime-cleanup`, `plan-ignores-unsafe-runtime-bin` and same-path runtime reclamation.
+9. **`lane acquire` can wait for `scheduling.lock` past a short `--timeout` or `--no-wait`,** up to 10 seconds and then exit 1, and up to three 15-second RPC attempts more before the `--timeout` clock starts. No shipped caller is known, so `docs/plugins.md` documents it rather than this PR changing lock handling during real-Mac testing.
+10. **Removal could unregister a login item that reads `notFound`.** A Swift `mainApp.unregister` attempt might remove the need for the manual route. Not done here, by decision.
+11. **Gaps the independent review listed, all present before this PR:** `validate-skips-pendingBundle`, `pending-skips-retained-backup-access`, `setup-skips-runtime-cleanup`, `plan-ignores-unsafe-runtime-bin` and same-path runtime reclamation.
 
 ## Evidence
 

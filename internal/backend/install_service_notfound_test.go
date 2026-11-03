@@ -380,8 +380,12 @@ func TestManagedRemovalRetryAfterNotFoundFollowsUnregister(t *testing.T) {
 				}
 				return output, err
 			}
-			if err := m.run(t); err == nil || !strings.Contains(err.Error(), "notFound after unregister") {
+			err := m.run(t)
+			if err == nil || !strings.Contains(err.Error(), "notFound after unregister") {
 				t.Fatal("a miss straight after unregistering was accepted", err)
+			}
+			if !strings.Contains(err.Error(), "Run removal again") {
+				t.Fatal("a refusal a retry clears did not say to retry", err)
 			}
 			for _, filename := range []string{filepath.Join(i.root, "installation.json"), filepath.Join(i.root, "install-in-progress.json"), filepath.Join(i.home, ".local/bin/agent-heavy")} {
 				if _, err := os.Lstat(filename); err != nil {
@@ -405,4 +409,51 @@ func TestManagedRemovalRetryAfterNotFoundFollowsUnregister(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Each refusal after the quit says what clears it. Reopening is only the first
+// step where nothing else can finish the work.
+func TestManagedRemovalRefusalGuidanceAfterTheQuit(t *testing.T) {
+	t.Run("phone record stays active", func(t *testing.T) {
+		m := managedTestFixture(t)
+		if err := m.run(t); err != nil {
+			t.Fatal(err)
+		}
+		i := m.installer
+		managedRemovalTarget(i)
+		original := i.command
+		i.command = func(ctx context.Context, args []string) ([]byte, error) {
+			if len(args) == 3 && args[1] == "--prepare-app-replacement" {
+				integrationTestWrite(t, filepath.Join(i.state, "remote/processes.json"), []byte(`{"active":true}`))
+			}
+			return original(ctx, args)
+		}
+		if err := m.run(t); err == nil || !strings.Contains(err.Error(), "Open Agent Queue, then run removal again") {
+			t.Fatal("a stuck phone record did not say to reopen the app", err)
+		}
+	})
+	t.Run("final status read fails", func(t *testing.T) {
+		m := managedTestFixture(t)
+		if err := m.run(t); err != nil {
+			t.Fatal(err)
+		}
+		i := m.installer
+		managedRemovalTarget(i)
+		original := i.command
+		i.command = func(ctx context.Context, args []string) ([]byte, error) {
+			output, err := original(ctx, args)
+			if len(args) == 4 && args[2] == "unregister" && args[3] == "login" {
+				m.nativeFailure = "status queue"
+			}
+			return output, err
+		}
+		err := m.run(t)
+		if err == nil || !strings.Contains(err.Error(), "Run removal again") || strings.Contains(err.Error(), "then run removal again") {
+			t.Fatal("a failed status read after the quit gave the wrong guidance", err)
+		}
+		m.nativeFailure = ""
+		if err := m.run(t); err != nil {
+			t.Fatal("retrying did not finish removal", err)
+		}
+	})
 }

@@ -1085,7 +1085,7 @@ func (install *installer) managedStopMenu(ctx context.Context) error {
 func (install *installer) managedRemovalNotFound(ctx context.Context, service string) error {
 	label := map[string]string{"queue": "io.went.agent-heavy", "resources": "io.went.agent-resources", "remote": "io.went.agent-remote"}[service]
 	if label == "" {
-		return fmt.Errorf("The %s service is notFound, so its registration cannot be verified; application must be preserved. Quit Agent Queue if it is running, register it again with agent-heavy install --app-bundle %s, then run removal again", service, installQuote(install.app))
+		return fmt.Errorf("%w. Quit Agent Queue if it is running, register it again with agent-heavy install --app-bundle %s, then run removal again", errInstallLoginUnverified, installQuote(install.app))
 	}
 	if _, loaded, err := install.inspectService(ctx, label); err != nil {
 		return err
@@ -1112,12 +1112,22 @@ func (install *installer) managedRemovalSchedulingLock(ctx context.Context) (*os
 	}
 }
 
+// managedRemovalGuidance says what clears a refusal once the app has quit. Nothing
+// is left running to finish a row or release a phone record, so retrying cannot
+// clear those and opening the app does. Anything else may clear on a retry.
+func managedRemovalGuidance(err error) error {
+	switch {
+	case errors.Is(err, errInstallLoginUnverified):
+		return err // It names its own route.
+	case errors.Is(err, errInstallStoppedQueueUnfinished), errors.Is(err, errInstallPhoneCleanupIncomplete):
+		return fmt.Errorf("%w. Open Agent Queue, then run removal again", err)
+	}
+	return fmt.Errorf("%w. Run removal again. If it refuses the same way, open Agent Queue first", err)
+}
+
 // Removal is an explicit mutation, separate from read-only preflight. The app
 // may be deleted only after this operation succeeds.
 func (install *installer) removeManaged(ctx context.Context) error {
-	// Nothing is left running to finish a row or release a record, so retrying
-	// cannot clear these. Opening the app does.
-	reopen := func(err error) error { return fmt.Errorf("%w. Open Agent Queue, then run removal again", err) }
 	for _, directory := range []string{install.root, install.state, install.config, install.launch, filepath.Join(install.home, ".local/bin"), filepath.Join(install.state, "remote")} {
 		if err := installInspectDirectory(directory); err != nil {
 			return err
@@ -1144,7 +1154,7 @@ func (install *installer) removeManaged(ctx context.Context) error {
 		return err
 	}
 	if _, err := install.planManaged(ctx); errors.Is(err, errInstallStoppedQueueUnfinished) {
-		return reopen(err)
+		return managedRemovalGuidance(err)
 	} else if err != nil {
 		return err
 	}
@@ -1194,7 +1204,7 @@ func (install *installer) removeManaged(ctx context.Context) error {
 	}
 	p, err := install.planManaged(ctx)
 	if errors.Is(err, errInstallStoppedQueueUnfinished) {
-		return reopen(err)
+		return managedRemovalGuidance(err)
 	} else if err != nil {
 		return err
 	}
@@ -1218,19 +1228,19 @@ func (install *installer) removeManaged(ctx context.Context) error {
 		return err
 	}
 	if err := install.quiesceManaged(ctx, p); err != nil {
-		return reopen(err)
+		return managedRemovalGuidance(err)
 	}
 	for service := range p.statuses {
 		status, err := install.managedStatus(ctx, install.app, service)
 		if err != nil {
-			return err
+			return managedRemovalGuidance(err)
 		}
 		if status == "notFound" {
 			if err := install.managedRemovalNotFound(ctx, service); err != nil {
-				return err
+				return managedRemovalGuidance(err)
 			}
 		} else if status != "notRegistered" {
-			return reopen(fmt.Errorf("Service %s is still registered; application must be preserved", service))
+			return managedRemovalGuidance(fmt.Errorf("Service %s is still registered; application must be preserved", service))
 		}
 	}
 	// Confirm every wrapper again before retiring any metadata. Keep private
@@ -1301,7 +1311,7 @@ func (install *installer) managedStopped(ctx context.Context) error {
 			return err
 		}
 		if cleanup {
-			return errors.New("Phone access process cleanup is incomplete; application must be preserved")
+			return errInstallPhoneCleanupIncomplete
 		}
 	}
 	return nil

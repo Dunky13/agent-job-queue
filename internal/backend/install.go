@@ -61,6 +61,8 @@ var errInstallPendingCleanup = errors.New("Queue migration must wait for queue w
 var errInstallCustomCallback = errors.New("Custom cleanup callback cannot be retained by managed migration; it will be backed up before replacement")
 
 var errInstallStoppedQueueUnfinished = errors.New("Managed setup requires a drained queue; stopped queue has unfinished jobs or attempts")
+var errInstallPhoneCleanupIncomplete = errors.New("Phone access process cleanup is incomplete; application must be preserved")
+var errInstallLoginUnverified = errors.New("The login service is notFound, so its registration cannot be verified; application must be preserved")
 var errInstallAppRunning = errors.New("Agent Queue is running and owns its queue processes. Quit it, then try setup again. Removal with --unregister-services quits it once its queue is drained")
 
 type installDrainPendingError struct {
