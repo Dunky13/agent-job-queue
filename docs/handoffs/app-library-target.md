@@ -11,7 +11,13 @@ The menu bar app's code now compiles as one static library, `AgentQueueCore`, th
 - `native/build.sh` still uses `swiftc` directly and builds each architecture with the same `-O`, Swift 6 and `-warnings-as-errors` flags, followed by `lipo`. `-force_load` keeps every object in the binary. It now also fails if hook symbols reach the binary, with a check that the symbols were readable at all.
 - `native/tests/build-test.sh` links any `@main` source against the `test` flavour. `scripts/test-native.sh` compiles that library once for its six suites, where it compiled the app six times before.
 - `native/tests/hooks/AppTestHooks.swift` holds the `--snapshot*` and `--verify*` launch path, its verification reports, `NativeSnapshotRenderer` and `FixtureDispatchRecorder`, moved verbatim. Only the `test` flavour compiles this directory.
-- `AGENT_QUEUE_TEST_HOOKS`, set only by the `test` flavour, gates `--fixture` parsing, the one call into the snapshot path, and the sample data seeded by the stores.
+- `AGENT_QUEUE_TEST_HOOKS`, set only by the `test` flavour, gates these:
+  - `--fixture` parsing and `fixtureRecorder` in `QueueStore`
+  - the fixture branches of `actionsDisabled` and `completeAction`
+  - the one call into the snapshot path, in `finishLaunching`
+  - the sample data seeded by the stores, and `LearningStore.previewDetail`
+  - the fixture and snapshot argument checks in `validateDiagnostics`, whose release branch is the refusal
+- `scripts/test-installer.sh` launches the packaged app once with `--fixture`. It requires exit 1, the refusal text and an empty private home. CI's `app` job and the distribution workflow both run that script.
 - `scripts/capture-native-screenshots.sh` links the same `AgentQueueMain.swift` against the `test` flavour, so the capture app differs from the shipped one only by the flavour's flags and hooks.
 
 ## Decisions
@@ -45,6 +51,8 @@ Every native suite links the `test` flavour, so the release flavour's normal lau
 
 Neither run read the window's contents, because `screencapture` could not capture it here, or clicked the menu. A complete managed launch of the release binary that starts the helpers was not run on this host, because it would touch the live queue. Quitting through the menu was not run either.
 
+Those two launches were a one-off and are not repeated. The first shared the bundle identifier `io.went.agent-queue` with the installed app, a risk not considered when it ran. The review asked for no further live launches beyond the single `--fixture` launch in `scripts/test-installer.sh`.
+
 Runtime class names change from `arm64.AppDelegate` and `x86_64.AppDelegate` to `AgentQueueCore.AppDelegate`. Nothing in `native/` looks up classes by name.
 
 ## Evidence
@@ -57,14 +65,21 @@ All of this ran on macOS 27 through the shared queue. The commands ran before th
 - `native/tests/run-resume-ui-tests.sh` with `--before-ref`: exit 0, both sides.
 - `native/tests/run-menu-bar-ui-tests.sh`: exit 0, `passed: true`. Five system-click checks were skipped because this terminal has no event-posting permission.
 - `scripts/capture-native-screenshots.sh`: exit 0, and the images show the fixture views. They differ from the committed ones because of macOS 27 rendering, so they were restored and not committed.
+- `scripts/test-installer.sh` with the new packaged `--fixture` launch: exit 0, on `arch/app-library-target` after 439bdf0. The check's failure branches (wrong exit, wrong text, a write to the home, a 30-second hang) were exercised on stub executables only. The installed app, daemon and scheduler kept the same process IDs and start times across the run.
 - Test Swift files: 13 lines added and none removed. No timeouts changed.
 
 `native/tests/run-bootstrap-ui-tests.sh` exits 1 here, including on the final head, so this runner has no local pass. It stops at its first scenario, at the known `NSApp.windows` check in `checkNeutralStartup`, which is not changed. Run one at a time, 10 of its 12 scenarios passed, and the other two stopped at that check. The check is intermittent on this host on both branches. Over three rounds of the default, `--cancellable-wait` and `--cancellable-wait --direct-quit` scenarios, `origin/main` failed all three in round 1 and passed the rest, and this branch passed all nine runs. Hosted CI on macOS 15 remains the evidence for this runner.
 
+## Accepted review items
+
+- F2: the dead `fixtureMode` guards ship as literal false. Follow-up, listed below.
+- F3: the shipped app keeps refusing `--fixture`, `--snapshot*` and `--verify-*`.
+- F5: a stray file in `native/` compiles into a local build. This is the documented design of using `native/*.swift` as the source list.
+
 ## Remaining work
 
 - Independent review, hosted CI and merge. Check both native matrix jobs.
-- Follow-up: delete `fixtureMode` from production. It is always false in the shipped app, but about 80 references in the views and stores, including the `PREVIEW` labels, still use it. Removing it is a larger UI change than this PR should carry.
+- Follow-up: delete `fixtureMode` from production. It is always false in the shipped app, but it still has 103 occurrences on 91 lines in `native/*.swift`, including the `PREVIEW` labels. It ships as dead guards that are always false, which the parent accepted as a follow-up. Removing it is a larger UI change than this PR should carry.
 - Follow-up: `QueueStore.init(arguments:)` is unused in the release flavour. `allowsInstallation`, `inspect()` and `serviceStatusRequests()` keep their `--fixture` guards as a second safety layer, although the refusal now runs first. `AppDelegate(environment:…)` is still a test-only seam in production.
 
 ## Next steps
