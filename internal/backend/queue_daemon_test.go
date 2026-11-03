@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -351,9 +352,11 @@ func TestQueueLaunchRejectsUnsafeLogsWithoutBlocking(t *testing.T) {
 	}
 }
 
-// A caller treats an unsafe socket as final, so the daemon must never expose its
-// socket at the path before it is private (the daemon runs with umask 077, so the bound mode is 0700, not 0600).
-func TestQueueSocketIsNeverVisibleBeforeItIsPrivate(t *testing.T) {
+// A caller treats an unsafe socket as final, so a restart must only ever show it a
+// private socket or a retryable absence. The daemon runs with umask 077, so a bound
+// socket starts at 0700. Exit removal and replacing a stale socket can each show a
+// retired inode. The pollers can only miss a bad state, so this cannot fail falsely.
+func TestQueueSocketRestartNeverLooksUnsafe(t *testing.T) {
 	previous := syscall.Umask(077)
 	t.Cleanup(func() { syscall.Umask(previous) })
 	root, err := os.MkdirTemp("/tmp", "queue-socket-")
@@ -367,21 +370,51 @@ func TestQueueSocketIsNeverVisibleBeforeItIsPrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := queueSocket(g)
-	var seen error
-	listener, err := listenQueueSocket(path, func() { seen = safeQueueSocket(path) })
-	if err != nil {
-		t.Fatal(err)
+	stop := make(chan struct{})
+	bad := make(chan error, 3)
+	var pollers sync.WaitGroup
+	for range 3 {
+		pollers.Add(1)
+		go func() {
+			defer pollers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if e := safeQueueSocket(path); e != nil && !errors.Is(queueTransportError(e), errQueueTransportUnavailable) {
+					bad <- e
+					return
+				}
+			}
+		}()
 	}
-	defer listener.Close()
-	if seen == nil || strings.Contains(seen.Error(), "Unsafe") || !errors.Is(queueTransportError(seen), errQueueTransportUnavailable) {
-		t.Fatalf("a caller checking while the daemon binds must see a retryable absence, got %v", seen)
+	for cycle := range 300 {
+		listener, e := listenQueueSocket(path)
+		if e != nil {
+			close(stop)
+			t.Fatal(e)
+		}
+		if cycle == 299 {
+			conn, e := net.Dial("unix", path)
+			if e != nil {
+				t.Errorf("the renamed socket must accept connections: %v", e)
+			} else {
+				conn.Close()
+			}
+		}
+		listener.Close()
+		// Odd cycles leave a stale socket for the next rename to replace.
+		if cycle%2 == 0 {
+			os.Remove(path)
+		}
 	}
-	if err = safeQueueSocket(path); err != nil {
-		t.Fatal(err)
+	close(stop)
+	pollers.Wait()
+	select {
+	case e := <-bad:
+		t.Fatalf("a caller checking during a restart got a final error: %v", e)
+	default:
 	}
-	conn, err := net.Dial("unix", path)
-	if err != nil {
-		t.Fatalf("the renamed socket must accept connections: %v", err)
-	}
-	conn.Close()
 }
