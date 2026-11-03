@@ -26,7 +26,11 @@ Consumers see the same JSON for every state a real daemon and controller produce
 - A pass-through field of the wrong JSON type, such as a non-integer limit, now fails `status` with `Queue returned invalid status data`. Before, it was published as is, and the Swift and Zod consumers then rejected it.
 - A nullable text field holding a non-string value now publishes `null`.
 - A required pass-through field missing from `resource-status.json` or a lane, such as the scheduler `reason`, publishes its zero value instead of `null`.
-- Keys the wire types do not declare are no longer published. None exist today.
+- Keys the wire types do not declare are no longer published, including nested ones such as those in `resources`. None exist today.
+- `learning: null` is now omitted.
+- `prediction: {}` and `resources: {}` become zero-filled objects, and a null metric becomes `0`.
+- A quoted number such as `"123"` becomes `123`, so a wrong type does not always fail `status`.
+- A plugin with no `warning` key now publishes `warning: null`.
 
 The simulated dashboard gained a `snapshot` fixture state for the new browser test. It rewrites every job's `logPath` into the preview's temporary directory, because the test-mode log endpoint trusts that path. An automated security review flagged the first version, which let a fixture choose the file.
 

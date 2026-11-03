@@ -168,6 +168,12 @@ func prepareStatusScenario(t *testing.T, scenario statusScenario) *Gate {
 }
 
 func normalizeStatusBytes(g *Gate, body []byte) []byte {
+	// json.Marshal escapes characters such as & in a temporary directory's path.
+	escaped, err := json.Marshal(g.State)
+	if err != nil {
+		panic(err)
+	}
+	body = bytes.ReplaceAll(body, escaped[1:len(escaped)-1], []byte("/example/state"))
 	body = bytes.ReplaceAll(body, []byte(g.State), []byte("/example/state"))
 	body = statusSampledAt.ReplaceAll(body, []byte(`"sampledAt":1792404000`))
 	return statusUpdatedAt.ReplaceAll(body, []byte(`"updatedAt":"2026-10-18T19:44:39.127731+00:00"}`))
