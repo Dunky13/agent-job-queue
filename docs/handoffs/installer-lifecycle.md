@@ -92,7 +92,9 @@ What clears each one differs, so `managedRemovalGuidance` says so:
 - `lsof` on a real signed app has not been seen.
 - Kernel paths are compared exactly. A real app launched through LaunchServices should record its plain `/Applications/...` path, as `managedLoadedBundleProgram` already assumes, but only a run on a real Mac shows it.
 
-## Tap companion PR, not opened yet
+## Tap companion PR
+
+This landed as [tap #7](https://github.com/Dunky13/homebrew-agent-job-queue/pull/7) before this PR merged, reset to build 242. Its dispatched refresh passed and published nothing, and build 255 was the first build since 162 to pass `Verify Homebrew delivery` through dispatch. The steps stay here for any later change to `packaging/homebrew/`. Builds and tags below are as they stood when written.
 
 The caveat in `internal/tooling/tooling.go` and `packaging/homebrew/refresh.go` now reads "Before removing the app, finish its jobs, then run this. It quits the app and removes its login item:".
 
@@ -237,7 +239,6 @@ Validation results are recorded in the PR description, pinned to its head.
 
 ## Next steps
 
-1. Independent review of the head, including a real older build through the seeded phases if wanted.
-2. Hosted CI on this PR, which is the first run of the ported packaged tests on Intel and Apple Silicon.
-3. The tap companion PR, then a run of removal against a running app on a real Mac.
-4. The stacked PR for `install.run` argv sniffing and typed commands.
+1. A real older build through the seeded phases, if wanted.
+2. A run of removal against a running app on a real Mac, on a released build. The last one was on a local build of `87599b9`.
+3. The stacked PR for `install.run` argv sniffing and typed commands.

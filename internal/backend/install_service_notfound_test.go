@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -502,4 +504,42 @@ func TestManagedRemovalRefusalGuidanceAfterTheQuit(t *testing.T) {
 			t.Fatal("retrying did not finish removal", err)
 		}
 	})
+}
+
+// Evidence that is missing or wrong leaves a lock holder unowned. Removal would
+// otherwise quit the app with a holder it cannot account for.
+func TestManagedHeldByAppRefusesWithoutEvidence(t *testing.T) {
+	gone := exec.Command("/usr/bin/true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	dead := strconv.Itoa(gone.Process.Pid)
+	self := strconv.Itoa(os.Getpid())
+	for name, test := range map[string]struct {
+		output string
+		err    error
+		want   string
+	}{
+		"lsof fails":     {err: errors.New("lsof failed"), want: "lsof failed"},
+		"no holder":      {output: "\n", want: "no holder found"},
+		"not a pid":      {output: "abc\n", want: `holder "abc" is not a process`},
+		"launchd":        {output: "1\n", want: `holder "1" is not a process`},
+		"holder is gone": {output: dead + "\n", want: "holder " + dead},
+		"another binary": {output: self + "\n", want: "holder " + self + " runs "},
+	} {
+		t.Run(name, func(t *testing.T) {
+			i := &installer{command: func(context.Context, []string) ([]byte, error) { return []byte(test.output), test.err }}
+			if err := i.managedHeldByApp(context.Background(), "/Applications/Agent Queue.app", "lock", "agent-heavy"); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("held by app: %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestManagedRemovalGuidanceEndsTheSentenceOnce(t *testing.T) {
+	for _, message := range []string{"refused", "refused."} {
+		if got := managedRemovalGuidance(errors.New(message)).Error(); !strings.HasPrefix(got, "refused. Run removal again.") {
+			t.Fatalf("guidance after %q: %s", message, got)
+		}
+	}
 }
