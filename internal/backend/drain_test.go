@@ -1511,8 +1511,10 @@ func TestRunInLaneOnDrainUncertainSubmitSaysSoAndKeepsItsFiles(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the uncertain wait did not end on a signal")
 	}
-	if !strings.Contains(stderr.String(), "the job may still exist, check agent-heavy status") || len(leftovers(g)) == 0 {
-		t.Fatalf("stderr=%q left=%v", stderr.String(), leftovers(g))
+	// captureStderr copies asynchronously, so a line printed before returning can still be on its way.
+	waitForText(t, stderr, "the job may still exist, check agent-heavy status")
+	if len(leftovers(g)) == 0 {
+		t.Fatalf("the uncertain submit discarded its files: %q", stderr.String())
 	}
 }
 
