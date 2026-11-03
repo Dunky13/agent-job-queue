@@ -183,27 +183,45 @@ func (o *callerOutput) String() string {
 // and its command starts. Before submitting, the caller identifies the project
 // (git subprocesses) and writes fsynced state, and that takes as long as the
 // host needs: seconds on a loaded hosted Intel runner. The wait therefore ends
-// when the daemon lists the job or the caller exits, not after a fixed
-// interval. Only the daemon's dispatch and the worker's start, which are
-// bounded local process work, get a short deadline.
+// when the daemon lists the job or the caller exits, and only a total hang
+// reaches liveAcceptBudget. The daemon's dispatch and the worker's start are
+// bounded local process work and get the shorter liveStartBudget.
 type liveCallerWait struct {
 	t        *testing.T
 	i        *installer
+	pid      int
 	finished chan error
 	output   *callerOutput
+	// lifetime, when set, is the context that kills the caller at its deadline.
+	lifetime context.Context
 }
+
+// liveAcceptBudget bounds only the caller's preparation before the daemon lists
+// its job; no test asserts anything about that stage. It replaces an 8 s wait
+// that also covered dispatch. A caller that never submits fails after this
+// budget instead of the scenario's 60 s (3 minutes for finish-pending)
+// context, so ten hung scenarios cost about 10 x (fixture + 30 s), inside the
+// 12 minute `go test` timeout in scripts/test-go-runtime.sh, which would
+// otherwise panic and discard every report. 30 s is about 6 times the slowest
+// preparation seen on a CPU and disk stressed hosted Intel runner (see
+// docs/handoffs/live-installer-job-start.md).
+const liveAcceptBudget = 30 * time.Second
 
 // liveStartBudget bounds the daemon's 100 ms dispatch tick plus one worker
 // process start. They took at most 0.6 s on a developer machine and under 2 s
 // on a CPU and disk stressed hosted Intel runner.
 const liveStartBudget = 8 * time.Second
 
-// accepted waits until the daemon lists at least jobs unfinished jobs.
+// accepted waits until the daemon lists exactly jobs jobs. The listing includes
+// retained history, and the fixture starts with an empty queue, so the count
+// equals the callers started so far.
 func (w liveCallerWait) accepted(ctx context.Context, jobs int) {
 	w.t.Helper()
-	w.until(ctx, fmt.Sprintf("the daemon to accept %d job(s)", jobs), func() bool {
-		value, err := w.i.liveControl(ctx, "snapshot", nil)
-		return err == nil && len(obj(value["tasks"])) >= jobs
+	budget, cancel := context.WithTimeout(ctx, liveAcceptBudget)
+	defer cancel()
+	w.until(budget, fmt.Sprintf("the daemon to accept %d job(s)", jobs), func() bool {
+		value, err := w.i.liveControl(budget, "snapshot", nil)
+		return err == nil && len(obj(value["tasks"])) == jobs
 	})
 }
 
@@ -215,24 +233,50 @@ func (w liveCallerWait) started(ctx context.Context, path string) {
 	w.until(budget, "the accepted job's command to start", func() bool { _, err := os.Stat(path); return err == nil })
 }
 
+// until logs how long each stage took, so a late start that still passes leaves
+// data (shown with go test -v or on any failure).
 func (w liveCallerWait) until(ctx context.Context, what string, ready func() bool) {
 	w.t.Helper()
+	begin := time.Now()
 	for ctx.Err() == nil {
 		if ready() {
+			w.t.Logf("waited %v for %s", time.Since(begin).Round(time.Millisecond), what)
 			return
 		}
 		select {
 		case err := <-w.finished:
 			w.finished <- err
+			if w.lifetime != nil && w.lifetime.Err() != nil {
+				w.t.Fatalf("the scenario deadline expired (%v) and ended the caller (%v) while waiting for %s\n%s", w.lifetime.Err(), err, what, w.describe())
+			}
 			w.t.Fatalf("the caller exited (%v) while waiting for %s\n%s", err, what, w.describe())
 		case <-time.After(40 * time.Millisecond):
 		}
 	}
-	w.t.Fatalf("gave up waiting for %s: %v\n%s", what, ctx.Err(), w.describe())
+	w.t.Fatalf("gave up waiting %v for %s: %v\n%s", time.Since(begin).Round(time.Millisecond), what, ctx.Err(), w.describe())
+}
+
+// liveTail returns at most the last 4 KiB of a file, so a runaway log cannot
+// flood a failure report.
+func liveTail(path string) string {
+	file, err := os.Open(path)
+	if err != nil {
+		return err.Error()
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return err.Error()
+	}
+	const limit = 4096
+	buffer := make([]byte, min(info.Size(), limit))
+	count, _ := file.ReadAt(buffer, max(info.Size()-limit, 0))
+	return string(buffer[:count])
 }
 
 // describe reports the daemon's view of every job, each job log, the caller and
-// the queue processes, so a hosted-runner failure explains itself.
+// its subprocesses, and the queue processes, so a hosted-runner failure explains
+// itself.
 func (w liveCallerWait) describe() string {
 	var report strings.Builder
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -246,8 +290,7 @@ func (w liveCallerWait) describe() string {
 	fmt.Fprintf(&report, "queue: %v\n", obj(snapshot["groups"]))
 	logs, _ := filepath.Glob(filepath.Join(w.i.state, "logs", "*.log"))
 	for _, path := range logs {
-		data, _ := os.ReadFile(path)
-		fmt.Fprintf(&report, "log %s: %q\n", filepath.Base(path), data)
+		fmt.Fprintf(&report, "log %s: %q\n", filepath.Base(path), liveTail(path))
 	}
 	select {
 	case err := <-w.finished:
@@ -260,12 +303,25 @@ func (w liveCallerWait) describe() string {
 		fmt.Fprintf(&report, "caller output: %q\n", w.output.String())
 	}
 	for _, path := range []string{filepath.Join(w.i.home, "daemon.log"), filepath.Join(w.i.state, "daemon.log")} {
-		data, _ := os.ReadFile(path)
-		fmt.Fprintf(&report, "daemon log: %q\n", data)
+		fmt.Fprintf(&report, "daemon log: %q\n", liveTail(path))
 	}
-	processes, _ := exec.Command("ps", "-axo", "pid,ppid,pgid,etime,stat,command").Output()
-	for _, line := range strings.Split(string(processes), "\n") {
-		if strings.Contains(line, w.i.home) {
+	// The caller runs in the test's directory, so its git subprocesses do not
+	// mention the fixture home. Include the caller's descendants by parentage.
+	processes, _ := exec.CommandContext(ctx, "ps", "-axo", "pid,ppid,pgid,etime,stat,command").Output()
+	lines := strings.Split(string(processes), "\n")
+	family := map[int]bool{w.pid: true}
+	for range 3 {
+		for _, line := range lines {
+			var pid, parent int
+			if _, err := fmt.Sscanf(strings.TrimSpace(line), "%d %d", &pid, &parent); err == nil && family[parent] {
+				family[pid] = true
+			}
+		}
+	}
+	for _, line := range lines {
+		var pid int
+		_, _ = fmt.Sscanf(strings.TrimSpace(line), "%d", &pid)
+		if strings.Contains(line, w.i.home) || (pid != w.pid && family[pid]) {
 			fmt.Fprintln(&report, line)
 		}
 	}
@@ -315,8 +371,9 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 				<-blockerDone
 			}
 		})
-		liveCallerWait{t: t, i: i, finished: blockerDone}.accepted(ctx, 1)
-		liveCallerWait{t: t, i: i, finished: blockerDone}.started(ctx, blockerStarted)
+		blockerWait := liveCallerWait{t: t, i: i, pid: blocker.Process.Pid, finished: blockerDone}
+		blockerWait.accepted(ctx, 1)
+		blockerWait.started(ctx, blockerStarted)
 	}
 	old := exec.CommandContext(callersContext, cli, "run", "--label", "Active across upgrade", "--", "/bin/sh", "-c", `printf 'once\n' >> "$1"; touch "$2"; while [ ! -f "$3" ]; do sleep .05; done; printf 'original outcome\n'; exit 23`, "fixture", runs, started, release)
 	old.Env = environment
@@ -327,7 +384,7 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 	}
 	finished := make(chan error, 1)
 	go func() { finished <- old.Wait() }()
-	oldWait := liveCallerWait{t: t, i: i, finished: finished, output: &output}
+	oldWait := liveCallerWait{t: t, i: i, pid: old.Process.Pid, finished: finished, output: &output}
 	joined := false
 	t.Cleanup(func() {
 		_ = os.WriteFile(release, nil, 0600)
@@ -579,7 +636,7 @@ func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string
 	}
 	finished := make(chan error, 1)
 	go func() { finished <- caller.Wait() }()
-	callerWait := liveCallerWait{t: t, i: i, finished: finished, output: &output}
+	callerWait := liveCallerWait{t: t, i: i, pid: caller.Process.Pid, finished: finished, output: &output, lifetime: ctx}
 	joined := false
 	t.Cleanup(func() {
 		_ = os.WriteFile(release, nil, 0600)
