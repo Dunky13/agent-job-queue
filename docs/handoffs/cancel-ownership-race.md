@@ -9,7 +9,7 @@
 The old error text named no members and the job log is gone, so the CI run cannot separate these two paths. Both end the same way: a worker record read earlier holds only the worker and its own `ps`, taken when the attempt started. A descendant that ignores SIGINT, here `sleep 60 &` in a non-interactive shell, keeps the group alive after the worker has gone. The group then has a member, but none the record names, and `VerifyGroupIdentity` refuses. `Cancel` resends every 200ms until the job is Done, so it keeps looking during this time.
 
 1. **Stale read.** The worker publishes and exits, and a repeat cancel read the row as running before that, then lists processes after it.
-2. **The repeat cancel kills the worker.** `executeWithAttempt` stopped handling SIGINT on return, before the outcome was published, so a resend in that gap killed the worker with nothing written. The row stays running until the daemon's wait settles it, and a cancel in that interval refuses. The job also reported the wrong status. An independent review forced this with injected delays and got the CI error text in 5 of 5 runs, and 0 of 5 with the handler held. A natural refusal also needs the daemon's goroutine to stall about 200 ms, and its natural rate was not measured.
+2. **The repeat cancel kills the worker.** `executeWithAttempt` stopped handling SIGINT on return, before the outcome was published, so a resend in that gap killed the worker with nothing written. The row stays running until the daemon's wait settles it, and a cancel in that interval refuses. A raw SIGINT with no cancel recorded also reported 125 instead of the command's status; a real `Cancel` marks the row first, so its wait reports 130. An independent review forced this with injected delays and got the CI error text in 5 of 5 runs, and 0 of 5 with the handler held. A natural refusal also needs the daemon's goroutine to stall about 200 ms, and its natural rate was not measured.
 
 What the evidence supports, for either path:
 
@@ -31,7 +31,7 @@ Ruled out:
 
 - `VerifyGroupIdentity` ends in a named error, `errGroupOwnershipUnverified`, and its message now states the group, the recorded members and the current members it compared (`pid@birth`). A recurrence names its cause.
 - `queueStore.settledAttempt` re-reads the row. If the same attempt and worker has published its outcome, the unverified group is no longer a reason to refuse: there is no worker to signal, and the settled job's cleanup, which uses the marker, owns what is left.
-- `executeWithAttempt` no longer stops its SIGINT handling on return, so a resend cannot kill the worker before it publishes. This closes the second path. A resend after the command has ended is discarded, which costs nothing because the command's status is already known. An earlier version of this fix registered a separate channel in `ExecuteAttempt`, before anything read it, and that lost an acknowledged cancel arriving before the command started. A review forced that with an injected 800ms delay: the command ran and exited 5, where it should have exited 130. The window measured 43-72ms over 8 runs, and it needs the client to be gone, because a live client resends every 200ms.
+- `executeWithAttempt` no longer stops its SIGINT handling on return, so a resend cannot kill the worker before it publishes. This closes the second path. A resend after the command has ended is discarded, which costs nothing because the command's status is already known. An earlier version of this fix registered a separate channel in `ExecuteAttempt`, before anything read it, and that lost an acknowledged cancel arriving at any point before the command started. A review forced that with an injected 800ms delay: the command ran and exited 5, where it should have exited 130. The window measured 43-72ms over 8 runs, and it needs the client to be gone, because a live client resends every 200ms.
 - Used by `queueDaemon.signal`, the daemon `tick` for an adopted running row, and the three handover readers in `queue_handover.go` that already re-read the row when the group was gone. They now do so for the unverified error too.
 - Not changed: a still-running row with no recorded member left keeps refusing, and nothing is ever signalled on unverified ownership. `Cleanup`, which uses the marker with all members, and `install_runtime_generations.go`, which retains on any error, are unchanged.
 
@@ -43,7 +43,7 @@ Ruled out:
 | Same test with the fix | passes |
 | Backend tests matching `Queue\|Handover\|Cancel\|Ownership\|Group\|Lease\|Signal\|Census\|Corrupt\|RealDaemon`, queue job | pass, 138s |
 | `go build ./... && go vet ./...` | pass |
-| Race-built `TestRealDaemonCancellationRemovesDescendants` plus the new test, 120 runs under `taskpolicy -c background`, at `2a5f930`, before the second path was closed | pass |
+| Race-built `TestRealDaemonCancellationRemovesDescendants` plus the new test, 120 runs under `taskpolicy -c background`, at `2964941`, before the second path was closed | pass |
 | `TestRealDaemonWorkerSurvivesInterruptsWhilePublishing` with the handling stopped on return | fails: the job reports 125 instead of the command's 7 |
 | `TestSettledAttemptKeysOnTheSameAttempt` with each part of the key, or either settled phase, removed | fails |
 
@@ -56,6 +56,7 @@ Not reproduced: the intermittent failure of the real test. It was 1 in 390 on ma
 - The full backend suite and hosted CI on this branch.
 - Intel hardware. The reproduction and probes ran on arm64.
 - `managedHeldByApp` reading a healthy lock holder as unowned on Intel. No link was found: the CI failure with "An unowned queue process holds its lifetime lock" comes from `managedDrain` in `install_managed.go`, which inspects locks and does not use process group ownership.
+- A cancel landing after `executeWithAttempt`'s last check and before the command starts, with no client left to resend, is still lost. A review forced it with an injected 800ms delay (`exit=5 want=130`, 3 of 3). The natural window is at most 1.7-6.1ms over 8 runs, and `main` has the same gap by code. A live client's 200ms resend reaches the command.
 - A regression test for the lost cancel before the command starts. The window cannot be forced without a production hook, so nothing pins the registration staying in `executeWithAttempt`.
 - The `tick` change and the three handover readers have no focused test for this path, because a stale snapshot cannot be forced without a hook. Removing the check at any of them passes every test.
 

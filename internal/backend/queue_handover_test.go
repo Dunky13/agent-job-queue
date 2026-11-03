@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -405,6 +406,7 @@ func TestQueueHandoverWorkerRetriesSchedulingSnapshotAfterCapacity(t *testing.T)
 				}
 				return testSnapshot(Object{"7": job.task}), nil
 			}
+			t.Cleanup(func() { signal.Reset(syscall.SIGINT) }) // executeWithAttempt leaves SIGINT caught until exit
 			code, err := executeWithAttempt(g, job.token, job.attempt)
 			if variant != "valid-handover" {
 				if code != 125 || err == nil || snapshots != 2 {
