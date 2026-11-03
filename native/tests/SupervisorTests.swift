@@ -628,7 +628,11 @@ struct SupervisorTests {
             let supervisor = f.real()
             supervisor.start()
             supervisor.start(.remote)
-            _ = await eventually { f.runs("scheduler").count >= 2 && f.runs("serve").count >= 2 }
+            _ = await eventually {
+                f.runs("daemon").count >= 2 && supervisor.state(.queue).lastExit == .code(0)
+                    && f.runs("scheduler").count >= 2
+                    && f.runs("serve").count >= 2 && supervisor.state(.remote).lastExit == .code(3)
+            }
             try check(f.runs("daemon").count >= 2 && supervisor.state(.queue).lastExit == .code(0), "real queue restarts after exit 0")
             try check(f.runs("scheduler").count >= 2, "real scheduler restarts after exit 0")
             try check(supervisor.state(.remote).lastExit == .code(3) && f.runs("serve").count >= 2, "real remote restarts after exit 3")
