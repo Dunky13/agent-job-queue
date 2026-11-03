@@ -226,8 +226,8 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 			return err
 		}
 		if busy && !p.loaded[label] {
-			if !install.managedHeldByApp(ctx, p.serviceApp(install.app), filepath.Join(install.state, name), "agent-heavy") {
-				return errors.New("An unowned queue process holds its lifetime lock; setup refused before service mutation")
+			if err := install.managedHeldByApp(ctx, p.serviceApp(install.app), filepath.Join(install.state, name), "agent-heavy"); err != nil {
+				return fmt.Errorf("An unowned queue process holds its lifetime lock; setup refused before service mutation: %w", err)
 			}
 			appRunning = true
 		}
@@ -238,8 +238,8 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 	}
 	remoteRunning := false
 	if busy && !p.loaded["io.went.agent-remote"] {
-		if !install.managedHeldByApp(ctx, p.serviceApp(install.app), filepath.Join(install.state, "remote/supervisor.lock"), "agent-remote") {
-			return errors.New("An unowned phone access process holds its lifetime lock; setup refused before service mutation")
+		if err := install.managedHeldByApp(ctx, p.serviceApp(install.app), filepath.Join(install.state, "remote/supervisor.lock"), "agent-remote"); err != nil {
+			return fmt.Errorf("An unowned phone access process holds its lifetime lock; setup refused before service mutation: %w", err)
 		}
 		appRunning, remoteRunning = true, true
 	}
@@ -302,36 +302,46 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 	return install.requireLegacyCleanup()
 }
 
-// managedHeldByApp reports whether every process holding a lifetime lock is app's
-// own helper, running as a child of app. launchd knows nothing of those, so each
+// managedHeldByApp checks that every process holding a lifetime lock is app's own
+// helper, running as a child of app. launchd knows nothing of those, so each
 // process's exec path and parent are the evidence. An exec path names what was
 // run, not the file there now, so a moved or replaced bundle does not change it.
-// Anything else, including no evidence, leaves the holder unowned.
-func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helper string) bool {
+// Anything else, including no evidence, leaves the holder unowned, and the error
+// says which evidence was missing.
+func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helper string) error {
 	output, err := install.run(ctx, "/usr/sbin/lsof", "-nP", "-t", "--", lock)
 	if err != nil {
-		return false
+		return err
 	}
 	holders := strings.Fields(string(output))
 	for _, holder := range holders {
 		pid, err := strconv.Atoi(holder)
 		if err != nil || pid <= 1 {
-			return false
+			return fmt.Errorf("holder %q is not a process", holder)
 		}
 		executable, err := installProcessExecutable(pid)
-		if err != nil || executable != filepath.Join(app, "Contents/MacOS", helper) {
-			return false
+		if err != nil {
+			return fmt.Errorf("holder %d cannot be read: %w", pid, err)
+		} else if executable != filepath.Join(app, "Contents/MacOS", helper) {
+			return fmt.Errorf("holder %d runs %s", pid, executable)
 		}
 		parent, err := installProcessParent(pid)
-		if err != nil || parent <= 1 {
-			return false
+		if err != nil {
+			return fmt.Errorf("holder %d has no readable parent: %w", pid, err)
+		} else if parent <= 1 {
+			return fmt.Errorf("holder %d has parent %d", pid, parent)
 		}
 		executable, err = installProcessExecutable(parent)
-		if err != nil || executable != filepath.Join(app, "Contents/MacOS/AgentQueue") {
-			return false
+		if err != nil {
+			return fmt.Errorf("parent %d of holder %d cannot be read: %w", parent, pid, err)
+		} else if executable != filepath.Join(app, "Contents/MacOS/AgentQueue") {
+			return fmt.Errorf("parent %d of holder %d runs %s", parent, pid, executable)
 		}
 	}
-	return len(holders) > 0
+	if len(holders) == 0 {
+		return errors.New("no holder found")
+	}
+	return nil
 }
 
 // managedRunningAppDrained asks the running daemon, because removal may only quit

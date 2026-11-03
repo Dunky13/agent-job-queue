@@ -202,12 +202,18 @@ Some legacy preflight tests now seed phone access or a blocked older install, be
 - Publication receipts and backups are only ever read and retired. Nothing writes a new one.
 - `install.run`'s argv sniffing and the Swift setup logic are unchanged, apart from removing the payload alternatives from `commandEnvironment`.
 
+## One unexplained CI failure
+
+`TestManagedRemovalRefusalAfterTheQuitSaysToReopen` failed once on the Intel shard, on `08a98ce` (run 41646896569): `An unowned queue process holds its lifetime lock`, before any quit, against a healthy fixture app. That check fails closed and nothing had changed.
+
+It did not reproduce on Apple silicon: 360 holder checks over two 90-second probes, one throttled to background priority, and 16 throttled repeats of the test all stayed clean. The cause is unknown. One unproven idea is that `lsof` caught a helper's child between fork and exec, since the lock's descriptor closes only at exec, and that child's parent is a helper, not the app. The refusal now names the missing evidence, so a recurrence shows the cause. No retry was added.
+
 ## Line counts
 
 | | Added | Removed | Net |
 |---|---|---|---|
-| Production | 538 | 1728 | -1190 |
-| Tests | 2271 | 2142 | +129 |
+| Production | 548 | 1728 | -1180 |
+| Tests | 2278 | 2142 | +136 |
 
 This is one PR rather than two: with `--payload` gone, the small shape is what remains.
 

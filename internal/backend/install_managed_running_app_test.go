@@ -349,6 +349,9 @@ func TestManagedRemovalRefusesUnownedLockHolder(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "unowned queue process") {
 			t.Fatal("a foreign lock holder was accepted", err)
 		}
+		if !strings.Contains(err.Error(), "holder") || !strings.Contains(err.Error(), " runs ") {
+			t.Fatal("the refusal did not name the missing evidence", err)
+		}
 		if a.quits != 0 {
 			t.Fatal("an unowned holder authorized quitting the app")
 		}
@@ -374,8 +377,12 @@ func TestManagedRemovalRefusesUnownedLockHolder(t *testing.T) {
 		})
 		managedRemovalTarget(i)
 		a.calls = nil
-		if err := i.execute(removalContext(t)); err == nil || !strings.Contains(err.Error(), "unowned queue process") {
+		err := i.execute(removalContext(t))
+		if err == nil || !strings.Contains(err.Error(), "unowned queue process") {
 			t.Fatal("a helper this app does not supervise was accepted", err)
+		}
+		if !strings.Contains(err.Error(), "parent") || !strings.Contains(err.Error(), " runs ") {
+			t.Fatal("the refusal did not name the missing evidence", err)
 		}
 		if a.quits != 0 {
 			t.Fatal("an unowned holder authorized quitting the app")
