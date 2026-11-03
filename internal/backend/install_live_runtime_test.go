@@ -198,14 +198,17 @@ type liveCallerWait struct {
 
 // liveAcceptBudget bounds only the caller's preparation before the daemon lists
 // its job; no test asserts anything about that stage. It replaces an 8 s wait
-// that also covered dispatch. A caller that never submits fails after this
-// budget instead of the scenario's 60 s (3 minutes for finish-pending)
-// context, so ten hung scenarios cost about 10 x (fixture + 30 s), inside the
-// 12 minute `go test` timeout in scripts/test-go-runtime.sh, which would
-// otherwise panic and discard every report. 30 s is about 6 times the slowest
-// preparation seen on a CPU and disk stressed hosted Intel runner (see
-// docs/handoffs/live-installer-job-start.md).
-const liveAcceptBudget = 30 * time.Second
+// that also covered dispatch. Without it a caller that never submits would
+// spend the scenario's whole 60 s (3 minutes for finish-pending) context, ten
+// hung scenarios would pass the 12 minute `go test` timeout in
+// scripts/test-go-runtime.sh, and its panic discards every buffered report.
+// 20 s is 4 times the slowest completed preparation measured on a CPU and disk
+// stressed hosted Intel runner (5.0 s, a cold first scenario; the rest took 1.1
+// s or less) and 2.5 times the 8 s that failed there. That runner took 448 s for
+// all ten scenarios, so ten hung preparations add 200 s: 648 s, inside the
+// 720 s timeout. A 30 s cap would reach 748 s. See
+// docs/handoffs/live-installer-job-start.md.
+const liveAcceptBudget = 20 * time.Second
 
 // liveStartBudget bounds the daemon's 100 ms dispatch tick plus one worker
 // process start. They took at most 0.6 s on a developer machine and under 2 s
