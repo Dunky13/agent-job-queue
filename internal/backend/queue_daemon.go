@@ -88,7 +88,7 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 		return nil, queueTransportError(e)
 	}
 	var response queueResponse
-	decoder := json.NewDecoder(io.LimitReader(conn, 32*1024*1024+1))
+	decoder := json.NewDecoder(&capReader{reader: conn, left: 32*1024*1024 + 1})
 	decoder.UseNumber()
 	if e = decoder.Decode(&response); e != nil {
 		return nil, fmt.Errorf("Invalid queue daemon response: %w", queueTransportError(e))
@@ -115,6 +115,27 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 		return nil, errors.New("Empty queue daemon response")
 	}
 	return response.Result, nil
+}
+
+var errQueueResponseTooLarge = errors.New("Queue daemon response exceeds the size limit")
+
+// capReader fails with a definite error once the limit is exceeded. io.LimitReader
+// would end the stream early, which classifies as a lost connection and is retried.
+type capReader struct {
+	reader io.Reader
+	left   int64
+}
+
+func (c *capReader) Read(p []byte) (int, error) {
+	if c.left <= 0 {
+		return 0, errQueueResponseTooLarge
+	}
+	if int64(len(p)) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.reader.Read(p)
+	c.left -= int64(n)
+	return n, err
 }
 
 type queueDaemon struct {

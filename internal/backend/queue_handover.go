@@ -847,6 +847,20 @@ func queueHandoverRetainedTaskWithProbe(g *Gate, id int, expectedToken, workerAt
 	if receipt.Phase != "committed" && receipt.Phase != "released" && receipt.Phase != "consumed" {
 		return nil, false, nil
 	}
+	// Custody covers the jobs that existed when the handover began, whatever phase
+	// the receipt reached. The daemon refuses submissions from prepare until a
+	// successor adopts the queue, so a later job is outside custody however long
+	// the receipt stays on disk, including a committed one left by a crash, and
+	// treating it as in custody would fail a follower on its first lost reply.
+	if id >= receipt.NextID {
+		inCustody := false
+		for i := range receipt.Attempts {
+			inCustody = inCustody || receipt.Attempts[i].ID == id
+		}
+		if !inCustody {
+			return nil, false, nil
+		}
+	}
 	if err := validateQueueHandoverDatabase(g, receipt); err != nil {
 		return nil, false, err
 	}

@@ -855,3 +855,45 @@ func TestRealDaemonRetainsHandoverCustodyWithoutAdvertisingIt(t *testing.T) {
 		t.Fatal("handover custody was not retained", err)
 	}
 }
+
+// A consumed receipt can stay on disk indefinitely. A job submitted after the
+// successor adopted the queue is outside its custody and must not make a
+// follower fail on its first lost reply.
+func TestQueueHandoverConsumedReceiptDoesNotCaptureLaterJobs(t *testing.T) {
+	g, _, receipt := releasedQueueFixture(t)
+	caller, err := queueHandoverIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.Phase, receipt.Consumer, receipt.NextID, receipt.Attempts = "consumed", &caller, 5, []queueHandoverAttempt{}
+	if err := writeQueueHandoverReceipt(g, receipt); err != nil {
+		t.Fatal(err)
+	}
+	probe := func(queueHandoverDaemon) (bool, error) {
+		t.Error("custody was consulted for a job submitted after the handover")
+		return false, nil
+	}
+	for _, id := range []int{5, 90} {
+		if _, allowed, err := queueHandoverRetainedTaskWithProbe(g, id, token(), "", probe); err != nil || allowed {
+			t.Fatalf("job %d: later job was captured by custody: allowed=%v err=%v", id, allowed, err)
+		}
+	}
+	// A committed receipt a crash left behind must not capture later jobs either.
+	// Without the check, this expired fixture fails on its expiry; with a live
+	// expiry and a dead daemon it would report a crash before release.
+	committed := *receipt
+	committed.Phase, committed.Consumer = "committed", nil
+	if err := writeQueueHandoverReceipt(g, &committed); err != nil {
+		t.Fatal(err)
+	}
+	if _, allowed, err := queueHandoverRetainedTaskWithProbe(g, 90, token(), "", probe); err != nil || allowed {
+		t.Fatalf("a stale committed receipt captured a later job: allowed=%v err=%v", allowed, err)
+	}
+	if err := writeQueueHandoverReceipt(g, receipt); err != nil {
+		t.Fatal(err)
+	}
+	// A job that existed at handover is still checked against custody.
+	if _, allowed, err := queueHandoverRetainedTaskWithProbe(g, 4, token(), "", func(queueHandoverDaemon) (bool, error) { return true, nil }); err == nil || allowed {
+		t.Fatalf("a pre-handover job outside the dispatch inventory was accepted: allowed=%v err=%v", allowed, err)
+	}
+}

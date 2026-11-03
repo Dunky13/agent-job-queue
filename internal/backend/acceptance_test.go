@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -22,9 +23,27 @@ type daemonFixture struct {
 	log         *os.File
 	clients     []*queueClient
 }
+
+// lockedBuffer lets a test read a client's output while the process still writes.
+type lockedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(p)
+}
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
+}
+
 type queueClient struct {
 	command     *exec.Cmd
-	out, errors bytes.Buffer
+	out, errors lockedBuffer
 	done        chan error
 }
 
@@ -460,9 +479,14 @@ func TestRealDaemonCrashRetainsOwnershipAndPausesRestart(t *testing.T) {
 	if _, err := os.Stat(f.gate.Slot); err != nil {
 		t.Fatal("daemon death released live work", err)
 	}
-	// Keep the outage observable until the waiter reports backend failure. It
-	// must not run its target or silently bypass the missing queue daemon.
-	second.wait(t, 125)
+	// The waiter rides out the outage: it must neither run its target nor
+	// silently bypass the missing queue daemon, and it ends only once the
+	// restarted daemon lets it cancel the job.
+	select {
+	case <-second.done:
+		t.Fatal("waiter gave up during a short daemon outage")
+	case <-time.After(time.Second):
+	}
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -490,8 +514,15 @@ func TestRealDaemonCrashRetainsOwnershipAndPausesRestart(t *testing.T) {
 	if err = Cleanup(f.gate, firstID); err != nil {
 		t.Fatal(err)
 	}
+	// The waiter must say why its job is not starting before an operator acts.
+	fixtureUntil(t, 20*time.Second, func() bool { return strings.Contains(second.errors.String(), "the queue is paused") })
 	if err = Cancel(f.gate, secondID); err != nil {
 		t.Fatal(err)
+	}
+	second.wait(t, 130)
+	notices := second.errors.String()
+	if !strings.Contains(notices, "queue daemon not responding") || !strings.Contains(notices, "queue answering again") || strings.Count(notices, "the queue is paused") != 1 {
+		t.Fatalf("outage or pause was not announced once: %q", notices)
 	}
 	select {
 	case <-first.done:
