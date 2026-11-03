@@ -247,8 +247,16 @@ func TestManagedRefusedMenuShutdownPreservesPreviousBundle(t *testing.T) {
 			if !reflect.DeepEqual(before, installBundleSnapshot(t, i.app)) {
 				t.Fatal("bundle changed after unconfirmed UI shutdown")
 			}
-			if _, err := os.Stat(filepath.Join(i.root, "install-in-progress.json")); err != nil {
-				t.Fatal("refused shutdown lost pending identity", err)
+			// The app is still running, so nothing may call it incomplete.
+			if _, err := os.Lstat(filepath.Join(i.root, "install-in-progress.json")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("refused shutdown left a pending marker", err)
+			}
+			if err := updateCompleted(i.root); err != nil {
+				t.Fatal("refused shutdown made the running app look incomplete", err)
+			}
+			i.command = original
+			if err := m.run(t); err != nil {
+				t.Fatal("removal could not finish once the app quit", err)
 			}
 		})
 	}

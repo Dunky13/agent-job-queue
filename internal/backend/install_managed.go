@@ -303,8 +303,9 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 }
 
 // managedHeldByApp reports whether every process holding a lifetime lock is app's
-// own helper, running as a child of app. launchd knows nothing of
-// those, so the kernel's record of each executable and parent is the evidence.
+// own helper, running as a child of app. launchd knows nothing of those, so each
+// process's exec path and parent are the evidence. An exec path names what was
+// run, not the file there now, so a moved or replaced bundle does not change it.
 // Anything else, including no evidence, leaves the holder unowned.
 func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helper string) bool {
 	output, err := install.run(ctx, "/usr/sbin/lsof", "-nP", "-t", "--", lock)
@@ -1084,7 +1085,7 @@ func (install *installer) managedStopMenu(ctx context.Context) error {
 func (install *installer) managedRemovalNotFound(ctx context.Context, service string) error {
 	label := map[string]string{"queue": "io.went.agent-heavy", "resources": "io.went.agent-resources", "remote": "io.went.agent-remote"}[service]
 	if label == "" {
-		return fmt.Errorf("The %s service is notFound, so its registration cannot be verified; application must be preserved", service)
+		return fmt.Errorf("The %s service is notFound, so its registration cannot be verified; application must be preserved. Quit Agent Queue if it is running, register it again with agent-heavy install --app-bundle %s, then run removal again", service, installQuote(install.app))
 	}
 	if _, loaded, err := install.inspectService(ctx, label); err != nil {
 		return err
@@ -1114,6 +1115,9 @@ func (install *installer) managedRemovalSchedulingLock(ctx context.Context) (*os
 // Removal is an explicit mutation, separate from read-only preflight. The app
 // may be deleted only after this operation succeeds.
 func (install *installer) removeManaged(ctx context.Context) error {
+	// Nothing is left running to finish a row or release a record, so retrying
+	// cannot clear these. Opening the app does.
+	reopen := func(err error) error { return fmt.Errorf("%w. Open Agent Queue, then run removal again", err) }
 	for _, directory := range []string{install.root, install.state, install.config, install.launch, filepath.Join(install.home, ".local/bin"), filepath.Join(install.state, "remote")} {
 		if err := installInspectDirectory(directory); err != nil {
 			return err
@@ -1139,12 +1143,15 @@ func (install *installer) removeManaged(ctx context.Context) error {
 	if _, err := install.managedRemovalIdentity(); err != nil {
 		return err
 	}
-	if _, err := install.planManaged(ctx); err != nil {
+	if _, err := install.planManaged(ctx); errors.Is(err, errInstallStoppedQueueUnfinished) {
+		return reopen(err)
+	} else if err != nil {
 		return err
 	}
 	// The first complete inspection above creates no files. Recheck under all
 	// three locks, retaining scheduling.lock through drain and daemon shutdown:
-	// job submission needs it, so nothing can start after the check below.
+	// agent-heavy run and lane acquire wait for it, so they add no work after the
+	// check below.
 	for _, directory := range []string{install.root, install.state, filepath.Join(install.state, "remote")} {
 		exists, err := updateExists(directory)
 		if err != nil {
@@ -1186,7 +1193,9 @@ func (install *installer) removeManaged(ctx context.Context) error {
 		return err
 	}
 	p, err := install.planManaged(ctx)
-	if err != nil {
+	if errors.Is(err, errInstallStoppedQueueUnfinished) {
+		return reopen(err)
+	} else if err != nil {
 		return err
 	}
 	identity, err = install.managedRemovalIdentity()
@@ -1198,17 +1207,18 @@ func (install *installer) removeManaged(ctx context.Context) error {
 		return err
 	}
 	raw = append(raw, '\n')
+	// A running app must quit first: only that stops the helpers it supervises,
+	// which quiesceManaged requires, and it replies only once they have stopped.
+	// A refused quit leaves it running, so nothing may mark it incomplete before.
+	if err := install.managedStopMenu(ctx); err != nil {
+		return err
+	}
 	marker := filepath.Join(install.root, "install-in-progress.json")
 	if err := installAtomic(marker, raw, 0600); err != nil {
 		return err
 	}
-	// A running app must quit first: only that stops the helpers it supervises,
-	// which quiesceManaged requires, and it replies only once they have stopped.
-	if err := install.managedStopMenu(ctx); err != nil {
-		return err
-	}
 	if err := install.quiesceManaged(ctx, p); err != nil {
-		return err
+		return reopen(err)
 	}
 	for service := range p.statuses {
 		status, err := install.managedStatus(ctx, install.app, service)
@@ -1220,7 +1230,7 @@ func (install *installer) removeManaged(ctx context.Context) error {
 				return err
 			}
 		} else if status != "notRegistered" {
-			return fmt.Errorf("Service %s is still registered; application must be preserved", service)
+			return reopen(fmt.Errorf("Service %s is still registered; application must be preserved", service))
 		}
 	}
 	// Confirm every wrapper again before retiring any metadata. Keep private

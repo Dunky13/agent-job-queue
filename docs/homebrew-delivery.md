@@ -51,9 +51,11 @@ Existing releases and casks remain immutable, and the first transition from a hi
 The app change replaces the tap's trusted tooling and cask template. The tap must receive it first, through a companion PR:
 
 1. From `packaging/homebrew/`, copy `refresh.go`, `refresh_test.go`, `test-cask.rb` and `.github/workflows/refresh.yml` into the tap checkout, together with the root `LICENSE`. Keep them byte-identical to this source revision; do not copy `SEED.txt`.
-2. In the tap checkout, run `go test -p 2 refresh.go refresh_test.go` and `go vet refresh.go` (Go 1.26 or later).
-3. Open a PR against the tap's `tap` branch with signed, DCO-signed-off commits, and merge it.
-4. Only then merge the source change. The delivery job compares the tap's helpers byte for byte (`internal/delivery/sync.go`), so a missing or stale sync fails delivery visibly.
+2. When the cask template changes, also set `Casks/agent-job-queue.rb` to the `agent-job-queue.rb` release asset of the tap's current build, byte for byte. Otherwise, a tap cask that drifted from that asset passes only while the old template still renders it, and every refresh then fails with `Current tap cask differs from its historical published release`.
+3. In the tap checkout, run `go test -p 2 refresh.go refresh_test.go`, `go vet refresh.go` and `go run -p 2 refresh.go` (Go 1.26 or later, with `gh` and `brew`). The tests do not read the cask, so only the last command shows this failure. It publishes nothing.
+4. Open a PR against the tap's `tap` branch with signed, DCO-signed-off commits. Before merging, check that the tap's scheduled refresh has not moved to a newer build, and repeat from step 2 if it has. Then merge.
+5. Dispatch `refresh.yml` on the `tap` branch and confirm it succeeds.
+6. Only then merge the source change. The delivery job compares the tap's helpers byte for byte (`internal/delivery/sync.go`), so a missing or stale sync fails `Verify Homebrew delivery` visibly, before it dispatches a refresh. Nothing depends on that job and the release is already published by then, so publishing continues through the tap's scheduled refresh, but every distribution run stays red until the tap catches up.
 
 ## One-time GitHub App setup
 
@@ -81,7 +83,7 @@ To inspect the workflow runs:
 gh run list --repo Dunky13/homebrew-agent-job-queue --workflow refresh.yml --limit 5
 ```
 
-Changes to the trusted tap files need a reviewed companion tap PR. Copy the standalone `refresh.go`, `refresh_test.go`, `test-cask.rb`, and `.github/workflows/refresh.yml` from `packaging/homebrew/`, together with the root `LICENSE`. The tap helper uses only the Go standard library and never downloads application source or dependencies to execute. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated `Casks/` files manually or execute arbitrary code from a release to repair drift.
+Changes to the trusted tap files need a reviewed companion tap PR. Copy the standalone `refresh.go`, `refresh_test.go`, `test-cask.rb`, and `.github/workflows/refresh.yml` from `packaging/homebrew/`, together with the root `LICENSE`. The tap helper uses only the Go standard library and never downloads application source or dependencies to execute. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated `Casks/` files manually or execute arbitrary code from a release to repair drift. The one exception is the reset above, which restores the exact bytes of a published release asset.
 
 After verified delivery, Homebrew users can upgrade normally:
 

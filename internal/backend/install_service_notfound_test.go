@@ -302,14 +302,27 @@ func TestManagedRemovalRefusesLoginItemItCannotVerify(t *testing.T) {
 		m.statuses["login"] = "notFound"
 		before := installTreeWitness(t, i.home)
 		m.calls = nil
-		if err := m.run(t); err == nil || !strings.Contains(err.Error(), "cannot be verified") {
+		err := m.run(t)
+		if err == nil || !strings.Contains(err.Error(), "cannot be verified") {
 			t.Fatal("removal passed on no evidence about the login item", err)
+		}
+		if !strings.Contains(err.Error(), "agent-heavy install --app-bundle "+installQuote(i.app)) {
+			t.Fatal("refusal gave no way forward", err)
 		}
 		managedRequireNoServiceMutation(t, m.calls)
 		if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
 			t.Fatal("refusal retired custody")
 		}
-		m.statuses["login"] = "enabled"
+		// The route the refusal names: setup registers it again, even from notFound.
+		i.unregisterServices = false
+		if err := m.run(t); err != nil {
+			t.Fatal("setup could not register the login item again", err)
+		}
+		if m.statuses["login"] != "enabled" {
+			t.Fatal("setup did not restore the login item", m.statuses)
+		}
+		i.unregisterServices = true
+		m.calls = nil
 		if err := m.run(t); err != nil {
 			t.Fatal("removal after the lookup answered", err)
 		}

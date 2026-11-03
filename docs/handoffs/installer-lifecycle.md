@@ -40,7 +40,7 @@ Still live, despite how they read: `serviceEnvironment`, `managedStopMenu`, `man
 ## Behaviour that changed
 
 1. **Removal no longer refuses a helper service that was never registered.** `--unregister-services` failed with `The remote service is notFound` whenever phone access had never been registered, seen on a real Mac on build 166. For queue, resources and remote, a `notFound` lookup now passes during planning and in the final check, unless launchd still has the label loaded. `managedRemovalNotFound` holds that check. Three limits apply:
-   - **The login item refuses on `notFound`.** It has no launchd label, so nothing shows that a miss means it is gone, and passing would retire wrappers and custody while it might still be registered. It refuses, as `main` did, until the lookup answers. Whether a real Mac ever reports this has not been seen.
+   - **The login item refuses on `notFound`.** It has no launchd label, so nothing shows that a miss means it is gone, and passing would retire wrappers and custody while it might still be registered. Setup requires `enabled` or `requiresApproval` to finish, so a completed setup does not leave this state, but a `brew upgrade` that was never opened or a reset of macOS background items can. Nothing shipped registers the item again by itself, so the refusal and the README give the route: quit the app and run `agent-heavy install --app-bundle PATH`. That route has run against mocked Service Management only.
    - **A miss straight after a real unregister fails closed,** because `managedAction` requires `notRegistered` at that moment. The next run finishes for a helper service, and for the login item once its lookup answers. `TestManagedRemovalRetryAfterNotFoundFollowsUnregister` verifies both.
    - Registered, enabled and awaiting-approval services are handled as before, and retained phone process records still refuse.
 2. **`--recover disable-phone-access` now works on a packaged app.** It ran `Contents/Resources/payload/source/bin/agent-remote`, a path `appservices.ValidateBundle` forbids, so it could only fail. It now runs `Contents/MacOS/agent-remote`, as `executeManaged` does.
@@ -50,19 +50,28 @@ Still live, despite how they read: `serviceEnvironment`, `managedStopMenu`, `man
 
 Owner decision: removal checks the drain over RPC, then quits the app itself. `--unregister-services` on a running app now works like this:
 
-1. **Recognise the lock holders.** For each lifetime lock that is busy with nothing loaded in launchd, `managedHeldByApp` finds the holders with `lsof`, then requires the kernel's record of each one's executable to be this bundle's helper and its parent's to be this bundle's `AgentQueue`. Anything else, including no evidence, is still "unowned" and refuses. That includes the app's own helper running without the app.
+1. **Recognise the lock holders.** For each lifetime lock that is busy with nothing loaded in launchd, `managedHeldByApp` finds the holders with `lsof`, then requires each one's exec path to be this bundle's helper and its parent's to be this bundle's `AgentQueue`. An exec path is the string `kern.procargs2` reports, not the file's identity, so it survives the bundle being moved, replaced or deleted. It fails closed, and it does not widen the threat model, since these processes already run as this user. Anything else, including no evidence, is still "unowned" and refuses. That includes the app's own helper running without the app.
 2. **Ask the running daemon.** `managedRunningAppDrained` reads the snapshot over RPC. With active or queued jobs it refuses with a message that says so, and it never quits the app. If the daemon does not answer it also refuses.
 3. **Quit, then unregister.** `managedStopMenu` now runs before `quiesceManaged`, because only quitting stops the helpers the app supervises and `quiesceManaged` needs their locks free. The native step waits for the app to exit, and the app exits only after its helpers stop.
 
-The check runs twice, the second time under `scheduling.lock`, which job submission also needs, so a job submitted through `agent-heavy run` cannot start between the check and the quit. Removal now waits up to 10 seconds for that lock, the bound `LockPrivate` gives everyone else, because a running app's helpers hold it briefly during normal work.
+The check runs twice, the second time under `scheduling.lock`. `agent-heavy run` and `lane acquire` both wait for that lock, so neither adds work between the check and the quit; `lane acquire` did not until the final review found a lease taken at that moment. A process calling the daemon's RPC directly could still do it, but no shipped client does. Removal now waits up to 10 seconds for the lock, the bound `LockPrivate` gives everyone else, because a running app's helpers hold it briefly during normal work.
 
-After the quit, the existing checks still apply. If a job somehow shows `phase != done` while the snapshot shows `Done`, the offline drain refuses at that point, with the app already quit. That is the one way the app can be quit and removal still refuse. The marker stays and retrying works.
+`install-in-progress.json` is written only once the quit has succeeded. A refused quit, such as a running `--setup` change cancelling it after 30 seconds, therefore leaves a running app that still looks complete to the updater and to `agent-remote enable`, and a retry works.
+
+**The app can be quit and removal still refuse.** All of these fail closed:
+
+- A job still in `outcome`, or otherwise unfinished, in the stopped store.
+- A phone access record staying active (`Phone access process cleanup is incomplete`).
+- A Service Management failure after unregistering.
+- A helper still holding its lifetime lock.
+
+Retrying does not clear the first of these, because no daemon is left to finish the row. So refusals after the quit, and an unfinished stopped store found while planning, say "Open Agent Queue, then run removal again". Opening the app does clear it: preflight is empty, setup succeeds and removes the marker. `TestManagedRemovalRefusalAfterTheQuitSaysToReopen` holds that.
 
 **Preflight had the same check.** Run from outside against a healthy running app, it reported "An unowned queue process holds its lifetime lock", from the same `managedDrain` branch. It and setup now report `app-running` and `errInstallAppRunning`, and change nothing. Setup still cannot run beside the app's helpers.
 
-**What the app does beside a running copy.** It stops and shows the message with Retry. It does not wait, because only the user can clear this, and a silent wait would look like a hang. `app-running` therefore offers no `wait` action, and neither `install_approved_repair.go` nor `approvedRepairStep` recognises it, so both stop for review as they do for any unknown requirement. No Swift logic changed; `BootstrapTests` and `TestInstallerAutomaticSetupStopsForARunningApp` hold this. A newer copy opened beside the running recorded app gets the same report, because recognition checks the recorded app during a relocation. Retry then continues once the other copy has quit. The menu's wording for this has not been looked at on a real Mac.
+**What the app does beside a running copy.** It stops and shows the message, with Retry in the startup menu and Check again in the `--setup` window. It does not wait, because only the user can clear this, and a silent wait would look like a hang. `app-running` therefore offers no `wait` action, and neither `install_approved_repair.go` nor `approvedRepairStep` recognises it, so both stop for review as they do for any unknown requirement. No Swift logic changed; `BootstrapTests` and `TestInstallerAutomaticSetupStopsForARunningApp` hold this. A newer copy opened beside the running recorded app gets the same report, because recognition checks the recorded app during a relocation. Either button then continues once the other copy has quit. The menu's wording for this has not been looked at on a real Mac.
 
-**What ran against the real thing.** `install_managed_running_app_test.go` uses a real process tree: copies of the test binary at the bundle's `AgentQueue` and `agent-heavy` paths, with the real daemon and scheduler as children, real `flock`, real `lsof`, the kernel's process records and real daemon RPC. Mutations removing recognition, the parent check or the drain check, or moving the quit after unregistering, each fail these tests.
+**What ran against the real thing.** `install_managed_running_app_test.go` uses a real process tree: copies of the test binary at the bundle's `AgentQueue` and `agent-heavy` paths, with the real daemon and scheduler as children, real `flock`, real `lsof`, real exec paths and parents from the kernel, and real daemon RPC. Mutations removing recognition, the parent check or the drain check, or moving the quit after unregistering, each fail these tests.
 
 **What has not run against the real thing:**
 
@@ -73,9 +82,11 @@ After the quit, the existing checks still apply. If a job somehow shows `phase !
 
 ## Tap companion PR, not opened yet
 
-The caveat in `internal/tooling/tooling.go` and `packaging/homebrew/refresh.go` now reads "Before removing the app, finish its jobs, then run this. It quits the app and removes its login item:". The tap has to receive that first, because delivery compares its helpers byte for byte (`internal/delivery/sync.go`) and a stale copy fails delivery visibly.
+The caveat in `internal/tooling/tooling.go` and `packaging/homebrew/refresh.go` now reads "Before removing the app, finish its jobs, then run this. It quits the app and removes its login item:".
 
-Files, copied byte for byte from this PR's final head:
+**Changing the template alone would stop Homebrew publishing.** The tap's installed cask, at build 222, already differs from that build's release asset, a drift left by #56: its caveat says "finish setup" and the asset says "use its menu bar". Today the tap's old template renders its own cask exactly, so nothing notices. With the new template the refresh falls through to the historical asset check, and every run fails with `Current tap cask differs from its historical published release`. The independent review confirmed this by running it: exit 1 with the cask unchanged, exit 0 with the cask reset to the asset. `go test` passes either way, so the failure would only appear after merging.
+
+Files, from this PR's final head:
 
 | From | To, in the tap |
 |---|---|
@@ -84,17 +95,31 @@ Files, copied byte for byte from this PR's final head:
 | `packaging/homebrew/test-cask.rb` | `test-cask.rb` |
 | `packaging/homebrew/.github/workflows/refresh.yml` | `.github/workflows/refresh.yml` |
 | `LICENSE` | `LICENSE` |
+| Release asset `agent-job-queue.rb` of the tap's current build | `Casks/agent-job-queue.rb` |
 
-Do not copy `SEED.txt`.
+Do not copy `SEED.txt`. Only `refresh.go`, `refresh_test.go` and the cask differ from what the tap has now. Setting the cask is the one exception to the rule against editing `Casks/`, because it restores the exact bytes of a published asset. Leave `Casks/agent-job-queue.json` alone.
 
 Steps, once this PR's head is final:
 
-1. In a checkout of the tap's `tap` branch, copy the files above.
-2. Run `go test -p 2 refresh.go refresh_test.go` and `go vet refresh.go` with Go 1.26 or later.
-3. Open a PR against `tap` with signed, DCO-signed-off commits, and merge it.
-4. Only then merge this PR.
+1. In a checkout of the tap's `tap` branch, read the current build from the `version` and `url` lines of `Casks/agent-job-queue.rb`. It is `build-222-03fcbd2` as I write this, but **the target moves**: the tap's scheduled refresh can publish a newer build at any time, rendered by its old template and so drifting the same way, and builds 229 and 232 are already out.
+2. `gh release download TAG --repo Dunky13/agent-job-queue --pattern agent-job-queue.rb --clobber --dir Casks`, using that build's tag, and copy the other files above.
+3. Run `go test -p 2 refresh.go refresh_test.go`, `go vet refresh.go` and `go run -p 2 refresh.go` with Go 1.26 or later, `gh` and `brew`. The last one must exit 0 and publishes nothing. It is the only one of the three that reads the cask.
+4. Open a PR against `tap` with signed, DCO-signed-off commits.
+5. Just before merging, re-read the tap's head. If its build moved, repeat from step 1 against the new build. Then merge.
+6. Dispatch `refresh.yml` on the `tap` branch and confirm it succeeds. If the schedule moved the tap in that gap, it fails with the error above; repeat from step 1.
+7. Only then merge this PR.
 
-The published cask keeps its old text, verified as a historical asset, until the next numbered build. Only `refresh.go` and `refresh_test.go` differ from what the tap has now.
+**What the delivery check blocks, and the order.** `Verify Homebrew delivery` (`homebrew-sync`) is the last job in `distribution.yml`, and nothing needs it. The release is already published by then, and `ci-required` belongs to a different workflow. A tooling mismatch stops it before it dispatches a refresh, so that run is not dispatched or verified, and the tap's scheduled refresh keeps publishing with the tap's own tooling.
+
+That mismatch exists today and was hidden: run 41625944175 logged `Tap tooling differs: refresh.go` and `exit status 1`, yet reported success, because the step had no `shell:` and so no pipefail through `tee -a`. This PR sets `shell: bash`, and `TestWorkflowPipelinesFailWhenAnyCommandFails` holds that for any step piping into `tee`.
+
+**The companion should land first.**
+
+- **Companion first, as above:** the check goes straight from hidden mismatch to passing when this PR merges. Between the two merges, `main` still lacks the fix, so its runs stay green and mismatched, as they do today.
+- **This PR first:** publishing is not broken, but every distribution run shows red and dispatches nothing until the companion lands.
+- **The companion without the cask reset:** this is what does break publishing, so step 2 is not optional.
+
+Anything else in the batch that changes `packaging/homebrew/` needs the same sync.
 
 ## Test porting
 
@@ -114,7 +139,7 @@ Limits of the seeding:
 
 Seeding the marker first caused a flake while porting, in about one run in 12 on a busy host. The fixture's real daemon and scheduler take `scheduling.lock` during normal work, so setup can get the transient refusal in follow-up 3 of `retire-handover-begin.md`. `runPackagedSetup` retries that only when no pending marker predates the call, and on #67 none did. Now `managedOlderPublication` sets `seededPending`, which excuses that one marker for one call. `TestPackagedSetupRetriesBusyOnlyOverASeededMarkerOnce` holds the rule, and the strict case in `TestPackagedSetupNeverRetriesMutationOrUncertainHistory` is unchanged. The finish-pending test now logs the setup error, last phase and daemon log when that wait fails.
 
-Backend top-level tests went from 540 to 532. Tests not listed below keep their names. Many had their setup ported and lost assertions on the launchd definitions that only the tail wrote. Each kept its subject: callback spellings, drain, Pueue import, slot, phone recovery, ownership refusal and so on.
+Backend top-level tests went from 581 to 577. Tests not listed below keep their names. Many had their setup ported and lost assertions on the launchd definitions that only the tail wrote. Each kept its subject: callback spellings, drain, Pueue import, slot, phone recovery, ownership refusal and so on.
 
 | Before | After | Reason |
 |---|---|---|
@@ -134,6 +159,8 @@ Backend top-level tests went from 540 to 532. Tests not listed below keep their 
 | `TestManagedSharedAppStagesThenMovesThroughFD`, `TestManagedSharedCopyBoundsAndOwnership`, `TestManagedSharedCopyDetectsReboundChild`, `TestManagedSharedCopyPinsParentDescriptor`, `TestManagedSharedCopyPreservesPrivateBoundary`, `TestManagedSharedCopyRefusesUnsafeEntries`, `TestManagedSharedNativeCopyRetainsMetadataAndVerifiesBeforeMove` | deleted | Tested the deleted copier. |
 | | `TestManagedRemovalAfterUnregisterAcceptsNotFoundOnlyWhenUnloaded`, `TestManagedRemovalOfSupervisedApp` | New, for the removal fix. Both fail with the old checks restored. |
 | | `TestPackagedSetupRetriesBusyOnlyOverASeededMarkerOnce` | New, for the seeded marker above. |
+| | `TestLaneAcquireWaitsForSchedulingLock`, `TestHeldLeaseFailsTheRemovalDrainCheck` | New: a lease cannot start after removal's last check, and a held one fails it. |
+| | `TestManagedRemovalRefusalAfterTheQuitSaysToReopen`, `TestManagedRemovalRefusedQuitLeavesARunningAppComplete` | New, for what follows a refusal. |
 | | `TestManagedResumedActivationNotFoundRemoteCannotHideOwnedWork` | Restores the resume-route gate's coverage, which the port lost. |
 | | `TestManagedRemovalRefusesLoginItemItCannotVerify`, `TestManagedRemovalRetryAfterNotFoundFollowsUnregister` | New, for the login item and for retrying. |
 | | `TestInstallerPreflightReviewsStateBesideAnInvalidBundle`, `TestInstallerPreflightLegacyDiagnostics` | New, for the invalid-bundle branch and the diagnostics that lost coverage. |
@@ -161,8 +188,8 @@ Some legacy preflight tests now seed phone access or a blocked older install, be
 
 | | Added | Removed | Net |
 |---|---|---|---|
-| Production | 489 | 1715 | -1226 |
-| Tests | 1966 | 2146 | -180 |
+| Production | 517 | 1723 | -1206 |
+| Tests | 2154 | 2144 | --10 |
 
 This is one PR rather than two: with `--payload` gone, the small shape is what remains.
 
@@ -176,7 +203,8 @@ This is one PR rather than two: with `--payload` gone, the small shape is what r
 6. **Naming.** `validatePayload`, `prepareManaged` and `install_managed_copy.go` are now `validateBundle`, `removeManaged` and `install_managed_parent.go`. Left to rename: `readPayload`, `installReadPayload`, `installPayloadParent`, `installValidatePayloadTree`, and the `payload-invalid` ID, which the wire contract uses.
 7. **The follow-ups in `retire-handover-begin.md` stand.** Its item 6, the payload path's different drain rule, no longer applies.
 8. **`buildManagedLiveFixtureCLI` has a one-minute build limit,** and a race build was killed at that limit on a busy host, failing the iteration. This predates this PR. Hosted runners have not shown it.
-9. **Gaps the independent review listed, all present before this PR:** `validate-skips-pendingBundle`, `pending-skips-retained-backup-access`, `setup-skips-runtime-cleanup`, `plan-ignores-unsafe-runtime-bin` and same-path runtime reclamation.
+9. **Removal could unregister a login item that reads `notFound`.** A Swift `mainApp.unregister` attempt might remove the need for the manual route. Not done here, by decision.
+10. **Gaps the independent review listed, all present before this PR:** `validate-skips-pendingBundle`, `pending-skips-retained-backup-access`, `setup-skips-runtime-cleanup`, `plan-ignores-unsafe-runtime-bin` and same-path runtime reclamation.
 
 ## Evidence
 

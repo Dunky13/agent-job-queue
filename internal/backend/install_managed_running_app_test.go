@@ -474,3 +474,72 @@ func TestInstallerNewerCopyBesideRunningRecordedAppStops(t *testing.T) {
 		t.Fatal("the recorded app changed", metadata, err)
 	}
 }
+
+// Nothing is left to finish a row once the app has quit, so retrying cannot clear
+// it. Opening the app does, because setup does not wait for the supervised queue.
+func TestManagedRemovalRefusalAfterTheQuitSaysToReopen(t *testing.T) {
+	a := runningAppFixture(t, true)
+	i := a.installer
+	original := i.command
+	i.command = func(ctx context.Context, args []string) ([]byte, error) {
+		output, err := original(ctx, args)
+		if len(args) == 3 && args[1] == "--prepare-app-replacement" && a.quits == 1 {
+			store, storeErr := openQueueStore(i.state, false)
+			if storeErr != nil {
+				t.Fatal(storeErr)
+			}
+			defer store.close()
+			if _, storeErr = store.db.Exec("INSERT INTO queue_jobs(id,token,task,phase) VALUES(41,'fixture','{}','outcome')"); storeErr != nil {
+				t.Fatal(storeErr)
+			}
+		}
+		return output, err
+	}
+	managedRemovalTarget(i)
+	for attempt := range 2 {
+		err := i.execute(removalContext(t))
+		if err == nil || !strings.Contains(err.Error(), "Open Agent Queue, then run removal again") {
+			t.Fatal("refusal after the quit gave no way forward", attempt, err)
+		}
+		for _, filename := range []string{filepath.Join(i.root, "install-in-progress.json"), filepath.Join(i.root, "installation.json"), filepath.Join(i.home, ".local/bin/agent-heavy")} {
+			if _, statErr := os.Lstat(filename); statErr != nil {
+				t.Fatal("refusal after the quit retired custody", filename, statErr)
+			}
+		}
+	}
+	i.unregisterServices = false
+	if err := i.execute(removalContext(t)); err != nil {
+		t.Fatal("opening the app could not finish setup", err)
+	}
+	if _, err := os.Lstat(filepath.Join(i.root, "install-in-progress.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("setup kept the marker", err)
+	}
+}
+
+// A refused quit leaves the app running and in charge, so it must not look
+// incomplete to the updater or to phone access in the meantime.
+func TestManagedRemovalRefusedQuitLeavesARunningAppComplete(t *testing.T) {
+	a := runningAppFixture(t, true)
+	i := a.installer
+	original := i.command
+	refuse := true
+	i.command = func(ctx context.Context, args []string) ([]byte, error) {
+		if refuse && len(args) == 3 && args[1] == "--prepare-app-replacement" {
+			return nil, errors.New("a running setup change cancelled the quit")
+		}
+		return original(ctx, args)
+	}
+	managedRemovalTarget(i)
+	a.calls = nil
+	if err := i.execute(removalContext(t)); err == nil {
+		t.Fatal("a refused quit reported success")
+	}
+	a.requireUntouched(t)
+	if err := updateCompleted(i.root); err != nil {
+		t.Fatal("a refused quit made the running app look incomplete", err)
+	}
+	refuse = false
+	if err := i.execute(removalContext(t)); err != nil {
+		t.Fatal("removal could not finish once the app could quit", err)
+	}
+}

@@ -51,11 +51,15 @@
 <ol><li>
 <p>From <code>packaging/homebrew/</code>, copy <code>refresh.go</code>, <code>refresh_test.go</code>, <code>test-cask.rb</code> and <code>.github/workflows/refresh.yml</code> into the tap checkout, together with the root <code>LICENSE</code>. Keep them byte-identical to this source revision; do not copy <code>SEED.txt</code>.</p>
 </li><li>
-<p>In the tap checkout, run <code>go test -p 2 refresh.go refresh_test.go</code> and <code>go vet refresh.go</code> (Go 1.26 or later).</p>
+<p>When the cask template changes, also set <code>Casks/agent-job-queue.rb</code> to the <code>agent-job-queue.rb</code> release asset of the tap&#39;s current build, byte for byte. Otherwise, a tap cask that drifted from that asset passes only while the old template still renders it, and every refresh then fails with <code>Current tap cask differs from its historical published release</code>.</p>
 </li><li>
-<p>Open a PR against the tap&#39;s <code>tap</code> branch with signed, DCO-signed-off commits, and merge it.</p>
+<p>In the tap checkout, run <code>go test -p 2 refresh.go refresh_test.go</code>, <code>go vet refresh.go</code> and <code>go run -p 2 refresh.go</code> (Go 1.26 or later, with <code>gh</code> and <code>brew</code>). The tests do not read the cask, so only the last command shows this failure. It publishes nothing.</p>
 </li><li>
-<p>Only then merge the source change. The delivery job compares the tap&#39;s helpers byte for byte (<code>internal/delivery/sync.go</code>), so a missing or stale sync fails delivery visibly.</p>
+<p>Open a PR against the tap&#39;s <code>tap</code> branch with signed, DCO-signed-off commits. Before merging, check that the tap&#39;s scheduled refresh has not moved to a newer build, and repeat from step 2 if it has. Then merge.</p>
+</li><li>
+<p>Dispatch <code>refresh.yml</code> on the <code>tap</code> branch and confirm it succeeds.</p>
+</li><li>
+<p>Only then merge the source change. The delivery job compares the tap&#39;s helpers byte for byte (<code>internal/delivery/sync.go</code>), so a missing or stale sync fails <code>Verify Homebrew delivery</code> visibly, before it dispatches a refresh. Nothing depends on that job and the release is already published by then, so publishing continues through the tap&#39;s scheduled refresh, but every distribution run stays red until the tap catches up.</p>
 </li></ol>
 
 <h2 id="one-time-github-app-setup">One-time GitHub App setup<span><a href="#one-time-github-app-setup">&para;</a> <a href="#top">&uarr;</a></span></h2>
@@ -84,7 +88,7 @@
 
 <pre>gh run list --repo Dunky13/homebrew-agent-job-queue --workflow refresh.yml --limit 5</pre>
 
-<p>Changes to the trusted tap files need a reviewed companion tap PR. Copy the standalone <code>refresh.go</code>, <code>refresh_test.go</code>, <code>test-cask.rb</code>, and <code>.github/workflows/refresh.yml</code> from <code>packaging/homebrew/</code>, together with the root <code>LICENSE</code>. The tap helper uses only the Go standard library and never downloads application source or dependencies to execute. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated <code>Casks/</code> files manually or execute arbitrary code from a release to repair drift.</p>
+<p>Changes to the trusted tap files need a reviewed companion tap PR. Copy the standalone <code>refresh.go</code>, <code>refresh_test.go</code>, <code>test-cask.rb</code>, and <code>.github/workflows/refresh.yml</code> from <code>packaging/homebrew/</code>, together with the root <code>LICENSE</code>. The tap helper uses only the Go standard library and never downloads application source or dependencies to execute. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated <code>Casks/</code> files manually or execute arbitrary code from a release to repair drift. The one exception is the reset a template change needs, which restores the exact bytes of a published release asset.</p>
 
 <p>After verified delivery, Homebrew users can upgrade normally:</p>
 

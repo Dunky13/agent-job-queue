@@ -8,8 +8,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// installProcessExecutable returns the absolute path the kernel recorded when
-// pid executed, independent of the argv[0] the process presents.
+// installProcessExecutable returns the path pid was executed from, independent
+// of the argv[0] it presents. It is that path as a string, not the file's identity:
+// it stays the same after the bundle is moved, replaced or deleted.
 func installProcessExecutable(pid int) (string, error) {
 	raw, err := unix.SysctlRaw("kern.procargs2", pid)
 	if err != nil {

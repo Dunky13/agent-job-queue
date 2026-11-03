@@ -404,3 +404,30 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 		t.Fatal("composite action lost explicit source identity")
 	}
 }
+
+// Without an explicit bash shell a step has no pipefail, so a failure piped into
+// tee reports success. Delivery verification hid a tooling mismatch that way.
+func TestWorkflowPipelinesFailWhenAnyCommandFails(t *testing.T) {
+	type step struct {
+		Name, Run, Shell string
+	}
+	for _, name := range []string{".github/workflows/ci.yml", ".github/workflows/distribution.yml", "packaging/homebrew/.github/workflows/refresh.yml"} {
+		var flow struct {
+			Jobs map[string]struct{ Steps []step }
+		}
+		data, err := os.ReadFile("../../" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal(data, &flow); err != nil {
+			t.Fatal(err)
+		}
+		for job, definition := range flow.Jobs {
+			for _, item := range definition.Steps {
+				if strings.Contains(item.Run, "| tee") && item.Shell != "bash" {
+					t.Errorf("%s job %s step %q pipes into tee without shell: bash", name, job, item.Name)
+				}
+			}
+		}
+	}
+}

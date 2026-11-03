@@ -266,7 +266,7 @@ func stoppedQueueTasks(ctx context.Context, db *sql.DB, path string) (Object, er
 		return nil, e
 	}
 	if unfinished != 0 {
-		return nil, errors.New("Managed setup requires a drained queue; stopped queue has unfinished jobs or attempts")
+		return nil, errInstallStoppedQueueUnfinished
 	}
 	store := &queueStore{db: db, path: path}
 	snapshot, e := store.snapshot()
