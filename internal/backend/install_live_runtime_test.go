@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -33,6 +34,9 @@ func TestInstallerManagedLiveResumeRetainsRunningAttempts(t *testing.T) {
 			name = "complete"
 		}
 		t.Run(name, func(t *testing.T) { testInstallerManagedLiveResume(t, helper, failure) })
+	}
+	for phase, failure := range map[string]string{"released": "register queue", "consumed": "register resources"} {
+		t.Run("finish pending from "+phase, func(t *testing.T) { testFinishPendingLiveResume(t, helper, phase, failure) })
 	}
 }
 
@@ -97,14 +101,9 @@ func requireLiveReceiptPhase(t *testing.T, i *installer, phase string) {
 	}
 }
 
-func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
-	queued := failure == "queued"
-	lostCommit := failure == "lost commit acknowledgement"
-	committed := failure == "committed"
-	released := failure == "released"
-	if queued || lostCommit || committed || released {
-		failure = ""
-	}
+// liveRuntimeFixture installs build 123 with real daemons in a short private home.
+func liveRuntimeFixture(t *testing.T, executable string) *managedFixture {
+	t.Helper()
 	m := managedTestFixture(t)
 	i := m.installer
 	// Darwin's Unix socket pathname budget is smaller than t.TempDir's full
@@ -157,6 +156,19 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 	if !errors.Is(setupContext.Err(), context.Canceled) {
 		t.Fatal("initial installation did not complete within its own readiness budget", setupContext.Err())
 	}
+	return m
+}
+
+func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
+	queued := failure == "queued"
+	lostCommit := failure == "lost commit acknowledgement"
+	committed := failure == "committed"
+	released := failure == "released"
+	if queued || lostCommit || committed || released {
+		failure = ""
+	}
+	m := liveRuntimeFixture(t, executable)
+	i := m.installer
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	// Accepted callers belong to the fixture lifecycle, independently of any
@@ -431,5 +443,134 @@ func testCancelledHandoverWaitsForActiveJob(t *testing.T, ctx context.Context, i
 	current, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
 	if err != nil || current.Build == nil || *current.Build != 124 {
 		t.Fatal("drained upgrade did not complete", current, err)
+	}
+}
+
+// The shipped route to resume on a newer build. Older build T is interrupted after
+// publishing, leaving its marker, retained app and journal. Build N, opened from
+// the other Applications folder, finishes T as a non-supervised app bundle using
+// N's controller, and relocates once the adopted job has finished.
+func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string) {
+	m := liveRuntimeFixture(t, executable)
+	i := m.installer
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	cli := filepath.Join(i.app, "Contents/MacOS/agent-heavy")
+	started, release, runs := filepath.Join(i.home, "started"), filepath.Join(i.home, "release"), filepath.Join(i.home, "attempts")
+	caller := exec.CommandContext(ctx, cli, "run", "--label", "Active across recovery", "--", "/bin/sh", "-c", `printf 'once\n' >> "$1"; touch "$2"; while [ ! -f "$3" ]; do sleep .05; done; printf 'original outcome\n'; exit 23`, "fixture", runs, started, release)
+	caller.Env = i.commandEnvironment([]string{cli, "status", "--json"})
+	var output bytes.Buffer
+	caller.Stdout, caller.Stderr = &output, &output
+	if err := caller.Start(); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() { finished <- caller.Wait() }()
+	joined := false
+	t.Cleanup(func() {
+		_ = os.WriteFile(release, nil, 0600)
+		if !joined {
+			<-finished
+		}
+	})
+	fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(started); return err == nil })
+	before, err := managedCaptureBundle(i.app)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedCandidate(t, m, "124")
+	seedOlderReleaseHandover(t, ctx, i)
+	m.nativeFailure = failure
+	if _, err := runPackagedSetup(ctx, m.installFixture, i.repairAndExecute); err == nil {
+		t.Fatal("injected interruption unexpectedly completed", failure)
+	}
+	m.nativeFailure = ""
+	fixtureUntil(t, 8*time.Second, func() bool {
+		receipt, err := readQueueHandoverReceipt(&Gate{State: i.state})
+		return err == nil && receipt.Phase == phase
+	})
+	pendingBuild := i.app
+	services := map[string]string{"queue": pendingBuild, "resources": pendingBuild, "remote": pendingBuild}
+	original := i.command
+	i.command = func(ctx context.Context, args []string) ([]byte, error) {
+		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" {
+			label := filepath.Base(args[2])
+			service := map[string]string{"io.went.agent-heavy": "queue", "io.went.agent-resources": "resources", "io.went.agent-remote": "remote"}[label]
+			if service != "" && m.loaded[label] && m.statuses[service] == "enabled" {
+				helper, command := "agent-heavy", "daemon"
+				if service == "resources" {
+					command = "scheduler"
+				} else if service == "remote" {
+					helper, command = "agent-remote", "serve"
+				}
+				return []byte("program = " + filepath.Join(services[service], "Contents/MacOS", helper) + "\narguments = {\n" + helper + "\n" + command + "\n}\n"), nil
+			}
+		}
+		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" {
+			services[args[3]] = filepath.Dir(filepath.Dir(filepath.Dir(args[0])))
+		}
+		return original(ctx, args)
+	}
+	managedCandidate(t, m, "125")
+	moved := filepath.Join(i.home, "Applications/Agent Queue moved.app")
+	if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), moved); err != nil {
+		t.Fatal(err)
+	}
+	i.app, i.appBundle, i.payload = moved, true, filepath.Join(moved, "Contents/Resources/payload")
+	report := i.preflight(ctx)
+	if len(report.Issues) != 1 || report.Issues[0].ID != "pending-installation" || !slices.ContainsFunc(report.Issues[0].Actions, func(action installRecoveryAction) bool { return action.ID == installFinishPending }) {
+		t.Fatalf("automatic setup cannot reach the retained build: %+v", report)
+	}
+	step, err := installApprovedNext(report)
+	if err != nil || step.action != installFinishPending {
+		t.Fatal("automatic setup did not select the retained build", step, err)
+	}
+	m.calls = nil
+	i.automaticSetup = true
+	if _, err := runPackagedSetup(ctx, m.installFixture, i.finishPendingInstallation); err != nil {
+		t.Fatal("the newer build's controller could not finish the retained build", err)
+	}
+	completed, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
+	if err != nil || completed.Build == nil || *completed.Build != 124 {
+		t.Fatal("the retained build did not complete", completed, err)
+	}
+	requireLiveJournalGone(t, i)
+	// Registering helpers proves the retained app bundle activated non-supervised.
+	if !slices.ContainsFunc(m.calls, func(args []string) bool {
+		return len(args) == 4 && strings.HasPrefix(args[0], pendingBuild+"/") && args[2] == "register" && args[3] == "resources"
+	}) {
+		t.Fatal("the retained app bundle did not activate its registered helpers")
+	}
+	if _, err := os.Stat(i.runtimeGenerationPath(before)); err != nil {
+		t.Fatal("resume did not retain the worker's exact previous bundle", err)
+	}
+	select {
+	case err := <-finished:
+		joined = true
+		t.Fatalf("the caller ended before its job was released: %v: %s", err, output.String())
+	default:
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	err = <-finished
+	joined = true
+	var exited *exec.ExitError
+	if !errors.As(err, &exited) || exited.ExitCode() != 23 || !strings.Contains(output.String(), "original outcome") {
+		t.Fatal("the caller lost its exact outcome", err, output.String())
+	}
+	if raw, err := os.ReadFile(runs); err != nil || string(raw) != "once\n" {
+		t.Fatal("the job was replayed", string(raw), err)
+	}
+	if _, err := runPackagedSetup(ctx, m.installFixture, i.repairAndExecute); err != nil {
+		t.Fatal("the newer build did not relocate after finishing the retained build", err)
+	}
+	completed, err = installReadInfo(filepath.Join(i.root, "build-info.json"))
+	if err != nil || completed.Build == nil || *completed.Build != 125 {
+		t.Fatal("the newer build did not complete", completed, err)
+	}
+	metadata, err := appservices.Load(i.home)
+	if err != nil || metadata == nil || metadata.App != moved {
+		t.Fatal("the newer location was not published", metadata, err)
 	}
 }

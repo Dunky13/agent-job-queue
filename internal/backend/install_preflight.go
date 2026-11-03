@@ -384,14 +384,7 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 			if _, recoveryErr := install.pendingInstallation(ctx); recoveryErr == nil {
 				actions = append([]string{installFinishPending}, actions...)
 			}
-			index := report.add("pending-installation", "Finish the previous installation", err.Error(), filepath.Join(install.root, "install-in-progress.json"), actions...)
-			if index >= 0 {
-				for n := range report.Issues[index].Actions {
-					if report.Issues[index].Actions[n].ID == "download-release" {
-						report.Issues[index].Actions[n].Title = "Open release history"
-					}
-				}
-			}
+			report.addPendingInstallation(err.Error(), filepath.Join(install.root, "install-in-progress.json"), actions...)
 			return report
 		}
 		actions := []string{"download-release", "reveal"}
@@ -404,6 +397,18 @@ func (install *installer) preflight(ctx context.Context) installPreflightReport 
 		return install.preflightManaged(ctx, report)
 	}
 	return install.preflightLegacy(ctx, report)
+}
+
+func (report *installPreflightReport) addPendingInstallation(detail, path string, actions ...string) {
+	index := report.add("pending-installation", "Finish the previous installation", detail, path, actions...)
+	if index < 0 {
+		return
+	}
+	for n := range report.Issues[index].Actions {
+		if report.Issues[index].Actions[n].ID == "download-release" {
+			report.Issues[index].Actions[n].Title = "Open release history"
+		}
+	}
 }
 
 func (install *installer) preflightLegacy(ctx context.Context, report installPreflightReport) installPreflightReport {

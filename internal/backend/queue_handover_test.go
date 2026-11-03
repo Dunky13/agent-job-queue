@@ -790,11 +790,50 @@ func TestQueuePreparedHandoverLeaseExpiresWithoutChangingQueueState(t *testing.T
 	}
 }
 
+// A restarted daemon never adopts or expires its predecessor's prepared receipt,
+// so that receipt alone cannot show custody: only the recorded daemon's life can.
+func TestRealDaemonPreparedReceiptBindsNothingOnceItsDaemonRestarts(t *testing.T) {
+	f := daemonAcceptance(t)
+	value := token()
+	digest := handoverTarget(t)
+	if _, err := f.gate.QueueControl("prepare-handover", Object{"token": value, "targetSHA256": digest}); err != nil {
+		t.Fatal(err)
+	}
+	i := &installer{state: f.gate.State}
+	live := &managedLiveUpgrade{Token: value, TargetSHA256: digest}
+	if phase, spent, err := i.liveJournalState(live); err != nil || phase != "prepared" || spent {
+		t.Fatal("a live daemon's prepared receipt was treated as spent", phase, spent, err)
+	}
+	if err := f.daemon.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.daemon.Wait()
+	queueRestartFixture(t, f)
+	if _, err := f.gate.QueueControl("prepare-handover", Object{"token": value, "targetSHA256": digest}); err == nil {
+		t.Fatal("the restarted daemon accepted its predecessor's custody")
+	}
+	if _, err := f.gate.QueueControl("cancel-handover", Object{"token": value}); err == nil {
+		t.Fatal("the restarted daemon cancelled its predecessor's custody")
+	}
+	if phase, spent, err := i.liveJournalState(live); err != nil || phase != "prepared" || !spent {
+		t.Fatal("a dead daemon's prepared receipt still binds", phase, spent, err)
+	}
+	// The freeze died with its daemon, so nothing depends on the receipt.
+	if _, err := f.gate.QueueControl("resume", nil); err != nil {
+		t.Fatal("the restarted daemon remains frozen", err)
+	}
+	runs := filepath.Join(f.root, "runs")
+	f.launch("/bin/sh", "-c", `printf once > "$1"`, "fixture", runs).wait(t, 0)
+	if raw, err := os.ReadFile(runs); err != nil || string(raw) != "once" {
+		t.Fatal("the restarted daemon did not dispatch", string(raw), err)
+	}
+}
+
 func TestRealDaemonRetainsHandoverCustodyWithoutAdvertisingIt(t *testing.T) {
 	f := daemonAcceptance(t)
 	// An older installer reads any failure here as "use the drained path".
-	if _, err := f.gate.QueueControl("handover-status", nil); err == nil {
-		t.Fatal("daemon still offers to begin a live handover")
+	if _, err := f.gate.QueueControl("handover-status", nil); err == nil || err.Error() != "Unknown queue operation" {
+		t.Fatal("daemon still offers to begin a live handover", err)
 	}
 	executable, err := os.Executable()
 	if err != nil {

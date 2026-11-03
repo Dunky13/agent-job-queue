@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -133,7 +134,7 @@ func (install *installer) readLiveJournal() (*managedLiveUpgrade, []byte, error)
 		return nil, nil, err
 	}
 	digest, err := hex.DecodeString(live.TargetSHA256)
-	if err != nil || len(digest) != 32 || live.SchemaVersion != 1 || live.App != install.app || !validToken(live.Token) || live.Attempts == nil || len(live.Attempts) > 4096 {
+	if err != nil || len(digest) != 32 || live.SchemaVersion != 1 || live.App == "" || !validToken(live.Token) || live.Attempts == nil || len(live.Attempts) > 4096 {
 		return nil, nil, errors.New("Invalid retained live-upgrade custody; evidence preserved")
 	}
 	seen := map[int]bool{}
@@ -160,6 +161,76 @@ func (install *installer) liveReceipt(live *managedLiveUpgrade) (Object, error) 
 	return queueHandoverObject(receipt)
 }
 
+// liveProcessAlive differs from queueHandoverDaemonAlive only in treating an
+// earlier boot or a reused PID as proof that the recorded process has gone.
+func liveProcessAlive(identity queueHandoverDaemon) (bool, error) {
+	snapshot, err := queueHandoverProcessSnapshot()
+	if err != nil {
+		return false, err
+	}
+	if snapshot.Boot != identity.BootUUID {
+		return false, nil
+	}
+	if state, present := snapshot.Processes[identity.PID]; present && state.Birth != strings.Join(strings.Fields(identity.Birth), " ") {
+		return false, nil
+	}
+	return snapshot.alive(identity)
+}
+
+// liveTargetCompletion compares the completed installation with a journal's target.
+func (install *installer) liveTargetCompletion(target BuildInfo) (finished, superseded bool) {
+	completed, err := installReadInfo(filepath.Join(install.root, "build-info.json"))
+	if err != nil {
+		return false, false
+	}
+	return completed.Equal(target), completed.Build != nil && target.Build != nil && *completed.Build > *target.Build
+}
+
+// liveJournalState reports the journal's receipt phase and whether the journal is
+// spent, meaning no live process or pending adoption depends on it. A restarted
+// daemon runs ordinary crash recovery and never adopts an unreleased receipt, so
+// a dead daemon's prepared or committed receipt binds nothing. A released receipt
+// does: every daemon but the exact target refuses to start, and running workers
+// may still follow it. It is spent only once a newer build completed, which only
+// the drained removal path allows, since resume refuses every other build.
+func (install *installer) liveJournalState(live *managedLiveUpgrade) (string, bool, error) {
+	gate := &Gate{State: install.state}
+	receipt, err := readQueueHandoverReceipt(gate)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", true, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if receipt.Token != live.Token || receipt.TargetSHA256 != live.TargetSHA256 {
+		return "", false, errors.New("Daemon handover differs from the retained installer custody")
+	}
+	var process queueHandoverDaemon
+	switch receipt.Phase {
+	case "cancelled", "expired":
+		return receipt.Phase, true, nil
+	case "released":
+		_, superseded := install.liveTargetCompletion(live.Target)
+		return receipt.Phase, superseded, nil
+	case "prepared", "committed":
+		process = receipt.Daemon
+	case "consumed":
+		process = *receipt.Consumer
+	default:
+		return "", false, errors.New("Unrecognized daemon handover phase; live replacement refused")
+	}
+	alive, err := liveProcessAlive(process)
+	if err != nil || alive {
+		return receipt.Phase, false, err
+	}
+	// A daemon publishes any advance before it exits, so read again after seeing it gone.
+	current, err := readQueueHandoverReceipt(gate)
+	if err != nil {
+		return "", false, err
+	}
+	return current.Phase, current.Phase == receipt.Phase, nil
+}
+
 func (install *installer) resumeManagedLive(ctx context.Context, plan *managedPlan) (*managedLiveUpgrade, error) {
 	if !liveAllowed(install, plan) {
 		return nil, nil
@@ -168,12 +239,22 @@ func (install *installer) resumeManagedLive(ctx context.Context, plan *managedPl
 	if err != nil || live == nil {
 		return nil, err
 	}
+	phase, spent, err := install.liveJournalState(live)
+	if err != nil {
+		return nil, err
+	}
+	if spent {
+		return nil, nil
+	}
 	if !live.Target.Equal(install.identity) {
-		completed, err := installReadInfo(filepath.Join(install.root, "build-info.json"))
-		if err == nil && completed.Equal(live.Target) {
+		// A finished installation's own running daemon binds no other build.
+		if finished, superseded := install.liveTargetCompletion(live.Target); phase == "consumed" && (finished || superseded) {
 			return nil, nil
 		}
-		return nil, errors.New("Another live candidate is pending; preserve its journal and finish that exact installation")
+		return nil, &installPendingError{identity: live.Target}
+	}
+	if live.App != install.app {
+		return nil, errors.New("Invalid retained live-upgrade custody; evidence preserved")
 	}
 	target, err := install.liveTargetDigest()
 	if err != nil || target != live.TargetSHA256 {
@@ -331,17 +412,15 @@ func (install *installer) finishManagedLive(live *managedLiveUpgrade) error {
 	return install.managedRemoveFile(install.liveJournalPath(), raw)
 }
 
-// Starting a handover used to discard a journal its finished installation left
-// behind. Unremoved, it reads as pending once a later build completes, and every
-// upgrade after that refuses. Callers must have ruled out a resumable journal.
-func (install *installer) retireFinishedLive() error {
+// Starting a handover used to discard journals that no longer bound anything.
+// Nothing else removes them, and a later setup must not have to reason about them.
+func (install *installer) retireSpentLive() error {
 	live, raw, err := install.readLiveJournal()
 	if err != nil || live == nil {
 		return err
 	}
-	completed, err := installReadInfo(filepath.Join(install.root, "build-info.json"))
-	if err != nil || !completed.Equal(live.Target) {
-		return nil
+	if _, spent, err := install.liveJournalState(live); err != nil || !spent {
+		return err
 	}
 	return install.managedRemoveFile(install.liveJournalPath(), raw)
 }

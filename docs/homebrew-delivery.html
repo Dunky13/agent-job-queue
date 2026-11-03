@@ -30,7 +30,7 @@
 
 <p>No destructive <code>zap</code> action is supplied. Private history, configuration and credentials remain retained.</p>
 
-<p>Setup waits for a running queue daemon's active and queued jobs before replacing it, and never starts a live handover; it only finishes one an older release left behind, on the exact build that began it. Original callers keep their outcomes and exit statuses, and no attempt is replayed. Uncertain attempts or ownership fail closed. Removal and external app-replacement preparation still require drain.</p>
+<p>Setup waits for a running queue daemon's active and queued jobs before replacing it, and never starts a live handover. After a normal quit no daemon remains: running jobs continue and their outcomes are recorded without replay, attached <code>agent-heavy run</code> callers exit with status 125 within about a second, and if jobs were running the next daemon comes up paused, so queued jobs run after <code>agent-heavy resume</code> with no caller attached. Original callers keep their outcomes and exit statuses only when finishing a handover an older release left behind, using that exact build's bundle. Uncertain attempts or ownership fail closed. Removal and external app-replacement preparation still require drain.</p>
 
 <p>Whole previous signed app generations remain visible under <code>~/Applications/Agent Queue Runtimes</code>, bound to exact filesystem and attempt identities. Only a later setup operation can reclaim them after verifying terminal attempts and dead original callers and owned workers.</p>
 

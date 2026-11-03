@@ -372,6 +372,10 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	if op == "prepare-handover" || op == "commit-handover" || op == "cancel-handover" {
 		return d.handoverControl(op, p)
 	}
+	if op == "handover-status" {
+		// Retired: an older installer reads this refusal as "use the drained path".
+		return nil, errors.New("Unknown queue operation")
+	}
 	if d.handover != nil && op != "snapshot" && op != "lease-status" {
 		if op == "submit" || op == "submit-lane" || op == "lease-acquire" {
 			value := text(p["token"])

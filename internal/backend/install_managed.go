@@ -1609,8 +1609,8 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	if err := install.managedRetireSupersededReceipt(); err != nil {
 		return err
 	}
-	if p.live == nil && liveAllowed(install, p) {
-		if err := install.retireFinishedLive(); err != nil {
+	if p.live == nil && !install.prepareReplacement && !install.unregisterServices {
+		if err := install.retireSpentLive(); err != nil {
 			return err
 		}
 	}
@@ -1793,8 +1793,9 @@ func (install *installer) executeManaged(ctx context.Context) error {
 // managedSupervised reports whether the menu bar app supervises the helpers.
 // The payload path registers them with Service Management instead, and so does
 // an app bundle resuming a live handover an older release left behind, whose
-// replacement daemon launchd has already started and must be waited for. Setup
-// no longer begins a live handover.
+// replacement daemon runs under launchd and must be waited for. Setup no longer
+// begins a live handover, so that bundle is the retained build finished by a newer
+// app (see finishPendingInstallation).
 func (install *installer) managedSupervised(p *managedPlan) bool {
 	return install.appBundle && p.live == nil
 }
@@ -2050,7 +2051,10 @@ func (install *installer) preflightManaged(ctx context.Context, report installPr
 	if _, err := install.planManaged(ctx); err != nil {
 		var approval *installApprovalError
 		var drain *installDrainPendingError
+		var pending *installPendingError
 		switch {
+		case errors.As(err, &pending):
+			report.addPendingInstallation(err.Error(), install.liveJournalPath(), "download-release", "reveal")
 		case errors.As(err, &approval):
 			report.add("service-approval", "Allow Agent Queue background services", err.Error(), "", "wait")
 		case errors.Is(err, errInstallPendingCleanup):

@@ -139,7 +139,7 @@ func managedPackagedRuntimeFixture(t *testing.T, m *managedFixture) {
 		}
 	}
 	t.Cleanup(func() { stop("resources"); stop("queue") })
-	start := func(service string) error {
+	start := func(service, helper string) error {
 		if processes[service] != nil {
 			return nil
 		}
@@ -151,8 +151,8 @@ func managedPackagedRuntimeFixture(t *testing.T, m *managedFixture) {
 		if err != nil {
 			return err
 		}
-		command := exec.Command(filepath.Join(i.app, "Contents/MacOS/agent-heavy"), argument)
-		command.Env = i.commandEnvironment([]string{filepath.Join(i.app, "Contents/MacOS/agent-heavy"), "status", "--json"})
+		command := exec.Command(helper, argument)
+		command.Env = i.commandEnvironment([]string{helper, "status", "--json"})
 		command.Stdout, command.Stderr = log, log
 		if err := command.Start(); err != nil {
 			log.Close()
@@ -199,7 +199,7 @@ func managedPackagedRuntimeFixture(t *testing.T, m *managedFixture) {
 			}
 			output, err := original(ctx, args)
 			if err == nil && args[2] == "register" && m.statuses[args[3]] == "enabled" {
-				err = start(args[3])
+				err = start(args[3], filepath.Join(filepath.Dir(args[0]), "agent-heavy"))
 			}
 			return output, err
 		}
