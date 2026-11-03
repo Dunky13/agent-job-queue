@@ -72,9 +72,11 @@ func TestInstallerPackagedLiveResume(t *testing.T) {
 // older release did: prepared against the exact candidate, with nothing replaced.
 func seedOlderReleaseHandover(t *testing.T, ctx context.Context, i *installer) *managedLiveUpgrade {
 	t.Helper()
-	if err := i.validatePayload(); err != nil {
+	identity, err := i.validatePayload()
+	if err != nil {
 		t.Fatal(err)
 	}
+	i.identity = identity
 	digest, err := i.liveTargetDigest()
 	if err != nil {
 		t.Fatal(err)
@@ -119,6 +121,7 @@ func liveRuntimeFixture(t *testing.T, executable string) *managedFixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	bundle := i.app
 	i.home = filepath.Join(base, "User")
 	if err := os.Mkdir(i.home, 0700); err != nil {
 		t.Fatal(err)
@@ -130,22 +133,20 @@ func liveRuntimeFixture(t *testing.T, executable string) *managedFixture {
 	i.launch = filepath.Join(i.home, "Library/LaunchAgents")
 	i.app = filepath.Join(i.home, "Applications/Agent Queue.app")
 	i.path += ":/usr/bin:/bin"
+	if err := installCopyTree(bundle, i.app); err != nil {
+		t.Fatal(err)
+	}
 	binary, err := os.ReadFile(executable)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, destination := range []string{
-		filepath.Join(i.payload, "source/bin/agent-heavy"),
-		filepath.Join(i.payload, "Agent Queue.app/Contents/MacOS/agent-heavy"),
-	} {
-		if err := os.WriteFile(destination, binary, 0700); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.WriteFile(filepath.Join(i.app, "Contents/MacOS/agent-heavy"), binary, 0700); err != nil {
+		t.Fatal(err)
 	}
 	managedPackagedRuntimeFixture(t, m)
 	setupContext, finishSetup := context.WithTimeout(context.Background(), 60*time.Second)
 	defer finishSetup()
-	if _, err := runPackagedSetup(setupContext, m.installFixture, i.execute); err != nil {
+	if _, err := runPackagedSetup(setupContext, m.installFixture, func(ctx context.Context) error { return managedOlderRegistered(ctx, m) }); err != nil {
 		for _, name := range []string{"daemon.log", "scheduler.log", "readiness.json"} {
 			data, _ := os.ReadFile(filepath.Join(i.home, name))
 			t.Log(name, string(data))
@@ -429,7 +430,7 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	managedCandidate(t, m, "124")
+	managedOlderPublication(t, m, "124")
 	live := seedOlderReleaseHandover(t, ctx, i)
 	if committed {
 		testResumeCommittedHandover(t, ctx, i, live)
@@ -661,15 +662,26 @@ func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string
 	if err != nil {
 		t.Fatal(err)
 	}
-	managedCandidate(t, m, "124")
+	managedOlderPublication(t, m, "124")
 	seedOlderReleaseHandover(t, ctx, i)
 	m.nativeFailure = failure
-	if _, err := runPackagedSetup(ctx, m.installFixture, i.repairAndExecute); err == nil {
+	_, interrupted := runPackagedSetup(ctx, m.installFixture, i.repairAndExecute)
+	if interrupted == nil {
 		t.Fatal("injected interruption unexpectedly completed", failure)
 	}
 	m.nativeFailure = ""
+	lastPhase := ""
+	t.Cleanup(func() {
+		if t.Failed() {
+			daemon, _ := os.ReadFile(filepath.Join(i.home, "daemon.log"))
+			t.Logf("interrupted by: %v; last receipt phase %q; daemon log: %s", interrupted, lastPhase, daemon)
+		}
+	})
 	fixtureUntil(t, 8*time.Second, func() bool {
 		receipt, err := readQueueHandoverReceipt(&Gate{State: i.state})
+		if err == nil {
+			lastPhase = receipt.Phase
+		}
 		return err == nil && receipt.Phase == phase
 	})
 	pendingBuild := i.app
@@ -694,12 +706,12 @@ func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string
 		}
 		return original(ctx, args)
 	}
-	managedCandidate(t, m, "125")
 	moved := filepath.Join(i.home, "Applications/Agent Queue moved.app")
-	if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), moved); err != nil {
+	if err := installCopyTree(i.app, moved); err != nil {
 		t.Fatal(err)
 	}
-	i.app, i.appBundle, i.payload = moved, true, filepath.Join(moved, "Contents/Resources/payload")
+	managedBundleBuild(t, i, moved, "125")
+	i.app = moved
 	report := i.preflight(ctx)
 	if len(report.Issues) != 1 || report.Issues[0].ID != "pending-installation" || !slices.ContainsFunc(report.Issues[0].Actions, func(action installRecoveryAction) bool { return action.ID == installFinishPending }) {
 		t.Fatalf("automatic setup cannot reach the retained build: %+v", report)

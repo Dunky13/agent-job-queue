@@ -144,7 +144,7 @@ func TestInstallerPreflightPrivateSymlinkAndInspectionErrorsFailClosed(t *testin
 			}
 			report := f.installer.preflight(context.Background())
 			ids := preflightIDs(report)
-			if kind == "symlink" && !ids["private-path-unsafe"] || kind == "query-error" && !ids["service-configuration"] {
+			if kind == "symlink" && !ids["private-path-unsafe"] || kind == "query-error" && !ids["managed-setup-blocked"] {
 				t.Fatalf("unsafe preflight passed: %+v", report)
 			}
 		})
@@ -161,6 +161,8 @@ func TestInstallerRecoveryCleanupAndCancellationUseSelectedOwnedJob(t *testing.T
 				f.tasks = Object{"7": Object{"id": 7, "status": Object{"Done": Object{"result": "Success"}}}}
 				integrationTestWrite(t, filepath.Join(f.installer.state, "receipts/7.json"), []byte(`{"task_id":7,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
 			} else {
+				// A legacy queue offers cancellation once its phone access blocks migration.
+				integrationTestWrite(t, filepath.Join(f.installer.config, "remote.json"), []byte(`{"enabled":true}`))
 				f.tasks = Object{"7": Object{"id": 7, "status": Object{"Queued": Object{}}}}
 				original := f.installer.command
 				f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
@@ -243,14 +245,14 @@ func TestInstallerCallbackRecoveryRequiresReviewedRevisionAndPreservesOriginal(t
 
 func TestInstallerPreflightModernUpgradeRetainsActiveJobsAndOffersStoppedServiceStart(t *testing.T) {
 	f := installTestFixture(t)
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
+	installOlderEmbeddedBlocked(t, f.installer)
+	f.loaded["io.went.agent-heavy"] = true
 	f.tasks = Object{"8": Object{"id": 8, "status": Object{"Running": Object{}}}}
 	if report := f.installer.preflight(context.Background()); preflightIDs(report)["legacy-jobs"] {
 		t.Fatal("modern upgrade requires legacy drain")
 	}
 	delete(f.loaded, "io.went.agent-heavy")
+	f.tasks = Object{}
 	report := f.installer.preflight(context.Background())
 	if !preflightIDs(report)["service-not-ready"] {
 		t.Fatalf("stopped service not diagnosed: %+v", report)
@@ -265,12 +267,12 @@ func TestInstallerPreflightModernUpgradeRetainsActiveJobsAndOffersStoppedService
 
 func TestInstallerRecoveryArgumentParserRejectsAmbiguity(t *testing.T) {
 	for _, suffix := range [][]string{{"--preflight"}, {"--json"}, {"--recover", ""}, {"--recover", "unknown"}, {"--recover", "wait"}, {"--recover", "cancel-job"}, {"--recover", "repair-service", "--job-id", "1"}, {"--recover", "reset-callback"}, {"--preflight", "--json", "--disable-phone-access"}, {"--recover", "cancel-job", "--job-id", "1", "--job-id", "2"}} {
-		if _, err := installParseOptions(append([]string{"--payload", "/payload"}, suffix...)); err == nil {
+		if _, err := installParseOptions(append([]string{"--app-bundle", "/Applications/Agent Queue.app"}, suffix...)); err == nil {
 			t.Fatalf("ambiguous recovery accepted: %v", suffix)
 		}
 	}
 	for _, suffix := range [][]string{{"--preflight", "--json"}, {"--recover", "cancel-job", "--job-id", "7"}, {"--recover", "repair-service"}, {"--recover", "reset-callback", "--expected-revision", strings.Repeat("a", 64)}, {"--disable-phone-access"}} {
-		if _, err := installParseOptions(append([]string{"--payload", "/payload"}, suffix...)); err != nil {
+		if _, err := installParseOptions(append([]string{"--app-bundle", "/Applications/Agent Queue.app"}, suffix...)); err != nil {
 			t.Fatalf("valid recovery rejected: %v", err)
 		}
 	}
@@ -359,7 +361,8 @@ func TestInstallerPreflightFindsExternalProcessesAndStoppingController(t *testin
 		}
 		return command(ctx, args)
 	}
-	ids := preflightIDs(f.installer.preflight(context.Background()))
+	// Managed planning refuses this state outright; the review names what remains.
+	ids := preflightIDs(f.installer.preflightLegacy(context.Background(), installPreflightReport{SchemaVersion: 1, Issues: []installPreflightIssue{}}))
 	if !ids["controller-stopping"] || !ids["legacy-processes"] {
 		t.Fatalf("remaining controller/process not diagnosed: %v", ids)
 	}
@@ -401,8 +404,8 @@ func TestInstallerRecoveryPhoneAccessPreservesLegacyAndGoCredentials(t *testing.
 			f := installTestFixture(t)
 			if kind == "legacy" {
 				f.legacy(t)
-			} else if err := f.run(t); err != nil {
-				t.Fatal(err)
+			} else {
+				installOlderEmbeddedBlocked(t, f.installer)
 			}
 			path := filepath.Join(f.installer.config, "remote.json")
 			integrationTestWrite(t, path, []byte(`{"enabled":true,"password_hash":"retained hash","secret_key":"retained secret","port":8743}`))
@@ -411,7 +414,7 @@ func TestInstallerRecoveryPhoneAccessPreservesLegacyAndGoCredentials(t *testing.
 			calls := 0
 			command := f.installer.command
 			f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if args[0] == filepath.Join(f.installer.payload, "source/bin/agent-remote") {
+				if args[0] == filepath.Join(f.installer.app, "Contents/MacOS/agent-remote") {
 					calls++
 					if len(args) != 2 || args[1] != "disable" {
 						t.Fatalf("unexpected remote recovery command: %v", args)

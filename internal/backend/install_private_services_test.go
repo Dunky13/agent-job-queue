@@ -90,33 +90,3 @@ func TestManagedPrivateNativeCommandsCannotReachRealServices(t *testing.T) {
 		}
 	}
 }
-
-func TestManagedInstallerOpensAppOnlyAfterDurableCompletion(t *testing.T) {
-	m := managedTestFixture(t)
-	i := m.installer
-	i.testing = false
-	original := i.command
-	opened := false
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if args[0] == "/usr/bin/ditto" {
-			return nil, installCopyTree(args[len(args)-2], args[len(args)-1])
-		}
-		if args[0] == "/usr/bin/open" {
-			if !slices.Equal(args, []string{"/usr/bin/open", "-a", i.app}) {
-				t.Fatal("opened an unrelated application", args)
-			}
-			if _, err := os.Stat(filepath.Join(i.root, "install-in-progress.json")); !os.IsNotExist(err) {
-				t.Fatal("opened ordinary app before setup completion", err)
-			}
-			if _, err := updateInstalled(i.root, i.app); err != nil {
-				t.Fatal("opened app without completed matching identity", err)
-			}
-			opened = true
-			return nil, nil
-		}
-		return original(ctx, args)
-	}
-	if err := m.run(t); err != nil || !opened {
-		t.Fatal("explicit managed install did not open the ready app", err)
-	}
-}

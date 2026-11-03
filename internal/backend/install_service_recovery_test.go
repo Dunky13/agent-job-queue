@@ -91,7 +91,7 @@ func TestInstallerMissingServiceDefinitionsRecovery(t *testing.T) {
 	if offersServiceRestore(f.installer.preflight(context.Background())) {
 		t.Fatal("restoration offered after completion")
 	}
-	if err := f.run(t); err != nil {
+	if err := f.installer.repairAndExecute(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -289,6 +289,7 @@ func TestInstallerMissingServiceDefinitionsRemoteAndExisting(t *testing.T) {
 				if err := f.installer.validatePhoneAccessRecovery(context.Background()); err != nil {
 					t.Fatal(err)
 				}
+				f.installer.automaticSetup = true
 				after := f.installer.preflight(context.Background())
 				if offersServiceRestore(after) || !preflightIDs(after)["legacy-phone-access"] {
 					t.Fatalf("did not advance to phone migration choice: %+v", after)

@@ -21,7 +21,7 @@ func (install *installer) privateManagedCommand(args []string) ([]string, error)
 		return nil, refused
 	}
 	app := filepath.Dir(filepath.Dir(filepath.Dir(args[0])))
-	if args[0] != filepath.Join(app, "Contents/MacOS/AgentQueue") || app != install.app && app != filepath.Join(install.payload, "Agent Queue.app") {
+	if args[0] != filepath.Join(app, "Contents/MacOS/AgentQueue") || app != install.app {
 		return nil, refused
 	}
 	var toolArgs []string

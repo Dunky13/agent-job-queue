@@ -24,21 +24,31 @@ func managedRelocationFixture(t *testing.T, pending bool, backup ...bool) (*mana
 	i := m.installer
 	old := i.app
 	newBuild := "124"
-	if len(backup) > 0 && backup[0] {
-		if err := m.run(t); err != nil {
-			t.Fatal(err)
-		}
-		managedCandidate(t, m, "124")
-		newBuild = "125"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := managedOlderRegistered(ctx, m); err != nil {
+		t.Fatal(err)
 	}
 	if pending {
-		m.nativeFailure = "register resources"
+		// An older release stopped after registering the queue, with the rest unset.
+		if len(backup) > 0 && backup[0] {
+			managedOlderPublication(t, m, "124")
+			newBuild = "125"
+		} else {
+			identity, err := managedCaptureBundle(i.app)
+			if err != nil {
+				t.Fatal(err)
+			}
+			integrationTestWrite(t, i.managedReceiptPath(), mustMetadataJSON(t, managedPublicationReceipt{SchemaVersion: 1, App: i.app, Pending: identity.Build, Candidate: identity}))
+			if err := os.Rename(filepath.Join(i.root, "build-info.json"), filepath.Join(i.root, "install-in-progress.json")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, service := range []string{"resources", "login"} {
+			m.statuses[service] = "notRegistered"
+		}
+		delete(m.loaded, "io.went.agent-resources")
 	}
-	err := m.run(t)
-	if pending && err == nil || !pending && err != nil {
-		t.Fatal("unexpected initial installation result", err)
-	}
-	m.nativeFailure = ""
 	services := map[string]string{}
 	for _, service := range []string{"queue", "resources", "remote"} {
 		services[service] = old
@@ -68,12 +78,12 @@ func managedRelocationFixture(t *testing.T, pending bool, backup ...bool) (*mana
 		}
 		return original(ctx, args)
 	}
-	managedCandidate(t, m, newBuild)
 	dropped := filepath.Join(i.home, "Applications/Agent Queue dragged.app")
-	if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), dropped); err != nil {
+	if err := installCopyTree(i.app, dropped); err != nil {
 		t.Fatal(err)
 	}
-	i.app, i.appBundle, i.payload = dropped, true, filepath.Join(dropped, "Contents/Resources/payload")
+	managedBundleBuild(t, i, dropped, newBuild)
+	i.app = dropped
 	m.calls = nil
 	return m, old
 }
@@ -289,7 +299,7 @@ func TestManagedDistinctAppDoesNotSupersedeRecordedPendingWithoutReceipt(t *test
 		t.Fatal(err)
 	}
 	var pending *installPendingError
-	if err := i.validatePayload(); !errors.As(err, &pending) {
+	if _, err := i.validatePayload(); !errors.As(err, &pending) {
 		t.Fatal("a different app superseded the still-retained exact pending build", err)
 	}
 	if err := i.repairAndExecute(context.Background()); err != nil {
@@ -304,7 +314,7 @@ func TestManagedRelocationKeepsRetainedCallerUntilItExits(t *testing.T) {
 	m, oldApp := managedRelocationFixture(t, false)
 	i := m.installer
 	old := *i
-	old.app, old.payload = oldApp, filepath.Join(oldApp, "Contents/Resources/payload")
+	old.app = oldApp
 	attempt := runtimeGenerationAttemptFixture(t)
 	caller, identity := runtimeGenerationCallerFixture(t)
 	attempt.Caller, attempt.Worker = identity, nil

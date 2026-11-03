@@ -65,14 +65,7 @@ func TestManagedLoadedBundleProgramAcceptsCrashLoopWithoutProcess(t *testing.T) 
 
 func managedAppBundleFixture(t *testing.T) *managedFixture {
 	t.Helper()
-	m := managedTestFixture(t)
-	i := m.installer
-	if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
-		t.Fatal(err)
-	}
-	i.appBundle = true
-	i.payload = filepath.Join(i.app, "Contents/Resources/payload")
-	return m
+	return managedTestFixture(t)
 }
 
 func managedServiceCalls(m *managedFixture, action string) []string {
@@ -191,7 +184,6 @@ func TestManagedAppBundleMigratesOldRegistrationsAwaitingApproval(t *testing.T) 
 		t.Fatal(err)
 	}
 	i := m.installer
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	for _, service := range []string{"queue", "resources", "remote"} {
 		m.statuses[service] = "requiresApproval"
 	}
@@ -228,7 +220,6 @@ func TestManagedAppBundleUnregistersCrashLoopingRegistrationWithoutProcess(t *te
 		t.Fatal(err)
 	}
 	i := m.installer
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	// Launchd keeps the registration but never runs it; nothing holds a lock.
 	m.statuses["queue"] = "enabled"
 	m.loaded["io.went.agent-heavy"] = true
@@ -265,7 +256,6 @@ func TestManagedAppBundleRefusesRegistrationWhoseProcessIsNotThisHelper(t *testi
 		t.Fatal(err)
 	}
 	i := m.installer
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	m.statuses["queue"] = "enabled"
 	m.loaded["io.went.agent-heavy"] = true
 	original := i.command
@@ -295,7 +285,6 @@ func TestManagedAppBundlePreflightIgnoresOldRegistrations(t *testing.T) {
 		t.Fatal(err)
 	}
 	i := m.installer
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	for _, status := range []string{"requiresApproval", "enabled", "notRegistered"} {
 		for _, service := range []string{"queue", "resources", "remote", "login"} {
 			m.statuses[service] = status
@@ -314,7 +303,6 @@ func TestManagedAppBundlePreflightAcceptsLoadedCrashLoopingRegistration(t *testi
 		t.Fatal(err)
 	}
 	i := m.installer
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	m.statuses["queue"] = "enabled"
 	m.loaded["io.went.agent-heavy"] = true
 	original := i.command
@@ -456,7 +444,6 @@ func TestManagedAppBundleCrashLoopingRegistrationWithUnfinishedJobsCompletes(t *
 	}
 	managedSetupNotices(m)
 	i := m.installer
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	managedSeedUnfinishedQueue(t, i, "running")
 	before := managedQueueRows(t, i)
 	// Launchd keeps the registration but never runs it, so it answers nothing.
@@ -533,7 +520,6 @@ func TestManagedAppBundleLiveAnsweringDaemonWithRunningJobsStillWaits(t *testing
 		t.Fatal(err)
 	}
 	i := m.installer
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	// A launchd daemon from an older version is registered, loaded and answering.
 	m.statuses["queue"] = "enabled"
 	m.loaded["io.went.agent-heavy"] = true

@@ -31,8 +31,11 @@ func TestInstallerAutomaticRepairBacksUpCustomCallbackAndInstalls(t *testing.T) 
 		t.Fatalf("automatic installation still requires callback confirmation: %v", err)
 	}
 	backup := filepath.Join(f.installer.config, "pueue.before-upgrade-"+report.Revision+".yml")
-	if !bytes.Equal(original, integrationTestRead(t, backup)) || !f.installer.embeddedDefinition() {
-		t.Fatal("automatic migration must preserve the complete original configuration and finish installation")
+	if !bytes.Equal(original, integrationTestRead(t, backup)) {
+		t.Fatal("automatic migration must preserve the complete original configuration")
+	}
+	if _, err := updateInstalled(f.installer.root, f.installer.app); err != nil {
+		t.Fatal("automatic migration did not finish installation", err)
 	}
 }
 
@@ -104,10 +107,7 @@ func TestInstallerAutomaticLegacyOptionsCannotBypassInstallationOwnership(t *tes
 }
 
 func TestInstallerAutomaticManagedUpgradeWaitsForActiveJobs(t *testing.T) {
-	m := managedTestFixture(t)
-	if err := m.run(t); err != nil {
-		t.Fatal(err)
-	}
+	m := managedOlderRegistration(t)
 	m.tasks = Object{"7": Object{"id": 7, "status": Object{"Running": Object{}}}}
 	waits := 0
 	err := installRunApprovedRepair(context.Background(), m.installer.preflight, m.installer.recover, m.installer.execute,
@@ -123,50 +123,6 @@ func TestInstallerAutomaticManagedUpgradeWaitsForActiveJobs(t *testing.T) {
 		}, func(string) {})
 	if err != nil || waits != 1 {
 		t.Fatalf("managed upgrade did not drain automatically: waits=%d err=%v", waits, err)
-	}
-}
-
-func TestInstallerAutomaticManagedApprovalWaitsWithoutReregistering(t *testing.T) {
-	m := managedTestFixture(t)
-	m.approval = "resources"
-	nativeExit := exec.Command("/bin/sh", "-c", "exit 2").Run()
-	if nativeExit == nil {
-		t.Fatal("approval fixture did not reproduce native exit 2")
-	}
-	original := m.installer.command
-	m.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-		output, err := original(ctx, args)
-		if err == nil && len(args) == 4 && args[1] == "--service-management" && args[2] == "register" && m.statuses[args[3]] == "requiresApproval" {
-			return output, nativeExit
-		}
-		return output, err
-	}
-	waits, registrations := 0, 0
-	err := installRunApprovedRepair(context.Background(), m.installer.preflight, m.installer.recover, m.installer.execute,
-		func(context.Context) error {
-			waits++
-			calls := 0
-			for _, call := range m.calls {
-				if len(call) == 4 && call[1] == "--service-management" && call[2] == "register" && call[3] == "resources" {
-					calls++
-				}
-			}
-			if calls != 1 {
-				t.Fatalf("approval caused registration retry: %d", calls)
-			}
-			if waits == 3 {
-				m.approval = ""
-				m.statuses["resources"] = "enabled"
-				m.loaded["io.went.agent-resources"] = true
-			}
-			registrations = calls
-			return nil
-		}, func(string) {})
-	if err != nil || waits != 3 || registrations != 1 {
-		t.Fatalf("approval did not resume automatically: waits=%d err=%v", waits, err)
-	}
-	if _, err := os.Stat(filepath.Join(m.installer.root, "install-in-progress.json")); !os.IsNotExist(err) {
-		t.Fatal("approved installation did not finish", err)
 	}
 }
 
@@ -227,10 +183,7 @@ func TestInstallerAutomaticApprovalFastReadbackAndNoProgressFence(t *testing.T) 
 }
 
 func TestInstallerAutomaticManagedCleanupUsesBundleOwnership(t *testing.T) {
-	m := managedTestFixture(t)
-	if err := m.run(t); err != nil {
-		t.Fatal(err)
-	}
+	m := managedOlderRegistration(t)
 	m.tasks = Object{"7": Object{"id": 7, "status": Object{"Done": Object{"result": "Success"}}}}
 	path := filepath.Join(m.installer.state, "receipts/7.json")
 	integrationTestWrite(t, path, []byte(`{"task_id":7,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
@@ -295,7 +248,7 @@ func TestInstallerAutomaticRepairWaitsBeforeChangingCallbackOrPhoneAccess(t *tes
 }
 
 func TestInstallerApprovedRepairOptions(t *testing.T) {
-	args := []string{"--payload", "/fixture/payload", "--repair-and-continue"}
+	args := []string{"--app-bundle", "/Applications/Agent Queue.app", "--repair-and-continue"}
 	if _, err := installParseOptions(args); err != nil {
 		t.Fatalf("approved automatic installation is unavailable: %v", err)
 	}
@@ -515,7 +468,7 @@ func TestInstallerApprovedRepairRealMissingFilesAndDefaultConsent(t *testing.T) 
 	original := install.command
 	phoneDisables := 0
 	install.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 2 && args[0] == filepath.Join(install.payload, "source/bin/agent-remote") && args[1] == "disable" {
+		if len(args) == 2 && args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote") && args[1] == "disable" {
 			phoneDisables++
 			delete(f.loaded, "io.went.agent-remote")
 			return nil, nil
@@ -534,9 +487,6 @@ func TestInstallerApprovedRepairRealMissingFilesAndDefaultConsent(t *testing.T) 
 	defer cancel()
 	if err := f.installer.repairAndExecute(ctx); err != nil {
 		t.Fatal(err)
-	}
-	if !f.installer.embeddedDefinition() {
-		t.Fatal("approved repair did not finish the embedded migration")
 	}
 	if _, err := os.Lstat(filepath.Join(f.installer.root, "install-in-progress.json")); !os.IsNotExist(err) {
 		t.Fatal("approved install did not finish", err)

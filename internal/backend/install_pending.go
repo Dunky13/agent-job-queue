@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/Dunky13/agent-job-queue/internal/appservices"
@@ -31,7 +30,7 @@ func (err *installPendingError) Error() string {
 // A strictly newer tracked bundle may then take over, unless an installer-made
 // backup or publication receipt still needs the exact pending build.
 func (install *installer) managedPendingSuperseded(identity, pending BuildInfo) (bool, error) {
-	if !install.appBundle || install.prepareReplacement || install.unregisterServices || install.pendingIdentity != nil ||
+	if install.unregisterServices || install.pendingIdentity != nil ||
 		identity.Build == nil || pending.Build == nil || *identity.Build <= *pending.Build {
 		return false, nil
 	}
@@ -56,58 +55,43 @@ func (install *installer) managedPendingSuperseded(identity, pending BuildInfo) 
 // never clears or replaces an unfinished identity to let a different build in.
 func (install *installer) pendingInstallation(ctx context.Context) (*installer, error) {
 	var pending *installPendingError
-	if err := install.validatePayload(); !errors.As(err, &pending) {
+	if _, err := install.validatePayload(); !errors.As(err, &pending) {
 		if err != nil {
 			return nil, err
 		}
 		return nil, errors.New("The pending installation changed; check setup again")
 	}
-	source := install.app
-	if !install.appBundle {
-		source = filepath.Join(install.payload, "Agent Queue.app")
-	}
-	if err := install.managedVerify(ctx, source); err != nil {
+	if err := install.managedVerify(ctx, install.app); err != nil {
 		return nil, err
 	}
 	retained := *install
-	retained.appBundle = true
-	if install.appBundle {
-		previous, err := appservices.Load(install.home)
-		if err != nil {
-			return nil, err
-		}
-		if previous != nil {
-			retained.app = previous.App
-		}
+	previous, err := appservices.Load(install.home)
+	if err != nil {
+		return nil, err
 	}
-	retained.payload = filepath.Join(retained.app, "Contents/Resources/payload")
-	retained.prepareReplacement = false
+	if previous != nil {
+		retained.app = previous.App
+	}
 	retained.unregisterServices = false
 	retained.pendingIdentity = &pending.identity
-	if err := retained.validatePayload(); err != nil {
+	identity, err := retained.validatePayload()
+	if err != nil {
 		return nil, fmt.Errorf("The exact pending app cannot be recovered: %w", err)
 	}
-	if !retained.identity.Equal(pending.identity) {
+	if !identity.Equal(pending.identity) {
 		return nil, pending
 	}
-	if retained.managed {
-		if err := retained.managedVerify(ctx, retained.app); err != nil {
-			return nil, err
-		}
-		selected, err := managedCaptureBundle(retained.app)
-		if err != nil {
-			return nil, err
-		}
-		retained.pendingBundle = &selected
-		if err := retained.managedBackupAccess(); err != nil {
-			return nil, err
-		}
-	} else {
-		for _, target := range []string{filepath.Join(retained.payload, "source/bin/agent-heavy"), filepath.Join(retained.payload, "source/bin/agent-remote"), retained.app} {
-			if _, err := retained.run(ctx, "/usr/bin/codesign", "--verify", "--strict", "--verbose=2", target); err != nil {
-				return nil, fmt.Errorf("Retained app signature verification failed: %w", err)
-			}
-		}
+	retained.identity = identity
+	if err := retained.managedVerify(ctx, retained.app); err != nil {
+		return nil, err
+	}
+	selected, err := managedCaptureBundle(retained.app)
+	if err != nil {
+		return nil, err
+	}
+	retained.pendingBundle = &selected
+	if err := retained.managedBackupAccess(); err != nil {
+		return nil, err
 	}
 	return &retained, nil
 }
@@ -120,7 +104,7 @@ func (install *installer) finishPendingInstallation(ctx context.Context) error {
 	// execute revalidates the exact identity under its normal locks and retains
 	// all drain, signature, ownership, custody, approval and readiness gates.
 	execute := retained.execute
-	if install.automaticSetup && retained.managed {
+	if install.automaticSetup {
 		execute = retained.repairAndExecute
 	} else {
 		bounded, cancel := context.WithTimeout(ctx, 5*time.Minute)

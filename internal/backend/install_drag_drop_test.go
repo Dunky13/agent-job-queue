@@ -44,7 +44,7 @@ func managedDraggedFixture(t *testing.T, receipt bool) (*managedFixture, string)
 	if err := os.Rename(old, dropped); err != nil {
 		t.Fatal(err)
 	}
-	i.app, i.appBundle, i.payload = dropped, true, filepath.Join(dropped, "Contents/Resources/payload")
+	i.app = dropped
 	m.calls = nil
 	return m, old
 }
@@ -183,16 +183,8 @@ func TestManagedAppBundleNewerBuildSupersedesInterruptedSetup(t *testing.T) {
 	drop := func(build string) {
 		t.Helper()
 		managedCandidate(t, m, build)
-		if err := os.RemoveAll(i.app); err != nil {
-			t.Fatal(err)
-		}
-		if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
-			t.Fatal(err)
-		}
 	}
-	payload := i.payload
 	drop("123")
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	before, err := os.ReadFile(marker)
 	if err != nil {
 		t.Fatal(err)
@@ -203,9 +195,7 @@ func TestManagedAppBundleNewerBuildSupersedesInterruptedSetup(t *testing.T) {
 	if after, err := os.ReadFile(marker); err != nil || string(after) != string(before) {
 		t.Fatal("refusal changed the interrupted setup marker", err)
 	}
-	i.appBundle, i.payload = false, payload
 	drop("125")
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	if err := m.run(t); err != nil {
 		t.Fatal("a newer dropped bundle could not supersede interrupted setup", err)
 	}
@@ -219,12 +209,8 @@ func TestManagedAppBundleNewerBuildSupersedesInterruptedSetup(t *testing.T) {
 }
 
 func TestManagedAppBundlePlanningReadsStoppedStoreWhenDaemonIsUnreachable(t *testing.T) {
-	m := managedTestFixture(t)
-	if err := m.run(t); err != nil {
-		t.Fatal(err)
-	}
+	m := managedOlderRegistration(t)
 	i := m.installer
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	store, err := openQueueStore(i.state, true)
 	if err != nil {
 		t.Fatal(err)
@@ -243,11 +229,6 @@ func TestManagedAppBundlePlanningReadsStoppedStoreWhenDaemonIsUnreachable(t *tes
 		t.Fatal("a daemon holding its lifetime lock was bypassed", err)
 	}
 	held.Close()
-	i.appBundle, i.payload = false, filepath.Join(filepath.Dir(i.payload), "unused")
-	if _, err := i.planManaged(ctx); err == nil {
-		t.Fatal("payload setup used the stopped-store fallback")
-	}
-	i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 	store, err = openQueueStore(i.state, false)
 	if err != nil {
 		t.Fatal(err)
@@ -261,10 +242,6 @@ func TestManagedAppBundlePlanningReadsStoppedStoreWhenDaemonIsUnreachable(t *tes
 	// to recover these jobs, so the supervised path never waits for a drain.
 	if _, err := i.planManaged(ctx); err != nil {
 		t.Fatal("an unfinished stopped job blocked supervised planning", err)
-	}
-	i.appBundle, i.payload = false, filepath.Join(filepath.Dir(i.payload), "unused")
-	if _, err := i.planManaged(ctx); err == nil {
-		t.Fatal("payload setup accepted an unfinished stopped job")
 	}
 }
 
@@ -311,10 +288,6 @@ func TestManagedAppBundleKeepsCustodyThatStillGuardsABundle(t *testing.T) {
 		if err := os.RemoveAll(i.app); err != nil {
 			t.Fatal(err)
 		}
-		if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
-			t.Fatal(err)
-		}
-		i.appBundle, i.payload = true, filepath.Join(i.app, "Contents/Resources/payload")
 		if superseded, err := i.managedPendingSuperseded(metadataTestInfo(t, "125"), metadataTestInfo(t, "124")); err != nil || superseded {
 			t.Fatal("a retained receipt did not keep the pending build authoritative", superseded, err)
 		}

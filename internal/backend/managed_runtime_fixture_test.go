@@ -55,6 +55,10 @@ func packagedSetupWitness(install *installer) (map[string]packagedSetupFile, err
 // Only a kernel busy refusal with unchanged installation custody and no native
 // mutation can be retried. The caller's original deadline spans every attempt.
 func runPackagedSetup(ctx context.Context, fixture *installFixture, execute func(context.Context) error) (int, error) {
+	// A marker the fixture seeded says nothing about this setup's own history. It
+	// stops counting as seeded here, because this setup may now accept mutations.
+	seeded := fixture.seededPending
+	fixture.seededPending = false
 	for attempt := 0; attempt < 3; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return attempt, err
@@ -74,7 +78,7 @@ func runPackagedSetup(ctx context.Context, fixture *installFixture, execute func
 		}
 		after, witnessError := packagedSetupWitness(fixture.installer)
 		pending := filepath.Join(fixture.installer.root, "install-in-progress.json")
-		if witnessError != nil || before[pending].present || !reflect.DeepEqual(before, after) {
+		if witnessError != nil || before[pending].present && !seeded || !reflect.DeepEqual(before, after) {
 			return attempt, fmt.Errorf("busy setup changed or retained mutation custody; no retry: %w", errors.Join(err, witnessError))
 		}
 		if len(fixture.calls) < calls {
@@ -184,8 +188,7 @@ func managedPackagedRuntimeFixture(t *testing.T, m *managedFixture) {
 	}
 	original := i.command
 	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[1] == "--prepare-app-replacement" && args[2] == i.app &&
-			(args[0] == filepath.Join(i.app, "Contents/MacOS/AgentQueue") || args[0] == filepath.Join(i.payload, "Agent Queue.app/Contents/MacOS/AgentQueue")) {
+		if len(args) == 3 && args[1] == "--prepare-app-replacement" && args[2] == i.app && args[0] == filepath.Join(i.app, "Contents/MacOS/AgentQueue") {
 			m.calls = append(m.calls, slices.Clone(args))
 			return mustMetadataJSON(t, Object{"schemaVersion": 1, "app": i.app, "status": "stopped"}), nil
 		}

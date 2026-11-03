@@ -2,22 +2,30 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Dunky13/agent-job-queue/internal/appservices"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
+// managedCandidate replaces the bundle at the app path with build, as dragging a
+// newer download over it would.
 func managedCandidate(t *testing.T, m *managedFixture, build string) BuildInfo {
 	t.Helper()
-	i := m.installer
+	return managedBundleBuild(t, m.installer, m.installer.app, build)
+}
+
+func managedBundleBuild(t *testing.T, i *installer, app, build string) BuildInfo {
+	t.Helper()
 	identity := metadataTestInfo(t, build)
-	app := filepath.Join(i.payload, "Agent Queue.app")
-	for _, filename := range []string{filepath.Join(i.payload, "source/build-info.json"), filepath.Join(app, "Contents/Resources/build-info.json"), filepath.Join(app, "Contents/Resources/payload/source/build-info.json")} {
+	for _, filename := range []string{filepath.Join(app, "Contents/Resources/payload/source/build-info.json"), filepath.Join(app, "Contents/Resources/build-info.json")} {
 		integrationTestWrite(t, filename, mustMetadataJSON(t, identity))
 	}
 	info, err := updatePlist(filepath.Join(app, "Contents/Info.plist"))
@@ -32,11 +40,92 @@ func managedCandidate(t *testing.T, m *managedFixture, build string) BuildInfo {
 	return identity
 }
 
+// managedOlderRegistered completes the installation an older release left: its
+// helpers registered with Service Management, and running under launchd. This
+// build never registers them on its own, but resume still has to.
+func managedOlderRegistered(ctx context.Context, m *managedFixture) error {
+	i := m.installer
+	identity, err := i.validatePayload()
+	if err != nil {
+		return err
+	}
+	i.identity = identity
+	for _, directory := range []string{i.root, i.state, i.config, filepath.Join(i.home, ".local/bin"), filepath.Join(i.state, "remote")} {
+		if err := installDirectory(directory); err != nil {
+			return err
+		}
+	}
+	raw, err := json.MarshalIndent(identity, "", "  ")
+	if err != nil {
+		return err
+	}
+	marker := filepath.Join(i.root, "install-in-progress.json")
+	if err := installAtomic(marker, append(raw, '\n'), 0600); err != nil {
+		return err
+	}
+	if err := i.managedSupport(); err != nil {
+		return err
+	}
+	metadata, err := json.Marshal(appservices.Installation{SchemaVersion: 1, App: i.app, ServiceManagement: true})
+	if err != nil {
+		return err
+	}
+	if err := installAtomic(filepath.Join(i.root, "installation.json"), append(metadata, '\n'), 0600); err != nil {
+		return err
+	}
+	published, err := managedCaptureBundle(i.app)
+	if err != nil {
+		return err
+	}
+	if _, err := i.managedActivate(ctx, published, false); err != nil {
+		return err
+	}
+	if err := installAtomic(filepath.Join(i.root, "build-info.json"), append(raw, '\n'), 0600); err != nil {
+		return err
+	}
+	return os.Remove(marker)
+}
+
+func managedOlderRegistration(t *testing.T) *managedFixture {
+	t.Helper()
+	m := managedTestFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := managedOlderRegistered(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// managedOlderPublication leaves what an older release's installer left when it
+// stopped right after publishing build over the bundle at the app path: the
+// candidate there, the previous bundle retained beside it, the receipt binding
+// both, and the pending marker. This build never publishes a copy itself.
+func managedOlderPublication(t *testing.T, m *managedFixture, build string) (backup, candidate managedBundleIdentity) {
+	t.Helper()
+	i := m.installer
+	if err := os.Rename(i.app, i.managedPreviousPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := installCopyTree(i.managedPreviousPath(), i.app); err != nil {
+		t.Fatal(err)
+	}
+	identity := managedBundleBuild(t, i, i.app, build)
+	var err error
+	if backup, err = managedCaptureBundle(i.managedPreviousPath()); err != nil {
+		t.Fatal(err)
+	}
+	if candidate, err = managedCaptureBundle(i.app); err != nil {
+		t.Fatal(err)
+	}
+	integrationTestWrite(t, i.managedReceiptPath(), mustMetadataJSON(t, managedPublicationReceipt{SchemaVersion: 1, App: i.app, Pending: identity, Candidate: candidate, Backup: &backup}))
+	integrationTestWrite(t, filepath.Join(i.root, "install-in-progress.json"), mustMetadataJSON(t, identity))
+	m.seededPending = true
+	return backup, candidate
+}
+
 func managedRemovalTarget(i *installer) {
-	i.prepareReplacement = false
 	i.unregisterServices = true
-	i.appBundle = true
-	i.payload = filepath.Join(i.app, "Contents/Resources/payload")
 }
 
 func managedRequireNoServiceMutation(t *testing.T, calls [][]string) {
@@ -72,22 +161,21 @@ func TestManagedAbsentLegacyMenuRequiresExactLaunchctlEvidence(t *testing.T) {
 }
 
 func TestManagedLifecycleOptionParsing(t *testing.T) {
-	for _, args := range [][]string{{"--payload", "/private/payload", "--prepare-replacement"}, {"--app-bundle", "/Applications/Agent Queue.app", "--unregister-services"}} {
-		options, err := installParseOptions(args)
-		if err != nil || options.prepareReplacement == options.unregisterServices || options.preflight || options.recovery != "" {
-			t.Fatalf("valid lifecycle request %v: %+v %v", args, options, err)
-		}
-		for _, extra := range [][]string{{"--preflight", "--json"}, {"--preflight"}, {"--json"}, {"--recover", "disable-phone-access"}, {"--disable-phone-access"}, {"--repair-and-continue"}, {"--prepare-replacement"}, {"--unregister-services"}, {"--job-id", "1"}, {"--expected-revision", strings.Repeat("a", 64)}} {
-			if _, err := installParseOptions(append(slices.Clone(args), extra...)); err == nil {
-				t.Fatal("invalid lifecycle combination accepted", args, extra)
-			}
+	args := []string{"--app-bundle", "/Applications/Agent Queue.app", "--unregister-services"}
+	options, err := installParseOptions(args)
+	if err != nil || !options.unregisterServices || options.preflight || options.recovery != "" {
+		t.Fatalf("valid lifecycle request %v: %+v %v", args, options, err)
+	}
+	for _, extra := range [][]string{{"--preflight", "--json"}, {"--preflight"}, {"--json"}, {"--recover", "disable-phone-access"}, {"--disable-phone-access"}, {"--repair-and-continue"}, {"--unregister-services"}} {
+		if _, err := installParseOptions(append(slices.Clone(args), extra...)); err == nil {
+			t.Fatal("invalid lifecycle combination accepted", args, extra)
 		}
 	}
 	for _, args := range [][]string{
 		{"--app-bundle", "/Applications/Agent Queue.app", "--prepare-replacement"},
+		{"--payload", "/private/payload"},
+		{"--payload", "/private/payload", "--prepare-replacement"},
 		{"--payload", "/private/payload", "--unregister-services"},
-		{"--payload", "relative", "--prepare-replacement"},
-		{"--payload", "/private/../payload", "--prepare-replacement"},
 		{"--app-bundle", "relative.app", "--unregister-services"},
 		{"--app-bundle", "/private/Agent Queue.app", "--unregister-services"},
 		{"--app-bundle", "/Applications/not-an-app", "--unregister-services"},
@@ -100,21 +188,22 @@ func TestManagedLifecycleOptionParsing(t *testing.T) {
 
 func TestManagedLifecycleRejectsUnmarkedLegacyCandidates(t *testing.T) {
 	for _, removal := range []bool{false, true} {
-		t.Run(map[bool]string{false: "prepare", true: "remove"}[removal], func(t *testing.T) {
+		t.Run(map[bool]string{false: "setup", true: "remove"}[removal], func(t *testing.T) {
 			f := installTestFixture(t)
 			i := f.installer
-			i.prepareReplacement = true
+			info, err := updatePlist(filepath.Join(i.app, "Contents/Info.plist"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			delete(info, "AgentQueueServiceManagement")
+			if err := i.writePlist(filepath.Join(i.app, "Contents/Info.plist"), info); err != nil {
+				t.Fatal(err)
+			}
 			if removal {
-				if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
-					t.Fatal(err)
-				}
-				if err := installCopyTree(filepath.Join(i.payload, "source"), filepath.Join(i.app, "Contents/Resources/payload/source")); err != nil {
-					t.Fatal(err)
-				}
 				managedRemovalTarget(i)
 			}
 			before := installTreeWitness(t, i.home)
-			if err := f.run(t); err == nil || !strings.Contains(err.Error(), "marked") {
+			if err := f.run(t); err == nil || !strings.Contains(err.Error(), "marker") {
 				t.Fatal("unmarked lifecycle request accepted", err)
 			}
 			if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
@@ -126,47 +215,35 @@ func TestManagedLifecycleRejectsUnmarkedLegacyCandidates(t *testing.T) {
 }
 
 func TestManagedLifecycleDrainRefusalChangesNothing(t *testing.T) {
-	for _, removal := range []bool{false, true} {
-		t.Run(map[bool]string{false: "prepare", true: "remove"}[removal], func(t *testing.T) {
-			m := managedTestFixture(t)
-			if err := m.run(t); err != nil {
-				t.Fatal(err)
-			}
-			i := m.installer
-			i.prepareReplacement = true
-			if removal {
-				managedRemovalTarget(i)
-			}
-			m.tasks["41"] = Object{"id": 41, "status": Object{"Running": Object{}}}
-			before := installTreeWitness(t, i.home)
-			m.calls = nil
-			if err := m.run(t); err == nil || !strings.Contains(err.Error(), "drained") {
-				t.Fatal("missing active-job refusal", err)
-			}
-			if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
-				t.Fatal("active-job refusal modified home")
-			}
-			managedRequireNoServiceMutation(t, m.calls)
-		})
+	m := managedOlderRegistration(t)
+	i := m.installer
+	managedRemovalTarget(i)
+	m.tasks["41"] = Object{"id": 41, "status": Object{"Running": Object{}}}
+	before := installTreeWitness(t, i.home)
+	m.calls = nil
+	if err := m.run(t); err == nil || !strings.Contains(err.Error(), "drained") {
+		t.Fatal("missing active-job refusal", err)
 	}
+	if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
+		t.Fatal("active-job refusal modified home")
+	}
+	managedRequireNoServiceMutation(t, m.calls)
 }
 
-func TestManagedPreparationFreezesBeforeAppMoveAndPostflightRetries(t *testing.T) {
-	m := managedTestFixture(t)
-	if err := m.run(t); err != nil {
-		t.Fatal(err)
-	}
+func TestManagedRemovalHoldsLocksThroughShutdown(t *testing.T) {
+	m := managedOlderRegistration(t)
 	i := m.installer
 	originalBundle := installBundleSnapshot(t, i.app)
-	originalWrappers, err := i.managedWrappers()
+	identity, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	candidate := managedCandidate(t, m, "124")
-	i.prepareReplacement = true
+	managedRemovalTarget(i)
 	original := i.command
+	unregistered := 0
 	i.command = func(ctx context.Context, args []string) ([]byte, error) {
 		if len(args) == 4 && args[1] == "--service-management" && args[2] == "unregister" {
+			unregistered++
 			for _, entry := range []struct{ directory, name string }{{i.state, "install.lock"}, {i.state, "scheduling.lock"}, {filepath.Join(i.state, "remote"), "control.lock"}} {
 				busy, err := installInspectLock(entry.directory, entry.name)
 				if err != nil || !busy {
@@ -174,59 +251,28 @@ func TestManagedPreparationFreezesBeforeAppMoveAndPostflightRetries(t *testing.T
 				}
 			}
 			pending, err := installReadInfo(filepath.Join(i.root, "install-in-progress.json"))
-			if err != nil || !pending.Equal(candidate) {
-				t.Fatal("shutdown lost candidate custody", pending, err)
+			if err != nil || !pending.Equal(identity) {
+				t.Fatal("shutdown lost custody", pending, err)
 			}
 		}
 		return original(ctx, args)
 	}
-	m.calls = nil
 	if err := m.run(t); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(originalBundle, installBundleSnapshot(t, i.app)) {
-		t.Fatal("preparation changed signed app bytes")
+	if unregistered == 0 {
+		t.Fatal("removal unregistered nothing")
 	}
-	wrappers, err := i.managedWrappers()
-	if err != nil || !reflect.DeepEqual(wrappers, originalWrappers) {
-		t.Fatal("preparation rewrote wrappers", err)
+	if !reflect.DeepEqual(originalBundle, installBundleSnapshot(t, i.app)) {
+		t.Fatal("removal changed signed app bytes")
 	}
 	for _, status := range m.statuses {
 		if status != "notRegistered" {
-			t.Fatal("preparation retained registration", m.statuses)
+			t.Fatal("removal retained registration", m.statuses)
 		}
 	}
-	completed, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
-	if err != nil || completed.Build == nil || *completed.Build != 123 {
-		t.Fatal("preparation published completed identity", completed, err)
-	}
-	if err := m.run(t); err != nil {
-		t.Fatal("preparation retry", err)
-	}
-	// Simulate only the cask artifact move after successful preparation.
-	if err := os.RemoveAll(i.app); err != nil {
-		t.Fatal(err)
-	}
-	if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
-		t.Fatal(err)
-	}
-	i.prepareReplacement = false
-	i.appBundle = true
-	i.payload = filepath.Join(i.app, "Contents/Resources/payload")
-	m.nativeFailure = "register login"
-	if err := m.run(t); err == nil {
-		t.Fatal("missing postflight partial failure")
-	}
-	m.nativeFailure = ""
-	if err := m.run(t); err != nil {
-		t.Fatal("postflight retry", err)
-	}
-	completed, err = installReadInfo(filepath.Join(i.root, "build-info.json"))
-	if err != nil || !completed.Equal(candidate) {
-		t.Fatal("postflight completed wrong identity", completed, err)
-	}
 	if _, err := os.Lstat(filepath.Join(i.root, "install-in-progress.json")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("postflight kept pending marker", err)
+		t.Fatal("removal kept its pending marker", err)
 	}
 }
 
@@ -302,70 +348,63 @@ func TestManagedRemovalPreservesDataAndVersionEvidence(t *testing.T) {
 }
 
 func TestManagedLifecycleForeignServicesAndCustomWrappersFailBeforeChanges(t *testing.T) {
-	for _, removal := range []bool{false, true} {
-		for _, kind := range []string{"queue", "remote", "custom-wrapper", "symlink-wrapper", "lifetime-lock", "orphaned-remote"} {
-			t.Run(map[bool]string{false: "prepare", true: "remove"}[removal]+"/"+kind, func(t *testing.T) {
-				m := managedTestFixture(t)
-				if err := m.run(t); err != nil {
+	for _, kind := range []string{"queue", "remote", "custom-wrapper", "symlink-wrapper", "lifetime-lock", "orphaned-remote"} {
+		t.Run(kind, func(t *testing.T) {
+			m := managedTestFixture(t)
+			if err := m.run(t); err != nil {
+				t.Fatal(err)
+			}
+			i := m.installer
+			managedRemovalTarget(i)
+			original := i.command
+			i.command = func(ctx context.Context, args []string) ([]byte, error) {
+				label := map[string]string{"queue": "io.went.agent-heavy", "remote": "io.went.agent-remote"}[kind]
+				if label != "" && slices.Equal(args, []string{"launchctl", "print", i.domain() + "/" + label}) {
+					return []byte("program = /foreign\narguments = {\n/foreign\n}\n"), nil
+				}
+				return original(ctx, args)
+			}
+			if kind == "custom-wrapper" {
+				integrationTestWrite(t, filepath.Join(i.home, ".local/bin/agent-heavy"), []byte("#!/bin/sh\necho custom\n"))
+			}
+			if kind == "symlink-wrapper" {
+				filename := filepath.Join(i.home, ".local/bin/agent-heavy")
+				if err := os.Remove(filename); err != nil {
 					t.Fatal(err)
 				}
-				i := m.installer
-				i.prepareReplacement = true
-				if removal {
-					managedRemovalTarget(i)
+				if err := os.Symlink(filepath.Join(i.app, "Contents/MacOS/agent-heavy"), filename); err != nil {
+					t.Fatal(err)
 				}
-				original := i.command
-				i.command = func(ctx context.Context, args []string) ([]byte, error) {
-					label := map[string]string{"queue": "io.went.agent-heavy", "remote": "io.went.agent-remote"}[kind]
-					if label != "" && slices.Equal(args, []string{"launchctl", "print", i.domain() + "/" + label}) {
-						return []byte("program = /foreign\narguments = {\n/foreign\n}\n"), nil
-					}
-					return original(ctx, args)
+			}
+			if kind == "lifetime-lock" {
+				m.statuses["resources"] = "notRegistered"
+				delete(m.loaded, "io.went.agent-resources")
+				lock, err := installLock(i.state, "resource-controller.lock")
+				if err != nil {
+					t.Fatal(err)
 				}
-				if kind == "custom-wrapper" {
-					integrationTestWrite(t, filepath.Join(i.home, ".local/bin/agent-heavy"), []byte("#!/bin/sh\necho custom\n"))
-				}
-				if kind == "symlink-wrapper" {
-					filename := filepath.Join(i.home, ".local/bin/agent-heavy")
-					if err := os.Remove(filename); err != nil {
-						t.Fatal(err)
-					}
-					if err := os.Symlink(filepath.Join(i.app, "Contents/MacOS/agent-heavy"), filename); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if kind == "lifetime-lock" {
-					m.statuses["resources"] = "notRegistered"
-					delete(m.loaded, "io.went.agent-resources")
-					lock, err := installLock(i.state, "resource-controller.lock")
-					if err != nil {
-						t.Fatal(err)
-					}
-					defer lock.Close()
-				}
-				if kind == "orphaned-remote" {
-					integrationTestWrite(t, filepath.Join(i.state, "remote/processes.json"), []byte(`{"active":true}`))
-				}
-				before := installTreeWitness(t, i.home)
-				m.calls = nil
-				if err := m.run(t); err == nil {
-					t.Fatal("unsafe lifecycle request accepted", kind)
-				}
-				if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
-					t.Fatal("unsafe lifecycle request changed home", kind)
-				}
-				managedRequireNoServiceMutation(t, m.calls)
-			})
-		}
+				defer lock.Close()
+			}
+			if kind == "orphaned-remote" {
+				integrationTestWrite(t, filepath.Join(i.state, "remote/processes.json"), []byte(`{"active":true}`))
+			}
+			before := installTreeWitness(t, i.home)
+			m.calls = nil
+			if err := m.run(t); err == nil {
+				t.Fatal("unsafe lifecycle request accepted", kind)
+			}
+			if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
+				t.Fatal("unsafe lifecycle request changed home", kind)
+			}
+			managedRequireNoServiceMutation(t, m.calls)
+		})
 	}
 }
 
 func TestManagedRemovalCanUnregisterDeniedApprovalWithoutEnabling(t *testing.T) {
-	m := managedTestFixture(t)
-	m.approval = "resources"
-	if err := m.run(t); err == nil {
-		t.Fatal("missing denied approval")
-	}
+	m := managedOlderRegistration(t)
+	m.statuses["resources"] = "requiresApproval"
+	delete(m.loaded, "io.went.agent-resources")
 	managedRemovalTarget(m.installer)
 	m.calls = nil
 	if err := m.run(t); err != nil {
@@ -381,54 +420,44 @@ func TestManagedRemovalCanUnregisterDeniedApprovalWithoutEnabling(t *testing.T) 
 		}
 	}
 	if !unregisteredDenied {
-		t.Fatal("denied service was not unregistered")
+		t.Fatal("removal retained denied registration")
 	}
 }
 
 func TestManagedLifecycleIncompleteUnregistrationPreservesAppAndMetadata(t *testing.T) {
-	for _, removal := range []bool{false, true} {
-		t.Run(map[bool]string{false: "prepare", true: "remove"}[removal], func(t *testing.T) {
-			m := managedTestFixture(t)
-			if err := m.run(t); err != nil {
-				t.Fatal(err)
-			}
-			i := m.installer
-			i.prepareReplacement = true
-			if removal {
-				managedRemovalTarget(i)
-			}
-			bundle := installBundleSnapshot(t, i.app)
-			wrappers, err := i.managedWrappers()
-			if err != nil {
-				t.Fatal(err)
-			}
-			original := i.command
-			i.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if len(args) == 4 && args[1] == "--service-management" && args[2] == "unregister" && args[3] == "queue" {
-					return nil, nil // Bridge returned, but registration did not change.
-				}
-				return original(ctx, args)
-			}
-			if err := m.run(t); err == nil || !strings.Contains(err.Error(), "after unregister") {
-				t.Fatal("incomplete unregistration accepted", err)
-			}
-			if !reflect.DeepEqual(bundle, installBundleSnapshot(t, i.app)) {
-				t.Fatal("incomplete unregistration changed app")
-			}
-			current, err := i.managedWrappers()
-			if err != nil || !reflect.DeepEqual(current, wrappers) {
-				t.Fatal("incomplete unregistration retired wrappers", err)
-			}
-			for _, filename := range []string{"installation.json", "install-in-progress.json"} {
-				if _, err := os.Stat(filepath.Join(i.root, filename)); err != nil {
-					t.Fatal("incomplete unregistration retired custody", filename, err)
-				}
-			}
-		})
+	m := managedOlderRegistration(t)
+	i := m.installer
+	managedRemovalTarget(i)
+	bundle := installBundleSnapshot(t, i.app)
+	wrappers, err := i.managedWrappers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := i.command
+	i.command = func(ctx context.Context, args []string) ([]byte, error) {
+		if len(args) == 4 && args[1] == "--service-management" && args[2] == "unregister" && args[3] == "queue" {
+			return nil, nil // Bridge returned, but registration did not change.
+		}
+		return original(ctx, args)
+	}
+	if err := m.run(t); err == nil || !strings.Contains(err.Error(), "after unregister") {
+		t.Fatal("incomplete unregistration accepted", err)
+	}
+	if !reflect.DeepEqual(bundle, installBundleSnapshot(t, i.app)) {
+		t.Fatal("incomplete unregistration changed app")
+	}
+	current, err := i.managedWrappers()
+	if err != nil || !reflect.DeepEqual(current, wrappers) {
+		t.Fatal("incomplete unregistration retired wrappers", err)
+	}
+	for _, filename := range []string{"installation.json", "install-in-progress.json"} {
+		if _, err := os.Stat(filepath.Join(i.root, filename)); err != nil {
+			t.Fatal("incomplete unregistration retired custody", filename, err)
+		}
 	}
 }
 
-func TestManagedPreparationPreservesPueueImportAndSlotForPostflight(t *testing.T) {
+func TestManagedRemovalPreservesPueueImportAndSlotForReinstall(t *testing.T) {
 	m := managedTestFixture(t)
 	m.legacy(t)
 	i := m.installer
@@ -442,31 +471,25 @@ func TestManagedPreparationPreservesPueueImportAndSlotForPostflight(t *testing.T
 		t.Fatal(err)
 	}
 	m.tasks["41"] = Object{"id": 41, "status": Object{"Done": Object{"result": "Success"}}}
-	i.prepareReplacement = true
+	managedRemovalTarget(i)
 	if err := m.run(t); err != nil {
 		t.Fatal(err)
 	}
-	for _, filename := range []string{filepath.Join(i.state, "legacy-queue-import.json"), filepath.Join(i.state, "legacy-slot.json"), filepath.Join(i.root, "agent_heavy.py"), filepath.Join(i.root, ".venv/bin/python"), filepath.Join(i.root, "install-in-progress.json")} {
+	for _, filename := range []string{filepath.Join(i.state, "legacy-queue-import.json"), filepath.Join(i.state, "legacy-slot.json"), filepath.Join(i.root, "agent_heavy.py"), filepath.Join(i.root, ".venv/bin/python")} {
 		if _, err := os.Stat(filename); err != nil {
-			t.Fatal("preparation lost legacy retry state", filename, err)
+			t.Fatal("removal lost legacy retry state", filename, err)
 		}
 	}
-	if _, err := os.Lstat(i.app); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("preparation published the app", err)
-	}
 	if _, err := os.Lstat(filepath.Join(i.home, ".local/bin/agent-heavy")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("preparation published a wrapper", err)
+		t.Fatal("removal published a wrapper", err)
 	}
+	i.unregisterServices = false
 	if err := m.run(t); err != nil {
-		t.Fatal("Pueue preparation retry", err)
-	}
-	i.prepareReplacement = false
-	if err := m.run(t); err != nil {
-		t.Fatal("Pueue postflight", err)
+		t.Fatal("reinstall after Pueue removal", err)
 	}
 	legacy, err := ReadPrivate(filepath.Join(i.state, "legacy-queue-import.json"))
 	if err != nil || obj(obj(legacy["tasks"])["41"]) == nil {
-		t.Fatal("postflight lost completed legacy history", legacy, err)
+		t.Fatal("reinstall lost completed legacy history", legacy, err)
 	}
 }
 
@@ -476,26 +499,11 @@ func TestManagedPendingCandidatePinsIdentityAndRemovalRetainsOrdering(t *testing
 		t.Fatal(err)
 	}
 	i := m.installer
-	candidate := managedCandidate(t, m, "124")
-	i.prepareReplacement = true
-	if err := m.run(t); err != nil {
-		t.Fatal(err)
-	}
-	for _, build := range []string{"123", "125"} {
-		managedCandidate(t, m, build)
-		before := installTreeWitness(t, i.home)
-		m.calls = nil
-		if err := m.run(t); err == nil {
-			t.Fatal("different pending candidate accepted", build)
-		}
-		if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
-			t.Fatal("pending identity refusal mutated installation")
-		}
-		managedRequireNoServiceMutation(t, m.calls)
-	}
+	candidate := metadataTestInfo(t, "124")
+	integrationTestWrite(t, filepath.Join(i.root, "install-in-progress.json"), mustMetadataJSON(t, candidate))
 	managedRemovalTarget(i) // Installed app is still build 123, pending is 124.
 	if err := m.run(t); err != nil {
-		t.Fatal("explicit removal after preparation", err)
+		t.Fatal("explicit removal with a newer pending build", err)
 	}
 	retained, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
 	if err != nil || !retained.Equal(candidate) {

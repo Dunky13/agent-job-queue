@@ -52,11 +52,7 @@ func (install *installer) liveControl(ctx context.Context, operation string, pay
 }
 
 func (install *installer) liveTargetDigest() (string, error) {
-	app := install.app
-	if !install.appBundle {
-		app = filepath.Join(install.payload, "Agent Queue.app")
-	}
-	raw, err := installReadPayload(app, filepath.Join(app, "Contents/MacOS/agent-heavy"), updateMaxArchive, true)
+	raw, err := install.readPayload(filepath.Join(install.app, "Contents/MacOS/agent-heavy"), updateMaxArchive)
 	if err != nil {
 		return "", err
 	}
@@ -65,7 +61,7 @@ func (install *installer) liveTargetDigest() (string, error) {
 }
 
 func liveAllowed(install *installer, plan *managedPlan) bool {
-	return !install.prepareReplacement && !install.unregisterServices && plan.previous != nil &&
+	return !install.unregisterServices && plan.previous != nil &&
 		!plan.python && !plan.pueue && len(plan.legacy) == 0
 }
 
@@ -294,14 +290,6 @@ func (install *installer) resumeManagedLive(ctx context.Context, plan *managedPl
 		current, err := managedCaptureBundle(install.app)
 		if err != nil || !current.Build.Equal(live.Target) {
 			return nil, errors.New("Adopted runtime differs from the pending candidate")
-		}
-		source := install.app
-		if !install.appBundle {
-			source = filepath.Join(install.payload, "Agent Queue.app")
-		}
-		selected, err := managedCaptureBundle(source)
-		if err != nil || selected.Digest != current.Digest {
-			return nil, errors.New("The adopted application is not the exact retained installer candidate")
 		}
 		if _, err := install.managedSnapshot(ctx); err != nil {
 			return nil, err

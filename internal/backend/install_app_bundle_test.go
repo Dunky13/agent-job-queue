@@ -20,6 +20,9 @@ func TestInstallerAppBundleCLIValidatesBundleBeforeSetup(t *testing.T) {
 	f := installTestFixture(t)
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MODE", "1")
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", f.installer.path)
+	if err := os.RemoveAll(f.installer.app); err != nil {
+		t.Fatal(err)
+	}
 	// A recognized mode with a missing bundle is an installation error, not usage.
 	if code := InstallMain([]string{"--app-bundle", f.installer.app}); code != 1 {
 		t.Fatalf("app-bundle mode was not recognized: exit %d", code)
@@ -27,20 +30,6 @@ func TestInstallerAppBundleCLIValidatesBundleBeforeSetup(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(f.installer.root, "install-in-progress.json")); !os.IsNotExist(err) {
 		t.Fatalf("invalid bundle started setup: %v", err)
 	}
-}
-
-func (f *installFixture) appBundle(t *testing.T) {
-	t.Helper()
-	install := f.installer
-	if err := installCopyTree(filepath.Join(install.payload, "Agent Queue.app"), install.app); err != nil {
-		t.Fatal(err)
-	}
-	payload := filepath.Join(install.app, "Contents/Resources/payload")
-	if err := installCopyTree(filepath.Join(install.payload, "source"), filepath.Join(payload, "source")); err != nil {
-		t.Fatal(err)
-	}
-	install.payload = payload
-	install.appBundle = true
 }
 
 type installBundleEntry struct {
@@ -96,21 +85,18 @@ func assertInstallerNoAppCommands(t *testing.T, f *installFixture) {
 
 func TestInstallerAppBundlePreservesApplicationAndLaunchesSuppliedPath(t *testing.T) {
 	f := installTestFixture(t)
-	f.appBundle(t)
 	install := f.installer
 	// The app's basename may be changed by Finder. Its installed path is authoritative.
 	app := filepath.Join(install.home, "Applications/Agent Queue Renamed.app")
 	if err := os.Rename(install.app, app); err != nil {
 		t.Fatal(err)
 	}
-	install.app, install.payload = app, filepath.Join(app, "Contents/Resources/payload")
+	install.app = app
 	if runtime.GOOS == "darwin" {
 		// Exercise production branches too; all launchctl calls remain simulated.
 		install.testing = false
 	}
-	for _, name := range []string{".Agent Queue.installing.app", ".Agent Queue.previous.app"} {
-		integrationTestWrite(t, filepath.Join(install.home, "Applications", name, "keep"), []byte("unrelated recovery artifact"))
-	}
+	integrationTestWrite(t, filepath.Join(install.home, "Applications/.Agent Queue.installing.app/keep"), []byte("unrelated recovery artifact"))
 	before := installBundleSnapshot(t, filepath.Join(install.home, "Applications"))
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
@@ -119,32 +105,24 @@ func TestInstallerAppBundlePreservesApplicationAndLaunchesSuppliedPath(t *testin
 		t.Fatal("self-install changed application bytes, ownership, mode, inode, timestamps, or sibling recovery artifacts")
 	}
 	assertInstallerNoAppCommands(t, f)
-	launch, err := updatePlist(filepath.Join(install.launch, "io.went.agent-queue.plist"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	args, err := stringsFrom(launch["ProgramArguments"])
-	if err != nil || !slices.Equal(args, []string{"/usr/bin/open", "-a", app}) {
-		t.Fatalf("launch agent targets another application: %v %v", args, err)
-	}
 	if _, err := updateInstalled(install.root, app); err != nil {
 		t.Fatalf("setup did not complete: %v", err)
 	}
 }
 
 func TestInstallerAppBundleLegacyCallbackMigrationAndFailureRetry(t *testing.T) {
-	f := installTestFixture(t)
+	m := managedTestFixture(t)
+	f := m.installFixture
 	f.legacy(t)
-	f.appBundle(t)
 	install := f.installer
 	configuration := install.freshConfig()
 	configuration["daemon"].(Object)["callback"] = "/opt/homebrew/bin/python3 " + installQuote(filepath.Join(install.root, "agent_heavy.py")) + " cleanup {{ id }}"
 	integrationTestWrite(t, filepath.Join(install.config, "pueue.yml"), mustMetadataJSON(t, configuration))
 	f.tasks = Object{"17": Object{"status": Object{"Done": Object{"result": "Success"}}, "command": "completed fixture"}}
 	before := installBundleSnapshot(t, install.app)
-	f.fail = "bootstrap "
+	m.nativeFailure = "register login"
 	if err := f.run(t); err == nil {
-		t.Fatal("failed daemon bootstrap reported completion")
+		t.Fatal("failed login registration reported completion")
 	}
 	if _, err := os.Stat(filepath.Join(install.root, "install-in-progress.json")); err != nil {
 		t.Fatalf("failed setup did not retain retry marker: %v", err)
@@ -152,7 +130,7 @@ func TestInstallerAppBundleLegacyCallbackMigrationAndFailureRetry(t *testing.T) 
 	if _, err := os.Stat(filepath.Join(install.root, "build-info.json")); !os.IsNotExist(err) {
 		t.Fatal("failed setup advanced installed identity")
 	}
-	f.fail = ""
+	m.nativeFailure = ""
 	if err := f.run(t); err != nil {
 		t.Fatalf("setup could not retry after backend publication: %v", err)
 	}
@@ -161,7 +139,7 @@ func TestInstallerAppBundleLegacyCallbackMigrationAndFailureRetry(t *testing.T) 
 		t.Fatal(err)
 	}
 	callback, err := installConfigCallback(config)
-	if err != nil || callback != installQuote(filepath.Join(install.root, "bin/agent-heavy"))+" cleanup {{ id }}" {
+	if err != nil || callback != installQuote(filepath.Join(install.home, ".local/bin/agent-heavy"))+" cleanup {{ id }}" {
 		t.Fatalf("legacy callback not migrated: %q %v", callback, err)
 	}
 	if _, err := os.Stat(filepath.Join(install.root, "agent_heavy.py")); !os.IsNotExist(err) {
@@ -182,10 +160,6 @@ func TestInstallerAppBundleUpgradePreservesActiveGoJobs(t *testing.T) {
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.RemoveAll(f.installer.app); err != nil {
-		t.Fatal(err)
-	}
-	f.appBundle(t)
 	private := filepath.Join(f.installer.state, "jobs/active-job.json")
 	integrationTestWrite(t, private, []byte("active Go job"))
 	f.tasks = Object{"8": Object{"status": Object{"Running": Object{}}, "command": "active Go job"}}
@@ -205,7 +179,7 @@ func TestInstallerAppBundleUpgradePreservesActiveGoJobs(t *testing.T) {
 }
 
 func TestInstallerAppBundleCLISyntax(t *testing.T) {
-	for _, args := range [][]string{nil, {"--app-bundle"}, {"--app-bundle", "relative.app"}, {"--payload", "relative"}, {"--app-bundle", "/Applications/Agent Queue.app", "--payload", "/payload"}} {
+	for _, args := range [][]string{nil, {"--app-bundle"}, {"--app-bundle", "relative.app"}, {"--payload", "relative"}, {"--payload", "/payload"}, {"--app-bundle", "/Applications/Agent Queue.app", "--payload", "/payload"}} {
 		if code := InstallMain(args); code != 2 {
 			t.Fatalf("invalid invocation %v returned %d", args, code)
 		}
@@ -216,9 +190,9 @@ func TestInstallerAppBundleRejectsUnsafePathsBeforeSetup(t *testing.T) {
 	for _, kind := range []string{"downloads", "disk-image", "arbitrary", "nested", "traversal", "dot", "relative", "symlink-app", "symlink-parent", "symlink-payload", "symlink-source", "symlink-binary", "writable-binary", "hardlink", "optional-symlink", "writable-directory", "recursive-app"} {
 		t.Run(kind, func(t *testing.T) {
 			f := installTestFixture(t)
-			f.appBundle(t)
 			install := f.installer
-			filename := filepath.Join(install.payload, "source/bin/agent-heavy")
+			filename := filepath.Join(install.app, "Contents/MacOS/agent-heavy")
+			payload := filepath.Join(install.app, "Contents/Resources/payload")
 			switch kind {
 			case "downloads", "disk-image", "arbitrary", "nested", "traversal", "dot", "relative":
 				paths := map[string]string{
@@ -231,7 +205,6 @@ func TestInstallerAppBundleRejectsUnsafePathsBeforeSetup(t *testing.T) {
 					"relative":   "Applications/Agent Queue.app",
 				}
 				install.app = paths[kind]
-				install.payload = filepath.Join(install.app, "Contents/Resources/payload")
 			case "symlink-app", "symlink-parent", "symlink-payload", "symlink-source", "symlink-binary":
 				switch kind {
 				case "symlink-app":
@@ -239,9 +212,9 @@ func TestInstallerAppBundleRejectsUnsafePathsBeforeSetup(t *testing.T) {
 				case "symlink-parent":
 					filename = filepath.Dir(install.app)
 				case "symlink-payload":
-					filename = install.payload
+					filename = payload
 				case "symlink-source":
-					filename = filepath.Join(install.payload, "source")
+					filename = filepath.Join(payload, "source")
 				}
 				outside := filepath.Join(install.home, "outside")
 				if err := os.Rename(filename, outside); err != nil {
@@ -262,18 +235,18 @@ func TestInstallerAppBundleRejectsUnsafePathsBeforeSetup(t *testing.T) {
 				// Even unconsumed payload entries must not cross the bundle boundary.
 				outside := filepath.Join(install.home, "outside")
 				integrationTestWrite(t, outside, []byte("outside payload"))
-				if err := os.Symlink(outside, filepath.Join(install.payload, "source/unused")); err != nil {
+				if err := os.Symlink(outside, filepath.Join(payload, "source/unused")); err != nil {
 					t.Fatal(err)
 				}
 			case "writable-directory":
-				if err := os.Mkdir(filepath.Join(install.payload, "source/unused"), 0777); err != nil {
+				if err := os.Mkdir(filepath.Join(payload, "source/unused"), 0777); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.Chmod(filepath.Join(install.payload, "source/unused"), 0777); err != nil {
+				if err := os.Chmod(filepath.Join(payload, "source/unused"), 0777); err != nil {
 					t.Fatal(err)
 				}
 			case "recursive-app":
-				integrationTestWrite(t, filepath.Join(install.payload, "Agent Queue.app/unexpected"), nil)
+				integrationTestWrite(t, filepath.Join(payload, "Agent Queue.app/unexpected"), nil)
 			}
 			if err := f.run(t); err == nil {
 				t.Fatal("unsafe app or payload accepted")
@@ -292,12 +265,11 @@ func TestInstallerAppBundleIdentityFences(t *testing.T) {
 	for _, kind := range []string{"support-mismatch", "bundle-version", "newer-installed", "newer-pending", "same-build-conflict", "private-marker-symlink"} {
 		t.Run(kind, func(t *testing.T) {
 			f := installTestFixture(t)
-			f.appBundle(t)
 			install := f.installer
 			newer := metadataTestInfo(t, "124")
 			switch kind {
 			case "support-mismatch":
-				integrationTestWrite(t, filepath.Join(install.payload, "source/build-info.json"), mustMetadataJSON(t, newer))
+				integrationTestWrite(t, filepath.Join(install.app, "Contents/Resources/payload/source/build-info.json"), mustMetadataJSON(t, newer))
 			case "bundle-version":
 				updateTestBundle(t, install.app, "io.went.agent-queue", newer, plist.XMLFormat)
 			case "newer-installed", "newer-pending", "same-build-conflict", "private-marker-symlink":
@@ -338,7 +310,6 @@ func TestInstallerAppBundlePrivatePathsRemainStrict(t *testing.T) {
 	for _, kind := range []string{"state-symlink", "lock-symlink", "config-symlink", "config-writable", "marker-writable"} {
 		t.Run(kind, func(t *testing.T) {
 			f := installTestFixture(t)
-			f.appBundle(t)
 			install := f.installer
 			outside := filepath.Join(install.home, "outside")
 			integrationTestWrite(t, filepath.Join(outside, "keep"), []byte("private external state"))
@@ -397,28 +368,13 @@ func TestInstallerBundleRootOwnershipDoesNotRelaxPrivateReads(t *testing.T) {
 	if info.Uid != 0 || info.Nlink != 1 {
 		t.Skip("system fixture is not a single-link root-owned resource")
 	}
-	if _, err := installReadPayload("/usr", filename, updateMaxArchive, true); err != nil {
+	if _, err := installReadPayload("/usr", filename, updateMaxArchive); err != nil {
 		t.Fatalf("immutable root-owned bundle resource refused: %v", err)
-	}
-	if _, err := installReadPayload("/usr", filename, updateMaxArchive, false); err == nil {
-		t.Fatal("classic payload accepted a foreign-owned file")
 	}
 	if _, err := updateReadOwned(filename, updateMaxArchive); err == nil {
 		t.Fatal("private metadata reader accepted a root-owned file")
 	}
 	if err := installValidateAppPath(integrationHome(), "/Applications/Agent Queue.app"); err != nil {
 		t.Fatalf("system Applications location refused: %v", err)
-	}
-}
-
-func TestInstallerClassicPayloadCanonicalBoundary(t *testing.T) {
-	f := installTestFixture(t)
-	alias := filepath.Join(filepath.Dir(f.installer.payload), "payload-alias")
-	if err := os.Symlink(f.installer.payload, alias); err != nil {
-		t.Fatal(err)
-	}
-	f.installer.payload = alias
-	if err := f.run(t); err != nil {
-		t.Fatalf("classic installer source alias no longer supported: %v", err)
 	}
 }

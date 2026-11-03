@@ -24,8 +24,8 @@ type managedFixture struct {
 
 func managedTestFixture(t *testing.T) *managedFixture {
 	t.Helper()
-	f := installTestFixture(t)
-	app := filepath.Join(f.installer.payload, "Agent Queue.app")
+	f := installBaseFixture(t)
+	app := f.installer.app
 	info, err := updatePlist(filepath.Join(app, "Contents/Info.plist"))
 	if err != nil {
 		t.Fatal(err)
@@ -35,7 +35,7 @@ func managedTestFixture(t *testing.T) *managedFixture {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		integrationTestWrite(t, filepath.Join(app, "Contents/MacOS", name), []byte("#!/bin/sh\nexit 0\n"))
+		integrationTestWrite(t, filepath.Join(app, "Contents/MacOS", name), []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"))
 		if err := os.Chmod(filepath.Join(app, "Contents/MacOS", name), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -50,12 +50,6 @@ func managedTestFixture(t *testing.T) *managedFixture {
 		if err := f.installer.writePlist(filename, Object{"Label": "io.went.agent-" + service, "BundleProgram": "Contents/MacOS/" + helper, "ProgramArguments": []string{helper, command}}); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := installCopyTree(filepath.Join(f.installer.payload, "source"), filepath.Join(app, "Contents/Resources/payload/source")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(filepath.Join(app, "Contents/Resources/payload/source/bin")); err != nil {
-		t.Fatal(err)
 	}
 	m := &managedFixture{installFixture: f, statuses: map[string]string{"queue": "notRegistered", "resources": "notRegistered", "remote": "notRegistered", "login": "notRegistered"}}
 	original := f.installer.command
@@ -158,11 +152,6 @@ func TestManagedFreshInstallUsesOnlyBundleHelpers(t *testing.T) {
 func TestManagedFinderBundleAndPreflightAreReadOnly(t *testing.T) {
 	m := managedTestFixture(t)
 	i := m.installer
-	if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
-		t.Fatal(err)
-	}
-	i.appBundle = true
-	i.payload = filepath.Join(i.app, "Contents/Resources/payload")
 	before := installTreeWitness(t, i.home)
 	report := i.preflight(context.Background())
 	if len(report.Issues) != 0 {
@@ -185,49 +174,70 @@ func TestManagedFinderBundleAndPreflightAreReadOnly(t *testing.T) {
 	}
 }
 
-func TestManagedApprovalFailureRetainsPendingAndNeverReregisters(t *testing.T) {
+// A resumed handover activates its helpers under launchd, so it can still wait
+// for macOS approval. Retrying never registers a service again.
+func TestManagedResumedActivationWaitsForApprovalWithoutReregistering(t *testing.T) {
 	m := managedTestFixture(t)
-	m.approval = "resources"
-	if err := m.run(t); err == nil {
-		t.Fatal("approval refusal completed install")
-	}
 	i := m.installer
-	if _, err := os.Stat(filepath.Join(i.root, "install-in-progress.json")); err != nil {
-		t.Fatal("lost partial-failure marker", err)
+	m.approval = "resources"
+	integrationTestWrite(t, filepath.Join(i.root, "install-in-progress.json"), integrationTestRead(t, filepath.Join(i.app, "Contents/Resources/build-info.json")))
+	published, err := managedCaptureBundle(i.app)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := updateRegisteredApp(); err == nil {
-		t.Fatal("updater ignored pending installation")
+	activate := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := i.managedActivate(ctx, published, false)
+		return err
 	}
-	before := installTreeWitness(t, i.home)
+	var approval *installApprovalError
+	if err := activate(); !errors.As(err, &approval) {
+		t.Fatal("approval refusal completed activation", err)
+	}
 	m.calls = nil
-	if err := m.run(t); err == nil {
-		t.Fatal("approval-required retry completed")
-	}
-	if !reflect.DeepEqual(before, installTreeWitness(t, i.home)) {
-		t.Fatal("denied approval retry changed installation")
+	if err := activate(); !errors.As(err, &approval) {
+		t.Fatal("approval-required retry completed", err)
 	}
 	for _, args := range m.calls {
-		if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" {
+		if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" && args[3] != "queue" {
 			t.Fatal("re-registered approval-required service", args)
 		}
 	}
 	m.approval = ""
 	m.statuses["resources"] = "enabled"
 	m.loaded["io.went.agent-resources"] = true
-	if err := m.run(t); err != nil {
+	if err := activate(); err != nil {
 		t.Fatal("approved retry failed", err)
+	}
+}
+
+func TestManagedResumedActivationRejectsWrongLoadedHelper(t *testing.T) {
+	m := managedOlderRegistration(t)
+	i := m.installer
+	if err := i.managedVerifyRegistrations(context.Background(), false, false, false); err != nil {
+		t.Fatal("registered helpers were refused", err)
+	}
+	original := i.command
+	i.command = func(ctx context.Context, args []string) ([]byte, error) {
+		if slices.Equal(args, []string{"launchctl", "print", i.domain() + "/io.went.agent-heavy"}) {
+			return []byte("program = /unknown\narguments = {\n/unknown\n}\n"), nil
+		}
+		return original(ctx, args)
+	}
+	if err := i.managedVerifyRegistrations(context.Background(), false, false, false); err == nil {
+		t.Fatal("foreign readiness accepted")
 	}
 }
 
 func TestManagedDrainGatePrecedesEveryMutation(t *testing.T) {
 	for _, managed := range []bool{false, true} {
 		t.Run(map[bool]string{false: "legacy", true: "managed"}[managed], func(t *testing.T) {
-			m := managedTestFixture(t)
+			var m *managedFixture
 			if managed {
-				if err := m.run(t); err != nil {
-					t.Fatal(err)
-				}
+				m = managedOlderRegistration(t)
 			} else {
+				m = managedTestFixture(t)
 				i := m.installer
 				for _, directory := range []string{i.state, i.launch} {
 					if err := os.MkdirAll(directory, 0700); err != nil {
@@ -266,19 +276,14 @@ func TestManagedLegacyGoMigrationAndRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := i.validateServices(); err != nil {
-		t.Fatal(err)
-	}
-	if err := i.serviceDefinitions(false); err != nil {
-		t.Fatal(err)
-	}
+	installOlderServiceDefinitions(t, i)
 	for _, name := range []string{"agent-heavy", "agent-remote"} {
 		integrationTestWrite(t, filepath.Join(i.root, "bin", name), []byte("old helper"))
 	}
 	m.loaded["io.went.agent-heavy"] = true
 	m.loaded["io.went.agent-resources"] = true
 	m.loaded["io.went.agent-queue"] = true
-	m.nativeFailure = "register resources"
+	m.nativeFailure = "register login"
 	if err := m.run(t); err == nil {
 		t.Fatal("missing native failure")
 	}
@@ -347,21 +352,18 @@ func TestManagedInvalidNativeJSONAndInstallationMetadata(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			m := managedTestFixture(t)
 			i := m.installer
-			if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
-				t.Fatal(err)
-			}
 			switch kind {
 			case "json":
 				m.badStatus = true
 			case "metadata":
 				integrationTestWrite(t, filepath.Join(i.root, "installation.json"), []byte(`{"schemaVersion":99,"app":"/unknown","serviceManagement":true}`))
 			case "marker":
-				info, err := updatePlist(filepath.Join(i.payload, "Agent Queue.app/Contents/Info.plist"))
+				info, err := updatePlist(filepath.Join(i.app, "Contents/Info.plist"))
 				if err != nil {
 					t.Fatal(err)
 				}
 				info["AgentQueueServiceManagement"] = "true"
-				if err := i.writePlist(filepath.Join(i.payload, "Agent Queue.app/Contents/Info.plist"), info); err != nil {
+				if err := i.writePlist(filepath.Join(i.app, "Contents/Info.plist"), info); err != nil {
 					t.Fatal(err)
 				}
 			case "signature":
@@ -375,37 +377,6 @@ func TestManagedInvalidNativeJSONAndInstallationMetadata(t *testing.T) {
 				t.Fatal("invalid install mutated home")
 			}
 		})
-	}
-}
-
-func TestManagedReplacementRetainsPreviousUntilSuccessfulRetry(t *testing.T) {
-	m := managedTestFixture(t)
-	i := m.installer
-	if err := m.run(t); err != nil {
-		t.Fatal(err)
-	}
-	previousDigest, err := managedBundleDigest(i.app)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Different signed bytes with the same development identity still require a
-	// drained service restart; signature verification is mocked by this fixture.
-	integrationTestWrite(t, filepath.Join(i.payload, "Agent Queue.app/Contents/Resources/new-resource"), []byte("new bundle bytes"))
-	m.nativeFailure = "register resources"
-	if err := m.run(t); err == nil {
-		t.Fatal("missing partial replacement failure")
-	}
-	backup := filepath.Join(filepath.Dir(i.app), ".Agent Queue.previous.app")
-	digest, err := managedBundleDigest(backup)
-	if err != nil || digest != previousDigest {
-		t.Fatal("known-good bundle lost", err)
-	}
-	m.nativeFailure = ""
-	if err := m.run(t); err != nil {
-		t.Fatal("replacement retry", err)
-	}
-	if _, err := os.Lstat(backup); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("completed retry did not retire backup", err)
 	}
 }
 
@@ -442,10 +413,7 @@ func TestManagedOfflineDrainReadsPrivateCopy(t *testing.T) {
 }
 
 func TestManagedUnregistrationMustCompleteBeforeReplacement(t *testing.T) {
-	m := managedTestFixture(t)
-	if err := m.run(t); err != nil {
-		t.Fatal(err)
-	}
+	m := managedOlderRegistration(t)
 	m.nativeFailure = "unregister queue"
 	before := installBundleSnapshot(t, m.installer.app)
 	if err := m.run(t); err == nil {
@@ -456,42 +424,9 @@ func TestManagedUnregistrationMustCompleteBeforeReplacement(t *testing.T) {
 	}
 }
 
-func TestManagedInterruptedPublicationRestoresKnownGoodThenRetries(t *testing.T) {
-	m := managedTestFixture(t)
-	i := m.installer
-	if err := m.run(t); err != nil {
-		t.Fatal(err)
-	}
-	old, err := os.ReadFile(filepath.Join(i.root, "build-info.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	integrationTestWrite(t, filepath.Join(i.root, "install-in-progress.json"), old)
-	for _, service := range []string{"queue", "resources", "login"} {
-		m.statuses[service] = "notRegistered"
-	}
-	m.loaded = map[string]bool{}
-	backup := filepath.Join(filepath.Dir(i.app), ".Agent Queue.previous.app")
-	identity, err := managedCaptureBundle(i.app)
-	if err != nil {
-		t.Fatal(err)
-	}
-	receipt := managedPublicationReceipt{SchemaVersion: 1, App: i.app, Pending: identity.Build, Candidate: identity, Backup: &identity}
-	integrationTestWrite(t, i.managedReceiptPath(), mustMetadataJSON(t, receipt))
-	if err := os.Rename(i.app, backup); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.run(t); err != nil {
-		t.Fatal("interrupted publication could not recover", err)
-	}
-	if _, err := os.Stat(filepath.Join(i.app, "Contents/MacOS/AgentQueue")); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestManagedPendingIdentityRefusesDowngrade(t *testing.T) {
 	m := managedTestFixture(t)
-	m.nativeFailure = "register resources"
+	m.nativeFailure = "register login"
 	if err := m.run(t); err == nil {
 		t.Fatal("missing pending install")
 	}
@@ -507,33 +442,10 @@ func TestManagedPendingIdentityRefusesDowngrade(t *testing.T) {
 	}
 }
 
-func TestManagedReadinessRejectsWrongLoadedHelper(t *testing.T) {
-	m := managedTestFixture(t)
-	i := m.installer
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if m.statuses["queue"] == "enabled" && slices.Equal(args, []string{"launchctl", "print", i.domain() + "/io.went.agent-heavy"}) {
-			return []byte("program = /unknown\narguments = {\n/unknown\n}\n"), nil
-		}
-		return original(ctx, args)
-	}
-	if err := m.run(t); err == nil {
-		t.Fatal("foreign readiness accepted")
-	}
-	if _, err := os.Stat(filepath.Join(i.root, "install-in-progress.json")); err != nil {
-		t.Fatal("lost pending marker", err)
-	}
-}
-
 func TestManagedCustomFinderLocationIsReadBackByUpdater(t *testing.T) {
 	m := managedTestFixture(t)
 	i := m.installer
-	i.app = filepath.Join(i.home, "Applications/Finder Copied Queue.app")
-	if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
-		t.Fatal(err)
-	}
-	i.payload = filepath.Join(i.app, "Contents/Resources/payload")
-	i.appBundle = true
+	installMoveBundle(t, i, filepath.Join(i.home, "Applications/Finder Copied Queue.app"))
 	if err := m.run(t); err != nil {
 		t.Fatal(err)
 	}
@@ -616,7 +528,7 @@ func TestManagedRejectsEmbeddedExecutableCopiesAndWrongStaticArguments(t *testin
 		t.Run(kind, func(t *testing.T) {
 			m := managedTestFixture(t)
 			i := m.installer
-			app := filepath.Join(i.payload, "Agent Queue.app")
+			app := i.app
 			switch kind {
 			case "bin":
 				integrationTestWrite(t, filepath.Join(app, "Contents/Resources/payload/source/bin/agent-heavy"), []byte("duplicate"))
@@ -635,7 +547,7 @@ func TestManagedRejectsEmbeddedExecutableCopiesAndWrongStaticArguments(t *testin
 				if err := os.Remove(helper); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.Symlink(filepath.Join(i.payload, "source/bin/agent-heavy"), helper); err != nil {
+				if err := os.Symlink(filepath.Join(i.home, "outside-helper"), helper); err != nil {
 					t.Fatal(err)
 				}
 			case "support-identity":
@@ -701,18 +613,8 @@ func TestManagedFinderTargetMigratesOldCanonicalMenuLocation(t *testing.T) {
 	if err := os.MkdirAll(i.launch, 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := i.validateServices(); err != nil {
-		t.Fatal(err)
-	}
-	if err := i.serviceDefinitions(false); err != nil {
-		t.Fatal(err)
-	}
-	i.app = filepath.Join(i.home, "Applications/Finder Copied Queue.app")
-	if err := installCopyTree(filepath.Join(i.payload, "Agent Queue.app"), i.app); err != nil {
-		t.Fatal(err)
-	}
-	i.payload = filepath.Join(i.app, "Contents/Resources/payload")
-	i.appBundle = true
+	installOlderServiceDefinitions(t, i)
+	installMoveBundle(t, i, filepath.Join(i.home, "Applications/Finder Copied Queue.app"))
 	if err := m.run(t); err != nil {
 		t.Fatal("explicit Finder target failed to adopt canonical old menu", err)
 	}

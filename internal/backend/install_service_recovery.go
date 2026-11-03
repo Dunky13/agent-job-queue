@@ -184,9 +184,11 @@ func (install *installer) validateRestoredEnvironment(label, key, value string) 
 
 func (install *installer) missingServiceDefinitions(ctx context.Context) ([]installMissingService, error) {
 	missing := []installMissingService{}
-	if err := install.validateServices(); err != nil {
+	slot, err := install.validateServices()
+	if err != nil {
 		return nil, err
 	}
+	install.serviceSlot = slot
 	for _, label := range installBackgroundLabels {
 		output, loaded, err := install.inspectService(ctx, label)
 		if err != nil {

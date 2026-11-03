@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/sys/unix"
 	"howett.net/plist"
 )
 
@@ -30,9 +29,17 @@ type installFixture struct {
 	loaded    map[string]bool
 	calls     [][]string
 	fail      string
+	// seededPending marks a pending marker the fixture wrote itself, not setup.
+	seededPending bool
 }
 
 func installTestFixture(t *testing.T) *installFixture {
+	t.Helper()
+	return managedTestFixture(t).installFixture
+}
+
+// installBaseFixture puts a marked bundle where the user dropped it and mocks launchctl.
+func installBaseFixture(t *testing.T) *installFixture {
 	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -49,7 +56,6 @@ func installTestFixture(t *testing.T) *installFixture {
 			t.Fatal(err)
 		}
 	}
-	payload := filepath.Join(base, "payload")
 	tools := filepath.Join(base, "tools")
 	if err := os.Mkdir(tools, 0700); err != nil {
 		t.Fatal(err)
@@ -61,22 +67,16 @@ func installTestFixture(t *testing.T) *installFixture {
 			t.Fatal(err)
 		}
 	}
+	install := &installer{home: home, root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: filepath.Join(home, "Applications/Agent Queue.app"), path: tools, testing: true}
 	info := metadataTestInfo(t, "123")
-	updateTestBundle(t, filepath.Join(payload, "Agent Queue.app"), "io.went.agent-queue", info, plist.BinaryFormat)
-	integrationTestWrite(t, filepath.Join(payload, "Agent Queue.app/Contents/MacOS/AgentQueue"), []byte("prebuilt app"))
-	if err := os.Chmod(filepath.Join(payload, "Agent Queue.app/Contents/MacOS/AgentQueue"), 0700); err != nil {
+	updateTestBundle(t, install.app, "io.went.agent-queue", info, plist.BinaryFormat)
+	integrationTestWrite(t, filepath.Join(install.app, "Contents/MacOS/AgentQueue"), []byte("prebuilt app"))
+	if err := os.Chmod(filepath.Join(install.app, "Contents/MacOS/AgentQueue"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	integrationTestWrite(t, filepath.Join(payload, "source/build-info.json"), mustMetadataJSON(t, info))
-	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		filename := filepath.Join(payload, "source/bin", name)
-		integrationTestWrite(t, filename, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"))
-		if err := os.Chmod(filename, 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	integrationTestWrite(t, filepath.Join(payload, "source/VERSION"), []byte("0.1.0\n"))
-	install := &installer{home: home, payload: payload, root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: filepath.Join(home, "Applications/Agent Queue.app"), path: tools, testing: true}
+	support := filepath.Join(install.app, "Contents/Resources/payload/source")
+	integrationTestWrite(t, filepath.Join(support, "build-info.json"), mustMetadataJSON(t, info))
+	integrationTestWrite(t, filepath.Join(support, "VERSION"), []byte("0.1.0\n"))
 	f := &installFixture{installer: install, tasks: Object{}, groups: Object{"default": Object{"parallel_tasks": 1, "status": "Running"}}, loaded: map[string]bool{}}
 	install.command = func(_ context.Context, args []string) ([]byte, error) {
 		f.calls = append(f.calls, append([]string{}, args...))
@@ -112,10 +112,6 @@ func installTestFixture(t *testing.T) *installFixture {
 					integrationTestWrite(t, filepath.Join(install.state, "pueue/state.json"), mustMetadataJSON(t, f.snapshot()))
 				}
 				delete(f.loaded, filepath.Base(args[2]))
-			case "kickstart":
-				if _, err := os.Stat(filepath.Join(install.root, "install-in-progress.json")); err != nil {
-					t.Fatal("controller restart must happen before completion")
-				}
 			}
 		}
 		if args[0] == "pueue" && strings.Contains(joined, "status --json") {
@@ -124,15 +120,124 @@ func installTestFixture(t *testing.T) *installFixture {
 			}
 			return mustMetadataJSON(t, f.snapshot()), nil
 		}
-		if args[0] == filepath.Join(install.root, "bin/agent-heavy") && strings.Contains(joined, "status --json") {
-			if !f.loaded["io.went.agent-heavy"] {
-				return nil, errors.New("fixture embedded daemon is not running")
-			}
-			return mustMetadataJSON(t, f.snapshot()), nil
-		}
 		return nil, nil
 	}
 	return f
+}
+
+// writePlist writes what older releases' service definitions and the bundle hold.
+func (install *installer) writePlist(filename string, value Object) error {
+	raw, err := plist.MarshalIndent(value, plist.XMLFormat, "  ")
+	if err != nil {
+		return err
+	}
+	return installAtomic(filename, raw, 0600)
+}
+
+func installCopyTree(source, destination string) error {
+	if err := installDirectory(destination); err != nil {
+		return err
+	}
+	return filepath.WalkDir(source, func(filename string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(source, filename)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(destination, relative)
+		if entry.IsDir() {
+			return installDirectory(target)
+		}
+		if !entry.Type().IsRegular() {
+			return errors.New("Application payload contains a symlink or special file")
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		raw, err := installReadPayload(source, filename, updateMaxArchive)
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(0600)
+		if info.Mode().Perm()&0111 != 0 {
+			mode = 0700
+		}
+		return installAtomic(target, raw, mode)
+	})
+}
+
+// installOlderServiceDefinitions writes the launchd definitions older releases
+// left. This build only retires them.
+func installOlderServiceDefinitions(t *testing.T, install *installer) {
+	t.Helper()
+	for _, directory := range []string{install.launch, install.root, install.state} {
+		if err := os.MkdirAll(directory, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	slot, err := install.validateServices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	install.serviceSlot = slot
+	environment := install.serviceEnvironment(Object{"PATH": ToolPath})
+	definitions := map[string]Object{
+		"io.went.agent-heavy":     {"Label": "io.went.agent-heavy", "ProgramArguments": []string{filepath.Join(install.root, "bin/agent-heavy"), "daemon"}, "EnvironmentVariables": environment, "KeepAlive": Object{"SuccessfulExit": false}, "RunAtLoad": true, "StandardErrorPath": filepath.Join(install.state, "daemon.log"), "StandardOutPath": filepath.Join(install.state, "daemon.log"), "ThrottleInterval": 10, "Umask": 077, "WorkingDirectory": install.state},
+		"io.went.agent-resources": {"Label": "io.went.agent-resources", "ProgramArguments": []string{filepath.Join(install.root, "bin/agent-heavy"), "scheduler"}, "EnvironmentVariables": environment, "KeepAlive": true, "RunAtLoad": true, "ThrottleInterval": 10, "Umask": 077, "StandardErrorPath": filepath.Join(install.state, "resources.log"), "StandardOutPath": filepath.Join(install.state, "resources.log"), "WorkingDirectory": install.state},
+		"io.went.agent-queue":     {"Label": "io.went.agent-queue", "ProgramArguments": []string{"/usr/bin/open", "-a", install.app}, "RunAtLoad": true, "KeepAlive": false},
+	}
+	for label, definition := range definitions {
+		if err := install.writePlist(filepath.Join(install.launch, label+".plist"), definition); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// installOlderEmbedded leaves an installation from before the location record
+// whose queue runs from a copied executable.
+func installOlderEmbedded(t *testing.T, install *installer) {
+	t.Helper()
+	installOlderUnmarkedState(t, install)
+	for _, name := range []string{"agent-heavy", "agent-remote"} {
+		filename := filepath.Join(install.root, "bin", name)
+		integrationTestWrite(t, filename, []byte("#!/bin/sh\nexit 0\n"))
+		if err := os.Chmod(filename, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// installOlderEmbeddedBlocked also leaves a stopped store and unfinished cleanup,
+// which is what sends preflight to its detailed review of an older installation.
+func installOlderEmbeddedBlocked(t *testing.T, install *installer) {
+	t.Helper()
+	installOlderEmbedded(t, install)
+	store, err := openQueueStore(install.state, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.close()
+	integrationTestWrite(t, filepath.Join(install.state, "receipts/9.json"), []byte(`{"task_id":9,"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
+}
+
+// installOlderUnmarkedState leaves a completed installation from before the
+// location record: its app is known only from its login launch agent.
+func installOlderUnmarkedState(t *testing.T, install *installer) {
+	t.Helper()
+	installOlderServiceDefinitions(t, install)
+	integrationTestWrite(t, filepath.Join(install.root, "build-info.json"), integrationTestRead(t, filepath.Join(install.app, "Contents/Resources/build-info.json")))
+}
+
+// installMoveBundle moves the fixture's bundle to app, as Finder would.
+func installMoveBundle(t *testing.T, install *installer, app string) {
+	t.Helper()
+	if err := os.Rename(install.app, app); err != nil {
+		t.Fatal(err)
+	}
+	install.app = app
 }
 
 func (f *installFixture) snapshot() Object {
@@ -166,7 +271,7 @@ func (f *installFixture) legacy(t *testing.T) {
 	configuration["daemon"].(Object)["callback"] = installQuote(filepath.Join(install.root, ".venv/bin/python")) + " " + installQuote(filepath.Join(install.root, "agent_heavy.py")) + " cleanup {{ id }}"
 	configuration["client"].(Object)["custom-option"] = "preserve me"
 	integrationTestWrite(t, filepath.Join(install.config, "pueue.yml"), mustMetadataJSON(t, configuration))
-	controller := Object{"Label": "io.went.agent-resources", "ProgramArguments": []string{filepath.Join(install.root, ".venv/bin/python"), filepath.Join(install.root, "agent_heavy.py"), "scheduler"}, "EnvironmentVariables": Object{"CUSTOM_OPERATOR_VALUE": "retained"}, "KeepAlive": true}
+	controller := Object{"Label": "io.went.agent-resources", "ProgramArguments": []string{filepath.Join(install.root, ".venv/bin/python"), filepath.Join(install.root, "agent_heavy.py"), "scheduler"}, "EnvironmentVariables": Object{}, "KeepAlive": true}
 	data, err := plist.Marshal(controller, plist.XMLFormat)
 	if err != nil {
 		t.Fatal(err)
@@ -195,15 +300,7 @@ func TestInstallerFreshPythonFreeAndPrivate(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(install.config, "pueue.yml")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("fresh embedded install generated legacy queue configuration")
 	}
-	controller, err := updatePlist(filepath.Join(install.launch, "io.went.agent-resources.plist"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	args := controller["ProgramArguments"].([]any)
-	if len(args) != 2 || args[0] != filepath.Join(install.root, "bin/agent-heavy") || args[1] != "scheduler" {
-		t.Fatalf("Go controller %v", args)
-	}
-	for _, filename := range []string{filepath.Join(install.root, "build-info.json"), filepath.Join(install.launch, "io.went.agent-heavy.plist")} {
+	for _, filename := range []string{filepath.Join(install.root, "build-info.json"), filepath.Join(install.root, "installation.json")} {
 		info, err := os.Stat(filename)
 		if err != nil || info.Mode().Perm() != 0600 {
 			t.Fatalf("private file %s: %v %v", filename, info, err)
@@ -246,13 +343,8 @@ func TestInstallerNeedsNoExternalRuntimeTools(t *testing.T) {
 			t.Fatalf("unexpected runtime prerequisite: %v", args)
 		}
 	}
-	queue, err := updatePlist(filepath.Join(install.launch, "io.went.agent-heavy.plist"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	args, err := stringsFrom(queue["ProgramArguments"])
-	if err != nil || !slices.Equal(args, []string{filepath.Join(install.root, "bin/agent-heavy"), "daemon"}) {
-		t.Fatalf("queue does not use installed embedded daemon: %v %v", args, err)
+	if _, err := os.Lstat(install.launch); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("setup created launchd definitions: %v", err)
 	}
 }
 
@@ -268,16 +360,14 @@ func TestInstallerEnabledRemoteMigratesBeforeCompletionAndRetainsFailureMarker(t
 	certificate := filepath.Join(install.state, "remote/caddy/pki/authorities/local/root.crt")
 	integrationTestWrite(t, certificate, []byte("preserved private CA fixture"))
 	previous := integrationTestRead(t, filepath.Join(install.root, "build-info.json"))
-	identity := metadataTestInfo(t, "124")
-	integrationTestWrite(t, filepath.Join(install.payload, "source/build-info.json"), mustMetadataJSON(t, identity))
-	updateTestBundle(t, filepath.Join(install.payload, "Agent Queue.app"), "io.went.agent-queue", identity, plist.XMLFormat)
+	managedBundleBuild(t, install, install.app, "124")
 	// Active Go queue work stays with its existing daemon during remote migration.
 	f.tasks = Object{"3": Object{"status": Object{"Running": Object{}}, "command": "existing Go job"}}
 	command := install.command
 	migrations := 0
 	failMigration := true
 	install.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if args[0] == filepath.Join(install.root, "bin/agent-remote") {
+		if args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote") {
 			if len(args) != 2 || args[1] != "migrate" {
 				t.Fatalf("unexpected remote migration: %v", args)
 			}
@@ -294,7 +384,7 @@ func TestInstallerEnabledRemoteMigratesBeforeCompletionAndRetainsFailureMarker(t
 		}
 		return command(ctx, args)
 	}
-	if err := f.run(t); err == nil || !strings.Contains(err.Error(), "Remote access migration did not finish") {
+	if err := f.run(t); err == nil || !strings.Contains(err.Error(), "Managed phone access migration is incomplete") {
 		t.Fatalf("failed migration reported complete: %v", err)
 	}
 	if !bytes.Equal(previous, integrationTestRead(t, filepath.Join(install.root, "build-info.json"))) {
@@ -377,7 +467,7 @@ func TestInstallerDisabledRemoteReconcilesStaleOwnedServicesBeforeCompletion(t *
 			cleanups := 0
 			failCleanup := true
 			install.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if args[0] == filepath.Join(install.root, "bin/agent-remote") {
+				if args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote") {
 					if len(args) != 2 || args[1] != "migrate" {
 						t.Fatalf("disabled service was reactivated: %v", args)
 					}
@@ -391,7 +481,7 @@ func TestInstallerDisabledRemoteReconcilesStaleOwnedServicesBeforeCompletion(t *
 				}
 				return command(ctx, args)
 			}
-			if err := f.run(t); err == nil || !strings.Contains(err.Error(), "Disabled remote service cleanup did not finish") {
+			if err := f.run(t); err == nil || !strings.Contains(err.Error(), "Managed phone access migration is incomplete") {
 				t.Fatalf("stale service was reported retired: %v", err)
 			}
 			if _, err := updateInstalled(install.root, install.app); err == nil || !strings.Contains(err.Error(), "incomplete") {
@@ -401,7 +491,8 @@ func TestInstallerDisabledRemoteReconcilesStaleOwnedServicesBeforeCompletion(t *
 			if err := f.run(t); err != nil {
 				t.Fatal(err)
 			}
-			if cleanups != 2 {
+			// The failed attempt already retired the loaded service's definition.
+			if expected := map[string]int{"loaded": 1}[state]; expected != 0 && cleanups != expected || expected == 0 && cleanups != 2 {
 				t.Fatalf("stale ownership cleanup was not retried: %d", cleanups)
 			}
 			if !bytes.Equal(credentials, integrationTestRead(t, configPath)) || string(integrationTestRead(t, certificate)) != "preserved private CA fixture" {
@@ -411,7 +502,7 @@ func TestInstallerDisabledRemoteReconcilesStaleOwnedServicesBeforeCompletion(t *
 	}
 }
 
-func TestInstallerRemoteMigrationRespectsConcurrentDisableAndControlLock(t *testing.T) {
+func TestInstallerRemoteControlLockSerializesSetup(t *testing.T) {
 	f := installTestFixture(t)
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
@@ -419,7 +510,6 @@ func TestInstallerRemoteMigrationRespectsConcurrentDisableAndControlLock(t *test
 	install := f.installer
 	config := filepath.Join(install.config, "remote.json")
 	enabled := []byte(`{"enabled":true,"secret_key":"preserved fixture"}`)
-	disabled := []byte(`{"enabled":false,"secret_key":"preserved fixture"}`)
 	integrationTestWrite(t, config, enabled)
 	remoteState := filepath.Join(install.state, "remote")
 	lock, err := installLock(remoteState, "control.lock")
@@ -428,104 +518,11 @@ func TestInstallerRemoteMigrationRespectsConcurrentDisableAndControlLock(t *test
 	}
 	err = f.run(t)
 	lock.Close()
-	if err == nil || !strings.Contains(err.Error(), "remote settings operation") {
+	if err == nil || !strings.Contains(err.Error(), "Another installer or queue change is running") {
 		t.Fatalf("installer did not serialize with remote control: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(install.root, "install-in-progress.json")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("remote lock contention changed installation")
-	}
-	command := install.command
-	changed, migrated := false, false
-	install.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if args[0] == "launchctl" && len(args) > 2 && args[1] == "print" && strings.HasSuffix(args[2], "/io.went.agent-heavy") && !changed {
-			if _, err := os.Stat(filepath.Join(install.root, "install-in-progress.json")); err == nil {
-				control, err := installLock(remoteState, "control.lock")
-				if err != nil {
-					t.Fatalf("installer retained remote lock after stable binary publication: %v", err)
-				}
-				integrationTestWrite(t, config, disabled)
-				control.Close()
-				changed = true
-			}
-		}
-		if args[0] == filepath.Join(install.root, "bin/agent-remote") {
-			if len(args) != 2 || args[1] != "migrate" {
-				t.Fatalf("snapshot action could undo latest user choice: %v", args)
-			}
-			if !changed || !bytes.Equal(integrationTestRead(t, config), disabled) {
-				t.Fatal("migrate did not receive the latest disabled choice")
-			}
-			control, err := installLock(remoteState, "control.lock")
-			if err != nil {
-				t.Fatalf("installer would deadlock remote migration: %v", err)
-			}
-			control.Close()
-			migrated = true
-		}
-		return command(ctx, args)
-	}
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
-	if !migrated || !bytes.Equal(integrationTestRead(t, config), disabled) {
-		t.Fatal("concurrent disable was lost")
-	}
-}
-
-func TestInstallerRemoteCopyFailurePreservesOldSupportAndRetriesMigration(t *testing.T) {
-	f := installTestFixture(t)
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
-	install := f.installer
-	credentials := []byte(`{"enabled":true,"secret_key":"preserved fixture"}`)
-	config := filepath.Join(install.config, "remote.json")
-	integrationTestWrite(t, config, credentials)
-	binary := filepath.Join(install.root, "bin/agent-remote")
-	oldBinary := integrationTestRead(t, binary)
-	outside := filepath.Join(install.home, "unrelated executable")
-	integrationTestWrite(t, outside, []byte("unrelated private content"))
-	if err := os.Remove(binary); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(outside, binary); err != nil {
-		t.Fatal(err)
-	}
-	command := install.command
-	migrations := 0
-	install.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if args[0] == binary {
-			migrations++
-		}
-		return command(ctx, args)
-	}
-	if err := f.run(t); err == nil {
-		t.Fatal("unsafe runtime destination was overwritten")
-	}
-	if migrations != 0 {
-		t.Fatal("failed runtime copy invoked migration")
-	}
-	if _, err := updateInstalled(install.root, install.app); err == nil || !strings.Contains(err.Error(), "incomplete") {
-		t.Fatalf("failed runtime copy lost pending marker: %v", err)
-	}
-	if string(integrationTestRead(t, outside)) != "unrelated private content" || !bytes.Equal(integrationTestRead(t, config), credentials) {
-		t.Fatal("failed copy changed unrelated data or credentials")
-	}
-	if err := os.Remove(binary); err != nil {
-		t.Fatal(err)
-	}
-	integrationTestWrite(t, binary, oldBinary)
-	if err := os.Chmod(binary, 0700); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
-	if migrations != 1 {
-		t.Fatalf("runtime copy retry did not reconcile old service: %d", migrations)
-	}
-	if _, err := updateInstalled(install.root, install.app); err != nil {
-		t.Fatalf("runtime copy retry did not complete: %v", err)
 	}
 }
 
@@ -537,7 +534,6 @@ func TestInstallerUpgradePreservesPrivateDataAndExistingDaemon(t *testing.T) {
 	install := f.installer
 	// An embedded upgrade also retains an existing inert legacy configuration.
 	integrationTestWrite(t, filepath.Join(install.config, "pueue.yml"), mustMetadataJSON(t, install.freshConfig()))
-	config := integrationTestRead(t, filepath.Join(install.config, "pueue.yml"))
 	privateFiles := map[string][]byte{filepath.Join(install.state, "learning.sqlite"): []byte("private database"), filepath.Join(install.state, "jobs/private-job.json"): []byte("private job"), filepath.Join(install.config, "remote.json"): []byte(`{"enabled":true,"secret_key":"fixture-secret"}`)}
 	for name, data := range privateFiles {
 		integrationTestWrite(t, name, data)
@@ -547,8 +543,9 @@ func TestInstallerUpgradePreservesPrivateDataAndExistingDaemon(t *testing.T) {
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(config, integrationTestRead(t, filepath.Join(install.config, "pueue.yml"))) {
-		t.Fatal("existing config changed")
+	node, err := installConfig(filepath.Join(install.config, "pueue.yml"))
+	if err != nil || installYAMLValue(installYAMLValue(node, "client"), "edit_mode").Value != "files" {
+		t.Fatal("existing config lost its settings", err)
 	}
 	for name, data := range privateFiles {
 		if !bytes.Equal(integrationTestRead(t, name), data) {
@@ -581,7 +578,7 @@ func TestInstallerLegacyHomebrewPythonCallbackMigratesAndRetries(t *testing.T) {
 		t.Fatal(err)
 	}
 	callback, err := installConfigCallback(config)
-	if err != nil || callback != installQuote(filepath.Join(install.root, "bin/agent-heavy"))+" cleanup {{ id }}" {
+	if err != nil || callback != installQuote(filepath.Join(install.home, ".local/bin/agent-heavy"))+" cleanup {{ id }}" {
 		t.Fatalf("cleanup callback was not migrated: %q %v", callback, err)
 	}
 	if installYAMLValue(installYAMLValue(config, "client"), "custom-option").Value != "preserve me" {
@@ -736,7 +733,7 @@ func TestInstallerCustomCleanupCallbacksRejectBeforeTransaction(t *testing.T) {
 				private := filepath.Join(install.state, "jobs/operator-state.json")
 				integrationTestWrite(t, private, []byte("operator state"))
 				err := f.run(t)
-				if err == nil || !strings.Contains(err.Error(), "callback is customized") {
+				if !errors.Is(err, errInstallCustomCallback) {
 					t.Fatalf("custom callback not rejected: %q %v", callback, err)
 				}
 				if !bytes.Equal(raw, integrationTestRead(t, configPath)) || string(integrationTestRead(t, private)) != "operator state" {
@@ -747,11 +744,7 @@ func TestInstallerCustomCleanupCallbacksRejectBeforeTransaction(t *testing.T) {
 						t.Fatalf("rejected callback published transaction: %s %v", filename, err)
 					}
 				}
-				for _, args := range f.calls {
-					if len(args) < 2 || args[0] != "launchctl" || args[1] != "print" {
-						t.Fatalf("rejected callback invoked a command beyond service inspection: %v", args)
-					}
-				}
+				managedRequireNoServiceMutation(t, f.calls)
 			})
 		}
 	}
@@ -766,24 +759,13 @@ func TestInstallerCleanupCallbackLiteralInstalledPaths(t *testing.T) {
 			if name != "plain" {
 				install.root += " ' $literal `literal` \\"
 			}
-			f.legacy(t)
 			script := installQuote(filepath.Join(install.root, "agent_heavy.py"))
 			if name == "unsafe-double-quotes" {
 				// Tokenization alone would hide expansions inside this quoted path.
 				script = "\"" + filepath.Join(install.root, "agent_heavy.py") + "\""
 			}
-			config := install.freshConfig()
-			config["daemon"].(Object)["callback"] = "python3 " + script + " cleanup {{ id }}"
-			configPath := filepath.Join(install.config, "pueue.yml")
-			raw := mustMetadataJSON(t, config)
-			integrationTestWrite(t, configPath, raw)
-			err := f.run(t)
-			if name == "unsafe-double-quotes" {
-				if err == nil || !strings.Contains(err.Error(), "callback is customized") || !bytes.Equal(raw, integrationTestRead(t, configPath)) {
-					t.Fatalf("unsafe quoted callback was not preserved: %v", err)
-				}
-			} else if err != nil {
-				t.Fatalf("literal installed path rejected: %v", err)
+			if got := install.standardCleanupCallback("python3 " + script + " cleanup {{ id }}"); got != (name != "unsafe-double-quotes") {
+				t.Fatalf("callback for %s classified as standard=%v", name, got)
 			}
 		})
 	}
@@ -815,12 +797,10 @@ func TestInstallerLegacyDrainedMigrationRemovesRuntimeAndUpdatesOwnedHooks(t *te
 	if installYAMLValue(installYAMLValue(config, "client"), "custom-option").Value != "preserve me" {
 		t.Fatal("custom configuration lost")
 	}
-	controller, err := updatePlist(filepath.Join(install.launch, "io.went.agent-resources.plist"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if controller["EnvironmentVariables"].(map[string]any)["CUSTOM_OPERATOR_VALUE"] != "retained" {
-		t.Fatal("operator environment lost")
+	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
+		if _, err := os.Lstat(filepath.Join(install.launch, label+".plist")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("legacy definition %s not retired: %v", label, err)
+		}
 	}
 	if !bytes.Equal(secret, integrationTestRead(t, filepath.Join(install.config, "remote.json"))) {
 		t.Fatal("remote credentials changed")
@@ -851,7 +831,6 @@ func TestInstallerLegacyExplicitProgramMigratesQueueAndController(t *testing.T) 
 			t.Fatal(err)
 		}
 		definition["Program"] = args[0]
-		definition["ThrottleInterval"] = 37
 		if err := install.writePlist(filename, definition); err != nil {
 			t.Fatal(err)
 		}
@@ -859,20 +838,12 @@ func TestInstallerLegacyExplicitProgramMigratesQueueAndController(t *testing.T) 
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
 	}
-	for label, command := range map[string]string{"io.went.agent-heavy": "daemon", "io.went.agent-resources": "scheduler"} {
-		definition, err := updatePlist(filepath.Join(install.launch, label+".plist"))
-		if err != nil {
-			t.Fatal(err)
+	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
+		if _, err := os.Lstat(filepath.Join(install.launch, label+".plist")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s definition with an explicit Program was not retired: %v", label, err)
 		}
-		if _, present := definition["Program"]; present {
-			t.Fatalf("%s retained obsolete explicit Program", label)
-		}
-		args, err := stringsFrom(definition["ProgramArguments"])
-		if err != nil || !slices.Equal(args, []string{filepath.Join(install.root, "bin/agent-heavy"), command}) {
-			t.Fatalf("%s did not adopt the installed Go executable: %v %v", label, args, err)
-		}
-		if interval, valid := integer(definition["ThrottleInterval"]); !valid || interval != 37 {
-			t.Fatalf("%s lost its operator setting", label)
+		if f.loaded[label] {
+			t.Fatalf("%s is still loaded", label)
 		}
 	}
 }
@@ -921,12 +892,12 @@ func TestInstallerReservedServiceEnvironmentMismatchRejectsBeforeMutation(t *tes
 			for _, key := range []string{"HOME", "AGENT_HEAVY_STATE", "AGENT_HEAVY_CONFIG"} {
 				t.Run(phase+"/"+label+"/"+key, func(t *testing.T) {
 					f := installTestFixture(t)
+					install := f.installer
 					if phase == "legacy" {
 						f.legacy(t)
-					} else if err := f.run(t); err != nil {
-						t.Fatal(err)
+					} else {
+						installOlderEmbedded(t, install)
 					}
-					install := f.installer
 					filename := filepath.Join(install.launch, label+".plist")
 					definition, err := updatePlist(filename)
 					if err != nil {
@@ -975,14 +946,14 @@ func TestInstallerConfiguredServiceSlotRemainsAuthoritative(t *testing.T) {
 	for _, phase := range []string{"legacy", "embedded"} {
 		t.Run(phase, func(t *testing.T) {
 			f := installTestFixture(t)
+			install := f.installer
 			if phase == "legacy" {
 				f.legacy(t)
-			} else if err := f.run(t); err != nil {
-				t.Fatal(err)
+			} else {
+				installOlderEmbedded(t, install)
 			}
-			install := f.installer
 			slot := filepath.Join(install.home, "Configured Queue Slot")
-			expected := Object{"HOME": install.home, "AGENT_HEAVY_STATE": install.state, "AGENT_HEAVY_CONFIG": filepath.Join(install.config, "pueue.yml"), "AGENT_HEAVY_LEGACY_SLOT": slot, "CUSTOM_OPERATOR_VALUE": "retained"}
+			expected := Object{"HOME": install.home, "AGENT_HEAVY_STATE": install.state, "AGENT_HEAVY_CONFIG": filepath.Join(install.config, "pueue.yml"), "AGENT_HEAVY_LEGACY_SLOT": slot}
 			for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
 				filename := filepath.Join(install.launch, label+".plist")
 				definition, err := updatePlist(filename)
@@ -1001,17 +972,9 @@ func TestInstallerConfiguredServiceSlotRemainsAuthoritative(t *testing.T) {
 			if install.serviceSlot != slot {
 				t.Fatal("validated service slot was not retained")
 			}
-			for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
-				definition, err := updatePlist(filepath.Join(install.launch, label+".plist"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				actual := obj(definition["EnvironmentVariables"])
-				for key, value := range expected {
-					if actual[key] != value {
-						t.Fatalf("configured service environment changed %s", key)
-					}
-				}
+			setting, err := ReadPrivate(filepath.Join(install.state, "legacy-slot.json"))
+			if err != nil || setting["slot"] != slot {
+				t.Fatal("configured service slot was not recorded for the helpers", setting, err)
 			}
 			foundSlot := false
 			for _, entry := range install.commandEnvironment([]string{filepath.Join(install.root, "bin/agent-heavy"), "status", "--json"}) {
@@ -1095,7 +1058,6 @@ func TestInstallerExternalGoDrainedSnapshotAndSettingsPreserved(t *testing.T) {
 	install := f.installer
 	f.tasks = Object{"401": Object{"id": 401, "status": Object{"Done": Object{"result": "Success"}}, "command": "retained historical command"}}
 	f.groups = Object{"default": Object{"parallel_tasks": 3, "status": "Paused"}}
-	config := integrationTestRead(t, filepath.Join(install.config, "pueue.yml"))
 	private := map[string][]byte{
 		filepath.Join(install.state, "metadata/401.json"):                           []byte(`{"id":401,"token":"retained"}`),
 		filepath.Join(install.state, "pueue/task_logs/401.log"):                     []byte("retained private output"),
@@ -1116,21 +1078,17 @@ func TestInstallerExternalGoDrainedSnapshotAndSettingsPreserved(t *testing.T) {
 	if limit, status, err := legacyQueueSettings(snapshot); err != nil || limit != 3 || status != "Paused" {
 		t.Fatalf("live queue settings were not retained after shutdown: %v %s %v", limit, status, err)
 	}
-	if !bytes.Equal(config, integrationTestRead(t, filepath.Join(install.config, "pueue.yml"))) {
-		t.Fatal("existing queue settings changed")
+	node, err := installConfig(filepath.Join(install.config, "pueue.yml"))
+	if err != nil || installYAMLValue(installYAMLValue(node, "client"), "edit_mode").Value != "files" {
+		t.Fatal("existing queue settings changed", err)
 	}
 	for name, expected := range private {
 		if !bytes.Equal(expected, integrationTestRead(t, name)) {
 			t.Fatalf("private state changed: %s", name)
 		}
 	}
-	definition, err := updatePlist(filepath.Join(install.launch, "io.went.agent-heavy.plist"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	args, err := stringsFrom(definition["ProgramArguments"])
-	if err != nil || !slices.Equal(args, []string{filepath.Join(install.root, "bin/agent-heavy"), "daemon"}) {
-		t.Fatalf("legacy queue service not replaced: %v %v", args, err)
+	if _, err := os.Lstat(filepath.Join(install.launch, "io.went.agent-heavy.plist")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy queue service not retired: %v", err)
 	}
 }
 
@@ -1407,14 +1365,13 @@ func TestInstallerLegacyRetryAfterEmbeddedPublication(t *testing.T) {
 	config := f.installer.freshConfig()
 	config["daemon"].(Object)["callback"] = `"/opt/homebrew/opt/python@3.12/bin/python3.12" "` + filepath.Join(f.installer.root, "agent_heavy.py") + `" cleanup {{ id }}`
 	integrationTestWrite(t, filepath.Join(f.installer.config, "pueue.yml"), mustMetadataJSON(t, config))
-	f.fail = "bootstrap "
-	if err := f.run(t); err == nil {
-		t.Fatal("fixture publication failure accepted")
+	// An older installer stopped after publishing its daemon and before retiring Python.
+	if err := f.installer.writePlist(filepath.Join(f.installer.launch, "io.went.agent-heavy.plist"), Object{"Label": "io.went.agent-heavy", "ProgramArguments": []string{filepath.Join(f.installer.root, "bin/agent-heavy"), "daemon"}}); err != nil {
+		t.Fatal(err)
 	}
 	if !f.installer.embeddedDefinition() {
-		t.Fatal("failure happened before embedded service publication")
+		t.Fatal("fixture did not publish the embedded service")
 	}
-	f.fail = ""
 	if err := f.run(t); err != nil {
 		t.Fatalf("retry failed after embedded publication: %v", err)
 	}
@@ -1504,7 +1461,7 @@ func TestInstallerLegacyPhoneAccessRecovery(t *testing.T) {
 			command := install.command
 			disables := 0
 			install.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if args[0] == filepath.Join(install.payload, "source/bin/agent-remote") {
+				if args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote") {
 					if !slices.Equal(args[1:], []string{"disable"}) {
 						t.Fatalf("unexpected recovery command: %v", args)
 					}
@@ -1601,7 +1558,7 @@ func TestInstallerPhoneAccessRecoveryRejectsUnownedServices(t *testing.T) {
 			}
 			command := install.command
 			install.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if args[0] == filepath.Join(install.payload, "source/bin/agent-remote") || (args[0] == "launchctl" && args[1] == "bootout") {
+				if args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote") || (args[0] == "launchctl" && args[1] == "bootout") {
 					t.Fatalf("unowned service permitted a shutdown command: %v", args)
 				}
 				if kind == "loaded-mismatch" && args[0] == "launchctl" && args[1] == "print" && filepath.Base(args[2]) == "io.went.agent-remote" {
@@ -1625,45 +1582,26 @@ func TestInstallerPhoneAccessRecoveryRejectsUnownedServices(t *testing.T) {
 func TestInstallMainLegacyPhoneAccessRecoveryDiagnostic(t *testing.T) {
 	f := installTestFixture(t)
 	f.legacy(t)
-	launchctl := filepath.Join(f.installer.path, "launchctl")
-	integrationTestWrite(t, launchctl, []byte(fmt.Sprintf("#!/bin/sh\nprintf 'Bad request.\\nCould not find service \"%%s\" in domain for user gui: %d\\n' \"${2##*/}\" >&2\nexit 113\n", os.Getuid())))
-	if err := os.Chmod(launchctl, 0700); err != nil {
-		t.Fatal(err)
+	install := f.installer
+	integrationTestWrite(t, filepath.Join(install.config, "remote.json"), []byte(`{"enabled":true}`))
+	command := install.command
+	install.command = func(ctx context.Context, args []string) ([]byte, error) {
+		if slices.Equal(args, []string{filepath.Join(install.app, "Contents/MacOS/agent-remote"), "disable"}) {
+			return nil, errors.New("fixture disable failure")
+		}
+		return command(ctx, args)
 	}
-	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MODE", "1")
-	t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", f.installer.path)
-	integrationTestWrite(t, filepath.Join(f.installer.config, "remote.json"), []byte(`{"enabled":true}`))
 	for _, recovery := range []bool{false, true} {
-		args := []string{"--payload", f.installer.payload}
-		if recovery {
-			args = append(args, "--disable-phone-access")
-			binary := filepath.Join(f.installer.payload, "source/bin/agent-remote")
-			integrationTestWrite(t, binary, []byte("#!/bin/sh\nexit 99\n"))
-			if err := os.Chmod(binary, 0700); err != nil {
-				t.Fatal(err)
-			}
+		install.disablePhoneAccess = recovery
+		err := f.run(t)
+		var message bytes.Buffer
+		installReportFailure(&message, err)
+		marker := strings.Contains(message.String(), "\n"+installDisablePhoneAccessRecovery+"\n")
+		if err == nil || marker == recovery {
+			t.Fatalf("recovery=%v: marker=%v diagnostic=%s", recovery, marker, message.String())
 		}
-		output, err := os.CreateTemp(t.TempDir(), "installer-stderr")
-		if err != nil {
-			t.Fatal(err)
-		}
-		original := os.Stderr
-		os.Stderr = output
-		code := InstallMain(args)
-		os.Stderr = original
-		if err := output.Close(); err != nil {
-			t.Fatal(err)
-		}
-		message, err := os.ReadFile(output.Name())
-		if err != nil {
-			t.Fatal(err)
-		}
-		marker := strings.Contains(string(message), "\n"+installDisablePhoneAccessRecovery+"\n")
-		if code != 1 || marker == recovery {
-			t.Fatalf("recovery=%v: exit=%d marker=%v diagnostic=%s", recovery, code, marker, message)
-		}
-		if recovery && !strings.Contains(string(message), "Phone access could not be disabled") {
-			t.Fatalf("recovery failed without actionable diagnostic: %s", message)
+		if recovery && !strings.Contains(message.String(), "fixture disable failure") {
+			t.Fatalf("recovery failed without actionable diagnostic: %s", message.String())
 		}
 	}
 }
@@ -1690,9 +1628,9 @@ func TestInstallerRemoteServiceAbsenceRequiresExactEvidence(t *testing.T) {
 
 func TestInstallMainPhoneAccessRecoverySyntax(t *testing.T) {
 	for _, args := range [][]string{
-		{"--payload", "/payload", "--disable-phone-acces"},
-		{"--disable-phone-access", "--payload", "/payload"},
-		{"--payload", "/payload", "--disable-phone-access", "--disable-phone-access"},
+		{"--app-bundle", "/Applications/Agent Queue.app", "--disable-phone-acces"},
+		{"--disable-phone-access", "--app-bundle", "/Applications/Agent Queue.app"},
+		{"--app-bundle", "/Applications/Agent Queue.app", "--disable-phone-access", "--disable-phone-access"},
 		{"--app-bundle", "relative.app", "--disable-phone-access"},
 	} {
 		if code := InstallMain(args); code != 2 {
@@ -1707,7 +1645,7 @@ func TestInstallerPhoneAccessRecoveryEnvironment(t *testing.T) {
 		t.Setenv(key, "unrelated-fixture")
 	}
 	t.Setenv("HOME", filepath.Join(t.TempDir(), "unrelated-home"))
-	environment := f.installer.commandEnvironment([]string{filepath.Join(f.installer.payload, "source/bin/agent-remote"), "disable"})
+	environment := f.installer.commandEnvironment([]string{filepath.Join(f.installer.app, "Contents/MacOS/agent-remote"), "disable"})
 	if !slices.Contains(environment, "HOME="+f.installer.home) {
 		t.Fatal("recovery escaped the installed user home")
 	}
@@ -1806,25 +1744,6 @@ class Gate:
 	}
 }
 
-func TestInstallerRecoversInterruptedAppRename(t *testing.T) {
-	f := installTestFixture(t)
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
-	install := f.installer
-	previous := filepath.Join(install.home, "Applications/.Agent Queue.previous.app")
-	if err := os.Rename(install.app, previous); err != nil {
-		t.Fatal(err)
-	}
-	f.fail = "kickstart -k"
-	if err := f.run(t); err == nil {
-		t.Fatal("simulated reload should fail")
-	}
-	if _, err := os.Stat(filepath.Join(install.app, "Contents/Info.plist")); err != nil {
-		t.Fatalf("last usable app lost: %v", err)
-	}
-}
-
 func TestInstallerCommandDeadlinesBoundServiceProbes(t *testing.T) {
 	outer, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
@@ -1892,49 +1811,6 @@ func TestInstallerReadinessEnvironmentTargetsInstalledQueue(t *testing.T) {
 	}
 }
 
-func TestInstallerPreservesAppQuarantineMetadata(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("macOS app metadata")
-	}
-	f := installTestFixture(t)
-	install := f.installer
-	install.testing = false
-	source := filepath.Join(install.payload, "Agent Queue.app")
-	quarantine := []byte("0081;6f35b100;AgentQueueInstaller;")
-	if err := unix.Setxattr(source, "com.apple.quarantine", quarantine, 0); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Setxattr(source, "io.went.agent-queue.fixture", []byte("preserved app attribute"), 0); err != nil {
-		t.Fatal(err)
-	}
-	command := install.command
-	install.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if args[0] == "/usr/bin/ditto" {
-			return exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput()
-		}
-		return command(ctx, args)
-	}
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
-	data := make([]byte, 1024)
-	length, err := unix.Getxattr(install.app, "com.apple.quarantine", data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// macOS may canonicalize the quarantine record while retaining its flags.
-	if !strings.HasPrefix(string(data[:length]), "0081;") {
-		t.Fatalf("app quarantine was stripped: %q %v", data[:length], err)
-	}
-	length, err = unix.Getxattr(install.app, "io.went.agent-queue.fixture", data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data[:length]) != "preserved app attribute" {
-		t.Fatal("application extended attribute changed")
-	}
-}
-
 func TestInstallerIdentitiesPreventDowngradeAndConflicts(t *testing.T) {
 	for _, marker := range []string{"build-info.json", "install-in-progress.json", "app"} {
 		for _, kind := range []string{"newer", "conflict", "corrupt", "symlink"} {
@@ -1967,8 +1843,8 @@ func TestInstallerIdentitiesPreventDowngradeAndConflicts(t *testing.T) {
 				if err := f.run(t); err == nil {
 					t.Fatal("unsafe identity accepted")
 				}
-				if _, err := os.Stat(filepath.Join(install.root, "bin/agent-heavy")); !errors.Is(err, os.ErrNotExist) {
-					t.Fatal("preflight failure copied support")
+				if _, err := os.Stat(filepath.Join(install.root, "installation.json")); !errors.Is(err, os.ErrNotExist) {
+					t.Fatal("preflight failure recorded an installation")
 				}
 			})
 		}
@@ -1976,18 +1852,18 @@ func TestInstallerIdentitiesPreventDowngradeAndConflicts(t *testing.T) {
 }
 
 func TestInstallerFailureLeavesIncompleteTransactionAndRetryRecovers(t *testing.T) {
-	f := installTestFixture(t)
+	m := managedTestFixture(t)
+	f := m.installFixture
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
 	}
 	install := f.installer
 	previous := integrationTestRead(t, filepath.Join(install.root, "build-info.json"))
-	info := metadataTestInfo(t, "124")
-	integrationTestWrite(t, filepath.Join(install.payload, "source/build-info.json"), mustMetadataJSON(t, info))
-	updateTestBundle(t, filepath.Join(install.payload, "Agent Queue.app"), "io.went.agent-queue", info, plist.XMLFormat)
-	f.fail = "kickstart -k"
+	managedBundleBuild(t, install, install.app, "124")
+	m.nativeFailure = "register login"
+	m.statuses["login"] = "notRegistered"
 	if err := f.run(t); err == nil {
-		t.Fatal("simulated reload succeeded")
+		t.Fatal("simulated registration succeeded")
 	}
 	if !bytes.Equal(integrationTestRead(t, filepath.Join(install.root, "build-info.json")), previous) {
 		t.Fatal("failed upgrade advanced marker")
@@ -1995,7 +1871,7 @@ func TestInstallerFailureLeavesIncompleteTransactionAndRetryRecovers(t *testing.
 	if _, err := updateInstalled(install.root, install.app); err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("failed upgrade reported complete: %v", err)
 	}
-	f.fail = ""
+	m.nativeFailure = ""
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
 	}
@@ -2043,10 +1919,7 @@ func TestInstallerLocksAndUnsafeDestinations(t *testing.T) {
 				}
 			case "symlink-app":
 				outside := filepath.Join(install.home, "outside")
-				if err := os.Mkdir(outside, 0700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.MkdirAll(filepath.Dir(install.app), 0700); err != nil {
+				if err := os.Rename(install.app, outside); err != nil {
 					t.Fatal(err)
 				}
 				if err := os.Symlink(outside, install.app); err != nil {
@@ -2102,36 +1975,15 @@ func TestInstallerRetirementRefusesSymlinkParentsAndWritableSource(t *testing.T)
 // The release smoke script supplies the built app. This test exercises the
 // actual universal binaries and native app distributed to users.
 func TestInstallerPackagedAppBundle(t *testing.T) {
-	installTestPackaged(t, true)
-}
-
-func installTestPackaged(t *testing.T, appBundle bool) {
-	t.Helper()
-	payload := os.Getenv("AGENT_QUEUE_TEST_INSTALLER_PAYLOAD")
 	appSource := os.Getenv("AGENT_QUEUE_TEST_APP_BUNDLE")
-	if payload == "" && (!appBundle || appSource == "") {
-		t.Skip("release payload not supplied")
+	if appSource == "" {
+		t.Skip("release app not supplied")
 	}
-	if payload != "" && !filepath.IsAbs(payload) {
-		t.Fatal("release payload must be absolute")
+	if !filepath.IsAbs(appSource) {
+		t.Fatal("release app must be absolute")
 	}
-	markedApp := appSource
-	if markedApp == "" || !appBundle {
-		markedApp = filepath.Join(payload, "Agent Queue.app")
-	}
-	metadata, err := updatePlist(filepath.Join(markedApp, "Contents/Info.plist"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	managed, _ := metadata["AgentQueueServiceManagement"].(bool)
-	var f *installFixture
-	var managedRuntime *managedFixture
-	if managed {
-		managedRuntime = managedTestFixture(t)
-		f = managedRuntime.installFixture
-	} else {
-		f = installTestFixture(t)
-	}
+	managedRuntime := managedTestFixture(t)
+	f := managedRuntime.installFixture
 	install := f.installer
 	base, err := os.MkdirTemp("/tmp", "aq-pkg-")
 	if err != nil {
@@ -2156,36 +2008,22 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 	})
 	t.Setenv("HOME", home)
 	install.home = home
-	install.payload = payload
 	install.root = filepath.Join(home, ".local/share/agent-heavy")
 	install.state = filepath.Join(home, ".local/state/agent-heavy")
 	install.config = filepath.Join(home, ".config/agent-heavy")
 	install.launch = filepath.Join(home, "Library/LaunchAgents")
 	install.app = filepath.Join(home, "Applications/Agent Queue.app")
-	var appBefore map[string]installBundleEntry
-	if appBundle {
-		if appSource == "" {
-			appSource = filepath.Join(payload, "Agent Queue.app")
-		}
-		if !filepath.IsAbs(appSource) {
-			t.Fatal("release app must be absolute")
-		}
-		if err := os.Mkdir(filepath.Dir(install.app), 0700); err != nil {
-			t.Fatal(err)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		output, err := exec.CommandContext(ctx, "/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", appSource, install.app).CombinedOutput()
-		cancel()
-		if err != nil {
-			t.Fatalf("copy packaged app into private home: %v: %s", err, output)
-		}
-		install.appBundle = true
-		install.payload = filepath.Join(install.app, "Contents/Resources/payload")
-		appBefore = installBundleSnapshot(t, install.app)
+	if err := os.Mkdir(filepath.Dir(install.app), 0700); err != nil {
+		t.Fatal(err)
 	}
-	if managed {
-		managedPackagedRuntimeFixture(t, managedRuntime)
+	copyContext, finishCopy := context.WithTimeout(context.Background(), 30*time.Second)
+	output, err := exec.CommandContext(copyContext, "/usr/bin/ditto", "--rsrc", "--extattr", "--qtn", "--acl", appSource, install.app).CombinedOutput()
+	finishCopy()
+	if err != nil {
+		t.Fatalf("copy packaged app into private home: %v: %s", err, output)
 	}
+	appBefore := installBundleSnapshot(t, install.app)
+	managedPackagedRuntimeFixture(t, managedRuntime)
 	// Packaged setup now owns actual daemon startup, previously performed later
 	// under its own readiness deadline. The five-second synthetic fixture runner
 	// cannot include cold executable policy checks, bundle copying and startup.
@@ -2227,19 +2065,17 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 	environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
 	environment["PACKAGED_TEST_VALUE"] = "fixture-env"
 	childEnv := envList(environment)
-	if appBundle {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		command := exec.CommandContext(ctx, filepath.Join(home, ".local/bin/agent-heavy"), "version", "--json")
-		command.Env = childEnv
-		output, err := command.CombinedOutput()
-		cancel()
-		if err != nil {
-			t.Fatalf("packaged self-installed version could not resolve app registration: %v: %s", err, output)
-		}
-		var version Object
-		if err := json.Unmarshal(output, &version); err != nil || version["version"] != install.identity.Version {
-			t.Fatalf("packaged self-installed version mismatch: %v %v", version, err)
-		}
+	versionContext, finishVersion := context.WithTimeout(context.Background(), 5*time.Second)
+	versionCommand := exec.CommandContext(versionContext, filepath.Join(home, ".local/bin/agent-heavy"), "version", "--json")
+	versionCommand.Env = childEnv
+	output, err = versionCommand.CombinedOutput()
+	finishVersion()
+	if err != nil {
+		t.Fatalf("packaged self-installed version could not resolve app registration: %v: %s", err, output)
+	}
+	var version Object
+	if err := json.Unmarshal(output, &version); err != nil || version["version"] != install.identity.Version {
+		t.Fatalf("packaged self-installed version mismatch: %v %v", version, err)
 	}
 	start := func(name string, args ...string) *exec.Cmd {
 		t.Helper()
@@ -2272,11 +2108,7 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 	cli := filepath.Join(home, ".local/bin/agent-heavy")
 	// Setup starts no helper for an app bundle: the menu bar app does, as its
 	// own children, once setup returns. This test plays that supervisor.
-	supervised := !managed || appBundle
-	var daemon *exec.Cmd
-	if supervised {
-		daemon = start("daemon", cli, "daemon")
-	}
+	daemon := start("daemon", cli, "daemon")
 	deadline := time.Now().Add(10 * time.Second)
 	ready := false
 	for time.Now().Before(deadline) {
@@ -2297,34 +2129,30 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 	if info, err := os.Lstat(QueueDatabasePath(install.state)); err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
 		t.Fatalf("packaged queue database is not a private regular file: %v %v", info, err)
 	}
-	if appBundle {
-		// Setup refuses to run beside helpers holding their lifetime locks, so
-		// the supervisor stops its children first, then starts them again.
-		_ = daemon.Process.Signal(syscall.SIGTERM)
-		_ = daemon.Wait()
-		if err := runPackaged(); err != nil {
-			t.Fatalf("packaged app setup could not retry after its helpers stopped: %v", err)
-		}
-		daemon = start("daemon", cli, "daemon")
-		fixtureUntil(t, 10*time.Second, func() bool {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			command := exec.CommandContext(ctx, cli, "status", "--json")
-			command.Env = childEnv
-			return command.Run() == nil
-		})
+	// Setup refuses to run beside helpers holding their lifetime locks, so
+	// the supervisor stops its children first, then starts them again.
+	_ = daemon.Process.Signal(syscall.SIGTERM)
+	_ = daemon.Wait()
+	if err := runPackaged(); err != nil {
+		t.Fatalf("packaged app setup could not retry after its helpers stopped: %v", err)
 	}
+	daemon = start("daemon", cli, "daemon")
+	fixtureUntil(t, 10*time.Second, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		command := exec.CommandContext(ctx, cli, "status", "--json")
+		command.Env = childEnv
+		return command.Run() == nil
+	})
 	if _, err := os.Stat(filepath.Join(install.config, "pueue.yml")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("packaged upgrade or daemon generated legacy queue configuration")
 	}
-	if supervised {
-		start("scheduler", cli, "scheduler")
-	}
+	scheduler := start("scheduler", cli, "scheduler")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	job := exec.CommandContext(ctx, cli, "run", "--label", "Packaged fixture", "--", "/bin/sh", "-c", `printf '%s|%s|%s\n' "$1" "$2" "$PACKAGED_TEST_VALUE"; exit 7`, "packaged-fixture", "argument with spaces", "literal;$HOME")
 	job.Env = childEnv
-	output, err := job.CombinedOutput()
+	output, err = job.CombinedOutput()
 	var exit *exec.ExitError
 	if !errors.As(err, &exit) || exit.ExitCode() != 7 {
 		t.Fatalf("packaged job exit %v: %s", err, output)
@@ -2376,10 +2204,30 @@ func installTestPackaged(t *testing.T, appBundle bool) {
 			t.Fatal("Go upgrade restarted its daemon")
 		}
 	}
-	if appBundle {
-		if after := installBundleSnapshot(t, install.app); !reflect.DeepEqual(appBefore, after) {
-			t.Fatal("packaged self-install or retry mutated the application")
-		}
-		assertInstallerNoAppCommands(t, f)
+	if after := installBundleSnapshot(t, install.app); !reflect.DeepEqual(appBefore, after) {
+		t.Fatal("packaged self-install or retry mutated the application")
+	}
+	assertInstallerNoAppCommands(t, f)
+	// The documented removal, after the app quit and stopped its helpers. Nothing
+	// but the login item was ever registered, so the others read as notFound.
+	for _, helper := range []*exec.Cmd{scheduler, daemon} {
+		_ = helper.Process.Signal(syscall.SIGTERM)
+		_ = helper.Wait()
+	}
+	for _, service := range []string{"queue", "resources", "remote"} {
+		managedRuntime.statuses[service] = "notFound"
+	}
+	install.unregisterServices = true
+	if err := runPackaged(); err != nil {
+		t.Fatalf("packaged app could not be removed: %v", err)
+	}
+	if _, err := os.Lstat(cli); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("removal retained the CLI wrapper", err)
+	}
+	if after := installBundleSnapshot(t, install.app); !reflect.DeepEqual(appBefore, after) {
+		t.Fatal("removal mutated the application")
+	}
+	if string(integrationTestRead(t, private)) != "preserved private fixture" {
+		t.Fatal("removal changed private data")
 	}
 }

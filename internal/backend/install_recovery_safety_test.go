@@ -12,9 +12,8 @@ import (
 
 func TestInstallerPreflightReadinessCannotPreparePrivateState(t *testing.T) {
 	f := installTestFixture(t)
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
+	installOlderEmbeddedBlocked(t, f.installer)
+	f.loaded["io.went.agent-heavy"] = true
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -50,33 +49,29 @@ func TestInstallerPreflightReadinessCannotPreparePrivateState(t *testing.T) {
 
 func TestInstallerPreflightLetsNormalInstallRepairNonExecutableBackend(t *testing.T) {
 	f := installTestFixture(t)
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
-	delete(f.loaded, "io.went.agent-heavy")
+	installOlderEmbeddedBlocked(t, f.installer)
 	binary := filepath.Join(f.installer.root, "bin/agent-heavy")
 	if err := os.Chmod(binary, 0600); err != nil {
 		t.Fatal(err)
 	}
 	report := f.installer.preflight(context.Background())
 	if preflightIDs(report)["service-not-ready"] {
-		t.Fatal("preflight blocks payload repair by offering startup of a non-executable backend")
+		t.Fatal("preflight blocks setup by offering startup of a non-executable backend")
+	}
+	if err := os.Remove(filepath.Join(f.installer.state, "receipts/9.json")); err != nil {
+		t.Fatal(err)
 	}
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(binary)
-	if err != nil || info.Mode().Perm()&0100 == 0 {
-		t.Fatal("normal install did not repair executable permissions", err)
+	if _, err := os.Lstat(binary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("normal install did not retire the copied executable", err)
 	}
 }
 
 func TestInstallerRecoveryRejectsSymlinkedExecutableParent(t *testing.T) {
 	f := installTestFixture(t)
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
-	delete(f.loaded, "io.went.agent-heavy")
+	installOlderEmbeddedBlocked(t, f.installer)
 	bin := filepath.Join(f.installer.root, "bin")
 	if err := os.Rename(bin, bin+"-original"); err != nil {
 		t.Fatal(err)
@@ -105,7 +100,7 @@ func TestInstallerPreflightExplainsLegacyStateWithoutConfiguration(t *testing.T)
 		t.Fatal(err)
 	}
 	integrationTestWrite(t, filepath.Join(f.installer.state, "pueue/state.json"), mustMetadataJSON(t, f.snapshot()))
-	report := f.installer.preflight(context.Background())
+	report := f.installer.preflightLegacy(context.Background(), installPreflightReport{SchemaVersion: 1, Issues: []installPreflightIssue{}})
 	if !preflightIDs(report)["configuration-missing"] {
 		t.Fatal("retained legacy state received no configuration recovery guidance")
 	}
@@ -139,6 +134,7 @@ func TestInstallerPreflightOnlyOffersCleanupForCompletedJobs(t *testing.T) {
 		"7": Object{"id": 7, "status": Object{"Running": Object{}}},
 		"8": Object{"id": 8, "status": Object{"Done": Object{"result": "Success"}}},
 	}
+	integrationTestWrite(t, filepath.Join(f.installer.config, "remote.json"), []byte(`{"enabled":true}`))
 	for _, id := range []string{"7", "8", "9"} {
 		integrationTestWrite(t, filepath.Join(f.installer.state, "receipts", id+".json"), []byte(`{"token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`))
 	}

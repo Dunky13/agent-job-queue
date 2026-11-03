@@ -260,19 +260,14 @@ func TestUpdatesInstalledVersionOfflineAndLegacy(t *testing.T) {
 
 func TestUpdatesInstalledVersionUsesRegisteredApp(t *testing.T) {
 	f := installTestFixture(t)
-	f.appBundle(t)
-	if err := f.run(t); err != nil {
-		t.Fatal(err)
-	}
 	install := f.installer
+	installOlderUnmarkedState(t, install)
 	app := filepath.Join(install.home, "Applications/Registered Agent Queue.app")
 	if err := os.Rename(install.app, app); err != nil {
 		t.Fatal(err)
 	}
 	install.app = app
-	if err := install.serviceDefinitions(false); err != nil {
-		t.Fatal(err)
-	}
+	installOlderServiceDefinitions(t, install)
 	before := installBundleSnapshot(t, app)
 	result, err := updateInstalled("", "")
 	if err != nil || result["build"] != 123 {
@@ -297,11 +292,8 @@ func TestUpdatesRegisteredAppRejectsUnsafeRegistration(t *testing.T) {
 	for _, kind := range []string{"label", "command", "program", "argument", "downloads", "traversal", "symlink-app", "symlink-parent", "symlink-plist", "writable-plist", "hardlink-plist", "invalid-plist", "symlink-marker", "writable-marker", "writable-bundle"} {
 		t.Run(kind, func(t *testing.T) {
 			f := installTestFixture(t)
-			f.appBundle(t)
-			if err := f.run(t); err != nil {
-				t.Fatal(err)
-			}
 			install := f.installer
+			installOlderUnmarkedState(t, install)
 			filename := filepath.Join(install.launch, "io.went.agent-queue.plist")
 			definition, err := updatePlist(filename)
 			if err != nil {
@@ -370,12 +362,17 @@ func TestUpdatesRegisteredAppRejectsUnsafeRegistration(t *testing.T) {
 
 func TestUpdatesDefaultAppLegacyFallback(t *testing.T) {
 	f := installTestFixture(t)
+	aside := filepath.Join(f.installer.home, "Agent Queue aside.app")
+	if err := os.Rename(f.installer.app, aside); err != nil {
+		t.Fatal(err)
+	}
 	if result, err := updateInstalled("", ""); err != nil || result["displayVersion"] != "Not installed" {
 		t.Fatalf("uninstalled default lookup failed: %v %v", result, err)
 	}
-	if err := f.run(t); err != nil {
+	if err := os.Rename(aside, f.installer.app); err != nil {
 		t.Fatal(err)
 	}
+	installOlderUnmarkedState(t, f.installer)
 	if err := os.Remove(filepath.Join(f.installer.launch, "io.went.agent-queue.plist")); err != nil {
 		t.Fatal(err)
 	}
