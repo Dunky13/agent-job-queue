@@ -1126,7 +1126,9 @@ func (install *installer) managedRemovalSchedulingLock(ctx context.Context) (*os
 
 // managedRemovalGuidance says what clears a refusal once the app has quit. Nothing
 // is left running to finish a row or release a phone record, so retrying cannot
-// clear those and opening the app does. Anything else may clear on a retry.
+// clear those. Opening the app finishes a row, and releases a phone record when
+// phone access is on; with it off, the next removal says to disable phone access.
+// Anything else may clear on a retry.
 func managedRemovalGuidance(err error) error {
 	switch {
 	case errors.Is(err, errInstallLoginUnverified):
