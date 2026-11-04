@@ -354,8 +354,24 @@ func (b *boundedOutput) Write(p []byte) (int, error) {
 }
 
 // Snapshot retains the private task shape while callers migrate to typed jobs.
+// It holds all retained history, so its cost grows with every finished job; a
+// repeating caller reads ActiveSnapshot, RecentSnapshot or Task instead.
 func (g *Gate) Snapshot() (Object, error) {
 	return g.QueueControl("snapshot", nil)
+}
+
+// recentDoneJobs is how many finished jobs status and the scheduler look at.
+const recentDoneJobs = 30
+
+// ActiveSnapshot leaves out jobs whose cleanup has finished. An older daemon
+// ignores the scope and answers with all history, so callers still check states.
+func (g *Gate) ActiveSnapshot() (Object, error) {
+	return g.RecentSnapshot(0)
+}
+
+// RecentSnapshot adds the most recently finished jobs to ActiveSnapshot.
+func (g *Gate) RecentSnapshot(done int) (Object, error) {
+	return g.QueueControl("snapshot", Object{"recentDone": done})
 }
 
 // defaultGroup reads the default queue from the daemon's private state. That
@@ -369,7 +385,7 @@ func (g *Gate) operationContext() context.Context {
 	return context.Background()
 }
 func (g *Gate) Task(id int) (Object, error) {
-	snapshot, err := g.Snapshot()
+	snapshot, err := g.QueueControl("snapshot", Object{"id": id})
 	if err != nil {
 		return nil, err
 	}

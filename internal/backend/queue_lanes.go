@@ -180,9 +180,35 @@ func (d *queueDaemon) laneOwner(name string) (queuePlugin, bool) {
 	return queuePlugin{}, false
 }
 
+// queueSnapshotFilter selects the rows a client asked for. No scope means all of them.
+func queueSnapshotFilter(p Object) (string, []any, error) {
+	if raw, ok := p["id"]; ok {
+		id, valid := integer(raw)
+		if !valid {
+			return "", nil, errors.New("Invalid task ID")
+		}
+		return queueOneJob, []any{id}, nil
+	}
+	if raw, ok := p["recentDone"]; ok {
+		done, valid := integer(raw)
+		// SQLite reads a negative LIMIT as no limit.
+		if !valid || done < 0 {
+			return "", nil, errors.New("Invalid finished job count")
+		}
+		if done == 0 {
+			return queueActiveJobs, nil, nil
+		}
+		if boolean(p["commandsOnly"]) {
+			return queueRecentCommands, []any{done}, nil
+		}
+		return queueRecentJobs, []any{done}, nil
+	}
+	return "", nil, nil
+}
+
 // snapshot adds the lane registry and live lane usage to the private task view.
-func (d *queueDaemon) snapshot() (Object, error) {
-	snapshot, err := d.store.snapshot()
+func (d *queueDaemon) snapshot(filter string, args ...any) (Object, error) {
+	snapshot, err := d.store.snapshotOf(filter, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -682,7 +708,7 @@ func (d *queueDaemon) leaseView(id int) (Object, error) {
 }
 
 func (d *queueDaemon) laneList() []Object {
-	snapshot, err := d.snapshot()
+	snapshot, err := d.snapshot(queueActiveJobs)
 	if err != nil {
 		return []Object{}
 	}

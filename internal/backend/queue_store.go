@@ -222,21 +222,38 @@ func scanQueueJob(row interface{ Scan(...any) error }) (queueJob, error) {
 
 const queueColumns = "id,token,task,attempt,phase,worker,outcome"
 
+// Snapshot scopes. The recent ones order by end time the way their readers do: a
+// job that waited long finishes after jobs with higher IDs. They also list every
+// finished row with no end time, because its status may disagree with its phase
+// and a reader that validates statuses must still see it.
+// The scheduler counts only commands, so finished leases must not fill its window.
+//
+// shortcut: the recent scopes sort every finished row, so they still grow with
+// history; give the end time its own indexed column if status or ticks show up in
+// a profile.
+const (
+	queueOneJob         = " WHERE id=?"
+	queueActiveJobs     = " WHERE phase!='done'"
+	queueRecentJobs     = queueRecentFirst + queueRecentLast
+	queueRecentCommands = queueRecentFirst + " AND json_extract(task,'$.kind') IS NOT 'lease'" + queueRecentLast
+	queueRecentFirst    = " WHERE phase!='done' OR json_extract(task,'$.status.Done.end') IS NULL OR id IN (SELECT id FROM queue_jobs WHERE phase='done'"
+	queueRecentLast     = " ORDER BY json_extract(task,'$.status.Done.end') DESC, id DESC LIMIT ?)"
+)
+
 func (s *queueStore) jobs() ([]queueJob, error) {
 	return s.readJobs("")
 }
 
 // unfinishedJobs retains outcomes until ownership-checked cleanup completes.
-// Public snapshots still include all retained history through jobs().
 func (s *queueStore) unfinishedJobs() ([]queueJob, error) {
-	return s.readJobs(" WHERE phase!='done'")
+	return s.readJobs(queueActiveJobs)
 }
 
-func (s *queueStore) readJobs(filter string) ([]queueJob, error) {
+func (s *queueStore) readJobs(filter string, args ...any) ([]queueJob, error) {
 	if e := queuePrivateFiles(s.path); e != nil {
 		return nil, e
 	}
-	rows, e := s.db.Query("SELECT " + queueColumns + " FROM queue_jobs" + filter + " ORDER BY id")
+	rows, e := s.db.Query("SELECT "+queueColumns+" FROM queue_jobs"+filter+" ORDER BY id", args...)
 	if e != nil {
 		return nil, e
 	}
@@ -289,11 +306,14 @@ func stoppedQueueTasks(ctx context.Context, db *sql.DB, path string) (Object, er
 	return obj(snapshot["tasks"]), nil
 }
 func (s *queueStore) snapshot() (Object, error) {
+	return s.snapshotOf("")
+}
+func (s *queueStore) snapshotOf(filter string, args ...any) (Object, error) {
 	settings, e := s.settings()
 	if e != nil {
 		return nil, e
 	}
-	jobs, e := s.jobs()
+	jobs, e := s.readJobs(filter, args...)
 	if e != nil {
 		return nil, e
 	}

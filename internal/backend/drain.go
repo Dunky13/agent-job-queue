@@ -278,7 +278,7 @@ func cancelForDrain(g *Gate, options drainOptions) error {
 	}
 	if options.cancelRunning {
 		var snapshot Object
-		if snapshot, unread = g.Snapshot(); unread != nil {
+		if snapshot, unread = g.ActiveSnapshot(); unread != nil {
 			unread = fmt.Errorf("running jobs could not be read: %w", unread)
 		}
 		tasks := obj(snapshot["tasks"])
@@ -322,7 +322,7 @@ func waitDrained(g *Gate) (int, error) {
 	defer signal.Stop(signals)
 	notice := time.Time{}
 	for {
-		snapshot, err := g.Snapshot()
+		snapshot, err := g.ActiveSnapshot()
 		if err != nil {
 			return 125, err
 		}
@@ -403,7 +403,7 @@ func UndrainMain(g *Gate, args []string) (int, error) {
 		}
 		return 0, nil
 	}
-	snapshot, err := g.Snapshot()
+	snapshot, err := g.ActiveSnapshot()
 	if errors.Is(err, errQueueTransportUnavailable) {
 		if !force {
 			fmt.Fprintf(os.Stderr, "agent-heavy: the queue daemon is not running, so the drain (until %s) stays and waiting callers stay attached; open Agent Queue, wait until the queue is up, then run agent-heavy undrain again, or pass --force to drop the drain anyway (waiting callers then exit 125)\n", drainClock(until))

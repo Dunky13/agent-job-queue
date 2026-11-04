@@ -250,7 +250,7 @@ func JobMarkerPath(g *Gate, marker Object) string {
 	return filepath.Join(g.Slot, "agent-heavy.json")
 }
 func LeaseCapacity(g *Gate) (int, error) {
-	snapshot, err := g.Snapshot()
+	snapshot, err := g.ActiveSnapshot()
 	if err != nil {
 		return 0, err
 	}

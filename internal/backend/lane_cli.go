@@ -154,7 +154,7 @@ func laneSnapshot(g *Gate) (Object, error) {
 	if err := g.Prepare(); err != nil {
 		return nil, err
 	}
-	snapshot, err := g.Snapshot()
+	snapshot, err := g.ActiveSnapshot()
 	if err != nil {
 		return nil, err
 	}
