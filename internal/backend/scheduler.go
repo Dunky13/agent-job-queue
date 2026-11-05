@@ -453,7 +453,7 @@ func schedulingPermit(g *Gate, marker Object, sharingMembers func(Object) int) (
 			if e != nil {
 				return false, e
 			}
-			queue, e := g.Snapshot()
+			queue, e := g.ActiveSnapshot()
 			if e != nil {
 				return false, e
 			}
@@ -509,7 +509,7 @@ func schedulingPermit(g *Gate, marker Object, sharingMembers func(Object) int) (
 		}
 	}
 	if configuration["mode"] != "adaptive" {
-		snapshot, e := g.Snapshot()
+		snapshot, e := g.ActiveSnapshot()
 		if e != nil {
 			return false, e
 		}
@@ -592,7 +592,7 @@ func SetSchedulingMode(g *Gate, mode string) error {
 	if e != nil {
 		return e
 	}
-	snapshot, e := g.Snapshot()
+	snapshot, e := g.ActiveSnapshot()
 	if e != nil {
 		return e
 	}

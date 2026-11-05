@@ -400,7 +400,7 @@ var queueCancelGrace = 3 * time.Second
 // queue, without guessing why it is paused. It reports whether it said so and
 // whether the daemon answered; the caller retries a check that was lost.
 func announcePausedQueue(g *Gate, id int) (shown, answered bool) {
-	snapshot, err := g.Snapshot()
+	snapshot, err := g.ActiveSnapshot()
 	if err != nil {
 		return false, false
 	}
@@ -886,7 +886,7 @@ func commandExitCode(err error) (int, error) {
 // submissionPrecheck refuses before anything is submitted. A non-zero code ends
 // the call with that exit status.
 func submissionPrecheck(g *Gate, lane string) (Object, int, error) {
-	snapshot, err := g.Snapshot()
+	snapshot, err := g.ActiveSnapshot()
 	if err != nil {
 		return nil, 125, err
 	}

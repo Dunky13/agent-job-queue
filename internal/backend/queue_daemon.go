@@ -516,7 +516,11 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	}
 	switch op {
 	case "snapshot":
-		return d.snapshot()
+		filter, args, e := queueSnapshotFilter(p)
+		if e != nil {
+			return nil, e
+		}
+		return d.snapshot(filter, args...)
 	case "submit":
 		return d.submit(p)
 	case "submit-lane":
@@ -537,7 +541,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		if err := d.reloadPlugins(); err != nil {
 			return nil, err
 		}
-		return d.snapshot()
+		return d.snapshot(queueActiveJobs)
 	}
 	if op == "limit" {
 		limit, ok := integer(p["limit"])
@@ -594,7 +598,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 		if e != nil {
 			return nil, e
 		}
-		return d.snapshot()
+		return d.snapshot(queueActiveJobs)
 	case "hold", "enqueue":
 		// Holding or enqueueing anything that is not waiting has always done nothing.
 		if e = d.store.setWaiting(j, op == "hold"); queueRowRefused(e) {
@@ -695,7 +699,7 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	if e != nil {
 		return nil, e
 	}
-	return d.snapshot()
+	return d.snapshot(queueActiveJobs)
 }
 
 // cancelQueued cancels every job and lease that has not started, in one pass

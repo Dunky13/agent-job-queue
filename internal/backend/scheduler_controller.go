@@ -135,6 +135,26 @@ type schedulerAudit struct {
 }
 
 func taskState(task Object) (string, Object, error) { return TaskStatus(task) }
+
+// queueView reads the jobs a tick works on. A sampled run that has not been
+// finalized still owes its final record. If more than recentDoneJobs commands
+// finished after it, that takes all history.
+func (c *Controller) queueView() (Object, error) {
+	snapshot, e := c.gate.QueueControl("snapshot", Object{"recentDone": recentDoneJobs, "commandsOnly": true})
+	if e != nil {
+		return nil, e
+	}
+	listed := map[string]bool{}
+	for _, raw := range obj(snapshot["tasks"]) {
+		listed[CommandToken(obj(raw))] = true
+	}
+	for value := range c.runs {
+		if !listed[value] && !c.finalized[value] {
+			return c.gate.Snapshot()
+		}
+	}
+	return snapshot, nil
+}
 func (c *Controller) Tick() (Object, error) {
 	g := c.gate
 	host, e := c.sampler.Host()
@@ -168,7 +188,7 @@ func (c *Controller) Tick() (Object, error) {
 		token     string
 		resources Object
 	}{}
-	snapshot, e := g.Snapshot()
+	snapshot, e := c.queueView()
 	if e != nil {
 		return nil, e
 	}
@@ -199,7 +219,7 @@ func (c *Controller) Tick() (Object, error) {
 		}
 		return terminal[i].id > terminal[j].id
 	})
-	terminal = terminal[:min(30, len(terminal))]
+	terminal = terminal[:min(recentDoneJobs, len(terminal))]
 	terminalTokens := map[string]bool{}
 	for _, entry := range terminal {
 		terminalTokens[entry.token] = true
@@ -395,7 +415,7 @@ func (c *Controller) Tick() (Object, error) {
 			return nil, e
 		}
 	}
-	current, e := g.Snapshot()
+	current, e := g.ActiveSnapshot()
 	if e != nil {
 		return nil, e
 	}
@@ -825,7 +845,7 @@ func (c *Controller) admitLeasesWithoutHost() (Object, error) {
 	if e != nil {
 		return nil, e
 	}
-	current, e := g.Snapshot()
+	current, e := g.ActiveSnapshot()
 	if e != nil {
 		return nil, e
 	}

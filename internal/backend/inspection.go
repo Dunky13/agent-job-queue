@@ -276,7 +276,7 @@ func StatusData(g *Gate) (wire.Snapshot, error) {
 	if err := g.Prepare(); err != nil {
 		return wire.Snapshot{}, err
 	}
-	snapshot, err := g.Snapshot()
+	snapshot, err := g.RecentSnapshot(recentDoneJobs)
 	if err != nil {
 		return wire.Snapshot{}, err
 	}
@@ -316,7 +316,7 @@ func StatusData(g *Gate) (wire.Snapshot, error) {
 		bi, _ := integer(doneEntries[j]["id"])
 		return ai > bi
 	})
-	entries = append(entries, doneEntries[:min(30, len(doneEntries))]...)
+	entries = append(entries, doneEntries[:min(recentDoneJobs, len(doneEntries))]...)
 	lanes := obj(snapshot["lanes"])
 	for _, entry := range entries {
 		id, _ := integer(entry["id"])
@@ -608,7 +608,7 @@ func StartJob(g *Gate, id int) error {
 		return err
 	}
 	defer unlock()
-	snapshot, err := g.Snapshot()
+	snapshot, err := g.ActiveSnapshot()
 	if err != nil {
 		return err
 	}

@@ -81,7 +81,7 @@ func BenchmarkQueueHistoryTick(b *testing.B) {
 }
 
 // Measure a small RPC through the actual private daemon while its reconciliation
-// ticker runs. History snapshots remain intentionally proportional to history.
+// ticker runs. Only one-job and active snapshots are independent of history.
 func BenchmarkQueueHistoryRPC(b *testing.B) {
 	if runtime.GOOS != "darwin" {
 		b.Skip("queue runtime uses macOS ownership APIs")
