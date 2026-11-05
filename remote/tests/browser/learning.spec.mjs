@@ -5,10 +5,17 @@ import { profileDetailSchema } from "../../static/schema.mjs";
 const profileId = "a".repeat(64);
 const targetId = "b".repeat(64);
 const editSchema = z.object({ revision: z.number().int(), label: z.string(), memoryFloorBytes: z.number().int().nullable(), cpuFloorCores: z.number().nullable() });
-async function openLearning(page) {
+// The catalog opens on projects; the group list is two drill-downs away.
+async function openGroups(page, project = "Sample app", operation = "All operations") {
   await page.goto("/");
   await expect(page.locator("#connection-text")).toContainText("Connected");
   await page.getByRole("button", { name: "Learned workloads", exact: true }).click();
+  await page.getByRole("button", { name: project, exact: true }).click();
+  await page.getByRole("button", { name: operation, exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Groups");
+}
+async function openLearning(page) {
+  await openGroups(page);
   await expect(page.locator("#profiles-list")).toContainText("Browser tests");
 }
 async function openProfile(page) {
@@ -51,7 +58,7 @@ test("queue polls preserve learning drafts and stale revisions require explicit 
   let historyRequests = 0;
   page.on("request", (request) => { if (request.url().includes("/api/profiles")) historyRequests += 1; });
   // Finish the optional merge-target lookup before measuring periodic traffic.
-  await expect(page.locator("#profile-merge-target option")).toHaveCount(2);
+  await expect(page.locator("#profile-merge-target option")).toHaveCount(14);
   historyRequests = 0;
   await page.getByLabel("Workload name", { exact: true }).fill("My unsaved correction");
   await page.getByLabel("Workload name", { exact: true }).focus();
@@ -126,15 +133,14 @@ test("job details link the matching profile and unavailable or malformed learnin
 
 test("learning catalog searches and pages through bounded responses", async ({ page, queueFixture }) => {
   await queueFixture.update({ profileCount: 101 });
-  await page.goto("/");
-  await page.getByRole("button", { name: "Learned workloads", exact: true }).click();
-  await expect(page.locator("#profiles-count")).toHaveText("1–100 of 101 workloads");
+  await openGroups(page);
+  await expect(page.locator("#profiles-count")).toHaveText("1–100 of 101 groups");
   await page.getByRole("button", { name: "Next", exact: true }).click();
-  await expect(page.locator("#profiles-count")).toHaveText("101–101 of 101 workloads");
+  await expect(page.locator("#profiles-count")).toHaveText("101–101 of 101 groups");
   await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
   await page.getByLabel("Find a workload", { exact: true }).fill("Workload 100");
   await page.getByRole("button", { name: "Search", exact: true }).click();
-  await expect(page.locator("#profiles-count")).toHaveText("1–1 of 1 workloads");
+  await expect(page.locator("#profiles-count")).toHaveText("1–1 of 1 group");
   await expect(page.locator("#profiles-list .job-card")).toHaveCount(1);
 });
 
@@ -281,8 +287,7 @@ test("a late member response cannot overwrite another member's inspection", asyn
 const combineSchema = z.object({ revision: z.number().int(), profileIds: z.array(z.string().regex(/^[a-f0-9]{64}$/)), families: z.array(z.string().regex(/^[a-f0-9]{64}$/)) });
 const fixtureGroup = (number) => number.toString(16).padStart(64, "0");
 async function openGeneratedLearning(page) {
-  await page.goto("/");
-  await page.getByRole("button", {name:"Learned workloads",exact:true}).click();
+  await openGroups(page);
   await expect(page.getByRole("button", {name:"Workload 0",exact:true})).toBeVisible();
 }
 
@@ -369,12 +374,196 @@ test("long selected group names wrap in the merge review on a narrow phone", asy
   const label="x".repeat(120);
   await queueFixture.update({profileFloors:{label}});
   await page.setViewportSize({width:375,height:844});
-  await page.goto("/");
-  await page.getByRole("button",{name:"Learned workloads",exact:true}).click();
+  await openGroups(page);
   await page.getByRole("checkbox",{name:`Select group: ${label}`,exact:true}).check();
   await page.getByLabel("Destination group",{exact:true}).selectOption(targetId);
   await page.getByRole("button",{name:"Merge selected…",exact:true}).click();
   await expect(page.locator("#profile-combine .confirmation")).toContainText(label);
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+  expect(await queueFixture.events()).toEqual([]);
+});
+
+const profileRequests = (page) => {
+  const urls = [];
+  page.on("request", (request) => { if (request.url().includes("/api/profiles?")) urls.push(new URL(request.url()).searchParams); });
+  return urls;
+};
+
+test("learning drills from projects through operations to groups with a working breadcrumb", async ({ page, queueFixture }) => {
+  const requests = profileRequests(page);
+  await page.goto("/");
+  await page.getByRole("button", { name: "Learned workloads", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Projects");
+  const rows = page.locator("#profiles-list .job-card");
+  await expect(rows).toHaveText([/Sample app.*11 workloads · 6 groups · 36 runs/, /Sample service.*10 workloads · 6 groups · 36 runs/, /Other projects.*2 workloads · 2 groups · 12 runs.*Covers 2 smaller projects/]);
+  await expect(page.locator("#profiles-breadcrumb")).toBeHidden();
+  await expect(page.locator("#profiles-pager")).toBeHidden();
+  expect(requests.map((query) => query.get("hierarchy"))).toEqual(["true"]);
+
+  await page.getByRole("button", { name: "Sample service", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Operations in Sample service");
+  await expect(page.locator("#profiles-level")).toBeFocused();
+  await expect(page.locator("#announcement")).toHaveText("Operations in Sample service");
+  await expect(rows.first()).toContainText("All operations10 workloads · 6 groups · 36 runs");
+  await expect(page.getByRole("button", { name: "Full tests", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Other", exact: true })).toBeVisible();
+  await expect(page.locator("#profiles-breadcrumb")).toHaveAttribute("aria-label", "Learned workload location");
+  await expect(page.locator("#profiles-breadcrumb [aria-current=page]")).toHaveText("Sample service");
+
+  await page.getByRole("button", { name: "Tests", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Groups");
+  await expect(page.locator("#profiles-breadcrumb")).toHaveText("All projects/Sample service/Tests");
+  await expect(page.locator("#profiles-list .job-card")).toHaveText([/API tests/]);
+  await expect(page.locator("#profiles-pager")).toBeVisible();
+  expect(Object.fromEntries(requests.at(-1))).toEqual({ offset: "0", limit: "100", query: "", project: "Sample service", operation: "tests" });
+
+  await page.locator("#profiles-breadcrumb").getByRole("button", { name: "Sample service", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Operations in Sample service");
+  await page.locator("#profiles-breadcrumb").getByRole("button", { name: "All projects", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Projects");
+  await expect(rows).toHaveCount(3);
+
+  await page.getByRole("button", { name: "Other projects", exact: true }).click();
+  await page.getByRole("button", { name: "Build", exact: true }).click();
+  await expect(page.locator("#profiles-list .job-card")).toHaveText([/Docs build/]);
+  expect(Object.fromEntries(requests.at(-1))).toEqual({ offset: "0", limit: "100", query: "", otherProjects: "true", operation: "build" });
+  for (const width of [390, 1280]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  }
+  expect(await queueFixture.events()).toEqual([]);
+});
+
+test("search is global, clearing it returns to the level, and a group's detail returns to its page", async ({ page, queueFixture }) => {
+  await queueFixture.update({ profileCount: 101 });
+  const requests = profileRequests(page);
+  await openGroups(page);
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(page.locator("#profiles-count")).toHaveText("101–101 of 101 groups");
+  await page.getByRole("button", { name: "Workload 100", exact: true }).click();
+  await expect(page.locator("#profile-name")).toHaveText("Workload 100");
+  await page.getByRole("button", { name: "‹ All learned workloads", exact: true }).click();
+  await expect(page.locator("#profiles-count")).toHaveText("101–101 of 101 groups");
+  expect(requests.at(-1).get("project")).toBe("Sample app");
+  expect(requests.at(-1).get("offset")).toBe("100");
+
+  await page.getByLabel("Find a workload", { exact: true }).fill("Workload 7");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Search results");
+  await expect(page.locator("#profiles-breadcrumb")).toBeHidden();
+  expect(Object.fromEntries(requests.at(-1))).toEqual({ offset: "0", limit: "100", query: "Workload 7" });
+  await page.getByLabel("Find a workload", { exact: true }).fill("");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Groups");
+  await expect(page.locator("#profiles-breadcrumb")).toHaveText("All projects/Sample app/All operations");
+  await expect(page.locator("#profiles-count")).toHaveText("1–100 of 101 groups");
+});
+
+test("a slow response from an earlier level cannot replace a later level", async ({ page, queueFixture }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Learned workloads", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Sample app", exact: true })).toBeVisible();
+  let release = () => {};
+  const held = new Promise((resolve) => { release = resolve; });
+  const empty = { revision: 4, total: 0, limit: 100, projects: [], controllerAppliedRevision: 3, controllerStatus: "Late" };
+  await page.route("**/api/profiles?hierarchy=*", async (route) => { await held; await route.fulfill({ contentType: "application/json", body: JSON.stringify(empty) }); }, { times: 1 });
+  await page.getByRole("button", { name: "Refresh learning", exact: true }).click();
+  await page.getByRole("button", { name: "Sample app", exact: true }).click();
+  await expect(page.getByRole("button", { name: "All operations", exact: true })).toBeVisible();
+  release();
+  await expect(page.locator("#profiles-controller")).not.toContainText("Late");
+  await page.getByRole("button", { name: "All operations", exact: true }).click();
+  await expect(page.locator("#profiles-list")).toContainText("Browser tests");
+  expect(await queueFixture.events()).toEqual([]);
+});
+
+test("a project or operation with nothing left shows an empty state with a way back", async ({ page, queueFixture }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Learned workloads", exact: true }).click();
+  await page.getByRole("button", { name: "Sample service", exact: true }).click();
+  await page.getByRole("button", { name: "Tests", exact: true }).click();
+  await expect(page.locator("#profiles-list")).toContainText("API tests");
+  await queueFixture.update({ profiles: {} });
+  await page.getByRole("button", { name: "Refresh learning", exact: true }).click();
+  await expect(page.locator("#profiles-list")).toContainText("Nothing is left here.");
+  await expect(page.locator("#profiles-error")).toBeHidden();
+  await page.getByRole("button", { name: "Back to all projects", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Projects");
+  await expect(page.locator("#profiles-list")).toContainText("Your Mac has not learned any workloads yet");
+});
+
+const summary = (id, label, project, memberCount) => ({ profile: { id: id.repeat(64), label, project, operation: "tests", memberCount, variantCount: 1, successCount: 1, incompleteCount: 0, peakMemoryBytes: 1, peakCpuCores: 1, lastRunAt: null, memoryFloorBytes: null, cpuFloorCores: null } });
+const noOverflow = (page) => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth);
+
+test("a very long project name wraps in the breadcrumb on a narrow phone", async ({ page, queueFixture }) => {
+  const project = "p".repeat(120);
+  await queueFixture.update({ profiles: { a: summary("a", "Long group", project, 3) } });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Learned workloads", exact: true }).click();
+  await page.getByRole("button", { name: project, exact: true }).click();
+  expect(await noOverflow(page)).toBe(true);
+  await page.getByRole("button", { name: "All operations", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Groups");
+  await expect(page.locator("#profiles-breadcrumb")).toContainText(project);
+  expect(await noOverflow(page)).toBe(true);
+});
+
+test("a project folded away by a merge still lists its groups instead of a false empty state", async ({ page, queueFixture }) => {
+  const requests = profileRequests(page);
+  await queueFixture.update({ profiles: { a: summary("a", "Big app build", "Big app", 3) } });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Learned workloads", exact: true }).click();
+  await page.getByRole("button", { name: "Big app", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Operations in Big app");
+  await queueFixture.update({ profiles: { a: summary("a", "Big app build", "Big app", 2) } });
+  await page.getByRole("button", { name: "Refresh learning", exact: true }).click();
+  await expect(page.locator("#profiles-list")).toContainText("Big app build");
+  await expect(page.locator("#profiles-list")).not.toContainText("no longer");
+  expect(requests.at(-1).get("project")).toBe("Big app");
+  // The folded project has no operations level, so its crumb leaves for the projects instead of looping back here.
+  await page.locator("#profiles-breadcrumb").getByRole("button", { name: "Big app", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Projects");
+  await expect(page.getByRole("button", { name: "Other projects", exact: true })).toBeVisible();
+});
+
+test("a page past the end after a merge shows the last page, not an empty one", async ({ page, queueFixture }) => {
+  await queueFixture.update({ profileCount: 101 });
+  await openGroups(page);
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(page.locator("#profiles-count")).toHaveText("101–101 of 101 groups");
+  await queueFixture.update({ profileCount: 100 });
+  await page.getByRole("button", { name: "Refresh learning", exact: true }).click();
+  await expect(page.locator("#profiles-count")).toHaveText("1–100 of 100 groups");
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
+});
+
+test("a failed group load leaves no placeholder, stale count or Next button", async ({ page, queueFixture }) => {
+  await queueFixture.update({ profileCount: 150 });
+  await openGroups(page);
+  await expect(page.locator("#profiles-count")).toHaveText("1–100 of 150 groups");
+  await page.route("**/api/profiles?offset=*", (route) => route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "Unavailable" }) }), { times: 1 });
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(page.locator("#profiles-error")).toBeVisible();
+  await expect(page.locator("#profiles-list")).not.toContainText("Loading");
+  await expect(page.locator("#profiles-count")).toHaveText("");
+  await expect(page.getByRole("button", { name: "Next", exact: true })).toBeDisabled();
+});
+
+test("a search replaces the previous level at once, moves focus and announces itself", async ({ page, queueFixture }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Learned workloads", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Sample app", exact: true })).toBeVisible();
+  let release = () => {};
+  const held = new Promise((resolve) => { release = resolve; });
+  await page.route("**/api/profiles?offset=*", async (route) => { await held; await route.continue(); }, { times: 1 });
+  await page.getByLabel("Find a workload", { exact: true }).fill("tests");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.locator("#profiles-level")).toHaveText("Search results");
+  await expect(page.locator("#profiles-level")).toBeFocused();
+  await expect(page.locator("#announcement")).toHaveText("Search results");
+  await expect(page.getByRole("button", { name: "Sample app", exact: true })).toHaveCount(0);
+  release();
+  await expect(page.locator("#profiles-list")).toContainText("API tests");
   expect(await queueFixture.events()).toEqual([]);
 });

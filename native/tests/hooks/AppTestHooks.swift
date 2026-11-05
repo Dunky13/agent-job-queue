@@ -75,6 +75,7 @@ extension AppDelegate {
                 window.center()
             }
             if arguments.contains("--snapshot-learning") {
+                if arguments.contains("--snapshot-learning-projects") { AppRuntime.learningStore.showFixtureLevel(.projects) }
                 window.contentView = NSHostingView(rootView: LearningWindow(store: AppRuntime.learningStore) {})
                 window.minSize = NSSize(width: 800, height: 550)
                 window.setContentSize(NSSize(width: 1000, height: 780))

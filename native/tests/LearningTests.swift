@@ -50,11 +50,29 @@ private func testDetail(id: String = sourceID, revision: Int = 7, label: String 
         controllerAppliedRevision: revision - 1, controllerStatus: "pending")
 }
 
+private let hierarchyFixture = LearningHierarchy(revision: 7, projects: [
+    LearningProjectRow(project: "Sample app", collapsed: false, workloadCount: 9, groupCount: 3, runCount: 40, operations: [
+        LearningOperationRow(operation: "tests", workloadCount: 5, groupCount: 2, runCount: 30),
+        LearningOperationRow(operation: "race-tests", workloadCount: 4, groupCount: 1, runCount: 10)]),
+    LearningProjectRow(project: "Other projects", collapsed: true, projectCount: 2, workloadCount: 2, groupCount: 2, runCount: 5, operations: [
+        LearningOperationRow(operation: "other", workloadCount: 2, groupCount: 2, runCount: 5)]),
+], total: 1, limit: 100, controllerAppliedRevision: 6, controllerStatus: "pending")
+
+/// Opens the first project's "All operations" list, the level where groups are browsed.
+@MainActor private func openGroups(_ store: LearningStore) async {
+    await store.loadPage()?.value
+    if let row = store.hierarchy?.projects.first { store.openProject(row) }
+    await store.openOperation(nil)?.value
+}
+
 private actor LearningFixture {
     private(set) var calls: [LearningCall] = []
     var revision = 7
     var shouldFail = false
     var shouldFailRead = false
+    var hierarchyEmpty = false
+    var catalogTotal = 104
+    var shouldFailHierarchy = false
     private var shouldHold = false
     private var held: CheckedContinuation<Void, Never>?
     private var waiter: CheckedContinuation<Void, Never>?
@@ -62,6 +80,11 @@ private actor LearningFixture {
     func holdNextCall() { shouldHold = true }
     func failNextMutation(_ value: Bool) { shouldFail = value }
     func failRead(_ value: Bool) { shouldFailRead = value }
+    /// Group selection follows every list read with a detail read; this finds the list read itself.
+    func lastList() -> [String]? { calls.last(where: { $0.arguments.count > 1 && $0.arguments[1] == "list" })?.arguments }
+    func emptyHierarchy(_ value: Bool) { hierarchyEmpty = value }
+    func setCatalogTotal(_ value: Int) { catalogTotal = value }
+    func failHierarchy(_ value: Bool) { shouldFailHierarchy = value }
     func waitUntilHeld() async {
         if held != nil { return }
         await withCheckedContinuation { waiter = $0 }
@@ -80,11 +103,16 @@ private actor LearningFixture {
         guard arguments.first == "profiles", arguments.count >= 3 else { throw ClientError.message("Unexpected command") }
         let encoder = JSONEncoder()
         let operation = arguments[1]
+        if operation == "list" && arguments.contains("--hierarchy") {
+            if shouldFailHierarchy { throw ClientError.message("Overview unavailable") }
+            return try encoder.encode(hierarchyEmpty ? LearningHierarchy(revision: revision, projects: [], total: 0, limit: 100) : hierarchyFixture)
+        }
         if operation == "list" {
             let offset = arguments.firstIndex(of: "--offset").flatMap { Int(arguments[$0 + 1]) } ?? 0
+            let page = offset < catalogTotal ? [testDetail(revision: revision).profile, testDetail(id: targetID, revision: revision, label: "Build tests").profile] : []
             return try encoder.encode(LearningCatalog(revision: revision,
-                profiles: [testDetail(revision: revision).profile, testDetail(id: targetID, revision: revision, label: "Build tests").profile],
-                total: 104, offset: offset, limit: 50, controllerAppliedRevision: revision - 1, controllerStatus: "pending"))
+                profiles: page,
+                total: catalogTotal, offset: offset, limit: 50, controllerAppliedRevision: revision - 1, controllerStatus: "pending"))
         }
         if operation == "show" {
             if shouldFailRead { throw ClientError.message("Profile no longer available") }
@@ -171,6 +199,7 @@ struct LearningTests {
 
         let linkingFixture = LearningFixture()
         let linkingStore = LearningStore(command: { try await linkingFixture.load($0.arguments, $0.input) })
+        await openGroups(linkingStore)
         await linkingFixture.holdNextCall()
         let catalogLoad = linkingStore.loadPage()
         await linkingFixture.waitUntilHeld()
@@ -180,13 +209,27 @@ struct LearningTests {
         try check(linkingStore.selectedID == targetID && linkingStore.detail?.profile.id == targetID,
             "Initial catalog I/O cannot overwrite a profile selected through a job link")
 
+        // First open from a job link: the window's own load is still reading the projects when the link selects its group.
+        let firstOpenFixture = LearningFixture()
+        let firstOpen = LearningStore(command: { try await firstOpenFixture.load($0.arguments, $0.input) })
+        await firstOpenFixture.holdNextCall()
+        let windowLoad = firstOpen.loadPage()
+        await firstOpenFixture.waitUntilHeld()
+        await firstOpen.loadPage(preserveSelection: true)?.value
+        await firstOpen.select(targetID)?.value
+        await firstOpenFixture.release()
+        await windowLoad?.value
+        try check(firstOpen.selectedID == targetID && firstOpen.detail?.profile.id == targetID,
+            "A group opened from a job link while the first projects read is in flight stays open")
+
         let fixture = LearningFixture()
         let store = LearningStore(command: { try await fixture.load($0.arguments, $0.input) })
         let openingCalls = await fixture.calls
         try check(openingCalls.isEmpty && store.catalog == nil, "Constructing learning state performs no implicit I/O")
-        await store.loadPage()?.value
+        await openGroups(store)
         let initialCalls = await fixture.calls
-        try check(initialCalls.first?.arguments == ["profiles", "list", "--offset", "0", "--limit", "50", "--query", "", "--json"] &&
+        try check(initialCalls.first?.arguments == ["profiles", "list", "--hierarchy", "--limit", "100", "--json"] &&
+            initialCalls.contains { $0.arguments == ["profiles", "list", "--offset", "0", "--limit", "50", "--query", "", "--project", "Sample app", "--json"] } &&
             initialCalls.allSatisfy { $0.input == nil }, "Catalog reads use bounded pagination without mutation input")
         try check(store.detail?.profile.id == sourceID && store.detail?.profile.successCount == 18 &&
             store.detail?.profile.incompleteCount == 2 && store.hasNext && !store.hasPrevious,
@@ -282,6 +325,141 @@ struct LearningTests {
             "Selections from different learning revisions cannot be silently combined")
         bulk.clearMergeSelection()
         try check(bulk.mergeSelection.isEmpty, "Clearing the bulk selection removes stale items")
+
+        let browseFixture = LearningFixture()
+        let browse = LearningStore(command: { try await browseFixture.load($0.arguments, $0.input) })
+        await browse.loadPage()?.value
+        try check(browse.displayLevel == .projects && browse.selectedID == nil && browse.detail == nil && browse.catalog == nil &&
+            browse.hierarchy?.projects.map(\.project) == ["Sample app", "Other projects"],
+            "The project level lists the overview and selects nothing")
+        guard let appRow = browse.hierarchy?.projects.first, let otherRow = browse.hierarchy?.projects.last else {
+            throw ClientError.message("Missing hierarchy fixture")
+        }
+        let callsBeforeDrill = await browseFixture.calls.count
+        browse.openProject(appRow)
+        let callsAfterDrill = await browseFixture.calls.count
+        try check(browse.displayLevel == .operations && browse.projectRow?.operations.count == 2 && browse.selectedID == nil &&
+            callsAfterDrill == callsBeforeDrill && browse.breadcrumb == "All projects / Sample app",
+            "Opening a project reads nothing, selects nothing and lists its operations")
+        try check(learningOperationName("race-tests") == "Race tests" && learningOperationName("other") == "Other" &&
+            learningCounts(workloads: 1, groups: 2, runs: 0) == "1 workload · 2 groups · 0 runs",
+            "Operations and counts have readable names")
+        await browse.openOperation("tests")?.value
+        let tests = ["profiles", "list", "--offset", "0", "--limit", "50", "--query", "", "--project", "Sample app", "--operation", "tests", "--json"]
+        try check(await browseFixture.lastList() == tests && browse.displayLevel == .groups && browse.selectedID == sourceID &&
+            browse.breadcrumb == "All projects / Sample app / Tests",
+            "Choosing an operation filters the group list and selects its first group")
+        browse.query = "web"
+        await browse.loadPage()?.value
+        try check(await browseFixture.lastList() == ["profiles", "list", "--offset", "0", "--limit", "50", "--query", "web", "--json"] &&
+            browse.searchActive && browse.displayLevel == .groups && browse.level == .groups && browse.selectedID == sourceID,
+            "Search ignores the drill-down and lists every project")
+        browse.query = ""
+        await browse.loadPage()?.value
+        try check(await browseFixture.lastList() == tests && !browse.searchActive && browse.breadcrumb == "All projects / Sample app / Tests",
+            "Clearing the search restores the group list of the level the operator was on")
+        await browse.goBack()?.value
+        try check(await browseFixture.lastList() == ["profiles", "list", "--hierarchy", "--limit", "100", "--json"] &&
+            browse.displayLevel == .operations && browse.selectedID == nil && browse.detail == nil && browse.operation == nil,
+            "Going back reloads the overview so counts are current and clears the group")
+        browse.query = "web"
+        await browse.loadPage()?.value
+        browse.query = ""
+        await browse.loadPage()?.value
+        try check(browse.displayLevel == .operations && browse.selectedID == nil && browse.detail == nil,
+            "Clearing a search made at the operations level neither selects a group nor leaves the level")
+        browse.openProject(otherRow)
+        await browse.openOperation("other")?.value
+        try check(await browseFixture.lastList() == ["profiles", "list", "--offset", "0", "--limit", "50", "--query", "", "--operation", "other", "--other-projects", "--json"],
+            "The folded row filters with other-projects instead of a project name")
+        await browseFixture.emptyHierarchy(true)
+        await browse.show(.operations)?.value
+        let foldedList = await browseFixture.lastList()
+        try check(browse.projectRow == nil && browse.displayLevel == .groups && browse.operation == nil && browse.selectedID == sourceID &&
+            foldedList == ["profiles", "list", "--offset", "0", "--limit", "50", "--query", "", "--other-projects", "--json"],
+            "A project folded out of the overview still lists its groups instead of claiming it is empty")
+        // A folded project has no operations level, so the user-facing Back and the project crumb leave for the projects.
+        await browse.goBack()?.value
+        try check(browse.displayLevel == .projects && browse.scope == nil && browse.selectedID == nil,
+            "Back from the groups of a folded project goes to the projects instead of looping back to the same groups")
+        browse.openProject(otherRow)
+        await browse.show(.operations)?.value
+        await browseFixture.setCatalogTotal(0)
+        await browse.show(.operations)?.value
+        try check(browse.catalog?.profiles.isEmpty == true && browse.error == nil && browse.displayLevel == .groups,
+            "The empty state appears only when the project filter really returns nothing")
+        await browse.reloadPage(offset: 50)?.value
+        try check(!browse.hasPrevious && !browse.hasNext && browse.pageLabel == "No learned workloads",
+            "An empty list offers neither Previous nor a range")
+        await browse.show(.projects)?.value
+        try check(browse.displayLevel == .projects && browse.scope == nil && browse.hierarchy?.projects.isEmpty == true,
+            "The empty state offers a way back to all projects")
+        await browseFixture.emptyHierarchy(false)
+        await browseFixture.setCatalogTotal(104)
+
+        // Refresh and paging answer the submitted search, not text typed in the box.
+        browse.openProject(appRow)
+        await browse.openOperation(nil)?.value
+        browse.query = "go"
+        await browse.loadPage()?.value
+        await browse.reloadPage(offset: 50)?.value
+        browse.query = ""
+        await browse.reloadPage(preserveSelection: true)?.value
+        try check(await browseFixture.lastList() == ["profiles", "list", "--offset", "50", "--limit", "50", "--query", "go", "--json"] &&
+            browse.searchActive && browse.submittedQuery == "go",
+            "Refresh keeps the submitted search and its page instead of mixing in the unsubmitted box")
+        browse.query = "go"
+        await browse.loadPage()?.value
+        browse.query = ""
+        await browse.loadPage()?.value
+        try check(await browseFixture.lastList() == ["profiles", "list", "--offset", "0", "--limit", "50", "--query", "", "--project", "Sample app", "--json"] &&
+            !browse.searchActive && browse.catalog?.offset == 0,
+            "Submitting a different search resets the page offset")
+
+        // An unsubmitted search must not leak into a drill-down or a reload.
+        browse.query = "lint"
+        await browse.openOperation("tests")?.value
+        try check(await browseFixture.lastList() == tests && !browse.searchActive && browse.displayLevel == .groups,
+            "Choosing an operation ignores text typed in the search box and not yet submitted")
+        await browse.show(.operations)?.value
+        browse.query = "lint"
+        await browse.reloadSelection()?.value
+        try check(!browse.searchActive && browse.submittedQuery.isEmpty && browse.displayLevel == .operations,
+            "Reloading with nothing selected ignores text typed in the search box and not yet submitted")
+
+        // A merge made at the operations level can fold the project away; its groups must still list.
+        await browse.select(sourceID)?.value
+        await browseFixture.emptyHierarchy(true)
+        await browse.merge(into: targetID)?.value
+        try check(browse.projectRow == nil && browse.displayLevel == .groups && browse.error == nil && browse.catalog?.profiles.isEmpty == false,
+            "A merge that folds the project at the operations level lists its groups instead of a false empty state")
+        await browseFixture.emptyHierarchy(false)
+
+        // After a merge a page past the end shows the last page.
+        await browseFixture.setCatalogTotal(101)
+        await browse.reloadPage(offset: 100)?.value
+        await browseFixture.setCatalogTotal(100)
+        await browse.reloadPage(offset: 100)?.value
+        try check(browse.catalog?.offset == 50 && browse.catalog?.total == 100 && browse.pageLabel == "51–52 of 100",
+            "A page past the end after a merge loads the last page that exists")
+        await browseFixture.setCatalogTotal(104)
+
+        // Leaving a search whose overview read fails shows the error at the level being restored.
+        await browse.show(.operations)?.value
+        browse.query = "go"
+        await browse.loadPage()?.value
+        await browseFixture.failHierarchy(true)
+        browse.query = ""
+        await browse.loadPage()?.value
+        try check(!browse.searchActive && browse.displayLevel == .operations && browse.error?.contains("Overview unavailable") == true,
+            "A failed overview read after clearing a search leaves the results and shows the error")
+        await browseFixture.failHierarchy(false)
+        try check(learningProjectsNote(total: 5, shown: 4, limit: 100)?.contains("1 project is not shown") == true &&
+            learningProjectsNote(total: 150, shown: 100, limit: 100)?.contains("50 projects are not shown") == true &&
+            learningProjectsNote(total: 100, shown: 100, limit: 100)?.contains("Smaller projects are not shown") == true &&
+            learningProjectsNote(total: 3, shown: 3, limit: 100) == nil &&
+            learningProjectsNote(total: 150, shown: 100, limit: 100)?.contains("Search a project or group name") == true,
+            "The truncation note counts what is hidden and says searching finds it")
 
         store.query = "tests"
         await store.loadPage(offset: 50)?.value

@@ -3,6 +3,7 @@ package backend
 import (
 	"fmt"
 	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 	"sort"
 	"strings"
 )
@@ -133,7 +134,7 @@ func (f ProfileFilter) any() bool { return f.Project != "" || f.Operation != "" 
 func profileProject(members []Object) string {
 	counts := map[string]int{}
 	for _, member := range members {
-		if name := text(member["project"]); name != "" {
+		if name := norm.NFC.String(text(member["project"])); name != "" {
 			counts[name]++
 		}
 	}
@@ -190,29 +191,41 @@ func (s *ProfileStore) CatalogFiltered(offset, limit int, query string, filter P
 			return e
 		}
 		all := []Object{}
+		memberProjects := map[string][]string{}
 		for id, profile := range profiles {
 			summary, e := profileSummary(profile, groups[id])
 			if e != nil {
 				return e
 			}
 			all = append(all, summary)
+			for _, member := range groups[id].members {
+				memberProjects[id] = append(memberProjects[id], profileFold(text(member["project"])))
+			}
 		}
 		collapsed := map[string]bool{}
 		if filter.OtherProjects {
 			collapsed = profileCollapsedProjects(profileProjectTotals(all))
 		}
 		entries := []Object{}
-		needle := strings.TrimSpace(cases.Fold().String(query))
+		needle := strings.TrimSpace(profileFold(query))
 		for _, summary := range all {
 			id := text(summary["id"])
 			if filter.Project != "" && text(summary["project"]) != filter.Project || filter.Operation != "" && text(summary["operation"]) != filter.Operation || filter.OtherProjects && !collapsed[text(summary["project"])] {
 				continue
 			}
-			if needle == "" || strings.Contains(cases.Fold().String(text(summary["label"])), needle) || strings.Contains(id, needle) {
+			// Search also matches any member project, so groups behind a truncated project list stay reachable.
+			if needle == "" || strings.Contains(profileFold(text(summary["label"])), needle) || strings.Contains(id, needle) || profileAnyContains(memberProjects[id], needle) {
 				entries = append(entries, summary)
 			}
 		}
+		// With a search, groups whose own label or id matches come before those matched only through a member project.
+		direct := func(entry Object) bool {
+			return needle == "" || strings.Contains(profileFold(text(entry["label"])), needle) || strings.Contains(text(entry["id"]), needle)
+		}
 		sort.Slice(entries, func(i, j int) bool {
+			if di, dj := direct(entries[i]), direct(entries[j]); di != dj {
+				return di
+			}
 			a, b := cases.Fold().String(text(entries[i]["label"])), cases.Fold().String(text(entries[j]["label"]))
 			if a == b {
 				return text(entries[i]["id"]) < text(entries[j]["id"])
@@ -223,6 +236,19 @@ func (s *ProfileStore) CatalogFiltered(offset, limit int, query string, filter P
 		return nil
 	})
 	return result, e
+}
+
+// profileFold compares text the way a person sees it: precomposed and case folded.
+// Foundation's Process hands arguments over decomposed, while stored names may be either form.
+func profileFold(value string) string { return cases.Fold().String(norm.NFC.String(value)) }
+
+func profileAnyContains(values []string, needle string) bool {
+	for _, value := range values {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // A project with this many workloads or fewer folds into the other-projects row.
@@ -496,10 +522,10 @@ func profileMemberPage(group *profileGroup, options ProfileDetailOptions) ([]Obj
 		family := text(row["family"])
 		byFamily[family].envelopes = append(byFamily[family].envelopes, row)
 	}
-	needle := cases.Fold().String(strings.TrimSpace(options.MemberQuery))
+	needle := strings.TrimSpace(profileFold(options.MemberQuery))
 	matching := []Object{}
 	for _, member := range group.members {
-		if needle == "" || strings.Contains(cases.Fold().String(strings.Join([]string{profileLabel(text(member["family"]), member), text(member["project"]), text(member["executable"]), text(member["family"])}, " ")), needle) {
+		if needle == "" || strings.Contains(profileFold(strings.Join([]string{profileLabel(text(member["family"]), member), text(member["project"]), text(member["executable"]), text(member["family"])}, " ")), needle) {
 			matching = append(matching, member)
 		}
 	}

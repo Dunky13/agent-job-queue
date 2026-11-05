@@ -116,6 +116,14 @@ func TestProfileMemberPagesSearchAllMembersAndRetainOwnStats(t *testing.T) {
 	}
 }
 
+func TestProfileMemberSearchFoldsDecomposedText(t *testing.T) {
+	group := &profileGroup{members: []Object{{"family": strings.Repeat("a", 64), "title": "Caf\u00e9 build", "project": "fixture", "executable": "go"}}}
+	page, info, err := profileMemberPage(group, ProfileDetailOptions{MemberQuery: "CAFE\u0301", MemberLimit: 256})
+	if err != nil || len(page) != 1 || metric(info["total"]) != 1 {
+		t.Fatal("A decomposed member search missed a precomposed member", page, info, err)
+	}
+}
+
 func TestProfileMemberCLIRejectsInvalidInspectionOptions(t *testing.T) {
 	gate := testGate(t)
 	for _, args := range [][]string{

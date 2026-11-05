@@ -26,6 +26,72 @@ struct LearningCatalog: Codable, Sendable {
     var controllerStatus: String? = nil
 }
 
+struct LearningOperationRow: Codable, Identifiable, Equatable, Sendable {
+    let operation: String
+    let workloadCount: Int
+    let groupCount: Int
+    let runCount: Int
+    var id: String { operation }
+}
+
+struct LearningProjectRow: Codable, Identifiable, Equatable, Sendable {
+    let project: String
+    let collapsed: Bool
+    var projectCount: Int? = nil
+    let workloadCount: Int
+    let groupCount: Int
+    let runCount: Int
+    let operations: [LearningOperationRow]
+    var id: String { "\(collapsed ? "other" : "project"):\(project)" }
+}
+
+struct LearningHierarchy: Codable, Equatable, Sendable {
+    let revision: Int
+    let projects: [LearningProjectRow]
+    let total: Int
+    let limit: Int
+    var controllerAppliedRevision: Int? = nil
+    var controllerStatus: String? = nil
+}
+
+enum LearningLevel: Sendable { case projects, operations, groups }
+
+/// The project row a drill-down is inside. Identity is the name plus the folded flag.
+struct LearningScope: Equatable, Sendable {
+    let project: String
+    let collapsed: Bool
+    /// Set when a merge left this project without an operations level; going up skips it.
+    var folded = false
+}
+
+func learningOperationName(_ operation: String) -> String {
+    let words = operation.replacingOccurrences(of: "-", with: " ")
+    return words.prefix(1).uppercased() + words.dropFirst()
+}
+
+func learningCounts(workloads: Int, groups: Int, runs: Int) -> String {
+    func plural(_ count: Int, _ word: String) -> String { "\(count.formatted()) \(word)\(count == 1 ? "" : "s")" }
+    return "\(plural(workloads, "workload")) · \(plural(groups, "group")) · \(plural(runs, "run"))"
+}
+
+/// The total counts only projects with three or more workloads; smaller ones fold into the last row, which truncation drops first.
+func learningProjectsNote(total: Int, shown: Int, limit: Int) -> String? {
+    if total > shown {
+        let hidden = total - shown
+        return "Showing the \(shown) busiest of \(total) projects with three or more workloads. \(hidden) \(hidden == 1 ? "project is" : "projects are") not shown, nor any smaller projects. Search a project or group name to find them."
+    }
+    if shown >= limit {
+        return "Showing the \(shown) busiest projects with three or more workloads. Smaller projects are not shown. Search a project or group name to find them."
+    }
+    return nil
+}
+
+struct LearningFilter: Equatable, Sendable {
+    var project: String?
+    var operation: String?
+    var otherProjects = false
+}
+
 struct LearningMember: Codable, Identifiable, Sendable {
     let family: String
     let label: String
@@ -149,6 +215,14 @@ enum LearningMemoryUnit: String, CaseIterable {
 @MainActor
 final class LearningStore: ObservableObject {
     @Published private(set) var catalog: LearningCatalog?
+    @Published private(set) var hierarchy: LearningHierarchy?
+    @Published private(set) var level = LearningLevel.projects
+    @Published private(set) var scope: LearningScope?
+    @Published private(set) var operation: String?
+    /// True while the visible list is a global search; it hides the drill-down until the query is cleared.
+    @Published private(set) var searchActive = false
+    /// The search the visible list answers. The box can hold something newer that was never submitted.
+    private(set) var submittedQuery = ""
     @Published private(set) var detail: LearningDetail?
     @Published private(set) var selectedID: String?
     @Published private(set) var isLoading = false
@@ -177,11 +251,13 @@ final class LearningStore: ObservableObject {
     private var memberTask: Task<Void, Never>?
     private let command: @Sendable (QueueClient.Command) async throws -> Data
 
-    init(fixtureMode: Bool = false, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
+    /// `flat` is for the merge-target picker, which lists every group and never drills down.
+    init(fixtureMode: Bool = false, flat: Bool = false, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
         try await QueueClient.run($0)
     }) {
         self.fixtureMode = fixtureMode
         self.command = command
+        level = flat ? .groups : .projects
         #if AGENT_QUEUE_TEST_HOOKS
         if fixtureMode {
             let preview = Self.previewDetail()
@@ -190,18 +266,52 @@ final class LearningStore: ObservableObject {
             selectedID = preview.profile.id
             detail = preview
             restoreDraft(preview)
+            if !flat {
+                hierarchy = Self.previewHierarchy()
+                level = .groups
+                scope = LearningScope(project: "Sample project", collapsed: false)
+                operation = "tests"
+            }
         }
         #endif
     }
 
+    var displayLevel: LearningLevel { searchActive ? .groups : level }
+    var projectRow: LearningProjectRow? {
+        guard let scope else { return nil }
+        return hierarchy?.projects.first { $0.collapsed == scope.collapsed && $0.project == scope.project }
+    }
+    /// Says what the overview leaves out, or nil when it lists everything.
+    var hierarchyNote: String? {
+        guard let hierarchy else { return nil }
+        return learningProjectsNote(total: hierarchy.total, shown: hierarchy.projects.filter { !$0.collapsed }.count, limit: hierarchy.limit)
+    }
+    var breadcrumb: String {
+        guard let scope else { return "All projects" }
+        let trail = ["All projects", scope.project]
+        return (displayLevel == .groups ? trail + [operation.map(learningOperationName) ?? "All operations"] : trail).joined(separator: " / ")
+    }
+
     var canSave: Bool { !fixtureMode && !isLoading && !isMutating && !isMemberPageLoading && detail != nil }
-    var hasPrevious: Bool { (catalog?.offset ?? 0) > 0 }
+    var hasPrevious: Bool { (catalog?.offset ?? 0) > 0 && (catalog?.total ?? 0) > 0 }
     var hasNext: Bool {
         guard let catalog else { return false }
         return catalog.offset + catalog.profiles.count < catalog.total
     }
+    #if AGENT_QUEUE_TEST_HOOKS
+    func showFixtureLevel(_ level: LearningLevel) {
+        guard fixtureMode else { return }
+        self.level = level
+        if level == .projects {
+            scope = nil
+            operation = nil
+            clearSelection()
+        }
+    }
+    #endif
+
     var pageLabel: String {
-        guard let catalog, catalog.total > 0 else { return "No learned workloads" }
+        guard let catalog, catalog.total > 0, !catalog.profiles.isEmpty else { return "No learned workloads" }
         return "\(catalog.offset + 1)–\(catalog.offset + catalog.profiles.count) of \(catalog.total)"
     }
     var controllerMessage: String? {
@@ -216,30 +326,125 @@ final class LearningStore: ObservableObject {
         return "Waiting for the controller to apply these corrections. Active jobs continue."
     }
 
+    /// Submits the search box and reads the list from `offset`.
     @discardableResult
     func loadPage(offset: Int = 0, preserveSelection: Bool = false) -> Task<Void, Never>? {
+        load(query: query.trimmingCharacters(in: .whitespacesAndNewlines), offset: offset, preserveSelection: preserveSelection)
+    }
+
+    /// Re-reads or pages the list on screen: its submitted search, never text typed in the box and not yet submitted.
+    @discardableResult
+    func reloadPage(offset: Int? = nil, preserveSelection: Bool = false) -> Task<Void, Never>? {
+        load(query: submittedQuery, offset: offset ?? catalog?.offset ?? 0, preserveSelection: preserveSelection)
+    }
+
+    private func load(query requestedQuery: String, offset: Int, preserveSelection: Bool) -> Task<Void, Never>? {
         guard !fixtureMode, !isLoading, !isMutating else { return nil }
         isLoading = true
         error = nil
-        let requestedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let searching = !requestedQuery.isEmpty
+        let requestedLevel = level
         let requestedGeneration = selectionGeneration
         return Task {
             defer { isLoading = false }
             do {
-                let result = try await readCatalog(offset: max(0, offset), query: requestedQuery)
-                catalog = result
-                if (!preserveSelection || selectedID == nil) && selectionGeneration == requestedGeneration {
-                    if let id = result.profiles.first?.id { await select(id)?.value }
-                    else {
-                        selectionTask?.cancel()
-                        selectionGeneration += 1
-                        selectedID = nil
-                        detail = nil
-                        isDetailLoading = false
-                        clearDraft()
+                if !searching && requestedLevel != .groups {
+                    if try await readOverview(from: requestedLevel) {
+                        searchActive = false
+                        submittedQuery = ""
+                        // A group opened from a job link while this read ran stays open.
+                        if (!preserveSelection || selectedID == nil) && selectionGeneration == requestedGeneration { clearSelection() }
+                        return
                     }
                 }
-            } catch { self.error = "Could not load learned workloads. \(error.localizedDescription)" }
+                let result = try await readCatalog(offset: max(0, offset), query: requestedQuery, filter: searching ? LearningFilter() : filter)
+                catalog = result
+                searchActive = searching
+                submittedQuery = requestedQuery
+                if (!preserveSelection || selectedID == nil) && selectionGeneration == requestedGeneration {
+                    if let id = result.profiles.first?.id { await select(id)?.value }
+                    else { clearSelection() }
+                }
+            } catch {
+                // Clearing a search that cannot be left would strand the view on results the box no longer asks for.
+                if !searching && searchActive {
+                    searchActive = false
+                    submittedQuery = ""
+                    if requestedLevel == .groups { catalog = nil }
+                    if selectionGeneration == requestedGeneration { clearSelection() }
+                }
+                self.error = "Could not load learned workloads. \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Re-reads the overview. A merge can fold the project into the other-projects row, which has no
+    /// operations level: then this switches to its groups and returns false for the caller to list them.
+    private func readOverview(from requestedLevel: LearningLevel) async throws -> Bool {
+        hierarchy = try await readHierarchy()
+        if requestedLevel != .operations || projectRow != nil { return true }
+        level = .groups
+        operation = nil
+        catalog = nil
+        scope?.folded = true
+        return false
+    }
+
+    private func clearSelection() {
+        selectionTask?.cancel()
+        selectionGeneration += 1
+        selectedID = nil
+        detail = nil
+        isDetailLoading = false
+        clearDraft()
+    }
+
+    private var filter: LearningFilter {
+        guard let scope else { return LearningFilter() }
+        return LearningFilter(project: scope.collapsed ? nil : scope.project, operation: operation, otherProjects: scope.collapsed)
+    }
+
+    /// Drilling down reads nothing: the overview already holds every operation of its project.
+    func openProject(_ row: LearningProjectRow) {
+        guard !fixtureMode, !isLoading, !isMutating else { return }
+        scope = LearningScope(project: row.project, collapsed: row.collapsed)
+        operation = nil
+        level = .operations
+        searchActive = false
+        submittedQuery = ""
+        query = ""
+        clearSelection()
+    }
+
+    @discardableResult
+    func openOperation(_ operation: String?) -> Task<Void, Never>? {
+        guard !fixtureMode, !isLoading, !isMutating, scope != nil else { return nil }
+        self.operation = operation
+        level = .groups
+        catalog = nil
+        clearSelection()
+        return reloadPage()
+    }
+
+    /// Going up reloads, so the counts reflect any merge or edit made below.
+    @discardableResult
+    func show(_ target: LearningLevel) -> Task<Void, Never>? {
+        guard !fixtureMode, !isLoading, !isMutating, target != .groups else { return nil }
+        level = target
+        operation = nil
+        if target == .projects { scope = nil }
+        query = ""
+        catalog = nil
+        clearSelection()
+        return loadPage()
+    }
+
+    @discardableResult
+    func goBack() -> Task<Void, Never>? {
+        switch level {
+        case .groups: show(scope?.folded == true ? .projects : .operations)
+        case .operations: show(.projects)
+        case .projects: nil
         }
     }
 
@@ -284,7 +489,7 @@ final class LearningStore: ObservableObject {
     func reloadSelection() -> Task<Void, Never>? {
         guard !isMutating else { return nil }
         if let selectedID { return select(selectedID) }
-        return loadPage()
+        return reloadPage()
     }
 
     func closeMember() {
@@ -520,17 +725,33 @@ final class LearningStore: ObservableObject {
                     else if operation == "merge" || operation == "combine" { ungroupedFrom = nil }
                     notice = success
                 }
-                do { catalog = try await readCatalog(offset: catalog?.offset ?? 0, query: query) }
-                catch { self.error = "The correction was saved, but the list could not refresh. \(error.localizedDescription)" }
+                do {
+                    if searchActive || level == .groups {
+                        catalog = try await readCatalog(offset: catalog?.offset ?? 0, query: searchActive ? submittedQuery : "",
+                            filter: searchActive ? LearningFilter() : filter)
+                    } else if try await !readOverview(from: level) {
+                        catalog = try await readCatalog(offset: 0, query: "", filter: filter)
+                    }
+                } catch { self.error = "The correction was saved, but the list could not refresh. \(error.localizedDescription)" }
             } catch {
                 self.error = "Could not confirm the correction. \(error.localizedDescription) Reload to check whether it was applied before retrying. Your edits are preserved."
             }
         }
     }
 
-    private func readCatalog(offset: Int, query: String) async throws -> LearningCatalog {
-        try JSONDecoder().decode(LearningCatalog.self, from: try await command(
-            .profilesList(offset: offset, limit: pageSize, query: query)))
+    private func readCatalog(offset: Int, query: String, filter: LearningFilter) async throws -> LearningCatalog {
+        func read(_ offset: Int) async throws -> LearningCatalog {
+            try JSONDecoder().decode(LearningCatalog.self, from: try await command(
+                .profilesList(offset: offset, limit: pageSize, query: query, project: filter.project,
+                    operation: filter.operation, otherProjects: filter.otherProjects)))
+        }
+        let page = try await read(offset)
+        // A merge can shrink the list below this page: show the last page that exists.
+        guard page.total > 0, page.offset >= page.total else { return page }
+        return try await read((page.total - 1) / pageSize * pageSize)
+    }
+    private func readHierarchy() async throws -> LearningHierarchy {
+        try JSONDecoder().decode(LearningHierarchy.self, from: try await command(.profilesHierarchy(limit: 100)))
     }
     private func readDetail(_ id: String) async throws -> LearningDetail {
         try JSONDecoder().decode(LearningDetail.self, from: try await command(.profilesShow(id)))
@@ -558,6 +779,19 @@ final class LearningStore: ObservableObject {
     }
 
     #if AGENT_QUEUE_TEST_HOOKS
+    nonisolated static func previewHierarchy() -> LearningHierarchy {
+        func operations(_ rows: [(String, Int, Int, Int)]) -> [LearningOperationRow] {
+            rows.map { LearningOperationRow(operation: $0.0, workloadCount: $0.1, groupCount: $0.2, runCount: $0.3) }
+        }
+        return LearningHierarchy(revision: 4, projects: [
+            LearningProjectRow(project: "Sample project", collapsed: false, workloadCount: 9, groupCount: 3, runCount: 44,
+                operations: operations([("tests", 1, 1, 20), ("build", 6, 1, 16), ("lint", 2, 1, 8)])),
+            LearningProjectRow(project: "Sample service", collapsed: false, workloadCount: 5, groupCount: 2, runCount: 30,
+                operations: operations([("tests", 4, 1, 22), ("race-tests", 1, 1, 8)])),
+            LearningProjectRow(project: "Other projects", collapsed: true, projectCount: 3, workloadCount: 3, groupCount: 3, runCount: 9,
+                operations: operations([("build", 2, 2, 6), ("other", 1, 1, 3)])),
+        ], total: 2, limit: 100, controllerAppliedRevision: 4, controllerStatus: "applied")
+    }
     nonisolated static func previewDetail() -> LearningDetail {
         let family = String(repeating: "b", count: 64)
         let variant = String(repeating: "c", count: 64)
@@ -660,15 +894,21 @@ struct LearningWindow: View {
                             description: Text("Reload the selected workload to try again."))
                             .frame(maxWidth: .infinity, minHeight: 250)
                     } else {
-                        ContentUnavailableView(store.query.isEmpty ? "No learned workloads" : "No matching workloads", systemImage: "chart.bar.doc.horizontal",
-                            description: Text(store.query.isEmpty ? "Run jobs with resource monitoring enabled to build a local history." : "Try another search or refresh the list."))
-                            .frame(maxWidth: .infinity, minHeight: 250)
+                        if store.displayLevel != .groups, store.hierarchy?.projects.isEmpty == false {
+                            ContentUnavailableView("Choose a group", systemImage: "chart.bar.doc.horizontal",
+                                description: Text("Pick a project, then an operation, to list its learned groups."))
+                                .frame(maxWidth: .infinity, minHeight: 250)
+                        } else {
+                            ContentUnavailableView(store.searchActive ? "No matching workloads" : "No learned workloads", systemImage: "chart.bar.doc.horizontal",
+                                description: Text(store.searchActive ? "Try another search or refresh the list." : "Run jobs with resource monitoring enabled to build a local history."))
+                                .frame(maxWidth: .infinity, minHeight: 250)
+                        }
                     }
                 }.frame(minWidth: 480, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task { if store.catalog == nil { await store.loadPage()?.value } }
+        .task { if store.catalog == nil && store.hierarchy == nil { await store.loadPage()?.value } }
         .sheet(isPresented: $choosingTarget, onDismiss: {
             if let pendingConfirmation {
                 confirmation = pendingConfirmation
@@ -729,43 +969,136 @@ struct LearningWindow: View {
                 TextField("Search workloads", text: $store.query).textFieldStyle(.roundedBorder)
                     .onSubmit { store.loadPage() }
                 Button("Search", systemImage: "magnifyingglass") { store.loadPage() }
-                    .labelStyle(.iconOnly).help("Search workload names and safe job descriptions")
+                    .labelStyle(.iconOnly).help("Search every project by workload, project or safe job description")
             }.disabled(store.fixtureMode || store.isLoading || store.isMutating)
+            if store.searchActive {
+                Text("Search results across every project").font(.caption).foregroundStyle(.secondary)
+            } else if store.level != .projects {
+                HStack(alignment: .firstTextBaseline) {
+                    Button("Back", systemImage: "chevron.left") { store.goBack() }
+                        .disabled(store.fixtureMode || store.isLoading || store.isMutating)
+                    breadcrumbTrail
+                }
+            }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
-                    ForEach(store.catalog?.profiles ?? []) { profile in
-                        HStack(alignment: .top, spacing: 6) {
-                            mergeToggle(LearningMergeItem(identity: profile.id, label: profile.label, isGroup: true, sourceGroup: profile.id, revision: store.catalog?.revision ?? 0))
-                            Button { store.select(profile.id) } label: {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text(profile.label).font(.headline).lineLimit(2)
-                                    Text("\(profile.memberCount) families · \(profile.variantCount) variants")
-                                    Text("\(profile.successCount) successful · \(profile.incompleteCount) incomplete")
-                                }.font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(10)
-                                    .contentShape(Rectangle())
-                                    .background(store.selectedID == profile.id ? Color.accentColor.opacity(0.13) : Color.clear)
-                                    .clipShape(RoundedRectangle(cornerRadius: 7))
-                            }.buttonStyle(.plain).disabled(store.fixtureMode)
-                        }
+                    switch store.displayLevel {
+                    case .projects: projectRows
+                    case .operations: operationRows
+                    case .groups: groupRows
                     }
                 }
             }
-            Divider()
-            HStack {
-                Button("Previous", systemImage: "chevron.left") {
-                    store.loadPage(offset: max(0, (store.catalog?.offset ?? 0) - store.pageSize))
-                }.labelStyle(.iconOnly).disabled(!store.hasPrevious)
-                Spacer()
-                Text(store.pageLabel).font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button("Next", systemImage: "chevron.right") {
-                    store.loadPage(offset: (store.catalog?.offset ?? 0) + store.pageSize)
-                }.labelStyle(.iconOnly).disabled(!store.hasNext)
-            }.disabled(store.fixtureMode || store.isLoading || store.isMutating)
+            if store.displayLevel == .groups {
+                Divider()
+                HStack {
+                    Button("Previous", systemImage: "chevron.left") {
+                        store.reloadPage(offset: max(0, (store.catalog?.offset ?? 0) - store.pageSize))
+                    }.labelStyle(.iconOnly).disabled(!store.hasPrevious)
+                    Spacer()
+                    Text(store.pageLabel).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Next", systemImage: "chevron.right") {
+                        store.reloadPage(offset: (store.catalog?.offset ?? 0) + store.pageSize)
+                    }.labelStyle(.iconOnly).disabled(!store.hasNext)
+                }.disabled(store.fixtureMode || store.isLoading || store.isMutating)
+            }
             Button("Refresh list", systemImage: "arrow.clockwise") {
-                store.loadPage(offset: store.catalog?.offset ?? 0, preserveSelection: true)
+                store.reloadPage(preserveSelection: true)
             }.disabled(store.fixtureMode || store.isLoading || store.isMutating)
         }.padding(16)
+    }
+
+    private func browseRow(_ title: String, _ counts: String, note: String? = nil, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title).font(.headline).lineLimit(2)
+                Text(counts)
+                if let note { Text(note) }
+            }.font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(10).contentShape(Rectangle())
+        }.buttonStyle(.plain).disabled(store.fixtureMode || store.isLoading || store.isMutating)
+    }
+
+    private var backToProjects: some View {
+        Button("Back to all projects") { store.show(.projects) }.disabled(store.fixtureMode || store.isLoading || store.isMutating)
+    }
+
+    /// Earlier parts of the location go to their level; the last part is where the operator is.
+    private var breadcrumbTrail: some View {
+        let blocked = store.fixtureMode || store.isLoading || store.isMutating
+        return HStack(spacing: 4) {
+            Button("All projects") { store.show(.projects) }.buttonStyle(.link).disabled(blocked)
+            if let scope = store.scope {
+                Text("/")
+                if store.displayLevel == .groups {
+                    Button(scope.project) { store.show(scope.folded ? .projects : .operations) }.buttonStyle(.link).disabled(blocked)
+                    Text("/")
+                    Text(store.operation.map(learningOperationName) ?? "All operations").fontWeight(.semibold)
+                } else {
+                    Text(scope.project).fontWeight(.semibold)
+                }
+            }
+        }.font(.caption).lineLimit(2).accessibilityElement(children: .contain).accessibilityLabel("Location: \(store.breadcrumb)")
+    }
+
+    @ViewBuilder private var projectRows: some View {
+        if let hierarchy = store.hierarchy, !hierarchy.projects.isEmpty {
+            if let note = store.hierarchyNote {
+                Text(note)
+                    .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 10)
+            }
+            ForEach(hierarchy.projects) { row in
+                browseRow(row.project, learningCounts(workloads: row.workloadCount, groups: row.groupCount, runs: row.runCount),
+                    note: row.collapsed ? row.projectCount.map { "Covers \($0) smaller \($0 == 1 ? "project" : "projects")" } : nil) { store.openProject(row) }
+            }
+        } else if store.hierarchy != nil {
+            Text("No learned workloads yet.").font(.callout).foregroundStyle(.secondary).padding(10)
+        } else if !store.isLoading {
+            Text("The project overview is not loaded. Use Refresh list.").font(.callout).foregroundStyle(.secondary).padding(10)
+        }
+    }
+
+    @ViewBuilder private var operationRows: some View {
+        if let row = store.projectRow {
+            browseRow("All operations", learningCounts(workloads: row.workloadCount, groups: row.groupCount, runs: row.runCount)) {
+                store.openOperation(nil)
+            }
+            ForEach(row.operations) { operation in
+                browseRow(learningOperationName(operation.operation),
+                    learningCounts(workloads: operation.workloadCount, groups: operation.groupCount, runs: operation.runCount)) {
+                    store.openOperation(operation.operation)
+                }
+            }
+        } else if store.hierarchy != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("\(store.scope?.project ?? "This project") no longer has any learned workloads.").font(.callout)
+                backToProjects
+            }.padding(10)
+        }
+    }
+
+    @ViewBuilder private var groupRows: some View {
+        ForEach(store.catalog?.profiles ?? []) { profile in
+            HStack(alignment: .top, spacing: 6) {
+                mergeToggle(LearningMergeItem(identity: profile.id, label: profile.label, isGroup: true, sourceGroup: profile.id, revision: store.catalog?.revision ?? 0))
+                Button { store.select(profile.id) } label: {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(profile.label).font(.headline).lineLimit(2)
+                        Text("\(profile.memberCount) families · \(profile.variantCount) variants")
+                        Text("\(profile.successCount) successful · \(profile.incompleteCount) incomplete")
+                    }.font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                        .contentShape(Rectangle())
+                        .background(store.selectedID == profile.id ? Color.accentColor.opacity(0.13) : Color.clear)
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                }.buttonStyle(.plain).disabled(store.fixtureMode)
+            }
+        }
+        if let catalog = store.catalog, catalog.profiles.isEmpty, !store.searchActive, store.scope != nil, !store.isLoading {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Nothing is left here.").font(.callout)
+                backToProjects
+            }.padding(10)
+        }
     }
 
     private func detailView(_ detail: LearningDetail) -> some View {
@@ -1037,7 +1370,7 @@ private struct LearningTargetPicker: View {
         self.sourceID = sourceID
         self.onChoose = onChoose
         self.onCancel = onCancel
-        _store = StateObject(wrappedValue: LearningStore(fixtureMode: fixtureMode))
+        _store = StateObject(wrappedValue: LearningStore(fixtureMode: fixtureMode, flat: true))
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1064,9 +1397,9 @@ private struct LearningTargetPicker: View {
                 }
             }.frame(minHeight: 160)
             HStack {
-                Button("Previous") { store.loadPage(offset: max(0, (store.catalog?.offset ?? 0) - store.pageSize)) }.disabled(!store.hasPrevious)
+                Button("Previous") { store.reloadPage(offset: max(0, (store.catalog?.offset ?? 0) - store.pageSize)) }.disabled(!store.hasPrevious)
                 Text(store.pageLabel).font(.caption).foregroundStyle(.secondary)
-                Button("Next") { store.loadPage(offset: (store.catalog?.offset ?? 0) + store.pageSize) }.disabled(!store.hasNext)
+                Button("Next") { store.reloadPage(offset: (store.catalog?.offset ?? 0) + store.pageSize) }.disabled(!store.hasNext)
                 Spacer()
                 Button("Cancel", action: onCancel).keyboardShortcut(.cancelAction)
             }.disabled(store.isLoading)
