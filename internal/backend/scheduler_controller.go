@@ -23,7 +23,37 @@ type Controller struct {
 	runs           map[string]Object
 	finalized      map[string]bool
 	groups         map[string]int
-	learningScopes map[string]string
+	learningScopes map[string]profileIdentity
+	scopesChecked  time.Time
+	retryHistory   time.Time
+}
+
+// A failed git probe looks like "not a repository", so an answer must not last.
+const learningScopeLifetime = 10 * time.Minute
+
+// historyPass reports whether the history pass has finished. History only
+// improves grouping, so a failure must not hold admissions, and it waits before
+// retrying because a failed apply rotates pending grants.
+func (c *Controller) historyPass(g *Gate, now time.Time) bool {
+	if now.Before(c.retryHistory) {
+		return false
+	}
+	failure := c.store.backfillSimilarity(g)
+	if failure == nil {
+		return true
+	}
+	c.retryHistory = now.Add(learningScopeLifetime)
+	if g.operationContext().Err() == nil {
+		fmt.Fprintln(os.Stderr, "Learning history pass failed; retrying later:", failure)
+	}
+	return false
+}
+
+func (c *Controller) scopes() map[string]profileIdentity {
+	if c.learningScopes == nil || time.Since(c.scopesChecked) > learningScopeLifetime {
+		c.learningScopes, c.scopesChecked = map[string]profileIdentity{}, time.Now()
+	}
+	return c.learningScopes
 }
 
 func NewController(g *Gate, sampler *ResourceSampler, store *ProfileStore) (*Controller, error) {
@@ -40,7 +70,7 @@ func NewController(g *Gate, sampler *ResourceSampler, store *ProfileStore) (*Con
 			return nil, e
 		}
 	}
-	return &Controller{gate: g, sampler: sampler, store: store, boot: boot, runs: map[string]Object{}, finalized: map[string]bool{}, groups: map[string]int{}, learningScopes: map[string]string{}}, nil
+	return &Controller{gate: g, sampler: sampler, store: store, boot: boot, runs: map[string]Object{}, finalized: map[string]bool{}, groups: map[string]int{}, learningScopes: map[string]profileIdentity{}}, nil
 }
 func (c *Controller) SampleRun(id int, value string, marker, host, prediction Object, finished bool) (Object, error) {
 	run := c.runs[value]
@@ -283,10 +313,7 @@ func (c *Controller) Tick() (Object, error) {
 		} else if e != nil {
 			return nil, e
 		}
-		if c.learningScopes == nil {
-			c.learningScopes = map[string]string{}
-		}
-		safe := profileSimilarityDescription(description, c.learningScopes)
+		safe := profileSimilarityDescription(description, c.scopes())
 		// Predictions are read together after every completion has been recorded.
 		prediction := Object{}
 		resources := Object{"prediction": prediction, "observed": nil, "decision": nil}
@@ -963,14 +990,11 @@ func serveScheduler(g *Gate, sampler *ResourceSampler, once bool) error {
 		regrouped := false
 		// Publish this controller's revision support before the first migration.
 		// The migration rotates pending grants; a fresh tick adopts its grouping.
-		if e == nil && !backfilled {
-			e = controller.store.backfillSimilarity(g)
-			if e == nil {
-				backfilled = true
-				var revision int
-				revision, e = controller.store.Revision()
-				regrouped = metric(state["learningRevision"]) != float64(revision)
-			}
+		if e == nil && !backfilled && controller.historyPass(g, started) {
+			backfilled = true
+			var revision int
+			revision, e = controller.store.Revision()
+			regrouped = metric(state["learningRevision"]) != float64(revision)
 		}
 		if ctx.Err() != nil {
 			return nil

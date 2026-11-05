@@ -132,6 +132,7 @@ func MakeDescription(g *Gate, argv []string, directory, label string) (Object, e
 	if kind := profileCommandKind(argv, title, executable); kind != "" {
 		result["learningKind"] = kind
 	}
+	result["learningTool"], result["learningOperation"] = profileClassify(argv, title, executable)
 	return result, nil
 }
 func payloadLabel(payload Object) string {
@@ -248,12 +249,23 @@ func DescribeTask(g *Gate, task Object, state string) (Object, error) {
 		result["title"] = DisplayText(label, 120)
 	}
 	if value != "" {
-		if !jsonEqual(g.DescriptionCache[value], result) {
-			if err := CacheDescription(g, value, result); err != nil {
+		// The classification is known only at submission, so the cached file keeps
+		// it; the returned description stays limited to the display fields.
+		persisted := Object{}
+		for k, v := range result {
+			persisted[k] = v
+		}
+		for _, key := range []string{"learningTool", "learningOperation"} {
+			if v, ok := description[key]; ok {
+				persisted[key] = v
+			}
+		}
+		if !jsonEqual(g.DescriptionCache[value], persisted) {
+			if err := CacheDescription(g, value, persisted); err != nil {
 				return nil, err
 			}
 		}
-		g.DescriptionCache[value] = result
+		g.DescriptionCache[value] = persisted
 	}
 	return result, nil
 }

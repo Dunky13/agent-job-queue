@@ -97,7 +97,23 @@ func learningController(g *Gate) (string, any, string) {
 	}
 	return machine, applied, reason
 }
+
+// ProfileCatalogOptions selects a catalog page, or the project hierarchy.
+type ProfileCatalogOptions struct {
+	Offset, Limit int
+	Query         string
+	Filter        ProfileFilter
+	Hierarchy     bool
+}
+
 func LearningInspect(g *Gate, identity string, offset, limit int, query string, detailOptions ...ProfileDetailOptions) (Object, error) {
+	detail := ProfileDetailOptions{MemberLimit: 256}
+	if len(detailOptions) > 0 {
+		detail = detailOptions[0]
+	}
+	return learningInspect(g, identity, ProfileCatalogOptions{Offset: offset, Limit: limit, Query: query}, detail)
+}
+func learningInspect(g *Gate, identity string, catalog ProfileCatalogOptions, options ProfileDetailOptions) (Object, error) {
 	machine, applied, status := learningController(g)
 	store, e := NewProfileStore(g.State, true)
 	if e != nil {
@@ -109,13 +125,14 @@ func LearningInspect(g *Gate, identity string, offset, limit int, query string, 
 		if e = profileID(identity); e != nil {
 			return nil, e
 		}
-		options := ProfileDetailOptions{MemberLimit: 256}
-		if len(detailOptions) > 0 {
-			options = detailOptions[0]
-		}
 		result, e = store.Inspect(identity, machine, options)
+	} else if catalog.Hierarchy {
+		if catalog.Offset != 0 || catalog.Query != "" || catalog.Filter.any() {
+			return nil, fmt.Errorf("The project hierarchy takes no page, search or filter")
+		}
+		result, e = store.Hierarchy(catalog.Limit)
 	} else {
-		result, e = store.Catalog(offset, limit, query)
+		result, e = store.CatalogFiltered(catalog.Offset, catalog.Limit, catalog.Query, catalog.Filter)
 	}
 	if e != nil {
 		return nil, e
@@ -354,6 +371,8 @@ func LearningCLI(gate *Gate, args []string, input io.Reader, output, errors io.W
 	}
 	identity, query := "", ""
 	offset, limit := 0, 100
+	catalog := ProfileCatalogOptions{}
+	seenCatalogOptions := map[string]bool{}
 	detailOptions := ProfileDetailOptions{MemberLimit: 256}
 	seenDetailOptions := map[string]bool{}
 	apply := false
@@ -405,9 +424,22 @@ func LearningCLI(gate *Gate, args []string, input io.Reader, output, errors io.W
 			}
 			return fail(fmt.Errorf("Invalid workload regroup argument"))
 		}
+		if operation == "list" && (arg == "--other-projects" || arg == "--hierarchy") {
+			if seenCatalogOptions[arg] {
+				return fail(fmt.Errorf("Duplicate workload profile option"))
+			}
+			seenCatalogOptions[arg] = true
+			catalog.Filter.OtherProjects = catalog.Filter.OtherProjects || arg == "--other-projects"
+			catalog.Hierarchy = catalog.Hierarchy || arg == "--hierarchy"
+			continue
+		}
 		if operation == "list" {
 			key, value, attached := strings.Cut(arg, "=")
-			if containsString([]string{"--offset", "--limit", "--query"}, key) {
+			if containsString([]string{"--offset", "--limit", "--query", "--project", "--operation"}, key) {
+				if (key == "--project" || key == "--operation") && seenCatalogOptions[key] {
+					return fail(fmt.Errorf("Duplicate workload profile option"))
+				}
+				seenCatalogOptions[key] = true
 				if !attached {
 					i++
 					if i >= len(args) {
@@ -428,6 +460,15 @@ func LearningCLI(gate *Gate, args []string, input io.Reader, output, errors io.W
 					}
 				case "--query":
 					query = value
+				case "--project", "--operation":
+					if value == "" {
+						return fail(fmt.Errorf("Invalid workload %s filter", strings.TrimPrefix(key, "--")))
+					}
+					if key == "--project" {
+						catalog.Filter.Project = value
+					} else {
+						catalog.Filter.Operation = value
+					}
 				}
 				continue
 			}
@@ -437,6 +478,10 @@ func LearningCLI(gate *Gate, args []string, input io.Reader, output, errors io.W
 			continue
 		}
 		return fail(fmt.Errorf("Invalid workload profile argument"))
+	}
+	// Presence decides, as in the HTTP route: a default-valued page is still a page.
+	if catalog.Hierarchy && (seenCatalogOptions["--offset"] || seenCatalogOptions["--query"]) {
+		return fail(fmt.Errorf("The project hierarchy takes no page, search or filter"))
 	}
 	if operation != "list" && operation != "regroup" && identity == "" {
 		return fail(fmt.Errorf("A workload profile identity is required"))
@@ -452,7 +497,8 @@ func LearningCLI(gate *Gate, args []string, input io.Reader, output, errors io.W
 			result, e = LearningRegroup(gate, apply, request)
 		}
 	} else if operation == "list" || operation == "show" {
-		result, e = LearningInspect(gate, identity, offset, limit, query, detailOptions)
+		catalog.Offset, catalog.Limit, catalog.Query = offset, limit, query
+		result, e = learningInspect(gate, identity, catalog, detailOptions)
 	} else {
 		var request Object
 		request, e = ReadLearningInput(input)

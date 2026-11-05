@@ -23,11 +23,15 @@ func profileDataset(c profileSQL) (map[string]Object, map[string]*profileGroup, 
 		for _, row := range rows {
 			profiles[text(row["id"])] = row
 		}
-		rows, e = profileRows(c, "SELECT * FROM learning_members")
+		rows, e = profileMemberRows(c, "")
 		if e != nil {
 			return nil, nil, e
 		}
 		for _, row := range rows {
+			// Only the catalog fails on a classification it cannot interpret; grouping skips it.
+			if _, ok := profileStoredClass(Object{"repository": row["learningRepository"], "tool": row["learningTool"], "operation": row["learningOperation"]}); !ok && row["learningTool"] != nil {
+				return nil, nil, fmt.Errorf("Invalid stored workload classification")
+			}
 			members[text(row["family"])] = row
 		}
 	}
@@ -100,14 +104,77 @@ func profileSummary(profile Object, group *profileGroup) (Object, error) {
 			incomplete++
 		}
 	}
-	return Object{"id": profile["id"], "label": profileGroupLabel(profile, group.members), "memberCount": len(group.members), "variantCount": len(variants), "successCount": successes, "incompleteCount": incomplete, "peakMemoryBytes": int64(peakMemory), "peakCpuCores": peakCPU, "lastRunAt": last, "memoryFloorBytes": profile["memory_floor"], "cpuFloorCores": profile["cpu_floor"]}, nil
+	return Object{"id": profile["id"], "label": profileGroupLabel(profile, group.members), "project": profileProject(group.members), "operation": profileGroupOperation(group.members), "memberCount": len(group.members), "variantCount": len(variants), "successCount": successes, "incompleteCount": incomplete, "peakMemoryBytes": int64(peakMemory), "peakCpuCores": peakCPU, "lastRunAt": last, "memoryFloorBytes": profile["memory_floor"], "cpuFloorCores": profile["cpu_floor"]}, nil
 }
+
+// ProfileFilter narrows the catalog before paging. OtherProjects selects the
+// projects the hierarchy collapses; it cannot be combined with Project.
+type ProfileFilter struct {
+	Project, Operation string
+	OtherProjects      bool
+}
+
+func (f ProfileFilter) validate() error {
+	if f.Project != "" && (len([]rune(f.Project)) > 120 || !profilePrintable(f.Project) || strings.TrimSpace(f.Project) != f.Project) {
+		return fmt.Errorf("Invalid workload project filter")
+	}
+	if f.Operation != "" && !containsString(profileOperations, f.Operation) {
+		return fmt.Errorf("Invalid workload operation filter")
+	}
+	if f.OtherProjects && f.Project != "" {
+		return fmt.Errorf("Choose a project or the other projects, not both")
+	}
+	return nil
+}
+
+func (f ProfileFilter) any() bool { return f.Project != "" || f.Operation != "" || f.OtherProjects }
+
+// profileProject is the group's display name: its most common member project.
+func profileProject(members []Object) string {
+	counts := map[string]int{}
+	for _, member := range members {
+		if name := text(member["project"]); name != "" {
+			counts[name]++
+		}
+	}
+	best := ""
+	for name, count := range counts {
+		if count > counts[best] || count == counts[best] && name < best {
+			best = name
+		}
+	}
+	if best == "" {
+		return "Unknown project"
+	}
+	return best
+}
+
+// profileGroupOperation is the shared operation of all members, else "other".
+func profileGroupOperation(members []Object) string {
+	operation := ""
+	for _, member := range members {
+		value := text(member["learningOperation"])
+		if value == "" || operation != "" && value != operation {
+			return "other"
+		}
+		operation = value
+	}
+	return profileDefault(operation)
+}
+
 func (s *ProfileStore) Catalog(offset, limit int, query string) (Object, error) {
+	return s.CatalogFiltered(offset, limit, query, ProfileFilter{})
+}
+
+func (s *ProfileStore) CatalogFiltered(offset, limit int, query string, filter ProfileFilter) (Object, error) {
 	if offset < 0 || limit < 1 || limit > 100 {
 		return nil, fmt.Errorf("Invalid workload profile page")
 	}
 	if len([]rune(query)) > 120 || !profilePrintable(query) {
 		return nil, fmt.Errorf("Invalid workload profile search")
+	}
+	if e := filter.validate(); e != nil {
+		return nil, e
 	}
 	result := Object{"revision": 0, "profiles": []Object{}, "total": 0, "offset": offset, "limit": limit}
 	if s.empty {
@@ -122,12 +189,24 @@ func (s *ProfileStore) Catalog(offset, limit int, query string) (Object, error) 
 		if e != nil {
 			return e
 		}
-		entries := []Object{}
-		needle := strings.TrimSpace(cases.Fold().String(query))
+		all := []Object{}
 		for id, profile := range profiles {
 			summary, e := profileSummary(profile, groups[id])
 			if e != nil {
 				return e
+			}
+			all = append(all, summary)
+		}
+		collapsed := map[string]bool{}
+		if filter.OtherProjects {
+			collapsed = profileCollapsedProjects(profileProjectTotals(all))
+		}
+		entries := []Object{}
+		needle := strings.TrimSpace(cases.Fold().String(query))
+		for _, summary := range all {
+			id := text(summary["id"])
+			if filter.Project != "" && text(summary["project"]) != filter.Project || filter.Operation != "" && text(summary["operation"]) != filter.Operation || filter.OtherProjects && !collapsed[text(summary["project"])] {
+				continue
 			}
 			if needle == "" || strings.Contains(cases.Fold().String(text(summary["label"])), needle) || strings.Contains(id, needle) {
 				entries = append(entries, summary)
@@ -141,6 +220,126 @@ func (s *ProfileStore) Catalog(offset, limit int, query string) (Object, error) 
 			return a < b
 		})
 		result = Object{"revision": revision, "profiles": entries[min(offset, len(entries)) : min(offset, len(entries))+min(limit, len(entries)-min(offset, len(entries)))], "total": len(entries), "offset": offset, "limit": limit}
+		return nil
+	})
+	return result, e
+}
+
+// A project with this many workloads or fewer folds into the other-projects row.
+const profileCollapseThreshold = 2
+const maxProfileHierarchyRows = 100
+
+type profileTotals struct{ workloads, groups, runs int }
+
+func (t *profileTotals) add(summary Object) {
+	t.workloads += int(metric(summary["memberCount"]))
+	t.groups++
+	t.runs += int(metric(summary["successCount"]) + metric(summary["incompleteCount"]))
+}
+
+func profileProjectTotals(summaries []Object) map[string]*profileTotals {
+	totals := map[string]*profileTotals{}
+	for _, summary := range summaries {
+		project := text(summary["project"])
+		if totals[project] == nil {
+			totals[project] = &profileTotals{}
+		}
+		totals[project].add(summary)
+	}
+	return totals
+}
+
+// profileCollapsedProjects is the one rule for which projects fold together,
+// shared by the hierarchy and by the filter that lists the folded set.
+func profileCollapsedProjects(totals map[string]*profileTotals) map[string]bool {
+	collapsed := map[string]bool{}
+	for project, total := range totals {
+		if total.workloads <= profileCollapseThreshold {
+			collapsed[project] = true
+		}
+	}
+	return collapsed
+}
+
+func profileHierarchyRow(project string, collapsed bool, summaries []Object) Object {
+	total := &profileTotals{}
+	byOperation := map[string]*profileTotals{}
+	for _, summary := range summaries {
+		operation := text(summary["operation"])
+		if byOperation[operation] == nil {
+			byOperation[operation] = &profileTotals{}
+		}
+		byOperation[operation].add(summary)
+		total.add(summary)
+	}
+	operations := []Object{}
+	for _, operation := range profileOperations {
+		if t := byOperation[operation]; t != nil {
+			operations = append(operations, Object{"operation": operation, "workloadCount": t.workloads, "groupCount": t.groups, "runCount": t.runs})
+		}
+	}
+	sort.SliceStable(operations, func(i, j int) bool {
+		return metric(operations[i]["workloadCount"]) > metric(operations[j]["workloadCount"])
+	})
+	return Object{"project": project, "collapsed": collapsed, "workloadCount": total.workloads, "groupCount": total.groups, "runCount": total.runs, "operations": operations}
+}
+
+// Hierarchy lists projects with their operations, busiest first, in at most
+// limit rows including the other-projects row. Projects over the limit are
+// counted in total but not listed. Counts describe the same
+// groups the project and operation filters return.
+func (s *ProfileStore) Hierarchy(limit int) (Object, error) {
+	if limit < 1 || limit > maxProfileHierarchyRows {
+		return nil, fmt.Errorf("Invalid workload project limit")
+	}
+	result := Object{"revision": 0, "projects": []Object{}, "total": 0, "limit": limit}
+	if s.empty {
+		return result, nil
+	}
+	e := s.connection(false, func(c profileSQL) error {
+		revision, e := profileRevision(c)
+		if e != nil {
+			return e
+		}
+		profiles, groups, e := profileDataset(c)
+		if e != nil {
+			return e
+		}
+		byProject := map[string][]Object{}
+		all := []Object{}
+		for id, profile := range profiles {
+			summary, e := profileSummary(profile, groups[id])
+			if e != nil {
+				return e
+			}
+			byProject[text(summary["project"])] = append(byProject[text(summary["project"])], summary)
+			all = append(all, summary)
+		}
+		totals := profileProjectTotals(all)
+		collapsed := profileCollapsedProjects(totals)
+		rows, folded := []Object{}, []Object{}
+		for project, summaries := range byProject {
+			if collapsed[project] {
+				folded = append(folded, summaries...)
+			} else {
+				rows = append(rows, profileHierarchyRow(project, false, summaries))
+			}
+		}
+		sort.Slice(rows, func(i, j int) bool {
+			if metric(rows[i]["workloadCount"]) != metric(rows[j]["workloadCount"]) {
+				return metric(rows[i]["workloadCount"]) > metric(rows[j]["workloadCount"])
+			}
+			return text(rows[i]["project"]) < text(rows[j]["project"])
+		})
+		total := len(rows)
+		if len(folded) > 0 {
+			other := profileHierarchyRow("Other projects", true, folded)
+			other["projectCount"] = len(collapsed)
+			rows = append(rows, other)
+		}
+		// The limit counts every row returned, and truncation drops the other-projects row first.
+		rows = rows[:min(limit, len(rows))]
+		result = Object{"revision": revision, "projects": rows, "total": total, "limit": limit}
 		return nil
 	})
 	return result, e
@@ -350,7 +549,13 @@ func profileEditable(c profileSQL, id string) (Object, *profileGroup, error) {
 		return nil, nil, fmt.Errorf("Workload profile was not found; refresh the list")
 	}
 	for _, member := range group.members {
-		if _, e = profileRegister(c, text(member["family"]), nil, true); e != nil {
+		family := text(member["family"])
+		if _, e = profileRegister(c, family, nil, true); e != nil {
+			return nil, nil, e
+		}
+		// A family that only had runs is a member now, and every member is classified.
+		legacy := profileValidLegacy(Object{"scope": member["learningScope"], "kind": member["learningKind"]})
+		if e = profileStoreClass(c, family, profileBackfillClass(member, text(legacy["kind"]), text(legacy["scope"]), &profileHistory{})); e != nil {
 			return nil, nil, e
 		}
 	}

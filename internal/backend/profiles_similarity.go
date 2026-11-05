@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"unicode"
 )
@@ -26,11 +25,20 @@ func profileMemberRows(c profileSQL, where string, args ...any) ([]Object, error
 	if e != nil {
 		return nil, e
 	}
-	query := "SELECT m.* FROM learning_members m"
-	if has {
-		query = "SELECT m.*,s.scope AS learningScope,s.kind AS learningKind FROM learning_members m LEFT JOIN learning_similarity s ON s.family=m.family"
+	classified, e := hasProfileClassification(c)
+	if e != nil {
+		return nil, e
 	}
-	return profileRows(c, query+where, args...)
+	columns, joins := "m.*", ""
+	if has {
+		columns += ",s.scope AS learningScope,s.kind AS learningKind"
+		joins += " LEFT JOIN learning_similarity s ON s.family=m.family"
+	}
+	if classified {
+		columns += ",k.repository AS learningRepository,k.tool AS learningTool,k.operation AS learningOperation"
+		joins += " LEFT JOIN learning_classification k ON k.family=m.family"
+	}
+	return profileRows(c, "SELECT "+columns+" FROM learning_members m"+joins+where, args...)
 }
 
 func profileMember(c profileSQL, family string) (Object, error) {
@@ -42,8 +50,16 @@ func profileMember(c profileSQL, family string) (Object, error) {
 }
 
 func profileDirectoryScope(directory string) string {
+	scope, _ := profileDirectoryIdentity(directory)
+	return scope
+}
+
+// profileDirectoryIdentity returns the v1 scope (repository plus relative
+// directory) and the repository digest alone. The repository is empty unless
+// git verifies it; a basename or path pattern never establishes one.
+func profileDirectoryIdentity(directory string) (string, string) {
 	if directory == "" || !filepath.IsAbs(directory) {
-		return ""
+		return "", ""
 	}
 	location := strings.Split(profileGit(directory, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"), "\n")
 	if len(location) == 2 {
@@ -55,16 +71,20 @@ func profileDirectoryScope(directory string) string {
 			relative, inside := profileUnder(resolved, root)
 			if err == nil && inside {
 				dev, ino := profileStatIdentity(info)
-				return profileDigest([]any{"learning-scope-v1", "git", dev, ino, relative})
+				return profileDigest([]any{"learning-scope-v1", "git", dev, ino, relative}), profileDigest([]any{"learning-repository-v1", dev, ino})
 			}
 		}
 	}
-	// Deleted checkouts can still share evidence within their original directory.
-	// Never infer repository identity from a project basename or a path pattern.
+	return profileMissingDirectoryIdentity(directory)
+}
+
+// Deleted checkouts can still share evidence within their original directory.
+// Never infer repository identity from a project basename or a path pattern.
+func profileMissingDirectoryIdentity(directory string) (string, string) {
 	if resolved, e := filepath.EvalSymlinks(directory); e == nil {
 		directory = resolved
 	}
-	return profileDigest([]any{"learning-scope-v1", "directory", filepath.Clean(directory)})
+	return profileDigest([]any{"learning-scope-v1", "directory", filepath.Clean(directory)}), ""
 }
 
 func profileToolClass(executable string) string {
@@ -89,6 +109,15 @@ func profileSimilarityKind(title, executable string) string {
 	if tool == "" {
 		return ""
 	}
+	if operation := profileOperation(title); operation != "" {
+		return tool + ":" + operation
+	}
+	return ""
+}
+
+// profileOperation returns the one operation a title names, or "" when it names
+// none or several. It needs no recognized tool.
+func profileOperation(title string) string {
 	words := map[string]bool{}
 	for _, word := range strings.FieldsFunc(strings.ToLower(title), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
 		words[word] = true
@@ -140,7 +169,7 @@ func profileSimilarityKind(title, executable string) string {
 	if len(operations) != 1 {
 		return ""
 	}
-	return tool + ":" + operations[0]
+	return operations[0]
 }
 
 func validProfileSimilarityKind(kind string) bool {
@@ -151,34 +180,10 @@ func validProfileSimilarityKind(kind string) bool {
 
 func profileCommandKind(argv []string, title, executable string) string {
 	// Recognize simple wrappers without interpreting or executing shell programs.
-	command := argv
-	for len(command) > 0 {
-		switch filepath.Base(command[0]) {
-		case "env":
-			command = command[1:]
-			for len(command) > 0 && (command[0] == "--" || (!strings.HasPrefix(command[0], "-") && strings.Contains(command[0], "="))) {
-				command = command[1:]
-			}
-		case "fnm":
-			if len(command) < 2 || command[1] != "exec" {
-				return profileSimilarityKind(title, executable)
-			}
-			separator := -1
-			for i, arg := range command[2:] {
-				if arg == "--" {
-					separator = i + 2
-					break
-				}
-			}
-			if separator < 0 {
-				return profileSimilarityKind(title, executable)
-			}
-			command = command[separator+1:]
-		default:
-			goto unwrapped
-		}
+	command, ok := profileUnwrap(argv)
+	if !ok {
+		return profileSimilarityKind(title, executable)
 	}
-unwrapped:
 	if len(command) > 0 {
 		if filepath.Base(command[0]) == "cargo" && len(command) > 1 && command[1] == "bench" {
 			return "cargo:benchmark"
@@ -223,84 +228,68 @@ func profileSimilarityLabel(kind, project string) string {
 }
 
 func profileRememberSimilarity(c profileSQL, family string, clean Object) (bool, error) {
-	scope, kind := text(clean["learningScope"]), text(clean["learningKind"])
-	if scope == "" || kind == "" {
-		return false, nil
+	class := profileClass{text(clean["learningRepository"]), text(clean["learningTool"]), text(clean["learningOperation"])}
+	// A family that already has a legacy kind keeps it: the controller observes
+	// before it backfills, and a job description no longer carries that kind.
+	if has, e := hasProfileSimilarity(c); e != nil {
+		return false, e
+	} else if has {
+		row, e := profileRow(c, "SELECT scope,kind FROM learning_similarity WHERE family=?", family)
+		if e != nil {
+			return false, e
+		}
+		if legacy := profileValidLegacy(row); legacy != nil {
+			class.tool, class.operation, _ = strings.Cut(text(legacy["kind"]), ":")
+		}
 	}
 	// Once registered, a label change cannot reclassify measured history.
-	if e := profileExec(c, "INSERT OR IGNORE INTO learning_similarity VALUES (?,?,?)", family, scope, kind); e != nil {
+	if scope, kind := text(clean["learningScope"]), text(clean["learningKind"]); scope != "" && kind != "" {
+		if e := profileExec(c, "INSERT OR IGNORE INTO learning_similarity VALUES (?,?,?)", family, scope, kind); e != nil {
+			return false, e
+		}
+	}
+	// A description with nothing in it cannot be classified yet. Backfill or a
+	// later observation will, rather than storing a lasting other/other.
+	if clean["learningTool"] == nil {
+		return false, nil
+	}
+	if e := profileStoreClass(c, family, class); e != nil {
 		return false, e
 	}
-	stored, e := profileRow(c, "SELECT scope,kind FROM learning_similarity WHERE family=?", family)
+	row, e := profileRow(c, "SELECT repository,tool,operation FROM learning_classification WHERE family=?", family)
 	if e != nil {
 		return false, e
 	}
-	return profileGroupSimilar(c, stored)
+	stored, ok := profileStoredClass(row)
+	if !ok || !stored.shareable() {
+		return false, nil
+	}
+	return profileGroupSimilar(c, &stored)
 }
 
-// profileGroupSimilar is deterministic, idempotent and transactional. Pinned
-// profiles (including explicit splits and resets) are never automatic targets.
-func profileGroupSimilar(c profileSQL, signature ...Object) (bool, error) {
-	query := `WITH eligible AS (SELECT m.profile,s.scope,s.kind FROM learning_members m JOIN learning_profiles p ON p.id=m.profile JOIN learning_similarity s ON s.family=m.family WHERE p.pinned=0`
-	args := []any{}
-	if len(signature) > 0 {
-		query += " AND s.scope=? AND s.kind=?"
-		args = append(args, signature[0]["scope"], signature[0]["kind"])
+// profileDescriptionIdentity computes the directory's v1 scope and repository
+// once per checkout, keyed by device and inode so renames do not go stale.
+func profileDescriptionIdentity(directory string, identities map[string]profileIdentity) profileIdentity {
+	cacheKey := directory
+	info, statError := os.Stat(directory)
+	if statError == nil {
+		dev, ino := profileStatIdentity(info)
+		cacheKey = profileDigest([]any{directory, dev, ino})
 	}
-	// Prove that every member of a profile has this signature once per profile,
-	// rather than rescanning a large shared profile for each individual member.
-	query += ` GROUP BY m.profile,s.scope,s.kind HAVING COUNT(*)=(SELECT COUNT(*) FROM learning_members all_members WHERE all_members.profile=m.profile)) SELECT m.family,m.profile,m.project,e.scope,e.kind FROM eligible e JOIN learning_members m ON m.profile=e.profile ORDER BY m.profile,m.family`
-	rows, e := profileRows(c, query, args...)
-	if e != nil {
-		return false, e
-	}
-	groups := map[string][]Object{}
-	for _, row := range rows {
-		if !profileHash.MatchString(text(row["scope"])) || !validProfileSimilarityKind(text(row["kind"])) {
-			return false, fmt.Errorf("Invalid stored workload similarity")
+	identity, ok := identities[cacheKey]
+	if !ok {
+		if statError != nil && filepath.IsAbs(directory) {
+			// Nothing to verify, so do not spend a git process on it.
+			identity.scope, identity.repository = profileMissingDirectoryIdentity(directory)
+		} else {
+			identity.scope, identity.repository = profileDirectoryIdentity(directory)
 		}
-		key := text(row["scope"]) + ":" + text(row["kind"])
-		groups[key] = append(groups[key], row)
+		identities[cacheKey] = identity
 	}
-	keys := make([]string, 0, len(groups))
-	for key := range groups {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	changed := false
-	for _, key := range keys {
-		members := groups[key]
-		if len(members) < 2 {
-			continue
-		}
-		target := text(members[0]["profile"])
-		groupChanged := false
-		for _, member := range members[1:] {
-			source := text(member["profile"])
-			if source == target {
-				continue
-			}
-			if e = profileExec(c, "UPDATE learning_members SET profile=? WHERE family=?", target, member["family"]); e != nil {
-				return false, e
-			}
-			// Do not delete an automatic profile while it still owns another family.
-			if e = profileExec(c, "DELETE FROM learning_profiles WHERE id=? AND NOT EXISTS(SELECT 1 FROM learning_members WHERE profile=?)", source, source); e != nil {
-				return false, e
-			}
-			changed = true
-			groupChanged = true
-		}
-		if groupChanged {
-			label := profileSimilarityLabel(text(members[0]["kind"]), text(members[0]["project"]))
-			if e = profileExec(c, "UPDATE learning_profiles SET label=?,updated=? WHERE id=? AND pinned=0", label, resourceNow(), target); e != nil {
-				return false, e
-			}
-		}
-	}
-	return changed, nil
+	return identity
 }
 
-func profileSimilarityDescription(description Object, scopes map[string]string) Object {
+func profileSimilarityDescription(description Object, identities map[string]profileIdentity) Object {
 	result := Object{}
 	for _, key := range []string{"title", "project", "executable"} {
 		limit := 80
@@ -315,38 +304,57 @@ func profileSimilarityDescription(description Object, scopes map[string]string) 
 	if !validProfileSimilarityKind(kind) {
 		kind = profileSimilarityKind(text(result["title"]), text(result["executable"]))
 	}
-	if kind == "" {
-		return result
+	identity := profileDescriptionIdentity(text(description["directory"]), identities)
+	if scope := text(description["learningScope"]); profileHash.MatchString(scope) {
+		identity.scope = scope
 	}
-	scope := text(description["learningScope"])
-	if !profileHash.MatchString(scope) {
-		directory := text(description["directory"])
-		cacheKey := directory
-		if info, e := os.Stat(directory); e == nil {
-			dev, ino := profileStatIdentity(info)
-			cacheKey = profileDigest([]any{directory, dev, ino})
-		}
-		var ok bool
-		scope, ok = scopes[cacheKey]
-		if !ok {
-			scope = profileDirectoryScope(directory)
-			scopes[cacheKey] = scope
-		}
+	if repository := text(description["learningRepository"]); profileHash.MatchString(repository) {
+		identity.repository = repository
 	}
-	if scope != "" {
-		result["learningScope"], result["learningKind"] = scope, kind
+	if identity.scope != "" && kind != "" {
+		result["learningScope"], result["learningKind"] = identity.scope, kind
+	}
+	// New jobs carry the tool and operation seen at submission, where the
+	// arguments were available. Older metadata falls back to what survives.
+	tool, operation := text(description["learningTool"]), text(description["learningOperation"])
+	if !containsString(profileTools, tool) || !containsString(profileOperations, operation) {
+		if result["title"] == nil && result["project"] == nil && result["executable"] == nil {
+			return result // Nothing survives to classify.
+		}
+		tool, operation, _ = strings.Cut(kind, ":")
+		if tool == "" {
+			tool = profileHistoricalTool(text(result["executable"]))
+		}
+		if operation == "" {
+			operation = profileOperation(text(result["title"]))
+		}
+		tool, operation = profileDefault(tool), profileDefault(operation)
+	}
+	result["learningTool"], result["learningOperation"] = tool, operation
+	if identity.repository != "" {
+		result["learningRepository"] = identity.repository
 	}
 	return result
 }
 
 func profileValidateSimilarityDescription(clean, description Object) error {
 	scope, kind := text(description["learningScope"]), text(description["learningKind"])
-	if scope == "" && kind == "" {
+	if scope != "" || kind != "" {
+		if !profileHash.MatchString(scope) || !validProfileSimilarityKind(kind) {
+			return fmt.Errorf("Invalid workload similarity description")
+		}
+		clean["learningScope"], clean["learningKind"] = scope, kind
+	}
+	repository, tool, operation := text(description["learningRepository"]), text(description["learningTool"]), text(description["learningOperation"])
+	if repository == "" && tool == "" && operation == "" {
 		return nil
 	}
-	if !profileHash.MatchString(scope) || !validProfileSimilarityKind(kind) {
-		return fmt.Errorf("Invalid workload similarity description")
+	if !(profileClass{repository, tool, operation}).valid() {
+		return fmt.Errorf("Invalid workload classification description")
 	}
-	clean["learningScope"], clean["learningKind"] = scope, kind
+	if repository != "" {
+		clean["learningRepository"] = repository
+	}
+	clean["learningTool"], clean["learningOperation"] = tool, operation
 	return nil
 }

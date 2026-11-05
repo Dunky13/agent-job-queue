@@ -15,8 +15,11 @@ func similarityIdentity(name string) Object {
 	return Object{"family": profileDigest([]any{"family", name}), "variant": profileDigest([]any{"variant", name}), "context": profileDigest("context")}
 }
 
-func similarityDescription(title, scope, kind string) Object {
-	return Object{"title": title, "project": "fixture", "executable": "go", "learningScope": profileDigest(scope), "learningKind": kind}
+// similarityDescription describes a family observed in the named repository.
+func similarityDescription(title, repository, kind string) Object {
+	tool, operation, _ := strings.Cut(kind, ":")
+	return Object{"title": title, "project": "fixture", "executable": "go", "learningScope": profileDigest("scope:" + repository), "learningKind": kind,
+		"learningRepository": profileDigest(repository), "learningTool": tool, "learningOperation": operation}
 }
 
 func TestProfileSimilaritySharesConservativeLearningWithoutExactSuccesses(t *testing.T) {
@@ -157,7 +160,7 @@ func TestProfileSimilarityRetroactivePlanPreservesRunsAndIsIdempotent(t *testing
 	if e != nil {
 		t.Fatal(e)
 	}
-	deletedDirectory := filepath.Join(t.TempDir(), "retired-checkout")
+	repository := gitRepository(t)
 	for i := 0; i < 4; i++ {
 		identity := similarityIdentity(fmt.Sprint(i))
 		token := fmt.Sprintf("%032x", i+1)
@@ -166,7 +169,7 @@ func TestProfileSimilarityRetroactivePlanPreservesRunsAndIsIdempotent(t *testing
 			t.Fatal(e)
 		}
 		recordProfile(t, store, token, identity, (i+1)*GiB, 1, i != 2, profileZero(), 0)
-		mustWrite(t, filepath.Join(g.Metadata, token+".json"), Object{"title": title, "project": "fixture", "executable": "go", "directory": deletedDirectory})
+		mustWrite(t, filepath.Join(g.Metadata, token+".json"), Object{"title": title, "project": "fixture", "executable": "go", "directory": repository})
 		// No workload sidecar or original command is needed for retained runs.
 	}
 	pinned := similarityIdentity("3")
@@ -224,7 +227,7 @@ func TestProfileSimilarityRetroactivePlanPreservesRunsAndIsIdempotent(t *testing
 		t.Fatal(e)
 	}
 	recordProfile(t, store, newToken, newIdentity, GiB, 1, true, profileZero(), 0)
-	mustWrite(t, filepath.Join(g.Metadata, newToken+".json"), Object{"title": "New regression tests", "project": "fixture", "executable": "go", "directory": deletedDirectory})
+	mustWrite(t, filepath.Join(g.Metadata, newToken+".json"), Object{"title": "New regression tests", "project": "fixture", "executable": "go", "directory": repository})
 	if e = store.backfillSimilarity(g); e != nil {
 		t.Fatal(e)
 	}
@@ -244,12 +247,13 @@ func TestProfileSimilarityRetroactivePlanPreservesRunsAndIsIdempotent(t *testing
 
 func TestProfileSimilarityFailedMigrationRollsBackEveryMembership(t *testing.T) {
 	store := fixtureProfileStore(t)
-	descriptions := map[string]Object{}
+	descriptions, repositories := map[string]Object{}, map[string]string{}
 	for i := 0; i < 3; i++ {
 		identity := similarityIdentity(fmt.Sprint(i))
 		if e := store.Observe(identity, Object{"title": "Tests", "project": "fixture", "executable": "go"}); e != nil {
 			t.Fatal(e)
 		}
+		repositories[text(identity["family"])] = profileDigest("repository")
 		descriptions[text(identity["family"])] = similarityDescription("Tests", "package", "go:tests")
 	}
 	if e := store.connection(true, func(c profileSQL) error {
@@ -257,7 +261,7 @@ func TestProfileSimilarityFailedMigrationRollsBackEveryMembership(t *testing.T) 
 	}); e != nil {
 		t.Fatal(e)
 	}
-	if _, e := store.regroup(descriptions, 0, true); e == nil {
+	if _, e := store.regroup(&profileHistory{descriptions: descriptions, aliases: map[string]string{}, repositories: repositories}, 0, true); e == nil {
 		t.Fatal("Injected migration interruption did not fail")
 	}
 	catalog, e := store.Catalog(0, 100, "")

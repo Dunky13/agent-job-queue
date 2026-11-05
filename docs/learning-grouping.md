@@ -4,13 +4,14 @@
 
 The previous matching path created one profile per strict command family and hashed almost every environment value plus HEAD into each exact variant. Agent invocation metadata and frequent commits prevented repeated measurements from accumulating. Similar tasks could share learning only after a manual merge.
 
-The new path keeps original family identities and numeric history intact, stabilizes future exact variants, and groups compatible families by a hashed repository/directory scope, tool class and operation. Borrowing keeps the complete conservative envelope. Exact successes and recent same-machine group successes are counted separately. Source revisions move to the freshness context; setup, toolchain, arguments and semantic environment remain in exact variants.
+The new path keeps original family identities and numeric history intact, stabilizes future exact variants, and groups compatible families by a hashed git repository identity, tool class and operation, independent of subdirectory. Borrowing keeps the complete conservative envelope. Exact successes and recent same-machine group successes are counted separately. Source revisions move to the freshness context; setup, toolchain, arguments and semantic environment remain in exact variants.
 
 ## Owners
 
 - `internal/backend/profiles_identity.go`: versioned stable variants and incidental environment exclusions.
-- `internal/backend/profiles_similarity.go`: bounded operation vocabulary, scope hashing, wrapper recognition, automatic membership and pinned-profile preservation.
-- `internal/backend/profiles_regroup.go`: historical metadata joins, read-only preview, revision-checked apply and the one-time controller backfill.
+- `internal/backend/profiles_classification.go`: stored classification (repository digest, tool, operation), inline program scan, wrapper unwrapping, the backfill's class rules (tool and operation from the legacy kind, then the stored executable and title; repository from the verified checkouts or from the scope stored for the family) and the shared merge planner, which never touches pinned profiles.
+- `internal/backend/profiles_similarity.go`: legacy operation vocabulary, scope hashing, repository identity and observation.
+- `internal/backend/profiles_regroup.go`: historical metadata joins, a read step that turns each metadata file into evidence and a pure aggregate over it, learning aliases from checkouts and from stored scopes, the legacy-pair conflict rule, read-only preview, revision-checked apply and the one-time controller backfill.
 - `internal/backend/profiles_store.go`: additive private schema and description observation.
 - `internal/backend/profiles_prediction.go` and `profiles_collection.go`: identical independent/batched estimates, exact counts and recent group counts.
 - `internal/backend/scheduler.go`: validates the additive group count while retaining the existing exact-run familiarity guard for waiting-helper compatibility.
@@ -18,15 +19,15 @@ The new path keeps original family identities and numeric history intact, stabil
 
 ## Compatibility and rollout
 
-Identity sidecars still contain exactly the original `family`, `variant` and `context` fields. Existing jobs and their stored identities are not rewritten. New exact fingerprints use `variant-v2`; historical variants remain distinct. Additive SQLite tables retain hashed scope and fixed operation categories. Old clients can still read original measurements and group membership. Read-only clients never migrate storage.
+Identity sidecars still contain exactly the original `family`, `variant` and `context` fields. Existing jobs and their stored identities are not rewritten. New exact fingerprints use `variant-v2`; historical variants remain distinct. Additive SQLite tables retain hashed scope and fixed operation categories. The additive `learning_classification` table holds the repository digest (null when unverifiable), tool and operation; nothing is added to existing tables, and `other` or new kinds are never written to `learning_similarity`, so old clients keep reading it. Old clients can still read original measurements and group membership. Read-only clients never migrate storage.
 
 The updated controller runs its initial collection before attempting the historical pass, then rotates pending grants through the existing correction path and collects fresh estimates. Operator splits, merges, labels, resets and floors stay pinned. Active grants and explicit overrides survive. A stale preview revision cannot apply a migration.
 
-The CLI can preview and explicitly apply grouping before a full application upgrade, because the membership schema and conservative group estimates remain compatible. Future stable fingerprints and automatic grouping require the updated runtime. Replacing or publishing a signed application remains a separate delivery step.
+The CLI can preview and explicitly apply grouping before a full application upgrade, because the membership schema and conservative group estimates remain compatible. Future stable fingerprints and automatic grouping require the updated runtime. The classification backfill is gated by grouping version 2 and runs once from the controller; an explicit CLI regroup applies it but never marks it done. A failed pass is logged in the resource controller log and retried after ten minutes; it does not hold admissions, because history only improves grouping. Replacing or publishing a signed application remains a separate delivery step.
 
 ## Validation
 
-Regression coverage exercises volatile invocation metadata, source revision changes, resource-control separation, wrapper recognition, scope/operation separation, shared conservative peaks, exact versus group success counts, machine isolation, operator corrections, stale revision rejection, read-only previews, byte-for-byte numeric history preservation and migration idempotence. Batched controller predictions are compared with independent reads.
+Regression coverage exercises volatile invocation metadata, source revision changes, resource-control separation, wrapper recognition, scope/operation separation, shared conservative peaks, exact versus group success counts, machine isolation, operator corrections, stale revision rejection, read-only previews, byte-for-byte numeric history preservation and migration idempotence. Batched controller predictions are compared with independent reads. Classification coverage adds subdirectory sharing, separation by repository, operation and tool, non-git and unrecognized-tool families staying alone, families in two repositories staying alone, order-independent classification over shuffled metadata, a backfill that skips corrupt records, deleted-worktree aliasing with ambiguous scopes left unknown, the version gate (new tool or operation vocabulary needs a version step), eviction clearing the new table, old-client compatibility and catalog filters with the project hierarchy.
 
 Run the applicable Go runtime checks through the shared queue as documented in `CONTRIBUTING.md`. Preview real history with `agent-heavy profiles regroup --json`; apply only the reviewed revision as described in `docs/learning.md`. Keep live-state copies and validation reports outside version control.
 

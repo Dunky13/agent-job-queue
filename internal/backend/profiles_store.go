@@ -89,7 +89,7 @@ func NewProfileStore(state string, readonly bool) (*ProfileStore, error) {
 			return fmt.Errorf("Unsupported resource history schema")
 		}
 		if !readonly {
-			if _, e := c.ExecContext(profileContext, profileDecisionSchema+profileLearningSchema+profileSimilaritySchema); e != nil {
+			if _, e := c.ExecContext(profileContext, profileDecisionSchema+profileLearningSchema+profileSimilaritySchema+profileClassificationSchema); e != nil {
 				return e
 			}
 		}
@@ -350,8 +350,10 @@ func profileRegistrySlot(c profileSQL) (bool, error) {
 	if e = profileExec(c, "DELETE FROM learning_members WHERE family=?", candidate["family"]); e != nil {
 		return false, e
 	}
-	if e = profileExec(c, "DELETE FROM learning_similarity WHERE family=?", candidate["family"]); e != nil {
-		return false, e
+	for _, table := range []string{"learning_similarity", "learning_classification"} {
+		if e = profileExec(c, "DELETE FROM "+table+" WHERE family=?", candidate["family"]); e != nil {
+			return false, e
+		}
 	}
 	e = profileExec(c, "DELETE FROM learning_profiles WHERE id=? AND NOT EXISTS(SELECT 1 FROM learning_members WHERE profile=?)", candidate["profile"], candidate["profile"])
 	return e == nil, e
@@ -399,7 +401,7 @@ func profileDescription(identity, description Object) (Object, error) {
 		return nil, fmt.Errorf("Invalid workload identity")
 	}
 	for key := range description {
-		if !containsString([]string{"title", "project", "executable", "learningScope", "learningKind"}, key) {
+		if !containsString([]string{"title", "project", "executable", "learningScope", "learningKind", "learningRepository", "learningTool", "learningOperation"}, key) {
 			return nil, fmt.Errorf("Invalid safe workload description")
 		}
 	}
@@ -426,8 +428,12 @@ func profileDescriptionChanged(prior, clean Object) bool {
 			return true
 		}
 	}
-	if prior["learningScope"] == nil && clean["learningScope"] != nil {
-		return true
+	// A family without a stored classification, or with an unknown repository
+	// that is now verified, needs one observation.
+	for _, key := range []string{"learningScope", "learningTool", "learningRepository"} {
+		if prior[key] == nil && clean[key] != nil {
+			return true
+		}
 	}
 	return false
 }

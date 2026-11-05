@@ -86,11 +86,14 @@ export function eligible(job, action) {
   return action === "cancel" && job.canCancel;
 }
 
+const operationSchema = z.literal(["tests", "browser-tests", "native-tests", "race-tests", "full-tests", "build", "lint", "typecheck", "dependencies", "benchmark", "checks", "other"]);
 const profileSchema = z.object({
   id: identitySchema, label: labelSchema, memberCount: integer.nonnegative(), variantCount: integer.nonnegative(),
   successCount: integer.nonnegative(), incompleteCount: integer.nonnegative(), peakMemoryBytes: integer.nonnegative(),
   peakCpuCores: nonnegative, lastRunAt: nonnegative.nullable(), memoryFloorBytes: integer.positive().max(2 ** 50).nullable(),
   cpuFloorCores: z.number().positive().max(1024).nullable(),
+  // Absent from daemons that predate project grouping.
+  project: z.string().min(1).max(120).optional(), operation: operationSchema.optional(),
 });
 const controllerFields = {
   controllerAppliedRevision: integer.nonnegative().nullable(), controllerStatus: z.string().max(4096),
@@ -98,6 +101,14 @@ const controllerFields = {
 export const profileCatalogSchema = z.object({
   revision: integer.nonnegative(), profiles: z.array(profileSchema).max(100), total: integer.nonnegative(),
   offset: integer.nonnegative(), limit: integer.min(1).max(100), ...controllerFields,
+});
+const hierarchyCounts = { workloadCount: integer.nonnegative(), groupCount: integer.nonnegative(), runCount: integer.nonnegative() };
+export const profileHierarchySchema = z.object({
+  revision: integer.nonnegative(), total: integer.nonnegative(), limit: integer.min(1).max(100), ...controllerFields,
+  projects: z.array(z.object({
+    project: z.string().min(1).max(120), collapsed: z.boolean(), projectCount: integer.positive().optional(), ...hierarchyCounts,
+    operations: z.array(z.object({ operation: operationSchema, ...hierarchyCounts })).max(32),
+  })).max(100),
 });
 export const profileDetailSchema = z.object({
   revision: integer.nonnegative(), profile: profileSchema, ...controllerFields,
