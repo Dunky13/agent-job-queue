@@ -404,6 +404,9 @@ func (api *queueAPI) profileDetail(w http.ResponseWriter, r *http.Request, id st
 	api.invoke(w, r, append(arguments, "--json"), nil)
 }
 
+// Kept in step with backend.ProfileOperations by a test; this package does not link the backend.
+var profileOperation = regexp.MustCompile(`^(tests|browser-tests|native-tests|race-tests|full-tests|build|lint|typecheck|dependencies|benchmark|checks|other)$`)
+
 func (api *queueAPI) profiles(w http.ResponseWriter, r *http.Request) {
 	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -411,7 +414,7 @@ func (api *queueAPI) profiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for key, values := range query {
-		if key != "offset" && key != "limit" && key != "query" || len(values) != 1 {
+		if !map[string]bool{"offset": true, "limit": true, "query": true, "project": true, "operation": true, "otherProjects": true, "hierarchy": true}[key] || len(values) != 1 {
 			jsonError(w, 400, "Unknown profile query parameter")
 			return
 		}
@@ -428,7 +431,39 @@ func (api *queueAPI) profiles(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, 400, "Invalid profile pagination or search")
 		return
 	}
-	api.invoke(w, r, []string{"profiles", "list", "--offset", offset, "--limit", limit, "--query", search, "--json"}, nil)
+	for _, key := range []string{"otherProjects", "hierarchy"} {
+		if query.Has(key) && query.Get(key) != "true" {
+			jsonError(w, 400, "Invalid profile filter")
+			return
+		}
+	}
+	project, operation := query.Get("project"), query.Get("operation")
+	if query.Has("project") && (project == "" || utf8.RuneCountInString(project) > 120 || !printable(project) || strings.TrimSpace(project) != project) ||
+		query.Has("operation") && !profileOperation.MatchString(operation) || query.Has("project") && query.Has("otherProjects") {
+		jsonError(w, 400, "Invalid profile filter")
+		return
+	}
+	if query.Has("hierarchy") {
+		for key := range query {
+			if key != "hierarchy" && key != "limit" {
+				jsonError(w, 400, "The project hierarchy takes only a limit")
+				return
+			}
+		}
+		api.invoke(w, r, []string{"profiles", "list", "--hierarchy", "--limit", limit, "--json"}, nil)
+		return
+	}
+	arguments := []string{"profiles", "list", "--offset", offset, "--limit", limit, "--query", search}
+	if query.Has("project") {
+		arguments = append(arguments, "--project", project)
+	}
+	if query.Has("operation") {
+		arguments = append(arguments, "--operation", operation)
+	}
+	if query.Has("otherProjects") {
+		arguments = append(arguments, "--other-projects")
+	}
+	api.invoke(w, r, append(arguments, "--json"), nil)
 }
 
 func (api *queueAPI) profileAction(w http.ResponseWriter, r *http.Request, id, action string) {

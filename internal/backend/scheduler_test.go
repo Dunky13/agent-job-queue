@@ -657,6 +657,9 @@ func TestControllerFinalizesJobFirstSeenFinished(t *testing.T) {
 				if e != nil {
 					t.Fatal(e)
 				}
+				if controller.scopesChecked.IsZero() {
+					t.Fatal("Tick bypassed the expiring identity cache")
+				}
 				// Samples of a finished job stay out of its evidence, but it still holds this capacity.
 				if held := metric(obj(obj(obj(state["jobs"])[value])["prediction"])["memoryBytes"]); held < 20<<30 {
 					t.Fatalf("Admission reserved %v bytes for a job holding 20 GiB", held)

@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/Dunky13/agent-job-queue/internal/backend"
 	"github.com/gorilla/csrf"
 )
 
@@ -161,6 +162,20 @@ func TestAPIStrictQueueMutations(t *testing.T) {
 	}
 }
 
+// The remote server validates operations without linking the backend, so the two
+// lists must not drift apart.
+func TestProfileOperationFilterMatchesBackend(t *testing.T) {
+	operations := backend.ProfileOperations()
+	if strings.Count(profileOperation.String(), "|")+1 != len(operations) {
+		t.Fatalf("%s does not list exactly %v", profileOperation, operations)
+	}
+	for _, operation := range operations {
+		if !profileOperation.MatchString(operation) {
+			t.Errorf("%s is rejected", operation)
+		}
+	}
+}
+
 func TestAPIProfilesReadOnlyBounds(t *testing.T) {
 	f := newAPIFixture(t)
 	id := strings.Repeat("a", 64)
@@ -174,6 +189,27 @@ func TestAPIProfilesReadOnlyBounds(t *testing.T) {
 	if !reflect.DeepEqual(f.calls[0].args, []string{"profiles", "list", "--offset", "100", "--limit", "25", "--query", "Browser tests", "--json"}) || !reflect.DeepEqual(f.calls[1].args, []string{"profiles", "show", id, "--json"}) {
 		t.Fatalf("wrong CLI arguments: %#v", f.calls)
 	}
+	filtered := map[string][]string{
+		"project=my%20app&operation=race-tests": {"profiles", "list", "--offset", "0", "--limit", "100", "--query", "", "--project", "my app", "--operation", "race-tests", "--json"},
+		"otherProjects=true&operation=other":    {"profiles", "list", "--offset", "0", "--limit", "100", "--query", "", "--operation", "other", "--other-projects", "--json"},
+		"hierarchy=true&limit=20":               {"profiles", "list", "--hierarchy", "--limit", "20", "--json"},
+		"hierarchy=true":                        {"profiles", "list", "--hierarchy", "--limit", "100", "--json"},
+	}
+	for query, want := range filtered {
+		before := len(f.calls)
+		if w := f.request("GET", "/api/profiles?"+query, "", nil); w.Code != 200 || len(f.calls) != before+1 || !reflect.DeepEqual(f.calls[before].args, want) {
+			t.Fatalf("filter %s: %d %#v", query, w.Code, f.calls[before:])
+		}
+	}
+	calls := len(f.calls)
+	for _, query := range []string{"operation=nope", "operation=", "operation=Tests", "project=", "project=%20x", "project=" + strings.Repeat("x", 121), "project=a%0Ab", "project=a&otherProjects=true", "otherProjects=false", "otherProjects=1", "hierarchy=yes", "hierarchy=true&query=x", "hierarchy=true&offset=1", "hierarchy=true&project=a", "hierarchy=true&limit=101", "kind=go%3Atests", "project=a&project=b", "operation=xtests", "operation=testsx", "operation=tests%0A", "operation=tests%20", "operation=deploy"} {
+		if w := f.request("GET", "/api/profiles?"+query, "", nil); w.Code != 400 {
+			t.Fatalf("accepted %s: %d", query, w.Code)
+		}
+	}
+	if len(f.calls) != calls {
+		t.Fatal("invalid filter invoked backend")
+	}
 	for _, query := range []string{"limit=101", "limit=0", "offset=-1", "offset=1.2", "offset=00", "query=" + strings.Repeat("x", 121), "limit=10&limit=20", "command=run", "query=%00", "query=%invalid", "offset=9999999999", "limit=01", "limit="} {
 		if w := f.request("GET", "/api/profiles?"+query, "", nil); w.Code != 400 {
 			t.Fatalf("accepted %s: %d", query, w.Code)
@@ -184,7 +220,7 @@ func TestAPIProfilesReadOnlyBounds(t *testing.T) {
 			t.Fatal("accepted invalid profile detail")
 		}
 	}
-	if len(f.calls) != 2 {
+	if len(f.calls) != 2+len(filtered) {
 		t.Fatal("invalid query invoked backend")
 	}
 }

@@ -110,3 +110,32 @@ test("accepts lane, lease and plugin fields and keeps older status valid", () =>
   assert.equal(eligible({ ...lease, state: "queued", canStart: true }, "start"), true);
   assert.equal(eligible(lease, "cancel"), true);
 });
+
+test("learning schemas accept project grouping and still read older daemons", async () => {
+  const { profileCatalogSchema, profileHierarchySchema } = await import("./schema.mjs");
+  const controller = { controllerAppliedRevision: 3, controllerStatus: "Current" };
+  const profile = { id: "a".repeat(64), label: "Browser tests", memberCount: 1, variantCount: 1, successCount: 1, incompleteCount: 0,
+    peakMemoryBytes: 1, peakCpuCores: 1, lastRunAt: 1, memoryFloorBytes: null, cpuFloorCores: null };
+  const catalog = { ...controller, revision: 3, total: 2, offset: 0, limit: 100, profiles: [profile, { ...profile, project: "agent-queue", operation: "browser-tests" }] };
+  assert.deepEqual(profileCatalogSchema.parse(catalog), catalog);
+  for (const invalid of [{ project: "" }, { operation: "" }, { project: "x".repeat(121) }, { operation: 5 }]) {
+    assert.equal(profileCatalogSchema.safeParse({ ...catalog, profiles: [{ ...profile, ...invalid }] }).success, false);
+  }
+  const counts = { workloadCount: 3, groupCount: 2, runCount: 9 };
+  const hierarchy = { ...controller, revision: 3, total: 1, limit: 100, projects: [
+    { project: "agent-queue", collapsed: false, ...counts, operations: [{ operation: "tests", ...counts }] },
+    { project: "Other projects", collapsed: true, projectCount: 4, ...counts, operations: [] }] };
+  assert.deepEqual(profileHierarchySchema.parse(hierarchy), hierarchy);
+  assert.equal("extra" in profileHierarchySchema.parse({ ...hierarchy, extra: 1 }), false);
+  for (const invalid of [{ collapsed: "yes" }, { workloadCount: -1 }, { project: "" }, { operations: [{ operation: "tests", workloadCount: 1 }] }]) {
+    assert.equal(profileHierarchySchema.safeParse({ ...hierarchy, projects: [{ ...hierarchy.projects[0], ...invalid }] }).success, false);
+  }
+  for (const operation of ["deploy", "Tests", ""]) {
+    assert.equal(profileCatalogSchema.safeParse({ ...catalog, profiles: [{ ...profile, operation }] }).success, false);
+    assert.equal(profileHierarchySchema.safeParse({ ...hierarchy, projects: [{ ...hierarchy.projects[0], operations: [{ operation, ...counts }] }] }).success, false);
+  }
+  assert.equal(profileHierarchySchema.safeParse({ ...hierarchy, projects: Array(101).fill(hierarchy.projects[0]) }).success, false);
+  assert.equal(profileHierarchySchema.safeParse({ ...hierarchy, projects: Array(100).fill(hierarchy.projects[0]) }).success, true);
+  assert.equal(profileHierarchySchema.safeParse({ ...hierarchy, projects: Array(102).fill(hierarchy.projects[0]) }).success, false);
+  assert.equal(profileHierarchySchema.safeParse({ ...hierarchy, projects: undefined }).success, false);
+});
