@@ -513,9 +513,15 @@ extension QueueClient.Command {
     private static func profilesRead(_ arguments: [String]) -> Self {
         .init(arguments: ["profiles"] + arguments + ["--json"], cancellation: .discard, decodesStructuredErrors: true)
     }
-    static func profilesList(offset: Int, limit: Int, query: String) -> Self {
-        profilesRead(["list", "--offset", String(offset), "--limit", String(limit), "--query", query])
+    static func profilesList(offset: Int, limit: Int, query: String, project: String? = nil,
+                             operation: String? = nil, otherProjects: Bool = false) -> Self {
+        var arguments = ["list", "--offset", String(offset), "--limit", String(limit), "--query", query]
+        if let project { arguments += ["--project", project] }
+        if let operation { arguments += ["--operation", operation] }
+        if otherProjects { arguments.append("--other-projects") }
+        return profilesRead(arguments)
     }
+    static func profilesHierarchy(limit: Int) -> Self { profilesRead(["list", "--hierarchy", "--limit", String(limit)]) }
     static func profilesShow(_ id: String) -> Self { profilesRead(["show", id]) }
     static func profilesShow(_ id: String, family: String) -> Self { profilesRead(["show", id, "--family", family]) }
     static func profilesShow(_ id: String, membersQuery: String, membersOffset: Int) -> Self {

@@ -30,8 +30,10 @@
         <section id="profile-combine" class="profile-panel" aria-label="Merge selection" hidden></section>
         <div id="profiles-catalog">
           <form id="profiles-search-form" action="/api/profiles" method="get" class="profile-search"><label for="profiles-query">Find a workload</label><div class="button-row"><input id="profiles-query" name="query" type="search" maxlength="120" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"><button type="submit">Search</button></div></form>
+          <nav id="profiles-breadcrumb" class="profile-breadcrumb" aria-label="Learned workload location" hidden></nav>
+          <h3 id="profiles-level" tabindex="-1"></h3>
           <p id="profiles-count" class="learning-copy"></p><ul id="profiles-list" class="job-list" role="list"></ul>
-          <div class="button-row pagination"><button id="profiles-previous" type="button" class="quiet-button">Previous</button><button id="profiles-next" type="button" class="quiet-button">Next</button></div>
+          <div id="profiles-pager" class="button-row pagination"><button id="profiles-previous" type="button" class="quiet-button">Previous</button><button id="profiles-next" type="button" class="quiet-button">Next</button></div>
         </div>
         <section id="profile-detail" hidden></section>
         <section id="profile-confirmation" class="confirmation" aria-labelledby="profile-confirmation-title" hidden><h3 id="profile-confirmation-title" tabindex="-1"></h3><p id="profile-confirmation-copy"></p><div class="button-row"><button id="profile-confirm" type="button">Confirm</button><button id="profile-dismiss" type="button" class="quiet-button">Keep profile</button></div></section>

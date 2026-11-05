@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 const maxLearningInput = 16384
@@ -395,6 +397,7 @@ func LearningCLI(gate *Gate, args []string, input io.Reader, output, errors io.W
 					}
 					value = args[i]
 				}
+				value = norm.NFC.String(value)
 				switch key {
 				case "--family":
 					if e := profileID(value); e != nil {
@@ -447,6 +450,7 @@ func LearningCLI(gate *Gate, args []string, input io.Reader, output, errors io.W
 					}
 					value = args[i]
 				}
+				value = norm.NFC.String(value)
 				switch key {
 				case "--offset", "--limit":
 					n, e := strconv.Atoi(value)

@@ -312,3 +312,77 @@ func TestPreviewCombineGroupsAndWorkloadsRetainsSiblings(t *testing.T) {
 		t.Fatal("Failed fixture combine committed changes", err)
 	}
 }
+
+func TestPreviewHierarchyAndFiltersFollowTheBackendContract(t *testing.T) {
+	q := &fakeQueue{root: t.TempDir()}
+	if err := q.reset(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	list := func(arguments ...string) map[string]any {
+		t.Helper()
+		result, err := q.run(ctx, append([]string{"profiles", "list"}, append(arguments, "--json")...), nil)
+		if err != nil {
+			t.Fatal(arguments, err)
+		}
+		return result
+	}
+	overview := list("--hierarchy", "--limit", "50")
+	rows, err := members(overview["projects"])
+	if err != nil || overview["total"] != 2 || len(rows) != 3 {
+		t.Fatal(overview, err)
+	}
+	var names []string
+	for _, row := range rows {
+		names = append(names, row["project"].(string))
+	}
+	if !reflect.DeepEqual(names, []string{"Sample app", "Sample service", "Other projects"}) {
+		t.Fatal("projects are not busiest first with the folded row last", names)
+	}
+	other := rows[2]
+	if other["collapsed"] != true || other["projectCount"] != float64(2) || other["groupCount"] != float64(2) || other["workloadCount"] != float64(2) {
+		t.Fatal(other)
+	}
+	operations, _ := members(rows[0]["operations"])
+	if len(operations) < 3 || operations[0]["operation"] != "tests" {
+		t.Fatal("operations are not busiest first", operations)
+	}
+	groups := func(arguments ...string) []map[string]any {
+		t.Helper()
+		page, err := members(list(append([]string{"--offset", "0", "--limit", "100", "--query", ""}, arguments...)...)["profiles"])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+	// Every count in the overview describes exactly the groups its filter returns.
+	for _, row := range rows {
+		filter := []string{"--project", row["project"].(string)}
+		if row["collapsed"] == true {
+			filter = []string{"--other-projects"}
+		}
+		if got := len(groups(filter...)); float64(got) != row["groupCount"] {
+			t.Fatal(row["project"], got, row["groupCount"])
+		}
+		inner, _ := members(row["operations"])
+		for _, operation := range inner {
+			if got := len(groups(append(filter, "--operation", operation["operation"].(string))...)); float64(got) != operation["groupCount"] {
+				t.Fatal(row["project"], operation["operation"], got, operation["groupCount"])
+			}
+		}
+	}
+	for _, bad := range [][]string{{"--hierarchy", "--query", "x"}, {"--hierarchy", "--project", "Sample app"}, {"--other-projects", "--project", "Sample app"}, {"--operation", "nope"}} {
+		if _, err := q.run(ctx, append(append([]string{"profiles", "list", "--limit", "5"}, bad...), "--json"), nil); err == nil {
+			t.Fatal("accepted", bad)
+		}
+	}
+	if found := groups("--query", "tooling scripts"); len(found) != 1 || strings.Contains(strings.ToLower(found[0]["label"].(string)), "tooling") {
+		t.Fatal("search must also match the project name", found)
+	}
+	if len(groups("--project", "Missing project")) != 0 {
+		t.Fatal("an unknown project must be an empty page, not an error")
+	}
+	if len(q.events) != 0 {
+		t.Fatal("reads recorded events", q.events)
+	}
+}

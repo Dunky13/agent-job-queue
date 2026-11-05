@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
@@ -80,18 +81,18 @@ func (q *fakeQueue) reset() error {
 }
 
 func learningProfiles() map[string]map[string]any {
-	detail := func(id, label string, families []string) map[string]any {
+	detail := func(id, label, project, operation string, families []string) map[string]any {
 		members := make([]map[string]any, 0, len(families))
 		for index, family := range families {
 			measurements := map[string]any{"variantCount": 0, "successCount": 0, "incompleteCount": 0, "peakMemoryBytes": 0, "peakCpuCores": 0, "lastRunAt": nil}
 			if index == 0 {
 				measurements = map[string]any{"variantCount": 1, "successCount": 5, "incompleteCount": 1, "peakMemoryBytes": 1610612736, "peakCpuCores": 1.5, "lastRunAt": 1792404000}
 			}
-			members = append(members, map[string]any{"family": family, "label": fmt.Sprintf("%s task %d", label, index+1), "project": "example-project", "executable": "go", "measurements": measurements})
+			members = append(members, map[string]any{"family": family, "label": fmt.Sprintf("%s task %d", label, index+1), "project": project, "executable": "go", "measurements": measurements})
 		}
 		return map[string]any{
 			"revision": 4,
-			"profile":  map[string]any{"id": id, "label": label, "memberCount": len(members), "variantCount": 1, "successCount": 5, "incompleteCount": 1, "peakMemoryBytes": 1610612736, "peakCpuCores": 1.5, "lastRunAt": 1792404000, "memoryFloorBytes": nil, "cpuFloorCores": nil},
+			"profile":  map[string]any{"id": id, "label": label, "project": project, "operation": operation, "memberCount": len(members), "variantCount": 1, "successCount": 5, "incompleteCount": 1, "peakMemoryBytes": 1610612736, "peakCpuCores": 1.5, "lastRunAt": 1792404000, "memoryFloorBytes": nil, "cpuFloorCores": nil},
 			"members":  members, "controllerAppliedRevision": 3, "controllerStatus": "Waiting for next fresh pass",
 			"variants":          []map[string]any{{"id": strings.Repeat("f", 64), "family": families[0], "successCount": 5, "incompleteCount": 1, "lastRunAt": 1792404000, "peakMemoryBytes": 1610612736, "peakCpuCores": 1.5}},
 			"runs":              []map[string]any{{"id": strings.Repeat("9", 64), "family": families[0], "variant": strings.Repeat("f", 64), "machine": strings.Repeat("2", 64), "sampledAt": 1792404000, "memoryBytes": 1610612736, "cpuCores": 1.5, "cpuSeconds": 20, "durationSeconds": 15, "success": false}},
@@ -99,7 +100,30 @@ func learningProfiles() map[string]map[string]any {
 			"predictionMachine": strings.Repeat("2", 64), "truncated": map[string]any{"members": false, "variants": false, "runs": false},
 		}
 	}
-	return map[string]map[string]any{strings.Repeat("a", 64): detail(strings.Repeat("a", 64), "Browser tests", []string{strings.Repeat("c", 64), strings.Repeat("d", 64)}), strings.Repeat("b", 64): detail(strings.Repeat("b", 64), "Client build", []string{strings.Repeat("e", 64)})}
+	profiles := map[string]map[string]any{
+		strings.Repeat("a", 64): detail(strings.Repeat("a", 64), "Browser tests", "Sample app", "browser-tests", []string{strings.Repeat("c", 64), strings.Repeat("d", 64)}),
+		strings.Repeat("b", 64): detail(strings.Repeat("b", 64), "Client build", "Sample app", "build", []string{strings.Repeat("e", 64)}),
+	}
+	// Two projects with several operations each, plus two small projects that fold into the other-projects row.
+	next := 0
+	for _, group := range []struct {
+		label, project, operation string
+		families                  int
+	}{
+		{"Unit tests", "Sample app", "tests", 3}, {"Component tests", "Sample app", "tests", 2}, {"Lint", "Sample app", "lint", 1}, {"Race tests", "Sample app", "race-tests", 2},
+		{"API tests", "Sample service", "tests", 3}, {"Service build", "Sample service", "build", 2}, {"Integration tests", "Sample service", "full-tests", 2},
+		{"Dependency update", "Sample service", "dependencies", 1}, {"Static checks", "Sample service", "checks", 1}, {"Service helper", "Sample service", "other", 1},
+		{"Docs build", "Docs site", "build", 1}, {"Script tests", "Tooling scripts", "tests", 1},
+	} {
+		next++
+		families := make([]string, group.families)
+		for index := range families {
+			families[index] = fmt.Sprintf("%064x", 0x10000+next*8+index)
+		}
+		id := fmt.Sprintf("%064x", 0x20000+next)
+		profiles[id] = detail(id, group.label, group.project, group.operation, families)
+	}
+	return profiles
 }
 
 func object(value any) (map[string]any, bool) {
@@ -118,32 +142,211 @@ func members(value any) ([]map[string]any, error) {
 	return result, nil
 }
 
+var previewOperations = []string{"tests", "browser-tests", "native-tests", "race-tests", "full-tests", "build", "lint", "typecheck", "dependencies", "benchmark", "checks", "other"}
+
+type previewCounts struct{ workloads, groups, runs int }
+
+// previewCount reads a number that fixture code stores as int and JSON state decodes as float64.
+func previewCount(value any) int {
+	switch number := value.(type) {
+	case int:
+		return number
+	case float64:
+		return int(number)
+	}
+	return 0
+}
+func (c *previewCounts) add(profile map[string]any) {
+	c.workloads += previewCount(profile["memberCount"])
+	c.runs += previewCount(profile["successCount"]) + previewCount(profile["incompleteCount"])
+	c.groups++
+}
+func (c previewCounts) row() map[string]any {
+	return map[string]any{"workloadCount": c.workloads, "groupCount": c.groups, "runCount": c.runs}
+}
+func previewLabel(profile map[string]any, key, fallback string) string {
+	if value, _ := profile[key].(string); value != "" {
+		return value
+	}
+	return fallback
+}
+
+// previewFolded mirrors the backend rule: a project with two workloads or fewer joins the other-projects row.
+func previewFolded(profiles []map[string]any) map[string]bool {
+	totals := map[string]*previewCounts{}
+	for _, profile := range profiles {
+		project := previewLabel(profile, "project", "Unknown project")
+		if totals[project] == nil {
+			totals[project] = &previewCounts{}
+		}
+		totals[project].add(profile)
+	}
+	folded := map[string]bool{}
+	for project, total := range totals {
+		folded[project] = total.workloads <= 2
+	}
+	return folded
+}
+
+func (q *fakeQueue) listProfiles(arguments []string) (map[string]any, error) {
+	offset, limit, query, project, operation := 0, 100, "", "", ""
+	var other, hierarchy bool
+	seen := map[string]bool{}
+	for index := 0; index < len(arguments); index++ {
+		flag := arguments[index]
+		seen[flag] = true
+		switch flag {
+		case "--json":
+		case "--other-projects":
+			other = true
+		case "--hierarchy":
+			hierarchy = true
+		case "--offset", "--limit", "--query", "--project", "--operation":
+			if index+1 >= len(arguments) {
+				return nil, errors.New("Missing fixture profile filter value")
+			}
+			index++
+			value := arguments[index]
+			var err error
+			switch flag {
+			case "--offset":
+				offset, err = strconv.Atoi(value)
+			case "--limit":
+				limit, err = strconv.Atoi(value)
+			case "--query":
+				query = strings.ToLower(value)
+			case "--project":
+				project = value
+			case "--operation":
+				if !slices.Contains(previewOperations, value) {
+					err = errors.New("Invalid profile filter")
+				}
+				operation = value
+			}
+			if err != nil || offset < 0 || limit < 1 || limit > 100 {
+				return nil, errors.New("Invalid profile pagination or filter")
+			}
+		default:
+			return nil, errors.New("Unknown profile option")
+		}
+	}
+	if other && seen["--project"] {
+		return nil, errors.New("Invalid profile filter combination")
+	}
+	for flag := range seen {
+		if hierarchy && !slices.Contains([]string{"--hierarchy", "--limit", "--json"}, flag) {
+			return nil, errors.New("The project hierarchy takes only a limit")
+		}
+	}
+	ids := make([]string, 0, len(q.profiles))
+	for id := range q.profiles {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	all := make([]map[string]any, 0, len(ids))
+	memberProjects := map[string]string{}
+	for _, id := range ids {
+		profile, ok := object(q.profiles[id]["profile"])
+		if !ok {
+			return nil, errors.New("Invalid fixture profile")
+		}
+		all = append(all, profile)
+		fixtureMembers, err := members(q.profiles[id]["members"])
+		if err != nil {
+			return nil, err
+		}
+		for _, member := range fixtureMembers {
+			memberProjects[id] += " " + strings.ToLower(fmt.Sprint(member["project"]))
+		}
+	}
+	status := map[string]any{"controllerAppliedRevision": 3, "controllerStatus": "Waiting for next fresh pass"}
+	if hierarchy {
+		return q.hierarchy(all, limit, status), nil
+	}
+	folded := previewFolded(all)
+	profiles := make([]map[string]any, 0)
+	for _, profile := range all {
+		name := previewLabel(profile, "project", "Unknown project")
+		label, _ := profile["label"].(string)
+		if project != "" && name != project || operation != "" && previewLabel(profile, "operation", "other") != operation || other && !folded[name] || !strings.Contains(strings.ToLower(label)+memberProjects[fmt.Sprint(profile["id"])], query) {
+			continue
+		}
+		profiles = append(profiles, clone(profile))
+	}
+	total := len(profiles)
+	start := min(offset, total)
+	end := min(start+limit, total)
+	result := map[string]any{"revision": q.profileRevision, "profiles": profiles[start:end], "total": total, "offset": offset, "limit": limit}
+	maps.Copy(result, status)
+	return result, nil
+}
+
+func (q *fakeQueue) hierarchy(all []map[string]any, limit int, status map[string]any) map[string]any {
+	folded := previewFolded(all)
+	byProject := map[string][]map[string]any{}
+	var foldedProfiles []map[string]any
+	for _, profile := range all {
+		name := previewLabel(profile, "project", "Unknown project")
+		if folded[name] {
+			foldedProfiles = append(foldedProfiles, profile)
+		} else {
+			byProject[name] = append(byProject[name], profile)
+		}
+	}
+	row := func(project string, collapsed bool, profiles []map[string]any) map[string]any {
+		total, byOperation := previewCounts{}, map[string]*previewCounts{}
+		for _, profile := range profiles {
+			operation := previewLabel(profile, "operation", "other")
+			if byOperation[operation] == nil {
+				byOperation[operation] = &previewCounts{}
+			}
+			byOperation[operation].add(profile)
+			total.add(profile)
+		}
+		operations := make([]map[string]any, 0, len(byOperation))
+		for _, operation := range previewOperations {
+			if counts := byOperation[operation]; counts != nil {
+				entry := counts.row()
+				entry["operation"] = operation
+				operations = append(operations, entry)
+			}
+		}
+		slices.SortStableFunc(operations, func(a, b map[string]any) int { return b["workloadCount"].(int) - a["workloadCount"].(int) })
+		result := total.row()
+		maps.Copy(result, map[string]any{"project": project, "collapsed": collapsed, "operations": operations})
+		return result
+	}
+	rows := make([]map[string]any, 0, len(byProject)+1)
+	for project, profiles := range byProject {
+		rows = append(rows, row(project, false, profiles))
+	}
+	slices.SortFunc(rows, func(a, b map[string]any) int {
+		if a["workloadCount"] != b["workloadCount"] {
+			return b["workloadCount"].(int) - a["workloadCount"].(int)
+		}
+		return strings.Compare(a["project"].(string), b["project"].(string))
+	})
+	total := len(rows)
+	if len(foldedProfiles) > 0 {
+		other := row("Other projects", true, foldedProfiles)
+		count := 0
+		for _, isFolded := range folded {
+			if isFolded {
+				count++
+			}
+		}
+		other["projectCount"] = count
+		rows = append(rows, other)
+	}
+	result := map[string]any{"revision": q.profileRevision, "projects": rows[:min(limit, len(rows))], "total": total, "limit": limit}
+	maps.Copy(result, status)
+	return result
+}
+
 func (q *fakeQueue) profilesCall(arguments []string, input []byte) (map[string]any, error) {
 	action := arguments[1]
 	if action == "list" {
-		offset, _ := strconv.Atoi(arguments[3])
-		limit, _ := strconv.Atoi(arguments[5])
-		query := strings.ToLower(arguments[7])
-		ids := make([]string, 0, len(q.profiles))
-		for id := range q.profiles {
-			ids = append(ids, id)
-		}
-		slices.Sort(ids)
-		profiles := make([]map[string]any, 0)
-		for _, id := range ids {
-			profile, ok := object(q.profiles[id]["profile"])
-			if !ok {
-				return nil, errors.New("Invalid fixture profile")
-			}
-			label, _ := profile["label"].(string)
-			if strings.Contains(strings.ToLower(label), query) {
-				profiles = append(profiles, clone(profile))
-			}
-		}
-		total := len(profiles)
-		start := min(offset, total)
-		end := min(start+limit, total)
-		return map[string]any{"revision": q.profileRevision, "profiles": profiles[start:end], "total": total, "offset": offset, "limit": limit, "controllerAppliedRevision": 3, "controllerStatus": "Waiting for next fresh pass"}, nil
+		return q.listProfiles(arguments[2:])
 	}
 	id := arguments[2]
 	detail, ok := q.profiles[id]

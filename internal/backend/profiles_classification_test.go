@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 func runGit(t *testing.T, directory string, args ...string) {
@@ -837,8 +839,45 @@ func TestProfileCatalogFiltersAndHierarchy(t *testing.T) {
 	if r, e := store.CatalogFiltered(0, 100, "build", ProfileFilter{Project: "big"}); e != nil || metric(r["total"]) != 1 {
 		t.Fatal("Search and filter do not combine", r, e)
 	}
+	// Search matches the member project name, case-insensitively, so groups of a project missing from the truncated list stay reachable.
+	if r, e := store.CatalogFiltered(0, 100, "SINGLE", ProfileFilter{}); e != nil || metric(r["total"]) != 1 || r["profiles"].([]Object)[0]["project"] != "single" || strings.Contains(strings.ToLower(text(r["profiles"].([]Object)[0]["label"])), "single") {
+		t.Fatal("Search does not match the project name", r, e)
+	}
 	if limited, _ := store.Hierarchy(1); len(limited["projects"].([]Object)) != 1 || metric(limited["total"]) != 1 {
 		t.Fatal("The hierarchy limit counts the other-projects row", limited)
+	}
+	// Foundation's Process passes arguments decomposed (NFD); a precomposed stored name must still be found, and the reverse.
+	add("cafe one", "caf\u00e9", "Go tests", "go", "cafe")
+	add("cafe two", "caf\u00e9", "Go tests", "go", "cafe")
+	add("cafe three", "caf\u00e9", "Go build", "go", "cafe")
+	if r, e := store.CatalogFiltered(0, 100, "", ProfileFilter{Project: "caf\u00e9"}); e != nil || metric(r["total"]) == 0 {
+		t.Fatalf("Project was not found: %v %v", r, e)
+	}
+	if r, e := store.CatalogFiltered(0, 100, "CAFE\u0301", ProfileFilter{}); e != nil || metric(r["total"]) == 0 {
+		t.Fatal("A decomposed search does not match a precomposed project", r, e)
+	}
+	// The same project stored in both forms is one project: one row, one count, and no stray group in the other projects.
+	add("nfc one", "caf\u00e9", "Go tests", "go", "cafe-nfc")
+	add("nfd one", "cafe\u0301", "Go tests", "go", "cafe-nfd")
+	add("nfd two", "cafe\u0301", "Go build", "go", "cafe-nfd")
+	hierarchy, _ = store.Hierarchy(100)
+	rows = hierarchy["projects"].([]Object)
+	cafeRows := 0
+	for _, row := range rows {
+		if norm.NFC.String(text(row["project"])) == "caf\u00e9" {
+			cafeRows++
+			if row["project"] != "caf\u00e9" || metric(row["groupCount"]) != metric(list(ProfileFilter{Project: "caf\u00e9"})["total"]) {
+				t.Fatal("The project row does not match the project filter", row)
+			}
+		}
+	}
+	if cafeRows != 1 {
+		t.Fatalf("A project stored in two forms has %d rows", cafeRows)
+	}
+	for _, p := range list(ProfileFilter{OtherProjects: true})["profiles"].([]Object) {
+		if norm.NFC.String(text(p["project"])) == "caf\u00e9" {
+			t.Fatal("A named project also appears under other projects", p)
+		}
 	}
 	for _, bad := range []ProfileFilter{{Operation: "typo"}, {Project: strings.Repeat("x", 121)}, {Project: "a\nb"}, {Project: " pad"}, {Project: "big", OtherProjects: true}} {
 		if _, e := store.CatalogFiltered(0, 100, "", bad); e == nil {
@@ -849,6 +888,21 @@ func TestProfileCatalogFiltersAndHierarchy(t *testing.T) {
 		if _, e := store.Hierarchy(limit); e == nil {
 			t.Errorf("Invalid hierarchy limit %d accepted", limit)
 		}
+	}
+}
+
+func TestProfileSearchRanksOwnLabelBeforeMemberProject(t *testing.T) {
+	store := fixtureProfileStore(t)
+	// Sorted by label alone, the project-only match ("Aardvark") would come first.
+	observeClassified(t, store, "project only", "zebra", "Aardvark", "go", "aardvark")
+	observeClassified(t, store, "label match", "other", "Zebra crossing", "go", "crossing")
+	r, e := store.CatalogFiltered(0, 100, "zebra", ProfileFilter{})
+	if e != nil {
+		t.Fatal(e)
+	}
+	entries := r["profiles"].([]Object)
+	if len(entries) != 2 || text(entries[0]["label"]) != "Zebra crossing" || text(entries[1]["label"]) != "Aardvark" {
+		t.Fatal("A label match does not sort before a project-only match", entries)
 	}
 }
 
@@ -893,6 +947,30 @@ func TestProfileCLICatalogFilters(t *testing.T) {
 		if code, r := run(bad...); code != 125 || r["error"] == nil {
 			t.Errorf("%v accepted: %d %v", bad, code, r)
 		}
+	}
+}
+
+func TestProfileCLINormalizesDecomposedFilters(t *testing.T) {
+	g := testGate(t)
+	store, e := NewProfileStore(g.State, false)
+	if e != nil {
+		t.Fatal(e)
+	}
+	run := func(args ...string) (int, Object) {
+		var output, stderr bytes.Buffer
+		code := LearningCLI(g, append([]string{"list", "--json"}, args...), strings.NewReader(""), &output, &stderr)
+		result := Object{}
+		_ = json.Unmarshal(output.Bytes(), &result)
+		return code, result
+	}
+	// Foundation hands the project over decomposed; the stored name is precomposed.
+	observeClassified(t, store, "accent", "caf\u00e9", "Go tests", "go", "accent")
+	if code, r := run("--project", "cafe\u0301"); code != 0 || metric(r["total"]) != 1 {
+		t.Fatal("A decomposed --project missed a precomposed project", code, r)
+	}
+	// Decomposed text is normalized before the length check: 80 characters are 160 runes in NFD.
+	if code, r := run("--project", strings.Repeat("e\u0301", 80)); code != 0 || metric(r["total"]) != 0 {
+		t.Fatal("A long decomposed project name was rejected", code, r)
 	}
 }
 

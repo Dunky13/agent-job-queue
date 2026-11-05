@@ -1,11 +1,14 @@
 import { setupProfileSelection } from "./profile-selection.js";
-import { profileCatalogSchema, profileDetailSchema, csrfSchema } from "./schema.mjs";
+import { profileCatalogSchema, profileDetailSchema, profileHierarchySchema, csrfSchema } from "./schema.mjs";
 
 const byId = (id) => document.getElementById(id);
 const gib = 1073741824;
 const bytes = (value) => value > 0 && value / gib < 0.01 ? `${value.toLocaleString()} bytes` : `${(value / gib).toLocaleString(undefined, { maximumFractionDigits: 2 })} GiB`;
 const number = (value) => value > 0 && value < 0.01 ? value.toExponential(2) : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 const when = (value) => value === null ? "No runs yet" : new Date(value * 1000).toLocaleString();
+const plural = (count, word) => `${count.toLocaleString()} ${word}${count === 1 ? "" : "s"}`;
+const operationName = (operation) => `${operation[0].toUpperCase()}${operation.slice(1).replaceAll("-", " ")}`;
+const hierarchyCounts = (row) => `${plural(row.workloadCount, "workload")} · ${plural(row.groupCount, "group")} · ${plural(row.runCount, "run")}`;
 const message = (error) => error instanceof Error ? error.message : "The learning request could not be completed.";
 function node(tag, className = "", text) {
   const result = document.createElement(tag);
@@ -38,7 +41,8 @@ function definitions(rows) {
 export function setupProfiles({ request, announce, show, queueBusy }) {
   const state = { detail: null, catalog: null, selected: null, query: "", offset: 0, busy: false, loading: false,
     dirty: false, confirmation: null, generation: 0, active: false, mergeGeneration: 0, mergeTargets: [],
-    memberGeneration: 0, memberController: null, memberQuery: "", memberOffset: 0, returnGroup: null };
+    memberGeneration: 0, memberController: null, memberQuery: "", memberOffset: 0, returnGroup: null,
+    level: "projects", scope: null, operation: null };
   const error = (text = "") => { byId("profiles-error").textContent = text; byId("profiles-error").hidden = !text; };
   const selection = setupProfileSelection({ request, reportError: error,
     isBlocked: () => state.busy || state.loading || queueBusy(), isDirty: () => state.dirty,
@@ -57,7 +61,7 @@ export function setupProfiles({ request, announce, show, queueBusy }) {
   }
   function controls() {
     byId("profiles-refresh").disabled = state.busy || state.loading;
-    byId("profiles-previous").disabled = state.loading || state.offset === 0;
+    byId("profiles-previous").disabled = state.loading || state.offset === 0 || state.catalog?.total === 0;
     byId("profiles-next").disabled = state.loading || !state.catalog || state.offset + state.catalog.profiles.length >= state.catalog.total;
     for (const control of byId("profile-detail").querySelectorAll("button, input, select")) control.disabled = state.busy || state.loading || control.dataset.unavailable === "true";
     byId("profile-confirm").disabled = state.busy;
@@ -137,7 +141,7 @@ export function setupProfiles({ request, announce, show, queueBusy }) {
     const search = node("form", "profile-search");
     const query = field(search, "Find a member in this group", "profile-member-query", data.memberPage?.query ?? state.memberQuery, { type: "search", maxLength: 120, autoComplete: "off" });
     const submit = node("button", "quiet-button", "Search members"); submit.type = "submit"; search.append(submit);
-    search.addEventListener("submit", (event) => { event.preventDefault(); void loadMembers(query.value.trim(), 0); });
+    search.addEventListener("submit", (event) => { event.preventDefault(); void loadMembers(query.value.trim().normalize("NFC"), 0); });
     section.append(search);
     for (const member of data.members) {
       const item = node("details", "profile-member"); item.name = "profile-members"; item.dataset.family = member.family;
@@ -183,18 +187,99 @@ export function setupProfiles({ request, announce, show, queueBusy }) {
     } catch (failure) { if (generation === state.generation) error(message(failure)); }
     finally { if (generation === state.generation) { state.loading = false; controls(); } }
   }
+  // A search is global: it lists groups across every project and hides the drill-down until it is cleared.
+  const searching = () => state.query !== "";
+  const currentLevel = () => searching() ? "groups" : state.level;
+  function renderLevel() {
+    const here = currentLevel();
+    byId("profiles-level").textContent = searching() ? "Search results" : here === "projects" ? "Projects" : here === "operations" ? `Operations in ${state.scope.project}` : "Groups";
+    byId("profiles-pager").hidden = here !== "groups";
+    const trail = byId("profiles-breadcrumb");
+    trail.hidden = searching() || here === "projects";
+    if (trail.hidden) return;
+    const parts = [["All projects", "projects"], [state.scope.project, state.scope.folded ? "projects" : "operations"], [state.operation ? operationName(state.operation) : "All operations", "groups"]].slice(0, here === "groups" ? 3 : 2);
+    trail.replaceChildren(...parts.flatMap(([text, target], index) => {
+      const last = index === parts.length - 1;
+      const part = last ? node("span", "", text) : button(text, () => browse(target, state.scope));
+      if (last) part.setAttribute("aria-current", "page");
+      return index ? [node("span", "job-context", "/"), part] : [part];
+    }));
+  }
+  function browse(level, scope, operation = null) {
+    if (state.busy) return;
+    Object.assign(state, { level, scope: level === "projects" ? null : scope, operation: level === "groups" ? operation : null, offset: 0, catalog: null });
+    byId("profiles-count").textContent = "";
+    byId("profiles-list").replaceChildren(node("li", "empty", "Loading…"));
+    void loadCatalog();
+    byId("profiles-level").focus();
+    announce(byId("profiles-level").textContent);
+  }
+  const emptyWithBack = (text) => {
+    const item = node("li", "empty", `${text} `);
+    item.append(button("Back to all projects", () => browse("projects")));
+    return item;
+  };
+  function projectRows(data) {
+    const shown = data.projects.filter((row) => !row.collapsed).length;
+    // The total counts only projects with three or more workloads; smaller ones fold into the last row, which truncation drops first.
+    byId("profiles-count").textContent = data.projects.length === 0 ? "" : data.total > shown
+      ? `Showing the ${shown} busiest of ${data.total} projects with three or more workloads. ${plural(data.total - shown, "project")} not shown, nor any smaller projects. Search a project or group name to find them.`
+      : shown >= data.limit ? `Showing the ${shown} busiest projects with three or more workloads. Smaller projects are not shown. Search a project or group name to find them.`
+      : "Choose a project to see what it ran.";
+    return data.projects.map((row) => {
+      const item = node("li", "job-card");
+      item.append(button(row.project, () => browse("operations", { project: row.project, collapsed: row.collapsed }), "profile-link"), node("p", "job-context", hierarchyCounts(row)));
+      if (row.collapsed && row.projectCount) item.append(node("p", "job-context", `Covers ${plural(row.projectCount, "smaller project")}.`));
+      return item;
+    });
+  }
+  const scopeRow = (data) => data.projects.find((candidate) => candidate.collapsed === state.scope.collapsed && candidate.project === state.scope.project);
+  function operationRows(data, row) {
+    byId("profiles-count").textContent = "Choose an operation, or view every group in this project.";
+    return [["All operations", row, null], ...row.operations.map((operation) => [operationName(operation.operation), operation, operation.operation])].map(([label, counts, operation]) => {
+      const item = node("li", "job-card");
+      item.append(button(label, () => browse("groups", state.scope, operation), "profile-link"), node("p", "job-context", hierarchyCounts(counts)));
+      return item;
+    });
+  }
   async function loadCatalog() {
     selection.dismiss();
     const generation = ++state.generation;
     state.loading = true;
-    error(); controls();
+    error(); controls(); renderLevel();
     try {
-      const query = new URLSearchParams({ offset: String(state.offset), limit: "100", query: state.query });
-      const data = await request(`/api/profiles?${query}`, profileCatalogSchema);
+      if (currentLevel() !== "groups") {
+        const data = await request(`/api/profiles?${new URLSearchParams({ hierarchy: "true", limit: "100" })}`, profileHierarchySchema);
+        if (generation !== state.generation) return;
+        applied(data);
+        const row = state.level === "operations" ? scopeRow(data) : null;
+        if (state.level === "projects" || row) {
+          const items = row ? operationRows(data, row) : projectRows(data);
+          byId("profiles-list").replaceChildren(...(items.length ? items : [node("li", "empty", "Your Mac has not learned any workloads yet. Jobs build this history as they run; learning corrections will appear here.")]));
+          return;
+        }
+        // A merge can fold the project into the other-projects row: list its groups directly. It has no operations level, so its crumb leads back to the projects.
+        Object.assign(state, { level: "groups", operation: null, offset: 0, scope: { ...state.scope, folded: true } }); renderLevel();
+      }
+      const groupQuery = () => {
+        const query = new URLSearchParams({ offset: String(state.offset), limit: "100", query: state.query });
+        if (!searching()) {
+          if (state.scope?.collapsed) query.set("otherProjects", "true"); else if (state.scope) query.set("project", state.scope.project);
+          if (state.operation) query.set("operation", state.operation);
+        }
+        return query;
+      };
+      let data = await request(`/api/profiles?${groupQuery()}`, profileCatalogSchema);
       if (generation !== state.generation) return;
+      if (data.total > 0 && data.offset >= data.total) {
+        // A merge shrank the list below this page: show the last page that exists.
+        state.offset = Math.floor((data.total - 1) / 100) * 100;
+        data = await request(`/api/profiles?${groupQuery()}`, profileCatalogSchema);
+        if (generation !== state.generation) return;
+      }
       state.catalog = data;
       applied(data);
-      byId("profiles-count").textContent = data.total ? `${data.offset + 1}–${data.offset + data.profiles.length} of ${data.total} workloads` : "No matching workloads.";
+      byId("profiles-count").textContent = data.profiles.length ? `${data.offset + 1}–${data.offset + data.profiles.length} of ${data.total} ${data.total === 1 ? "group" : "groups"}` : "No matching groups.";
       const items = data.profiles.map((profile) => {
         const item = node("li", "job-card");
         const link = button(profile.label, () => void open(profile.id), "profile-link");
@@ -203,8 +288,15 @@ export function setupProfiles({ request, announce, show, queueBusy }) {
           node("p", "job-context", `Last run: ${when(profile.lastRunAt)}`));
         return item;
       });
-      byId("profiles-list").replaceChildren(...(items.length ? items : [node("li", "empty", state.query ? "Try another name or clear your search." : "Your Mac has not learned any workloads yet. Jobs build this history as they run; learning corrections will appear here.")]));
-    } catch (failure) { if (generation === state.generation) error(`${message(failure)} Use Refresh learning to retry.`); }
+      const none = searching() ? node("li", "empty", "Try another name or clear your search.") : state.scope ? emptyWithBack("Nothing is left here.") : node("li", "empty", "Your Mac has not learned any workloads yet. Jobs build this history as they run; learning corrections will appear here.");
+      byId("profiles-list").replaceChildren(...(items.length ? items : [none]));
+    } catch (failure) {
+      if (generation === state.generation) {
+        // Leave nothing from the failed view behind: no placeholder, no stale count, no Next into another scope.
+        state.catalog = null; byId("profiles-count").textContent = ""; byId("profiles-list").replaceChildren();
+        error(`${message(failure)} Use Refresh learning to retry.`);
+      }
+    }
     finally { if (generation === state.generation) { state.loading = false; controls(); } }
   }
   async function mergeTargets(query = "") {
@@ -259,7 +351,7 @@ export function setupProfiles({ request, announce, show, queueBusy }) {
     const targetForm = node("form", "profile-search"); targetForm.action = "/api/profiles"; targetForm.method = "get";
     const targetQuery = field(targetForm, "Find a workload to share with", "profile-target-query", "", { type: "search", maxLength: 120, autoComplete: "off" });
     const find = node("button", "quiet-button", "Find workloads"); find.type = "submit"; targetForm.append(find);
-    targetForm.addEventListener("submit", (event) => { event.preventDefault(); void mergeTargets(targetQuery.value.trim()); });
+    targetForm.addEventListener("submit", (event) => { event.preventDefault(); void mergeTargets(targetQuery.value.trim().normalize("NFC")); });
     const targetLabel = node("label", "", "Target workload"); targetLabel.htmlFor = "profile-merge-target";
     const target = node("select"); target.id = "profile-merge-target"; target.name = "targetId";
     merging.append(targetForm, targetLabel, target, button("Share learning…", () => {
@@ -335,7 +427,16 @@ export function setupProfiles({ request, announce, show, queueBusy }) {
     if (id === null) { document.title = "Learned workloads | Agent Queue"; byId("profiles-title").focus(); await loadCatalog(); }
     else { document.title = "Workload learning | Agent Queue"; await loadDetail(id); }
   }
-  byId("profiles-search-form").addEventListener("submit", (event) => { event.preventDefault(); if (state.loading || state.busy) return; state.query = byId("profiles-query").value.trim(); state.offset = 0; void loadCatalog(); });
+  byId("profiles-search-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (state.loading || state.busy) return;
+    state.query = byId("profiles-query").value.trim().normalize("NFC"); state.offset = 0; state.catalog = null;
+    // Rows from the previous level must not stay clickable while the new level loads.
+    byId("profiles-count").textContent = ""; byId("profiles-list").replaceChildren(node("li", "empty", "Loading…"));
+    void loadCatalog();
+    byId("profiles-level").focus();
+    announce(byId("profiles-level").textContent);
+  });
   byId("profiles-previous").addEventListener("click", () => { state.offset = Math.max(0, state.offset - 100); void loadCatalog(); });
   byId("profiles-next").addEventListener("click", () => { state.offset += 100; void loadCatalog(); });
   byId("profiles-refresh").addEventListener("click", () => {
