@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -377,7 +378,7 @@ func TestControllerRunBaselineRestartGapAndFinalization(t *testing.T) {
 	value := strings.Repeat("2", 32)
 	marker := Object{"pgid": 400, "members": backend.members, "executionStartedAt": resourceNow()}
 	host := fixtureResourceHost()
-	first, e := controller.SampleRun(2, value, marker, host, fixturePrediction())
+	first, e := controller.SampleRun(2, value, marker, host, fixturePrediction(), false)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -386,7 +387,7 @@ func TestControllerRunBaselineRestartGapAndFinalization(t *testing.T) {
 	}
 	*now += 2
 	backend.usages[101] = fixtureUsage(1, 2*GiB, 3e9)
-	second, e := controller.SampleRun(2, value, marker, host, fixturePrediction())
+	second, e := controller.SampleRun(2, value, marker, host, fixturePrediction(), false)
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -395,11 +396,11 @@ func TestControllerRunBaselineRestartGapAndFinalization(t *testing.T) {
 	}
 	backend.fail[101] = true
 	*now += 2
-	controller.SampleRun(2, value, marker, host, fixturePrediction())
+	controller.SampleRun(2, value, marker, host, fixturePrediction(), false)
 	delete(backend.fail, 101)
 	*now += 2
 	backend.usages[101] = fixtureUsage(1, 100, 5e9)
-	controller.SampleRun(2, value, marker, host, fixturePrediction())
+	controller.SampleRun(2, value, marker, host, fixturePrediction(), false)
 	if boolean(controller.runs[value]["complete"]) {
 		t.Fatal("Later successful samples erased observation outage")
 	}
@@ -408,7 +409,7 @@ func TestControllerRunBaselineRestartGapAndFinalization(t *testing.T) {
 		t.Fatal(e)
 	}
 	*now += 2
-	fresh.SampleRun(2, value, marker, host, fixturePrediction())
+	fresh.SampleRun(2, value, marker, host, fixturePrediction(), false)
 	if boolean(fresh.runs[value]["complete"]) {
 		t.Fatal("Restart certified lost sampler history")
 	}
@@ -418,6 +419,278 @@ func TestControllerRunBaselineRestartGapAndFinalization(t *testing.T) {
 	retained, e := ReadPrivate(filepath.Join(g.State, "resource-runs", value+".json"))
 	if e != nil || boolean(retained["complete"]) {
 		t.Fatal("Outage censor did not survive restart")
+	}
+}
+func TestControllerRunKeepsCompletenessThroughTheFinalSample(t *testing.T) {
+	sampleTwice := func(t *testing.T) (*Controller, *fakeResourceBackend, *float64, *float64, func() (Object, error)) {
+		t.Helper()
+		g, _ := schedulerFixtureGate(t)
+		sampler, backend, now, shift := resourceFixture()
+		controller, e := NewController(g, sampler, nil)
+		if e != nil {
+			t.Fatal(e)
+		}
+		value := strings.Repeat("2", 32)
+		marker := Object{"pgid": 400, "members": backend.members, "executionStartedAt": resourceNow()}
+		sample := func() (Object, error) {
+			return controller.SampleRun(2, value, marker, fixtureResourceHost(), fixturePrediction(), false)
+		}
+		for range 2 {
+			if _, e = sample(); e != nil {
+				t.Fatal(e)
+			}
+			*now += 2
+		}
+		return controller, backend, now, shift, sample
+	}
+	value := strings.Repeat("2", 32)
+	t.Run("job exit during the final sample", func(t *testing.T) {
+		controller, backend, _, _, sample := sampleTwice(t)
+		backend.exited = map[int]bool{101: true}
+		if _, e := sample(); e != nil {
+			t.Fatal(e)
+		}
+		if !boolean(controller.runs[value]["complete"]) || boolean(controller.runs[value]["latestComplete"]) {
+			t.Fatalf("Final sample changed the run's evidence: %v", controller.runs[value])
+		}
+	})
+	t.Run("sampling error during the final sample", func(t *testing.T) {
+		controller, backend, _, _, sample := sampleTwice(t)
+		observedAt := controller.runs[value]["sampledAt"]
+		backend.members = []Object{{"pid": 999, "birth": "stranger"}}
+		if _, e := sample(); e != nil {
+			t.Fatal(e)
+		}
+		if !boolean(controller.runs[value]["complete"]) || controller.runs[value]["sampledAt"] != observedAt {
+			t.Fatalf("Failed final sample changed the run's evidence: %v", controller.runs[value])
+		}
+	})
+	t.Run("repeated sampling errors", func(t *testing.T) {
+		controller, backend, now, _, sample := sampleTwice(t)
+		backend.members = []Object{{"pid": 999, "birth": "stranger"}}
+		sample()
+		*now += 2
+		sample()
+		if boolean(controller.runs[value]["complete"]) {
+			t.Fatal("Repeated sampling errors kept the run complete")
+		}
+	})
+	t.Run("failed sampling of a job that keeps running", func(t *testing.T) {
+		controller, backend, now, _, sample := sampleTwice(t)
+		backend.fail[101] = true
+		sample()
+		delete(backend.fail, 101)
+		*now += 2
+		sample()
+		if boolean(controller.runs[value]["complete"]) {
+			t.Fatal("Observed failure was erased by a later sample")
+		}
+	})
+	t.Run("missed interval before the final sample", func(t *testing.T) {
+		controller, _, now, _, sample := sampleTwice(t)
+		*now += 600
+		sample()
+		if boolean(controller.runs[value]["complete"]) {
+			t.Fatal("Final sample hid a missed interval")
+		}
+	})
+}
+func TestControllerFinalizationRecordsOnlyObservedRuns(t *testing.T) {
+	stranger := []Object{{"pid": 999, "birth": "stranger"}}
+	for _, scenario := range []struct {
+		name          string
+		finalSample   func(*testing.T, *Controller, *fakeResourceBackend, func() (Object, error))
+		sampleAtEnd   bool
+		receiptFirst  bool
+		owned         bool
+		spike         bool
+		wantSuccesses int
+	}{
+		{name: "measured to the end", wantSuccesses: 1},
+		{name: "job exit fails the final sample", finalSample: func(t *testing.T, _ *Controller, b *fakeResourceBackend, sample func() (Object, error)) {
+			b.members = stranger
+			sample()
+		}, wantSuccesses: 1},
+		{name: "receipt outlives the job", receiptFirst: true, wantSuccesses: 1},
+		{name: "good sample lands just after the end", sampleAtEnd: true, wantSuccesses: 1},
+		{name: "failing samples while an owned receipt outlives the job", receiptFirst: true, owned: true, wantSuccesses: 1},
+		{name: "good samples while an owned receipt outlives the job", receiptFirst: true, owned: true, spike: true, wantSuccesses: 1},
+		{name: "stall hidden behind a failed final sample", finalSample: func(t *testing.T, c *Controller, b *fakeResourceBackend, sample func() (Object, error)) {
+			c.runs[strings.Repeat("2", 32)]["sampledAt"] = resourceNow() - 600
+			b.members = stranger
+			sample()
+		}, wantSuccesses: 0},
+		{name: "last sample long after the recorded end", finalSample: func(t *testing.T, c *Controller, _ *fakeResourceBackend, _ func() (Object, error)) {
+			c.runs[strings.Repeat("2", 32)]["sampledAt"] = resourceNow() + 2*MaxSampleInterval
+		}, wantSuccesses: 0},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			g, snapshot := schedulerFixtureGate(t)
+			value := strings.Repeat("2", 32)
+			if e := WritePrivate(filepath.Join(g.State, "workloads", value+".json"), fixtureIdentity()); e != nil {
+				t.Fatal(e)
+			}
+			sampler, backend, _, _ := resourceFixture()
+			sampler.wallClock = resourceNow
+			epoch := time.Now()
+			sampler.clock = func() float64 { return time.Since(epoch).Seconds() }
+			mustHost(t, sampler)
+			backend.raw["cpuTicks"] = []any{110, 100, 290, 100}
+			controller, e := NewController(g, sampler, nil)
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer controller.Close()
+			marker := Object{"pgid": 400, "members": backend.members, "executionStartedAt": resourceNow()}
+			sample := func() (Object, error) {
+				return controller.SampleRun(2, value, marker, fixtureResourceHost(), fixturePrediction(), false)
+			}
+			for range 3 {
+				time.Sleep(time.Millisecond)
+				if _, e = sample(); e != nil {
+					t.Fatal(e)
+				}
+			}
+			if scenario.finalSample != nil {
+				scenario.finalSample(t, controller, backend, sample)
+			}
+			ended := time.Now()
+			if scenario.sampleAtEnd {
+				time.Sleep(time.Millisecond)
+				if _, e = sample(); e != nil {
+					t.Fatal(e)
+				}
+			}
+			obj(snapshot["tasks"])["2"] = Object{"command": "agent-heavy execute " + value, "status": Object{"Done": Object{"start": ended.Add(-time.Second).UTC().Format(time.RFC3339Nano), "end": ended.UTC().Format(time.RFC3339Nano), "result": "Success"}}, "priority": 0}
+			writeSchedulerSnapshot(t, g, snapshot)
+			if scenario.receiptFirst {
+				receipt := Object{"task_id": 2, "token": value}
+				if scenario.owned {
+					owner := backend.members
+					receipt = Object{"task_id": 2, "token": value, "pgid": 400, "boot_uuid": "fixture-boot", "members": backend.members}
+					if e = os.MkdirAll(g.Slot, 0700); e != nil {
+						t.Fatal(e)
+					}
+					if e = WritePrivate(JobMarkerPath(g, receipt), receipt); e != nil {
+						t.Fatal(e)
+					}
+					backend.members = stranger
+					if scenario.spike {
+						backend.members = owner
+						backend.usages[101]["memoryBytes"] = uint64(8 << 30)
+					}
+				}
+				if e = WritePrivate(g.ReceiptPath(2), receipt); e != nil {
+					t.Fatal(e)
+				}
+				for range 3 {
+					if _, e = controller.Tick(); e != nil {
+						t.Fatal(e)
+					}
+				}
+				if e = os.Remove(g.ReceiptPath(2)); e != nil {
+					t.Fatal(e)
+				}
+			}
+			if _, e = controller.Tick(); e != nil {
+				t.Fatal(e)
+			}
+			successes, duration, memory := 0, 0.0, 0.0
+			if e = controller.store.connection(false, func(c profileSQL) error {
+				rows, e := profileRows(c, "SELECT success,duration,memory FROM runs")
+				if len(rows) != 1 {
+					t.Fatalf("Recorded %d runs", len(rows))
+				}
+				successes, duration, memory = int(metric(rows[0]["success"])), metric(rows[0]["duration"]), metric(rows[0]["memory"])
+				return e
+			}); e != nil {
+				t.Fatal(e)
+			}
+			if actual := float64(ended.UnixNano())/1e9 - metric(marker["executionStartedAt"]); math.Abs(duration-actual) > .001 {
+				t.Fatalf("Recorded duration %f, job ran for %f", duration, actual)
+			}
+			if memory >= 1<<30 {
+				t.Fatalf("A sample of the finished job reached its evidence: %v bytes", memory)
+			}
+			if successes != scenario.wantSuccesses {
+				t.Fatalf("Recorded success %d, want %d: %v", successes, scenario.wantSuccesses, controller.runs[value])
+			}
+		})
+	}
+}
+func TestControllerFinalizesJobFirstSeenFinished(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restart=%v", restart), func(t *testing.T) {
+			g, snapshot := schedulerFixtureGate(t)
+			value := strings.Repeat("2", 32)
+			if e := WritePrivate(filepath.Join(g.State, "workloads", value+".json"), fixtureIdentity()); e != nil {
+				t.Fatal(e)
+			}
+			sampler, backend, _, _ := resourceFixture()
+			sampler.wallClock = resourceNow
+			epoch := time.Now()
+			sampler.clock = func() float64 { return time.Since(epoch).Seconds() }
+			mustHost(t, sampler)
+			backend.raw["cpuTicks"] = []any{110, 100, 290, 100}
+			controller, e := NewController(g, sampler, nil)
+			if e != nil {
+				t.Fatal(e)
+			}
+			defer func() { controller.Close() }()
+			ended := time.Now()
+			obj(snapshot["tasks"])["2"] = Object{"command": "agent-heavy execute " + value, "status": Object{"Done": Object{"start": ended.Add(-time.Second).UTC().Format(time.RFC3339Nano), "end": ended.UTC().Format(time.RFC3339Nano), "result": "Success"}}}
+			writeSchedulerSnapshot(t, g, snapshot)
+			receipt := Object{"task_id": 2, "token": value, "pgid": 400, "boot_uuid": "fixture-boot", "members": backend.members, "executionStartedAt": resourceNow()}
+			if e = os.MkdirAll(g.Slot, 0700); e != nil {
+				t.Fatal(e)
+			}
+			if e = WritePrivate(JobMarkerPath(g, receipt), receipt); e != nil {
+				t.Fatal(e)
+			}
+			if e = WritePrivate(g.ReceiptPath(2), receipt); e != nil {
+				t.Fatal(e)
+			}
+			backend.usages[101]["memoryBytes"] = uint64(20 << 30)
+			for range 4 {
+				time.Sleep(time.Millisecond)
+				state, e := controller.Tick()
+				if e != nil {
+					t.Fatal(e)
+				}
+				// Samples of a finished job stay out of its evidence, but it still holds this capacity.
+				if held := metric(obj(obj(obj(state["jobs"])[value])["prediction"])["memoryBytes"]); held < 20<<30 {
+					t.Fatalf("Admission reserved %v bytes for a job holding 20 GiB", held)
+				}
+			}
+			persisted, e := ReadPrivate(filepath.Join(g.State, "resource-runs", value+".json"))
+			if e != nil {
+				t.Fatal(e)
+			}
+			if metric(persisted["samples"]) != 0 || text(persisted["machine"]) == "" {
+				t.Fatalf("The persisted run must keep its identity and no samples of the finished job: %v", persisted)
+			}
+			if e = os.Remove(g.ReceiptPath(2)); e != nil {
+				t.Fatal(e)
+			}
+			if restart {
+				controller.Close()
+				if controller, e = NewController(g, sampler, nil); e != nil {
+					t.Fatal(e)
+				}
+			}
+			if _, e = controller.Tick(); e != nil {
+				t.Fatal(e)
+			}
+			if e = controller.store.connection(false, func(c profileSQL) error {
+				rows, e := profileRows(c, "SELECT success FROM runs")
+				if len(rows) != 1 || metric(rows[0]["success"]) != 0 {
+					t.Fatalf("A job never sampled while running must record one incomplete run: %v", rows)
+				}
+				return e
+			}); e != nil {
+				t.Fatal(e)
+			}
+		})
 	}
 }
 func TestSchedulingPayloadMigrationRequiresAcknowledgedIdentity(t *testing.T) {

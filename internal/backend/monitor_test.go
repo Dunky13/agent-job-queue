@@ -3,6 +3,7 @@ package backend
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/Dunky13/agent-job-queue/internal/census"
@@ -13,6 +14,7 @@ type fakeResourceBackend struct {
 	members   []Object
 	usages    map[int]Object
 	fail      map[int]bool
+	exited    map[int]bool
 	after     []Object
 	calls     int
 	onHost    func()
@@ -51,6 +53,9 @@ func (b *fakeResourceBackend) Members(int) ([]Object, error) {
 func (b *fakeResourceBackend) Process(pid, pgid int) (Object, error) {
 	if b.onProcess != nil {
 		b.onProcess()
+	}
+	if b.exited[pid] {
+		return nil, errResourceProcessExited
 	}
 	if b.fail[pid] {
 		return nil, fmt.Errorf("Counter unavailable")
@@ -191,6 +196,76 @@ func TestResourceGroupWorkersExitsPIDReuseAndResets(t *testing.T) {
 	if metric(mustGroup(t, s)["cpuSeconds"]) != 1e-9 {
 		t.Fatal("Forgotten process group inherited totals")
 	}
+}
+func TestResourceGroupRejectsOwnershipLostDuringSample(t *testing.T) {
+	s, b, _, _ := resourceFixture()
+	owner := b.members
+	b.after = []Object{{"pid": 900, "birth": "stranger"}}
+	if _, e := s.Group(400, owner); e == nil || !strings.Contains(e.Error(), "changed during sampling") {
+		t.Fatalf("Ownership loss during a sample was accepted: %v", e)
+	}
+}
+func TestResourceGroupSampleToleratesWorkerChurn(t *testing.T) {
+	stable, leaving, joining := Object{"pid": 101, "birth": "stable birth"}, Object{"pid": 102, "birth": "leaving"}, Object{"pid": 103, "birth": "joining"}
+	sample := func(t *testing.T, prepare func(*fakeResourceBackend)) Object {
+		t.Helper()
+		s, b, now, _ := resourceFixture()
+		mustGroup(t, s)
+		*now += 2
+		b.calls = 0
+		prepare(b)
+		return mustGroup(t, s)
+	}
+	t.Run("worker exits during the sample", func(t *testing.T) {
+		v := sample(t, func(b *fakeResourceBackend) {
+			b.members = []Object{stable, leaving}
+			b.usages[102] = fixtureUsage(2, 500, 1)
+			b.after = []Object{stable}
+		})
+		if !boolean(v["complete"]) || metric(v["memoryBytes"]) != 100 {
+			t.Fatalf("Exited worker failed the sample or kept its footprint: %v", v)
+		}
+	})
+	t.Run("worker exits before its counters are read", func(t *testing.T) {
+		v := sample(t, func(b *fakeResourceBackend) {
+			b.members = []Object{stable, leaving}
+			b.fail[102] = true
+			b.after = []Object{stable}
+		})
+		if !boolean(v["complete"]) {
+			t.Fatalf("Exited worker failed the sample: %v", v)
+		}
+	})
+	t.Run("worker starts during the sample", func(t *testing.T) {
+		v := sample(t, func(b *fakeResourceBackend) { b.after = []Object{stable, joining} })
+		if !boolean(v["complete"]) {
+			t.Fatalf("New worker failed the sample: %v", v)
+		}
+	})
+	t.Run("unreaped worker has exited", func(t *testing.T) {
+		v := sample(t, func(b *fakeResourceBackend) {
+			b.members = []Object{stable, leaving}
+			b.exited = map[int]bool{102: true}
+		})
+		if !boolean(v["complete"]) {
+			t.Fatalf("Unreaped worker failed the sample: %v", v)
+		}
+	})
+	t.Run("lasting worker could not be read", func(t *testing.T) {
+		v := sample(t, func(b *fakeResourceBackend) {
+			b.members = []Object{stable, leaving}
+			b.fail[102] = true
+		})
+		if boolean(v["complete"]) {
+			t.Fatalf("Unmeasured worker was certified: %v", v)
+		}
+	})
+	t.Run("every worker has gone", func(t *testing.T) {
+		v := sample(t, func(b *fakeResourceBackend) { b.exited = map[int]bool{101: true} })
+		if boolean(v["complete"]) {
+			t.Fatalf("Empty sample was certified: %v", v)
+		}
+	})
 }
 func TestResourceGroupGapsAndCollectionSuspend(t *testing.T) {
 	for _, gap := range [][2]float64{{600, 600}, {2, 602}, {2, -298}, {600, 2}, {0, 600}, {-1, 2}, {2, 0}, {2, 5}} {

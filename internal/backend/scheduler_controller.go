@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -41,7 +42,7 @@ func NewController(g *Gate, sampler *ResourceSampler, store *ProfileStore) (*Con
 	}
 	return &Controller{gate: g, sampler: sampler, store: store, boot: boot, runs: map[string]Object{}, finalized: map[string]bool{}, groups: map[string]int{}, learningScopes: map[string]string{}}, nil
 }
-func (c *Controller) SampleRun(id int, value string, marker, host, prediction Object) (Object, error) {
+func (c *Controller) SampleRun(id int, value string, marker, host, prediction Object, finished bool) (Object, error) {
 	run := c.runs[value]
 	if run == nil {
 		var e error
@@ -62,6 +63,13 @@ func (c *Controller) SampleRun(id int, value string, marker, host, prediction Ob
 		}
 		c.runs[value] = run
 	}
+	run["task_id"] = id
+	run["machine"] = host["machine"]
+	// A finished job holds its capacity until cleanup, but samples taken now say
+	// nothing about the run, so they stay out of its evidence.
+	if finished {
+		run = maps.Clone(run)
+	}
 	pgid, ok := integer(marker["pgid"])
 	if !ok {
 		return nil, fmt.Errorf("Invalid resource process group")
@@ -74,13 +82,21 @@ func (c *Controller) SampleRun(id int, value string, marker, host, prediction Ob
 		}
 		members = append(members, member)
 	}
+	// The last sample of a job races the job's own exit, so a failed sample only
+	// proves an observation gap once the job is seen again. A missed interval
+	// already is a gap, even if the job has ended by now.
+	if boolean(run["sampleFailed"]) {
+		run["complete"] = false
+	}
 	measured, e := c.sampler.Group(pgid, members)
 	if e != nil {
-		run["complete"] = false
+		run["sampleFailed"] = true
 		run["latestComplete"] = false
 	} else {
 		run["latestComplete"] = boolean(measured["complete"])
-		if !boolean(measured["complete"]) && (metric(run["attempts"]) > 0 || !boolean(measured["baseline"])) {
+		failed := !boolean(measured["complete"]) && (metric(run["attempts"]) > 0 || !boolean(measured["baseline"]))
+		run["sampleFailed"] = failed
+		if failed && !boolean(measured["intervalValid"]) {
 			run["complete"] = false
 		}
 		run["memoryBytes"] = measured["memoryBytes"]
@@ -96,10 +112,12 @@ func (c *Controller) SampleRun(id int, value string, marker, host, prediction Ob
 	n, _ := integer(run["attempts"])
 	run["attempts"] = n + 1
 	run["durationSeconds"] = max(0.0, resourceNow()-metric(run["started"]))
-	run["sampledAt"] = resourceNow()
-	run["task_id"] = id
-	run["machine"] = host["machine"]
-	if e = WritePrivate(filepath.Join(c.gate.State, "resource-runs", value+".json"), run); e != nil {
+	// Only a good sample proves the job was observed. Finalization measures any
+	// gap up to the job's end from here, so a failed sample must not close it.
+	if !boolean(run["sampleFailed"]) {
+		run["sampledAt"] = resourceNow()
+	}
+	if e = WritePrivate(filepath.Join(c.gate.State, "resource-runs", value+".json"), c.runs[value]); e != nil {
 		return nil, e
 	}
 	c.groups[value] = pgid
@@ -287,7 +305,7 @@ func (c *Controller) Tick() (Object, error) {
 				return nil, e
 			}
 			if marker != nil {
-				resources, e = c.SampleRun(id, value, marker, host, prediction)
+				resources, e = c.SampleRun(id, value, marker, host, prediction, state == "Done")
 				if e != nil {
 					return nil, e
 				}
@@ -297,11 +315,9 @@ func (c *Controller) Tick() (Object, error) {
 		} else if state == "Running" || state == "Paused" {
 			candidates = append(candidates, schedulerCandidate{id: id, token: value, task: task, resources: resources})
 		}
-		if state == "Done" && receipt != nil {
-			if c.runs[value] != nil {
-				c.runs[value]["complete"] = false
-			}
-		} else if state == "Done" {
+		// A receipt outlives the job until its cleanup runs. Wait for it to go, then
+		// finalization measures any observation gap against the job's recorded end.
+		if state == "Done" && receipt == nil {
 			run := c.runs[value]
 			observedHere := run != nil
 			if run == nil {
@@ -319,11 +335,12 @@ func (c *Controller) Tick() (Object, error) {
 				if run["sampledAt"] == nil {
 					observedAt = metric(run["started"]) + metric(run["durationSeconds"])
 				}
-				if !endOK || ended-observedAt < 0 || ended-observedAt > MaxSampleInterval || ended > resourceNow() {
+				// A sample can land just after the end: the worker stamps it before exiting, and this tick's snapshot may predate it.
+				if !endOK || ended-observedAt < -MaxSampleInterval || ended-observedAt > MaxSampleInterval || ended > resourceNow() {
 					run["complete"] = false
 				}
 				if endOK && metric(run["started"]) <= ended && ended <= resourceNow() {
-					run["durationSeconds"] = max(metric(run["durationSeconds"]), ended-metric(run["started"]))
+					run["durationSeconds"] = ended - metric(run["started"])
 				}
 				metrics := Object{"memoryBytes": run["peakMemoryBytes"], "cpuSeconds": run["cpuSeconds"], "cpuCores": run["peakCpuCores"], "durationSeconds": run["durationSeconds"], "sampledAt": observedAt}
 				if !c.finalized[value] {
@@ -359,9 +376,9 @@ func (c *Controller) Tick() (Object, error) {
 	for i, entry := range collected {
 		prediction := collection.predictions[i]
 		if sampledActive[entry.token] {
-			run := c.runs[entry.token]
-			prediction["memoryBytes"] = int64(max(metric(prediction["memoryBytes"]), float64(int64(metric(run["peakMemoryBytes"])*1.2))))
-			prediction["cpuCores"] = max(metric(prediction["cpuCores"]), metric(run["peakCpuCores"]))
+			sampled := obj(entry.resources["prediction"])
+			prediction["memoryBytes"] = int64(max(metric(prediction["memoryBytes"]), metric(sampled["memoryBytes"])))
+			prediction["cpuCores"] = max(metric(prediction["cpuCores"]), metric(sampled["cpuCores"]))
 		}
 		entry.resources["prediction"] = prediction
 		entry.resources["learning"] = collection.matches[i]
