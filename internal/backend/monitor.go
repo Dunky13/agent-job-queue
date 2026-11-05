@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -185,6 +186,10 @@ func intersect(a, b map[string]bool) bool {
 	}
 	return false
 }
+
+// errResourceProcessExited reports a process that ended before its counters were read.
+var errResourceProcessExited = errors.New("A process exited during resource sampling")
+
 func (s *ResourceSampler) Group(pgid int, expected []Object) (Object, error) {
 	if pgid <= 1 || pgid > math.MaxInt32 {
 		return nil, fmt.Errorf("Invalid resource process group")
@@ -226,11 +231,15 @@ func (s *ResourceSampler) Group(pgid int, expected []Object) (Object, error) {
 	complete := true
 	type reading struct{ member, usage Object }
 	sampled := []reading{}
+	exited := map[string]bool{}
 	for _, member := range members {
 		pid, _ := integer(member["pid"])
 		usage, e := reader.Process(pid, pgid)
+		if errors.Is(e, errResourceProcessExited) {
+			exited[memberKey(member)] = true
+			continue
+		}
 		if e != nil {
-			complete = false
 			continue
 		}
 		valid := true
@@ -249,23 +258,23 @@ func (s *ResourceSampler) Group(pgid int, expected []Object) (Object, error) {
 		return nil, e
 	}
 	after := memberSet(membersAfter)
-	if len(after) != len(identities) {
-		complete = false
-	}
-	for key := range identities {
-		if !after[key] {
-			complete = false
-		}
-	}
 	if ownership != nil && !intersect(after, ownership) {
 		return nil, fmt.Errorf("Resource group ownership changed during sampling")
+	}
+	// Workers come and go during normal work. A sample is complete when it read
+	// every process that lasted through it: an exited worker has released its
+	// footprint, and a new one is read in full by the next sample.
+	lasting := 0
+	for key := range identities {
+		if after[key] && !exited[key] {
+			lasting++
+		}
 	}
 	beforeCPU := state.cpu
 	memory := uint64(0)
 	count := 0
 	for _, sample := range sampled {
 		if !after[memberKey(sample.member)] {
-			complete = false
 			continue
 		}
 		identity := fmt.Sprintf("%s\x00%v", memberKey(sample.member), sample.usage["start"])
@@ -308,7 +317,7 @@ func (s *ResourceSampler) Group(pgid int, expected []Object) (Object, error) {
 	if intervalValid {
 		cores = float64(state.cpu-beforeCPU) / 1e9 / elapsed
 	}
-	return Object{"memoryBytes": memory, "cpuSeconds": float64(state.cpu) / 1e9, "cpuCores": cores, "processCount": count, "complete": complete && count == len(members) && count > 0 && intervalValid, "baseline": baseline && complete && count == len(members) && count > 0 && collectionValid, "readBytes": state.read, "writeBytes": state.write}, nil
+	return Object{"memoryBytes": memory, "cpuSeconds": float64(state.cpu) / 1e9, "cpuCores": cores, "processCount": count, "complete": complete && count == lasting && count > 0 && intervalValid, "intervalValid": intervalValid, "baseline": baseline && complete && count == lasting && count > 0 && collectionValid, "readBytes": state.read, "writeBytes": state.write}, nil
 }
 
 // resourceProcessListing deliberately reads no arguments, environment or paths.

@@ -12,6 +12,7 @@ package backend
 #include <libproc.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
+#include <mach/mach_time.h>
 #include <mach/host_info.h>
 #include <mach/vm_statistics.h>
 
@@ -32,10 +33,13 @@ static int queue_host_memory(uint64_t *values) {
  return 0;
 }
 static int queue_process_usage(int pid, uint64_t *values) {
+ // rusage CPU times are Mach ticks: 1 ns on Intel, about 41.67 ns on Apple Silicon.
+ static mach_timebase_info_data_t timebase;
+ if (timebase.denom==0 && (mach_timebase_info(&timebase)!=KERN_SUCCESS || timebase.denom==0)) return -1;
  struct rusage_info_v2 usage;
  if (proc_pid_rusage(pid,RUSAGE_INFO_V2,(rusage_info_t *)&usage)!=0) return -1;
  values[0]=usage.ri_proc_start_abstime;values[1]=usage.ri_proc_exit_abstime;values[2]=usage.ri_phys_footprint;
- values[3]=usage.ri_user_time+usage.ri_system_time;values[4]=usage.ri_diskio_bytesread;values[5]=usage.ri_diskio_byteswritten;
+ values[3]=(uint64_t)(((unsigned __int128)usage.ri_user_time+usage.ri_system_time)*timebase.numer/timebase.denom);values[4]=usage.ri_diskio_bytesread;values[5]=usage.ri_diskio_byteswritten;
  return 0;
 }
 static int queue_swap_used(uint64_t *used) {
@@ -54,6 +58,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"syscall"
@@ -150,15 +155,25 @@ func (b *darwinResourceBackend) Members(pgid int) ([]Object, error) {
 }
 func (b *darwinResourceBackend) Process(pid, pgid int) (Object, error) {
 	group, e := syscall.Getpgid(pid)
+	if errors.Is(e, syscall.ESRCH) {
+		return nil, errResourceProcessExited
+	}
 	if e != nil || group != pgid {
 		return nil, fmt.Errorf("A process resource identity is unavailable")
 	}
 	var values [6]C.uint64_t
 	if C.queue_process_usage(C.int(pid), &values[0]) != 0 {
+		// The counter read also fails for a process that exited just before it.
+		if _, e = syscall.Getpgid(pid); errors.Is(e, syscall.ESRCH) {
+			return nil, errResourceProcessExited
+		}
 		return nil, fmt.Errorf("A process resource counter is unavailable")
 	}
 	group, e = syscall.Getpgid(pid)
-	if e != nil || group != pgid || values[0] == 0 || values[1] != 0 {
+	if errors.Is(e, syscall.ESRCH) || values[1] != 0 {
+		return nil, errResourceProcessExited
+	}
+	if e != nil || group != pgid || values[0] == 0 {
 		return nil, fmt.Errorf("A process resource identity changed")
 	}
 	return Object{"start": uint64(values[0]), "memoryBytes": uint64(values[2]), "cpuNanoseconds": uint64(values[3]), "readBytes": uint64(values[4]), "writeBytes": uint64(values[5])}, nil
