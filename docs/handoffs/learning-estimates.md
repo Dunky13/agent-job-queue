@@ -66,7 +66,7 @@ These need a decision or a larger change. Each is confirmed against the same cop
 
 - `TestProfileSimilarityUnusualSiblingDoesNotSetALargeGroupsEstimate` fails under the old rule (90 GiB estimate) and passes now. It also checks nine, ten, eleven and twenty other workloads, CPU trimmed on its own, a workload keeping its own peak in a new variant, batched and independent reads agreeing, and the group estimate.
 - `TestWorkloadIdentityIgnoresAgentInvocationMetadata` covers the agent namespaces, `AI_AGENT` and the launch values, and still requires `GOMAXPROCS` to change the variant.
-- `scripts/lint.sh` and the `core-1` and `core-2` runtime partitions ran locally with race detection. The other partitions, the web, native and installer checks were left to hosted CI, because this change touches only `internal/backend` and documentation.
+- `scripts/lint.sh`, the `core-1` and `core-2` runtime partitions with race detection and `scripts/test-native.sh` passed locally. The other partitions, the web and installer checks were left to hosted CI, because this change touches only `internal/backend`, one native caption and documentation.
 
 ## Next steps
 
