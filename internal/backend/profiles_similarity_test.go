@@ -94,7 +94,7 @@ func TestProfileSimilarityUnusualSiblingDoesNotSetALargeGroupsEstimate(t *testin
 		}
 		return identity
 	}
-	// Nine ordinary siblings and one runaway: under ten, the largest peak is shared.
+	// Eight ordinary workloads and one runaway: under ten others, the largest peak is shared.
 	for i := 0; i < 8; i++ {
 		share(fmt.Sprintf("ordinary %d", i), 2*GiB)
 	}
@@ -111,6 +111,23 @@ func TestProfileSimilarityUnusualSiblingDoesNotSetALargeGroupsEstimate(t *testin
 	collection := mustProfileCollection(t, store, []profileRequest{{fresh, similarityDescription("fresh tests", "busy-repository", "go:tests")}})
 	if !reflect.DeepEqual(prediction, collection.predictions[0]) {
 		t.Fatal("Batched and independent estimates disagree", prediction, collection.predictions[0])
+	}
+	// One in ten is set aside, not one per group: with eleven others the second
+	// runaway sets the memory estimate, and with twenty both are set aside. Each
+	// measure is trimmed on its own, so the one eight-core peak never counts.
+	second := similarityIdentity("second runaway")
+	if e := store.Observe(second, similarityDescription("second runaway tests", "busy-repository", "go:tests")); e != nil {
+		t.Fatal(e)
+	}
+	recordProfile(t, store, "second runaway", second, 40*GiB, 8, true, profileZero(), 0)
+	if prediction := predictProfile(t, store, fresh); metric(prediction["memoryBytes"]) != 60*GiB || metric(prediction["cpuCores"]) != 2 {
+		t.Fatal("Eleven other workloads set aside more or less than one", prediction)
+	}
+	for i := 9; i < 18; i++ {
+		share(fmt.Sprintf("ordinary %d", i), 2*GiB)
+	}
+	if prediction := predictProfile(t, store, fresh); metric(prediction["memoryBytes"]) != 3*GiB || metric(prediction["cpuCores"]) != 2 {
+		t.Fatal("Twenty other workloads did not set aside two", prediction)
 	}
 	// A workload always keeps its own peak, in a new variant too.
 	again := cloneResourceObject(runaway)

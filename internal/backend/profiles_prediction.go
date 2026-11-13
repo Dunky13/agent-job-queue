@@ -60,9 +60,8 @@ func (s *ProfileStore) Prediction(identity Object, machine string) (Object, erro
 	return result, e
 }
 
-// profilePrediction estimates family within the group that member belongs to.
-// An empty family is a workload the group has not seen, which is what a group
-// estimate describes.
+// profilePrediction estimates family within member's group. An empty family is
+// a workload the group has not seen, which is what a group estimate describes.
 func profilePrediction(c profileSQL, member, family, variant, machine string) (Object, error) {
 	families, operator, e := profilePredictionGroup(c, member)
 	if e != nil {
@@ -155,10 +154,9 @@ func profileEstimate(family, variant string, operator Object, envelopes, runs, f
 	if len(selected) == 0 {
 		return Object{"memoryBytes": profileCeilInteger(memoryFloor), "cpuCores": cpuFloor, "durationSeconds": nil, "samples": 0, "familySamples": 0, "confidence": "unknown", "source": source}
 	}
-	// This workload's own family counts in full. Every other family in the group
-	// counts once, and the highest tenth of them is set aside, so one unusual
-	// workload cannot set the estimate for a large group. Fewer than ten other
-	// families still share their largest peak.
+	// The own family counts in full. Each other family counts once and one in
+	// ten of them, the highest, is set aside, so a single unusual workload cannot
+	// set a large group's estimate. Under ten others share their largest peak.
 	latestAt := 0.0
 	var peak [3]float64 // memory, cpu, duration
 	others := map[string]*[3]float64{}

@@ -476,14 +476,15 @@ func IdentifyWorkload(argv []string, cwd string, env map[string]string) (Object,
 	return Object{"family": family, "variant": variant, "context": profileDigest([]any{"context-v2", revision, caches})}, nil
 }
 
-// The agent that submits a job configures itself through its own namespace:
-// session and thread ids, sockets, tokens and process ids that change with
-// every session. None of it changes what the job needs, so a named list of
-// such keys goes stale with each agent release; the namespaces do not.
+// What launched a job says nothing about an ordinary build or test. Agents keep
+// per-session ids, sockets and tokens in their own namespaces, matched by prefix
+// because a list of names goes stale with every agent release.
 func profileIncidentalEnvironment(key string) bool {
 	if containsString([]string{
 		"PWD", "OLDPWD", "SHLVL", "_", "TMPDIR", "TERM", "TERM_PROGRAM", "TERM_SESSION_ID",
 		"SSH_AUTH_SOCK", "SSH_AGENT_PID", "CLAUDECODE", "AI_AGENT",
+		// macOS launch services: the service name carries per-launch process ids.
+		"XPC_SERVICE_NAME", "XPC_FLAGS", "__CFBundleIdentifier", "__CF_USER_TEXT_ENCODING",
 	}, key) {
 		return true
 	}

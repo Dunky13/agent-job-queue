@@ -2,10 +2,10 @@
 
 ## Result
 
-Two defects made estimates and grouping feel wrong, and both are fixed.
+Two defects are fixed: one in how a borrowed estimate is calculated, one in how runs of the same command are matched to an exact variant. Group membership itself is unchanged; its limits are measured under "Found and not changed".
 
 1. A workload that borrowed from its group got the largest peak any member ever measured, times 1.5. One runaway run set the estimate for the whole group. A borrowed estimate now keeps the workload's own peaks in full, counts every other workload in the group once, and sets aside the highest tenth of those. Groups with fewer than ten other workloads are unchanged.
-2. The exact variant included per-session values that agents set for themselves, so the same command from another agent session was a new variant with no history. Agent namespaces are now left out of the variant.
+2. The exact variant included per-session values that agents set for themselves, so the same command from another agent session was a new variant with no history. Agent namespaces and the macOS launch values are now left out of the variant.
 
 ## Evidence
 
@@ -35,8 +35,9 @@ Within one family, peak memory varies by 1.9 times on average. Within one group 
 
 - `internal/backend/profiles_prediction.go`: the shared-peak rule in `profileEstimate`, used by both the independent and the batched read. `profilePrediction` takes the member that locates the group apart from the family being estimated.
 - `internal/backend/profiles_learning.go`: the group estimate describes a workload the group has not seen, instead of treating an arbitrary member as its own.
-- `internal/backend/profiles_identity.go`: `CLAUDECODE`, `AI_AGENT` and the `CLAUDE_`, `CODEX_` and `T3CODE_` namespaces are incidental environment.
-- `docs/learning.md`, `docs/learning.html`: the estimate and variant rules.
+- `internal/backend/profiles_identity.go`: `CLAUDECODE`, `AI_AGENT`, the `CLAUDE_`, `CODEX_` and `T3CODE_` namespaces and four macOS launch values are incidental environment. `XPC_SERVICE_NAME` carries per-launch process ids, so it reset every variant on each app relaunch.
+- `native/AgentLearning.swift`: the caption under the group estimate says what the figure describes. Text only; no screenshot was taken.
+- `docs/learning.md`, `docs/learning-grouping.md`: the estimate and variant rules. `docs/learning.html` gets the estimate sentences it already had.
 
 Stored data, schemas, identity sidecars and the prediction contract are unchanged. A job submitted from an agent session gets a new variant once.
 
@@ -51,10 +52,20 @@ These need a decision or a larger change. Each is confirmed against the same cop
 5. **1,802 of 3,190 families have no verifiable repository**, mostly deleted worktrees (3,289 of 4,630 metadata directories are gone). They cannot join a group. New jobs record their repository while the checkout exists, so this shrinks as history ages out.
 6. **Half of all families have operation `other`**, because job titles are free text. They share one group per repository and tool. The shared-peak rule is what makes those groups usable.
 
+## Behaviour worth knowing
+
+- Lower borrowed estimates admit more. An unfamiliar job in a group of ten or more now reserves the trimmed figure, so in Adaptive mode it can start beside a held lane reservation that the group's largest peak used to block. The three-success overlap guard, budget check, live sampling, operator minimums and machine floors are unchanged.
+- Adding a workload to a group can now lower other members' estimates, when it takes the group from nine to ten other workloads. Before, a new member could only raise them.
+- Groups an operator shared are trimmed like automatic ones. A minimum reservation on the group is the way to hold every member above a figure.
+- The group estimate describes a workload new to the group. A member of a group with exactly ten measured workloads has nine others, so it still borrows the largest peak while the group estimate shows the trimmed one.
+- A job that is itself an agent run (`codex exec`, `claude -p`) is no longer told apart by `CODEX_HOME`, `CLAUDE_CONFIG_DIR` or sandbox settings. Its envelope keeps the largest peak of either configuration.
+- Variables an agent sets outside its namespace, such as `GIT_EDITOR`, still feed the variant. The same command from a different kind of launcher can stay a separate variant, each with its own history.
+- `docs/learning.html` was already missing ten paragraphs of `docs/learning.md` before this change, including the variant paragraph. It was not regenerated.
+
 ## Validation
 
-- `TestProfileSimilarityUnusualSiblingDoesNotSetALargeGroupsEstimate` fails under the old rule (96 GiB estimate) and passes now. It also checks the ten-workload boundary, a workload keeping its own peak in a new variant, batched and independent reads agreeing, and the group estimate.
-- `TestWorkloadIdentityIgnoresAgentInvocationMetadata` covers the agent namespaces and still requires `GOMAXPROCS` to change the variant.
+- `TestProfileSimilarityUnusualSiblingDoesNotSetALargeGroupsEstimate` fails under the old rule (90 GiB estimate) and passes now. It also checks nine, ten, eleven and twenty other workloads, CPU trimmed on its own, a workload keeping its own peak in a new variant, batched and independent reads agreeing, and the group estimate.
+- `TestWorkloadIdentityIgnoresAgentInvocationMetadata` covers the agent namespaces, `AI_AGENT` and the launch values, and still requires `GOMAXPROCS` to change the variant.
 - `scripts/lint.sh` and the `core-1` and `core-2` runtime partitions ran locally with race detection. The other partitions, the web, native and installer checks were left to hosted CI, because this change touches only `internal/backend` and documentation.
 
 ## Next steps
