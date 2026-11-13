@@ -403,17 +403,11 @@ func TestProfileUnicodeSearchAndLargePredictionsRemainSafe(t *testing.T) {
 	}
 }
 
-func TestProfileOuterRetentionFallsBackToMachineAndGlobalFloors(t *testing.T) {
+func TestProfileOuterRetentionForgetsTheOldestHistory(t *testing.T) {
 	store := fixtureProfileStore(t)
 	identity := fixtureIdentity()
 	machine := profileDigest([]any{"machine-v1", "fixture-machine"})
-	if e := store.Observe(identity, Object{"title": "Pinned reset group"}); e != nil {
-		t.Fatal(e)
-	}
-	if e := store.Edit(text(identity["family"]), 0, "Pinned reset group", nil, nil); e != nil {
-		t.Fatal(e)
-	}
-	if e := store.Reset(text(identity["family"]), 1); e != nil {
+	if e := store.Observe(identity, Object{"title": "Forgotten workload"}); e != nil {
 		t.Fatal(e)
 	}
 	if e := store.connection(true, func(c profileSQL) error {
@@ -426,11 +420,6 @@ func TestProfileOuterRetentionFallsBackToMachineAndGlobalFloors(t *testing.T) {
 				return e
 			}
 		}
-		for i := 0; i < maxProfileMachines+1; i++ {
-			if e := profileExec(c, "INSERT INTO floors VALUES (?,?,?,?)", profileDigest([]any{"floor-machine", i}), 2*GiB, 3.0, resourceNow()+float64(i)); e != nil {
-				return e
-			}
-		}
 		return nil
 	}); e != nil {
 		t.Fatal(e)
@@ -438,24 +427,21 @@ func TestProfileOuterRetentionFallsBackToMachineAndGlobalFloors(t *testing.T) {
 	changed := cloneResourceObject(identity)
 	changed["variant"] = strings.Repeat("e", 64)
 	recordProfile(t, store, "trigger-outer-retention", changed, 128*1024*1024, .5, true, profileZero(), 0)
+	// A forgotten peak must not come back as a floor under every other estimate.
 	estimate := predictProfile(t, store, identity)
-	if metric(estimate["memoryBytes"]) < 8*GiB || metric(estimate["cpuCores"]) < 6 {
-		t.Fatalf("Outer pruning lost upper evidence after reset: %v", estimate)
+	if metric(estimate["memoryBytes"]) != GiB || metric(estimate["cpuCores"]) != 2 {
+		t.Fatalf("Forgotten history still raises the estimate: %v", estimate)
 	}
 	if e := store.connection(false, func(c profileSQL) error {
-		var retained, machines int
+		var retained, floors int
 		if e := c.QueryRowContext(profileContext, "SELECT COUNT(*) FROM learning_retained").Scan(&retained); e != nil {
 			return e
 		}
-		if e := c.QueryRowContext(profileContext, "SELECT COUNT(*) FROM floors WHERE machine!='*'").Scan(&machines); e != nil {
+		if e := c.QueryRowContext(profileContext, "SELECT COUNT(*) FROM floors").Scan(&floors); e != nil {
 			return e
 		}
-		global, e := profileRow(c, "SELECT * FROM floors WHERE machine='*'")
-		if e != nil {
-			return e
-		}
-		if retained > maxRetainedEnvelopes || machines > maxProfileMachines || global == nil {
-			t.Fatalf("Retention limits or global fallback failed: retained=%d machines=%d global=%v", retained, machines, global)
+		if retained != maxRetainedEnvelopes || floors != 0 {
+			t.Fatalf("Outer retention kept or converted old history: retained=%d floors=%d", retained, floors)
 		}
 		return nil
 	}); e != nil {

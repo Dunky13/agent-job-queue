@@ -18,7 +18,6 @@ import (
 
 const maxProfileRuns = 4096
 const maxProfileEnvelopes = 2048
-const maxProfileMachines = 64
 const maxProfileDecisions = 4096
 const maxRegisteredFamilies = 8192
 const maxRetainedEnvelopes = 8192

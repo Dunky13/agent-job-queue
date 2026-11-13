@@ -295,34 +295,9 @@ func (s *ProfileStore) Record(runToken string, identity Object, machine string, 
 				return e
 			}
 		}
-		overflow, e = profileRows(c, "SELECT * FROM learning_retained ORDER BY sampled DESC LIMIT -1 OFFSET ?", maxRetainedEnvelopes)
-		if e != nil {
-			return e
-		}
-		for _, row := range overflow {
-			if e = profileExec(c, `INSERT INTO floors VALUES (?,?,?,?) ON CONFLICT(machine) DO UPDATE SET memory=MAX(memory,excluded.memory),cpu=MAX(cpu,excluded.cpu),sampled=MAX(sampled,excluded.sampled)`, row["machine"], row["memory"], row["cpu"], row["sampled"]); e != nil {
-				return e
-			}
-			if e = profileExec(c, "UPDATE learning_profiles SET ignore_legacy=0 WHERE id IN (SELECT profile FROM learning_members WHERE family=?)", row["family"]); e != nil {
-				return e
-			}
-			if e = profileExec(c, "DELETE FROM learning_retained WHERE machine=? AND family=? AND variant=?", row["machine"], row["family"], row["variant"]); e != nil {
-				return e
-			}
-		}
-		overflow, e = profileRows(c, "SELECT * FROM floors WHERE machine!='*' ORDER BY sampled DESC LIMIT -1 OFFSET ?", maxProfileMachines)
-		if e != nil {
-			return e
-		}
-		for _, row := range overflow {
-			if e = profileExec(c, `INSERT INTO floors VALUES ('*',?,?,?) ON CONFLICT(machine) DO UPDATE SET memory=MAX(memory,excluded.memory),cpu=MAX(cpu,excluded.cpu),sampled=MAX(sampled,excluded.sampled)`, row["memory"], row["cpu"], row["sampled"]); e != nil {
-				return e
-			}
-			if e = profileExec(c, "DELETE FROM floors WHERE machine=?", row["machine"]); e != nil {
-				return e
-			}
-		}
-		return nil
+		// History past the outer bound is forgotten, so its workload starts again like
+		// one never seen. Kept as a machine floor, it only ever raised every estimate.
+		return profileExec(c, "DELETE FROM learning_retained WHERE rowid IN (SELECT rowid FROM learning_retained ORDER BY sampled DESC LIMIT -1 OFFSET ?)", maxRetainedEnvelopes)
 	})
 }
 
