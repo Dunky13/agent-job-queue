@@ -1,6 +1,6 @@
 module github.com/Dunky13/agent-job-queue
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.5

@@ -82,6 +82,70 @@ func TestProfileSimilaritySharesConservativeLearningWithoutExactSuccesses(t *tes
 	}
 }
 
+func TestProfileSimilarityUnusualSiblingDoesNotSetALargeGroupsEstimate(t *testing.T) {
+	store := fixtureProfileStore(t)
+	share := func(name string, memory int) Object {
+		identity := similarityIdentity(name)
+		if e := store.Observe(identity, similarityDescription(name+" tests", "busy-repository", "go:tests")); e != nil {
+			t.Fatal(e)
+		}
+		if memory > 0 {
+			recordProfile(t, store, name, identity, memory, 1, true, profileZero(), 0)
+		}
+		return identity
+	}
+	// Eight ordinary workloads and one runaway: under ten others, the largest peak is shared.
+	for i := 0; i < 8; i++ {
+		share(fmt.Sprintf("ordinary %d", i), 2*GiB)
+	}
+	runaway := share("runaway", 60*GiB)
+	fresh := share("fresh", 0)
+	if prediction := predictProfile(t, store, fresh); metric(prediction["memoryBytes"]) < 90*GiB {
+		t.Fatal("A small group stopped sharing its largest peak", prediction)
+	}
+	share("ordinary 8", 2*GiB)
+	prediction := predictProfile(t, store, fresh)
+	if prediction["source"] != "family" || metric(prediction["memoryBytes"]) != 3*GiB || metric(prediction["familySamples"]) != 10 {
+		t.Fatal("One unusual sibling set the estimate for a large group", prediction)
+	}
+	collection := mustProfileCollection(t, store, []profileRequest{{fresh, similarityDescription("fresh tests", "busy-repository", "go:tests")}})
+	if !reflect.DeepEqual(prediction, collection.predictions[0]) {
+		t.Fatal("Batched and independent estimates disagree", prediction, collection.predictions[0])
+	}
+	// One in ten is set aside, not one per group: with eleven others the second
+	// runaway sets the memory estimate, and with twenty both are set aside. Each
+	// measure is trimmed on its own, so the one eight-core peak never counts.
+	second := similarityIdentity("second runaway")
+	if e := store.Observe(second, similarityDescription("second runaway tests", "busy-repository", "go:tests")); e != nil {
+		t.Fatal(e)
+	}
+	recordProfile(t, store, "second runaway", second, 40*GiB, 8, true, profileZero(), 0)
+	if prediction := predictProfile(t, store, fresh); metric(prediction["memoryBytes"]) != 60*GiB || metric(prediction["cpuCores"]) != 2 {
+		t.Fatal("Eleven other workloads set aside more or less than one", prediction)
+	}
+	for i := 9; i < 18; i++ {
+		share(fmt.Sprintf("ordinary %d", i), 2*GiB)
+	}
+	if prediction := predictProfile(t, store, fresh); metric(prediction["memoryBytes"]) != 3*GiB || metric(prediction["cpuCores"]) != 2 {
+		t.Fatal("Twenty other workloads did not set aside two", prediction)
+	}
+	// A workload always keeps its own peak, in a new variant too.
+	again := cloneResourceObject(runaway)
+	again["variant"] = profileDigest("runaway after a dependency change")
+	if prediction := predictProfile(t, store, again); metric(prediction["memoryBytes"]) < 90*GiB {
+		t.Fatal("A workload forgot its own measured peak", prediction)
+	}
+	// The group estimate describes a workload the group has not seen.
+	match, e := store.Match(fresh)
+	if e != nil {
+		t.Fatal(e)
+	}
+	detail, e := store.Detail(text(match["id"]), "fixture-machine")
+	if e != nil || metric(obj(detail["prediction"])["memoryBytes"]) != 3*GiB || metric(obj(detail["profile"])["peakMemoryBytes"]) != 60*GiB {
+		t.Fatal("Group estimate or measured peak is wrong", detail, e)
+	}
+}
+
 func TestProfileSimilaritySeparatesScopeOperationsAndOperatorCorrections(t *testing.T) {
 	store := fixtureProfileStore(t)
 	identities := []Object{}

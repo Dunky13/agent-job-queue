@@ -4,7 +4,7 @@
 
 The previous matching path created one profile per strict command family and hashed almost every environment value plus HEAD into each exact variant. Agent invocation metadata and frequent commits prevented repeated measurements from accumulating. Similar tasks could share learning only after a manual merge.
 
-The new path keeps original family identities and numeric history intact, stabilizes future exact variants, and groups compatible families by a hashed git repository identity, tool class and operation, independent of subdirectory. Borrowing keeps the complete conservative envelope. Exact successes and recent same-machine group successes are counted separately. Source revisions move to the freshness context; setup, toolchain, arguments and semantic environment remain in exact variants.
+The new path keeps original family identities and numeric history intact, stabilizes future exact variants, and groups compatible families by a hashed git repository identity, tool class and operation, independent of subdirectory. Borrowing kept the complete conservative envelope until the estimate change in `docs/handoffs/learning-estimates.md`: a workload now keeps its own peaks in full and borrows the other workloads' peaks with the highest tenth set aside. Exact successes and recent same-machine group successes are counted separately. Source revisions move to the freshness context; setup, toolchain, arguments and semantic environment remain in exact variants.
 
 ## Owners
 

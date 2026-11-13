@@ -491,7 +491,7 @@ func (s *ProfileStore) Inspect(id, machine string, options ProfileDetailOptions)
 		var hashedMachine any
 		if machine != "" {
 			hashedMachine = profileDigest([]any{"machine-v1", machine})
-			prediction, e = profilePrediction(c, text(originalGroup.members[0]["family"]), profileDigest([]any{"group-estimate-v1", id}), text(hashedMachine))
+			prediction, e = profilePrediction(c, text(originalGroup.members[0]["family"]), "", profileDigest([]any{"group-estimate-v1", id}), text(hashedMachine))
 			if e != nil {
 				return e
 			}

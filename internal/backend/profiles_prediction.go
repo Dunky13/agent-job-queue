@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -53,13 +54,16 @@ func (s *ProfileStore) Prediction(identity Object, machine string) (Object, erro
 	var result Object
 	e := s.connection(false, func(c profileSQL) error {
 		var err error
-		result, err = profilePrediction(c, text(identity["family"]), text(identity["variant"]), profileDigest([]any{"machine-v1", machine}))
+		result, err = profilePrediction(c, text(identity["family"]), text(identity["family"]), text(identity["variant"]), profileDigest([]any{"machine-v1", machine}))
 		return err
 	})
 	return result, e
 }
-func profilePrediction(c profileSQL, family, variant, machine string) (Object, error) {
-	families, operator, e := profilePredictionGroup(c, family)
+
+// profilePrediction estimates family within member's group. An empty family is
+// a workload the group has not seen, which is what a group estimate describes.
+func profilePrediction(c profileSQL, member, family, variant, machine string) (Object, error) {
+	families, operator, e := profilePredictionGroup(c, member)
 	if e != nil {
 		return nil, e
 	}
@@ -150,15 +154,37 @@ func profileEstimate(family, variant string, operator Object, envelopes, runs, f
 	if len(selected) == 0 {
 		return Object{"memoryBytes": profileCeilInteger(memoryFloor), "cpuCores": cpuFloor, "durationSeconds": nil, "samples": 0, "familySamples": 0, "confidence": "unknown", "source": source}
 	}
-	age, maxMemory, maxCPU, maxDuration := 0.0, 0.0, 0.0, 0.0
+	// The own family counts in full. Each other family counts once and one in
+	// ten of them, the highest, is set aside, so a single unusual workload cannot
+	// set a large group's estimate. Under ten others share their largest peak.
 	latestAt := 0.0
+	var peak [3]float64 // memory, cpu, duration
+	others := map[string]*[3]float64{}
 	for _, row := range selected {
 		latestAt = max(latestAt, metric(row["sampled"]))
-		maxMemory = max(maxMemory, metric(row["memory"]))
-		maxCPU = max(maxCPU, metric(row["cpu"]))
-		maxDuration = max(maxDuration, metric(row["duration"]))
+		target := &peak
+		if other := text(row["family"]); other != family {
+			if others[other] == nil {
+				others[other] = &[3]float64{}
+			}
+			target = others[other]
+		}
+		for i, key := range []string{"memory", "cpu", "duration"} {
+			target[i] = max(target[i], metric(row[key]))
+		}
 	}
-	age = max(0.0, now-latestAt)
+	for i := range peak {
+		shared := make([]float64, 0, len(others))
+		for _, other := range others {
+			shared = append(shared, other[i])
+		}
+		if len(shared) > 0 {
+			sort.Float64s(shared)
+			peak[i] = max(peak[i], shared[(len(shared)*9+9)/10-1])
+		}
+	}
+	maxMemory, maxCPU, maxDuration := peak[0], peak[1], peak[2]
+	age := max(0.0, now-latestAt)
 	margin := 1.5
 	if useExact {
 		margin = 1.25
@@ -269,34 +295,9 @@ func (s *ProfileStore) Record(runToken string, identity Object, machine string, 
 				return e
 			}
 		}
-		overflow, e = profileRows(c, "SELECT * FROM learning_retained ORDER BY sampled DESC LIMIT -1 OFFSET ?", maxRetainedEnvelopes)
-		if e != nil {
-			return e
-		}
-		for _, row := range overflow {
-			if e = profileExec(c, `INSERT INTO floors VALUES (?,?,?,?) ON CONFLICT(machine) DO UPDATE SET memory=MAX(memory,excluded.memory),cpu=MAX(cpu,excluded.cpu),sampled=MAX(sampled,excluded.sampled)`, row["machine"], row["memory"], row["cpu"], row["sampled"]); e != nil {
-				return e
-			}
-			if e = profileExec(c, "UPDATE learning_profiles SET ignore_legacy=0 WHERE id IN (SELECT profile FROM learning_members WHERE family=?)", row["family"]); e != nil {
-				return e
-			}
-			if e = profileExec(c, "DELETE FROM learning_retained WHERE machine=? AND family=? AND variant=?", row["machine"], row["family"], row["variant"]); e != nil {
-				return e
-			}
-		}
-		overflow, e = profileRows(c, "SELECT * FROM floors WHERE machine!='*' ORDER BY sampled DESC LIMIT -1 OFFSET ?", maxProfileMachines)
-		if e != nil {
-			return e
-		}
-		for _, row := range overflow {
-			if e = profileExec(c, `INSERT INTO floors VALUES ('*',?,?,?) ON CONFLICT(machine) DO UPDATE SET memory=MAX(memory,excluded.memory),cpu=MAX(cpu,excluded.cpu),sampled=MAX(sampled,excluded.sampled)`, row["memory"], row["cpu"], row["sampled"]); e != nil {
-				return e
-			}
-			if e = profileExec(c, "DELETE FROM floors WHERE machine=?", row["machine"]); e != nil {
-				return e
-			}
-		}
-		return nil
+		// History past the outer bound is forgotten, so its workload starts again like
+		// one never seen. Kept as a machine floor, it only ever raised every estimate.
+		return profileExec(c, "DELETE FROM learning_retained WHERE rowid IN (SELECT rowid FROM learning_retained ORDER BY sampled DESC LIMIT -1 OFFSET ?)", maxRetainedEnvelopes)
 	})
 }
 

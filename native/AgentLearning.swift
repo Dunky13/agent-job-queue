@@ -1160,7 +1160,7 @@ struct LearningWindow: View {
                 if let duration = prediction.durationSeconds {
                     Text("Expected duration \(duration.formatted(.number.precision(.fractionLength(0...1)))) seconds").font(.caption)
                 }
-                Text("This group envelope is conservative. A particular job can use its exact variant's better-established history.")
+                Text("What a workload new to this group would borrow. With ten or more other workloads, the highest tenth of their peaks is set aside. Each workload keeps its own measured peaks, and a job can use its exact variant's better-established history.")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 Text("Unavailable until a current machine identity is known. No estimate has been invented.")
