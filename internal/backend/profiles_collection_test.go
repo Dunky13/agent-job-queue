@@ -83,6 +83,10 @@ func TestProfileCollectionMatchesIndependentHistoryReads(t *testing.T) {
 				t.Fatalf("Batch changed history semantics: prediction=%v/%v match=%v/%v", prediction, c.predictions[i], match, c.matches[i])
 			}
 		}
+		// Floors stored by earlier versions hold this machine's estimates up until a reset.
+		if want := map[bool]float64{false: 7 * GiB, true: 5 * GiB}[reset]; metric(c.predictions[0]["memoryBytes"]) != want {
+			t.Fatalf("Stored machine floor misapplied (reset=%v): %v", reset, c.predictions[0])
+		}
 		c.predictions[0]["memoryBytes"] = 99 * GiB
 		if metric(c.predictions[3]["memoryBytes"]) == 99*GiB {
 			t.Fatal("Job maps alias each other")

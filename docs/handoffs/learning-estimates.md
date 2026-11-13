@@ -31,7 +31,7 @@ Variants:
 - When the same command ran again, 83% of the runs landed on a new variant.
 - Across six live job payloads from five agent sessions, `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_PID` and `T3CODE_THREAD_ID` each had five distinct values. All four fed the variant.
 
-Retention: `learning_retained` holds 8,192 rows and is empty today. At about 150 new variants a day it starts filling in roughly six weeks. Replaying the eviction order on the copy, the old floor reached 3.4 GiB after the first 50 evicted rows and 8.2 GiB after 500.
+Retention: `floors` is empty today. `learning_retained` holds 1,776 of its 8,192 rows, and at about 150 new variants a day the first rows fall out in roughly six weeks. Replaying the eviction order on the copy, the old floor reached 3.4 GiB after the first 50 evicted rows and 8.2 GiB after 500.
 
 Within one family, peak memory varies by 1.9 times on average. Within one group it varies by 17 times. That is why a workload's own peaks count in full while the others are trimmed.
 
@@ -44,7 +44,7 @@ Within one family, peak memory varies by 1.9 times on average. Within one group 
 - `native/AgentLearning.swift`: the caption under the group estimate says what the figure describes. Text only; no screenshot was taken.
 - `docs/learning.md`, `docs/learning-grouping.md`: the estimate and variant rules. `docs/learning.html` gets the estimate sentences it already had.
 
-Schemas, identity sidecars and the prediction contract are unchanged, and no stored row is rewritten. A job submitted from an agent session gets a new variant once. Rows already in `floors` on an existing store are still read and still raise estimates there; resetting a group makes it ignore them, as before.
+Schemas, identity sidecars and the prediction contract are unchanged, and no stored row is rewritten. A job submitted from an agent session gets a new variant once. Rows already in `floors` on an existing store are still read and still raise estimates there; resetting a group makes it ignore them, and nothing turns them back on for that group any more.
 
 `go.mod` and `CONTRIBUTING.md` move to Go 1.26.11. The hosted vulnerability scan failed on this branch on GO-2026-6859 in `net/http` of Go 1.26.10, the version `main` pins too.
 
@@ -66,14 +66,14 @@ These need a decision or a larger change. Each is confirmed against the same cop
 - The group estimate describes a workload new to the group. A member of a group with exactly ten measured workloads has nine others, so it still borrows the largest peak while the group estimate shows the trimmed one.
 - A job that is itself an agent run (`codex exec`, `claude -p`) is no longer told apart by `CODEX_HOME`, `CLAUDE_CONFIG_DIR` or sandbox settings. Its envelope keeps the largest peak of either configuration.
 - Variables an agent sets outside its namespace, such as `GIT_EDITOR`, still feed the variant. The same command from a different kind of launcher can stay a separate variant, each with its own history.
-- A workload whose history was forgotten borrows from its group again, or gets the 1 GiB prior when the group has nothing else. A heavy job that runs less often than 10,240 other variants are recorded on that store starts low once and is corrected by live sampling.
+- A workload whose history was forgotten borrows from its group again, or gets the 1 GiB prior when the group has nothing else. A heavy job that runs less often than 10,240 other variants are recorded on that store starts low once and is corrected by live sampling. A variant that keeps running keeps its recent peaks, but a higher peak it measured before that horizon is forgotten too.
 - `docs/learning.html` was already missing ten paragraphs of `docs/learning.md` before this change, including the variant paragraph. It was not regenerated.
 
 ## Validation
 
 - `TestProfileSimilarityUnusualSiblingDoesNotSetALargeGroupsEstimate` fails under the old rule (90 GiB estimate) and passes now. It also checks nine, ten, eleven and twenty other workloads, CPU trimmed on its own, a workload keeping its own peak in a new variant, batched and independent reads agreeing, and the group estimate.
 - `TestWorkloadIdentityIgnoresAgentInvocationMetadata` covers the agent namespaces, `AI_AGENT` and the launch values, and still requires `GOMAXPROCS` to change the variant.
-- `TestProfileOuterRetentionForgetsTheOldestHistory` replaces `TestProfileOuterRetentionFallsBackToMachineAndGlobalFloors`. It fails on the old rule (8 GiB and 6 cores from the floor) and passes now with the 1 GiB, 2-core cold floors and an empty `floors` table.
+- `TestProfileOuterRetentionForgetsTheOldestHistory` replaces `TestProfileOuterRetentionFallsBackToMachineAndGlobalFloors`. It fails on the old rule (8 GiB and 6 cores from the floor) and passes now with the 1 GiB, 2-core cold floors and an empty `floors` table. `TestProfileCollectionMatchesIndependentHistoryReads` now asserts that a floor already stored still raises an estimate, and that a reset group ignores it.
 - `govulncheck` as CI runs it reports GO-2026-6859 on Go 1.26.10 and no vulnerabilities on 1.26.11.
 - `scripts/lint.sh`, the `core-1` and `core-2` runtime partitions with race detection and `scripts/test-native.sh` passed locally. The other partitions, the web and installer checks were left to hosted CI, because this change touches only `internal/backend`, one native caption and documentation.
 

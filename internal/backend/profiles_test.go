@@ -411,8 +411,10 @@ func TestProfileOuterRetentionForgetsTheOldestHistory(t *testing.T) {
 		t.Fatal(e)
 	}
 	if e := store.connection(true, func(c profileSQL) error {
-		if e := profileExec(c, "INSERT INTO learning_retained VALUES (?,?,?,?,?,?,?)", machine, identity["family"], identity["variant"], 8*GiB, 6.0, 100.0, resourceNow()-100); e != nil {
-			return e
+		for i, variant := range []any{identity["variant"], strings.Repeat("c", 64)} {
+			if e := profileExec(c, "INSERT INTO learning_retained VALUES (?,?,?,?,?,?,?)", machine, identity["family"], variant, 8*GiB, 6.0, 100.0, resourceNow()-100-float64(i)); e != nil {
+				return e
+			}
 		}
 		for i := 0; i < maxRetainedEnvelopes; i++ {
 			variant := profileDigest([]any{"outer-retention-fixture", i})
