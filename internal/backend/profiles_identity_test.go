@@ -140,10 +140,15 @@ func TestWorkloadIdentityIgnoresAgentInvocationMetadata(t *testing.T) {
 	first := identityForTest(t, []string{"go", "test", "./..."}, directory, map[string]string{
 		"PATH": "/nonexistent", "CODEX_SESSION_ID": "session-a", "CODEX_THREAD_ID": "thread-a",
 		"CODEX_TOOL_CALL_ID": "call-a", "SSH_AUTH_SOCK": "/private/socket-a", "GOMAXPROCS": "2",
+		"CLAUDE_CODE_MESSAGING_SOCKET": "/private/messaging-a", "CLAUDE_CODE_MESSAGING_TOKEN": "token-a",
+		"CLAUDE_PID": "100", "T3CODE_THREAD_ID": "thread-a", "CLAUDECODE": "1",
 	})
+	// Another session, and another agent, running the same command.
 	second := identityForTest(t, []string{"go", "test", "./..."}, directory, map[string]string{
 		"PATH": "/nonexistent", "CODEX_SESSION_ID": "session-b", "CODEX_THREAD_ID": "thread-b",
 		"CODEX_TOOL_CALL_ID": "call-b", "SSH_AUTH_SOCK": "/private/socket-b", "GOMAXPROCS": "2",
+		"CLAUDE_CODE_MESSAGING_SOCKET": "/private/messaging-b", "CLAUDE_CODE_MESSAGING_TOKEN": "token-b",
+		"CLAUDE_PID": "200", "T3CODE_THREAD_ID": "thread-b", "CODEX_SANDBOX": "seatbelt",
 	})
 	if first["family"] != second["family"] || first["variant"] != second["variant"] {
 		t.Fatal("Agent invocation metadata prevents repeated workload learning")

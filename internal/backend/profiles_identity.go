@@ -476,12 +476,23 @@ func IdentifyWorkload(argv []string, cwd string, env map[string]string) (Object,
 	return Object{"family": family, "variant": variant, "context": profileDigest([]any{"context-v2", revision, caches})}, nil
 }
 
+// The agent that submits a job configures itself through its own namespace:
+// session and thread ids, sockets, tokens and process ids that change with
+// every session. None of it changes what the job needs, so a named list of
+// such keys goes stale with each agent release; the namespaces do not.
 func profileIncidentalEnvironment(key string) bool {
-	return containsString([]string{
+	if containsString([]string{
 		"PWD", "OLDPWD", "SHLVL", "_", "TMPDIR", "TERM", "TERM_PROGRAM", "TERM_SESSION_ID",
-		"CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
-		"CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "SSH_AUTH_SOCK", "SSH_AGENT_PID", "T3CODE_CLI_PATH",
-	}, key) || strings.HasPrefix(key, "AGENT_HEAVY_") || strings.HasPrefix(key, "PUEUE_")
+		"SSH_AUTH_SOCK", "SSH_AGENT_PID", "CLAUDECODE", "AI_AGENT",
+	}, key) {
+		return true
+	}
+	for _, prefix := range []string{"AGENT_HEAVY_", "PUEUE_", "CLAUDE_", "CODEX_", "T3CODE_"} {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 func errorsOptionalPath(e error) bool {
 	return os.IsNotExist(e) || strings.Contains(e.Error(), "not a directory") || strings.Contains(e.Error(), "file name too long")
