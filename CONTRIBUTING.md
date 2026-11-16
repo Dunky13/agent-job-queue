@@ -122,13 +122,13 @@ git commit -s -m "feat(queue): describe the change"
 
 The pre-push hook checks the complete PR range from `origin/main`, including previously pushed commits, through the Go commit policy tool. Fetch `origin/main` before pushing. A bootstrap repository without that reference checks initial history or commits since the remote branch. GitHub verifies DCO and signatures and protects `main` with the aggregate required check. Do not bypass checks or branch protection.
 
-A squash merge creates a new commit. Its author identity must exactly match a `Signed-off-by` trailer, including when GitHub selects a noreply address. Select the matching verified email or add the matching trailer. Keep the final identity and signature checks intact.
+A squash merge creates a new commit. Its author identity, after `.mailmap`, must exactly match a `Signed-off-by` trailer. Keep the final identity and signature checks intact.
 
 For this repository's maintainer, use `Marc Went <marc@went.io>` as the author and committer identity for future commits. Keep exactly one maintainer certification in each commit and final squash body: `Signed-off-by: Marc Went <marc@went.io>`. Let `git commit -s` add the trailer once. When preparing an amended or squash message, consolidate duplicate maintainer trailers and the maintainer's noreply alias into that single primary-email trailer; preserve other contributors' certifications.
 
-For maintainer-owned PRs, use the guarded command below to pass `--author-email marc@went.io` explicitly. GitHub's default web squash author can use the maintainer's noreply address even when every source commit has the primary identity. Green PR checks validate the source commits, not the future squash commit; they do not establish its DCO identity. PRs 47 and 48 both encountered this mismatch. Use the guarded CLI path for maintainer squash merges. This replaces the earlier dual-address workaround; historical commits retain their original metadata.
+GitHub's web squash merge authors the commit as the maintainer's noreply address, `Dunky13@users.noreply.github.com`, even when every source commit has the primary identity. Green PR checks validate the source commits, not the future squash commit, so PRs 47, 48 and 77 to 83 all failed on `main`. `.mailmap` maps that alias to `Marc Went <marc@went.io>`, and the commit policy reads the mapped identity, so a web squash merge with the single primary trailer passes. GitHub's signature verification remains the identity control. Do not map any other address to the maintainer. The guarded command below still sets the primary author explicitly and verifies the result.
 
-After owner approval, run the guarded command from the repository root:
+After owner approval, the guarded command runs from the repository root:
 
 ```sh
 sh scripts/merge-pr.sh PR_NUMBER REVIEWED_HEAD SQUASH_BODY_FILE

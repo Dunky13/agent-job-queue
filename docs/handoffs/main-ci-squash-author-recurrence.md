@@ -19,20 +19,20 @@ The scan failure on `7e748be` was GO-2026-6859 in `net/http` of Go 1.26.10, fixe
 
 ## Recovery
 
-Push CI checks the range from the previous `main` commit (`github.event.before`), so a correctly authored commit on top of `55060e0` passes the commit policy without rewriting history. This handoff is that commit. It is merged with `scripts/merge-pr.sh`, which sets the author to `marc@went.io` and verifies the result. A green main run then starts Distribution for the current `main`, which includes every change since build 263.
+Push CI checks the range from the previous `main` commit (`github.event.before`), so the next commit on top of `55060e0` that passes the commit policy turns `main` green without rewriting history. This PR is that commit. It is merged with `scripts/merge-pr.sh`, which sets the author to `marc@went.io` and verifies the result. A green main run then starts Distribution for the current `main`, which includes every change since build 263.
 
 The failed runs stay failed. Do not dispatch Distribution with a failed run's ID; that skips the commit policy.
 
 ## Recurrence
 
-Any web-interface squash merge by the maintainer fails main CI again. Closing that gap needs an owner decision between:
+The owner chose to map the alias in the repository. `.mailmap` maps `Dunky13@users.noreply.github.com` to `Marc Went <marc@went.io>`, and `CheckCommits` reads the author with `%aN`/`%aE`, which apply it. A web squash merge whose body keeps the single `Signed-off-by: Marc Went <marc@went.io>` trailer now passes. The trailer is still required, the rule is still an exact match after mapping, and GitHub still verifies every signature. The alternatives were changing the account's email settings, which cannot be checked from the repository, and merging only through `scripts/merge-pr.sh`, which six merges in a row did not use.
 
-- mapping the noreply alias to the primary identity in the commit policy,
-- changing the account's email settings so web merges use `marc@went.io`, or
-- keeping the rule and merging only through `scripts/merge-pr.sh`.
+`TestCheckCommitsMapsTheMaintainerNoreplyAlias` fails without the mapping and passes with it. With the mapping, `check-commits --base 58ec253 --head 55060e0` passes all six failed commits.
+
+The mapping comes from the checked-out tree, so a PR could add another alias. Review any `.mailmap` change as a change to the commit policy.
 
 ## Next steps
 
 1. Confirm main CI passes on the recovery commit and Distribution publishes a new build.
 2. If Distribution fails on a transient Apple network error, let `Distribution recovery` continue it, then check its result.
-3. Apply the owner's recurrence decision.
+3. Merge the next PR from the web interface and confirm its main run passes the commit policy.

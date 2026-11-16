@@ -120,3 +120,26 @@ func TestSourceBoundaryFindsPrivatePathsAndSymlinks(t *testing.T) {
 		t.Fatal("accepted source symlink")
 	}
 }
+
+func TestCheckCommitsMapsTheMaintainerNoreplyAlias(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	git := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", append([]string{"-c", "commit.gpgsign=false", "-c", "user.name=Marc Went", "-c", "user.email=Dunky13@users.noreply.github.com"}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("commit", "-q", "--allow-empty", "-m", "web squash\n\nSigned-off-by: Marc Went <marc@went.io>")
+	if err := CheckCommits("", "HEAD", false, ""); err == nil || !strings.Contains(err.Error(), "missing author-matching DCO sign-off") {
+		t.Fatalf("Unmapped noreply author passed: %v", err)
+	}
+	if err := os.WriteFile(".mailmap", []byte("Marc Went <marc@went.io> <Dunky13@users.noreply.github.com>\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckCommits("", "HEAD", false, ""); err != nil {
+		t.Fatalf("Mapped noreply author rejected: %v", err)
+	}
+}
