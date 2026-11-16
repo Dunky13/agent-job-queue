@@ -239,7 +239,8 @@ func CheckCommits(base, head string, local bool, repository string) error {
 		return errors.New("Invalid GitHub repository")
 	}
 	for _, commit := range commits {
-		info, err := gitOutput("show", "-s", "--format=%an%n%ae%n%B", commit)
+		// %aN/%aE apply .mailmap: GitHub web merges author as the maintainer's noreply alias.
+		info, err := gitOutput("show", "-s", "--format=%aN%n%aE%n%B", commit)
 		if err != nil {
 			return err
 		}
