@@ -25,7 +25,7 @@ The failed runs stay failed. Do not dispatch Distribution with a failed run's ID
 
 ## Recurrence
 
-The owner chose to map the alias in the repository. `.mailmap` maps `Dunky13@users.noreply.github.com` to `Marc Went <marc@went.io>`, and `CheckCommits` reads the author with `%aN`/`%aE`, which apply it. A web squash merge whose body keeps the single `Signed-off-by: Marc Went <marc@went.io>` trailer now passes. The trailer is still required, the rule is still an exact match after mapping, and GitHub still verifies every signature. The alternatives were changing the account's email settings, which cannot be checked from the repository, and merging only through `scripts/merge-pr.sh`, which six merges in a row did not use.
+The owner chose to map the alias in the repository. `.mailmap` maps `Dunky13@users.noreply.github.com` and its `991668+Dunky13@users.noreply.github.com` form to `Marc Went <marc@went.io>`, and `CheckCommits` reads the author with `%aN`/`%aE`, which apply it. A web squash merge whose body keeps the single `Signed-off-by: Marc Went <marc@went.io>` trailer now passes. The trailer is still required, the rule is still an exact match after mapping, and GitHub still verifies every signature. The alternatives were changing the account's email settings, which cannot be checked from the repository, and merging only through `scripts/merge-pr.sh`, which six merges in a row did not use.
 
 `TestCheckCommitsMapsTheMaintainerNoreplyAlias` fails without the mapping and passes with it. With the mapping, `check-commits --base 58ec253 --head 55060e0` passes all six failed commits.
 

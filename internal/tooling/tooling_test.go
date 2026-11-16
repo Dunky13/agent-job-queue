@@ -125,6 +125,11 @@ func TestCheckCommitsMapsTheMaintainerNoreplyAlias(t *testing.T) {
 	t.Chdir(t.TempDir())
 	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
 	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	// A hook or shell can export these; they would redirect git to another repository or identity.
+	for _, name := range []string{"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"} {
+		t.Setenv(name, "")
+		os.Unsetenv(name)
+	}
 	git := func(args ...string) {
 		t.Helper()
 		if out, err := exec.Command("git", append([]string{"-c", "commit.gpgsign=false", "-c", "user.name=Marc Went", "-c", "user.email=Dunky13@users.noreply.github.com"}, args...)...).CombinedOutput(); err != nil {
