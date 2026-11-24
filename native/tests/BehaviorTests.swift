@@ -60,6 +60,7 @@ struct BehaviorTests {
         }
         try checkMenuBarBehavior(check)
         try checkLaneStatusDecoding(check)
+        try checkQueueRowSummaries(check)
         let store = QueueStore()
         guard store.fixtureMode, let recorder = store.fixtureRecorder,
               let queued = store.waiting.first, let original = store.snapshot else {
@@ -255,4 +256,27 @@ func checkLaneStatusDecoding(_ check: (Bool, String) throws -> Void) throws {
     older.plugins = nil
     let reencoded = try JSONDecoder().decode(QueueSnapshot.self, from: JSONEncoder().encode(older))
     try check(reencoded.lanes == nil && !reencoded.hasSameContent(as: snapshot), "Lane changes are visible to refresh comparison")
+}
+
+// Rows condense resources into one line; the waiting reason is not repeated when the phase already says it.
+func checkQueueRowSummaries(_ check: (Bool, String) throws -> Void) throws {
+    let fixtures = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("fixtures")
+    let snapshot = try JSONDecoder().decode(QueueSnapshot.self, from: Data(contentsOf: fixtures.appendingPathComponent("queue.json")))
+    guard let running = snapshot.jobs.first(where: { $0.isRunning && $0.resources?.observed != nil }),
+          let waiting = snapshot.jobs.first(where: { $0.isWaiting && $0.resources?.decision != nil }),
+          let reason = waiting.resources?.decision?.reason else {
+        throw ClientError.message("Generated status lacks running and waiting jobs with resources")
+    }
+    let runningLine = running.resourceLine
+    try check(runningLine?.text.contains(" now · peak ") == true && runningLine?.text.contains("est. ") == true
+              && runningLine?.details.contains(running.resources?.prediction.summary ?? "?") == true,
+              "Running row shows observed memory against the estimate")
+    let waitingLine = waiting.resourceLine
+    try check(waitingLine?.text.hasPrefix("Waiting For Memory Headroom · Est. ") == true
+              && waitingLine?.text.lowercased().components(separatedBy: reason.lowercased()).count == 2
+              && waitingLine?.details.hasSuffix(reason) == true,
+              "Waiting row states its reason once")
+    var bare = running
+    bare.resources = nil
+    try check(bare.distinctPhase == nil && bare.resourceLine == nil, "Rows without phase or resources omit the resource line")
 }

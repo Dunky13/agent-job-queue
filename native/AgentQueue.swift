@@ -180,6 +180,27 @@ struct QueueJob: Codable, Identifiable, Sendable, Equatable {
         return display.capitalized
     }
     var context: String { [project, branch].filter { !$0.isEmpty }.joined(separator: " / ") }
+    /// One row line combining phase, resource use and the waiting reason; `details` holds the full figures.
+    var resourceLine: (text: String, details: String)? {
+        var parts: [String] = []
+        if let phase = distinctPhase { parts.append(phase) }
+        var details: [String] = []
+        if let resources {
+            let prediction = resources.prediction
+            if let observed = resources.observed, isRunning {
+                parts.append("\(resourceBytes(observed.memoryBytes)) now · peak \(resourceBytes(observed.peakMemoryBytes)) · est. \(resourceBytes(prediction.memoryBytes))")
+            } else {
+                parts.append("Est. \(resourceBytes(prediction.memoryBytes)) · \(resourceCores(prediction.cpuCores))")
+            }
+            details.append(prediction.summary)
+            if let observed = resources.observed { details.append(observed.summary) }
+            if isWaiting, let reason = resources.decision?.reason, !reason.isEmpty {
+                details.append(reason)
+                if reason.caseInsensitiveCompare(distinctPhase ?? "") != .orderedSame { parts.append(reason) }
+            }
+        }
+        return parts.isEmpty ? nil : (parts.joined(separator: " · "), details.joined(separator: "\n"))
+    }
     var stateLabel: String {
         if let code = exitCode, code != 0 { return "Failed (\(code))" }
         return state.capitalized
@@ -1286,7 +1307,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
     let popover = NSPopover()
     let menu = NSMenu()
     private var observation: AnyCancellable?
-    private var deactivationObservation: AnyCancellable?
+    private var pendingTitle: String?
     private var menuTrackingObservations: [AnyCancellable] = []
     private var menuTrackingDepth = 0
     private var eventMonitor: Any?
@@ -1320,13 +1341,16 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
         }
         buildMenu()
         observation = store.snapshotPublisher.combineLatest(store.$error).sink { [weak self] snapshot, error in
+            guard let self else { return }
             let presentation = QueueStatusPresentation(snapshot: snapshot, error: error)
-            self?.statusItem.button?.title = presentation.title
-            self?.statusItem.button?.setAccessibilityLabel(presentation.accessibilityLabel)
-            self?.statusItem.button?.toolTip = presentation.accessibilityLabel
+            // A wider or narrower title moves the anchored popover sideways, so hold it while shown.
+            // The accessibility label and tooltip stay current; the open popover shows the same state.
+            if self.popover.isShown { self.pendingTitle = presentation.title } else { self.statusItem.button?.title = presentation.title }
+            self.statusItem.button?.setAccessibilityLabel(presentation.accessibilityLabel)
+            self.statusItem.button?.toolTip = presentation.accessibilityLabel
         }
-        deactivationObservation = NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)
-            .sink { [weak self] _ in self?.closePopover() }
+        // The popover deliberately survives another app taking focus (agent jobs launch browsers
+        // and simulators). Outside clicks, Escape and the status item still dismiss it.
         menuTrackingObservations = [
             NotificationCenter.default.publisher(for: NSMenu.didBeginTrackingNotification)
                 .sink { [weak self] _ in self?.menuTrackingDepth += 1 },
@@ -1451,6 +1475,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
 
     private func releaseVisibleSurface() {
         stopMonitoringEvents()
+        if let pendingTitle { statusItem.button?.title = pendingTitle; self.pendingTitle = nil }
         guard registeredVisibleSurface else { return }
         registeredVisibleSurface = false
         store.disappear(fullWindow: false)
@@ -1461,7 +1486,6 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
         isTornDown = true
         closePopover()
         observation = nil
-        deactivationObservation = nil
         menuTrackingObservations = []
         NSStatusBar.system.removeStatusItem(statusItem)
     }
@@ -1523,8 +1547,9 @@ struct QueuePanel: View {
     var fullWindow = false
     var tracksVisibility = true
     @StateObject private var navigation: QueueNavigation
-    @State private var draftLimit = "1"
-    @State private var draftMode = SchedulingMode.fixed
+    // The requested value shows until the queue reports it, so a menu never snaps back mid-change.
+    @State private var pendingLimit: Int?
+    @State private var pendingMode: SchedulingMode?
 
     init(store: QueueStore, fullWindow: Bool = false, tracksVisibility: Bool = true, navigation: QueueNavigation = QueueNavigation()) {
         self.store = store
@@ -1534,17 +1559,10 @@ struct QueuePanel: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if let confirmation = navigation.confirmation {
-                let currentJob = store.snapshot?.jobs.first(where: { $0.id == confirmation.job.id }) ?? confirmation.job
-                JobConfirmationPanel(action: confirmation.action, job: currentJob,
-                    unavailable: navigation.unavailability(in: store), error: store.error,
-                    disabled: store.actionsDisabled, onDecline: navigation.decline,
-                    onConfirm: { navigation.confirm(in: store) })
-            } else if let job = navigation.selected {
-                let currentJob = store.snapshot?.jobs.first(where: { $0.id == job.id }) ?? job
-                JobDetail(job: currentJob, fixtureMode: store.fixtureMode, onClose: navigation.back)
-            } else {
+        let overlaid = navigation.confirmation != nil || navigation.selected != nil
+        ZStack {
+            // The queue stays alive under details and confirmations so returning keeps its scroll position.
+            VStack(spacing: 0) {
                 header
                 Divider()
                 if let error = store.error {
@@ -1570,33 +1588,47 @@ struct QueuePanel: View {
                 Divider()
                 footer
             }
+            .opacity(overlaid ? 0 : 1).disabled(overlaid).accessibilityHidden(overlaid)
+            if let confirmation = navigation.confirmation {
+                let currentJob = store.snapshot?.jobs.first(where: { $0.id == confirmation.job.id }) ?? confirmation.job
+                JobConfirmationPanel(action: confirmation.action, job: currentJob,
+                    unavailable: navigation.unavailability(in: store), error: store.error,
+                    disabled: store.actionsDisabled, onDecline: navigation.decline,
+                    onConfirm: { navigation.confirm(in: store) })
+                    .background(Color(nsColor: .windowBackgroundColor))
+            } else if let job = navigation.selected {
+                let currentJob = store.snapshot?.jobs.first(where: { $0.id == job.id }) ?? job
+                JobDetail(job: currentJob, fixtureMode: store.fixtureMode, onClose: navigation.back)
+                    .background(Color(nsColor: .windowBackgroundColor))
+            }
         }
         .frame(minWidth: 470, minHeight: 440)
         .frame(width: fullWindow ? nil : 500, height: fullWindow ? nil : 650)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear {
-            draftLimit = String(store.snapshot?.queue.limit ?? 1)
-            draftMode = store.snapshot?.scheduler?.mode ?? .fixed
-            if tracksVisibility { store.appear(fullWindow: fullWindow) }
-        }
-        .onChange(of: store.snapshot?.queue.limit) { _, value in
-            if let value { draftLimit = String(value) }
-        }
-        .onChange(of: store.snapshot?.scheduler?.mode) { _, value in
-            if let value { draftMode = value }
-        }
+        .onAppear { if tracksVisibility { store.appear(fullWindow: fullWindow) } }
         .onDisappear { if tracksVisibility { store.disappear(fullWindow: fullWindow) } }
+        .onChange(of: store.snapshot?.queue.limit) { pendingLimit = nil }
+        .onChange(of: store.snapshot?.scheduler?.mode) { pendingMode = nil }
+        .onChange(of: store.error) { pendingLimit = nil; pendingMode = nil }
     }
 
-    private func applyLimit() {
-        guard let value = Int(draftLimit), (1...8).contains(value) else { return }
-        store.dispatchLimit(value)
+    // Menus apply on selection. They are disabled while an action runs, so no choice is silently refused.
+    private var limitSelection: Binding<Int> {
+        Binding(get: { pendingLimit ?? store.snapshot?.queue.limit ?? 1 },
+                set: { value in
+                    guard value != store.snapshot?.queue.limit, store.dispatchLimit(value) != nil else { return }
+                    pendingLimit = value
+                })
+    }
+    private var modeSelection: Binding<SchedulingMode> {
+        Binding(get: { pendingMode ?? store.snapshot?.scheduler?.mode ?? .fixed },
+                set: { value in if store.dispatchScheduling(value) != nil { pendingMode = value } })
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 11) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("Agent Queue", systemImage: QueueBrand.symbolName).font(.system(size: 20, weight: .semibold))
+                Label("Agent Queue", systemImage: QueueBrand.symbolName).font(.system(size: 15, weight: .semibold))
                 Spacer()
                 if store.fixtureMode { Text("PREVIEW").font(.caption2.weight(.semibold)).foregroundStyle(.secondary) }
                 Button { Task { await store.refresh(manual: true) } } label: {
@@ -1605,74 +1637,96 @@ struct QueuePanel: View {
                     .accessibilityLabel("Refresh queue").keyboardShortcut("r")
                     .disabled(store.isRefreshing || store.isMutating || store.fixtureMode)
             }
-            HStack(spacing: 16) {
+            HStack(spacing: 14) {
                 Label("\(store.snapshot?.queue.running ?? 0) running", systemImage: "play.fill").foregroundStyle(.green)
                 Label("\(store.snapshot?.queue.waiting ?? 0) waiting", systemImage: "clock").foregroundStyle(.secondary)
-                Spacer()
-                Text("\(store.snapshot?.queue.limit ?? 1) at a time").foregroundStyle(.secondary)
             }.font(.system(size: 12, weight: .medium))
-            HStack(spacing: 8) {
-                Text("Parallel jobs").font(.caption.weight(.medium))
-                TextField("Limit", text: $draftLimit)
-                    .textFieldStyle(.roundedBorder).frame(width: 48)
-                    .multilineTextAlignment(.center).font(.caption.monospacedDigit())
-                    .accessibilityLabel("Parallel job limit").onSubmit { applyLimit() }
-                Stepper("Parallel job limit", onIncrement: {
-                    let current = min(8, max(1, Int(draftLimit) ?? store.snapshot?.queue.limit ?? 1))
-                    draftLimit = String(min(8, current + 1))
-                }, onDecrement: {
-                    let current = min(8, max(1, Int(draftLimit) ?? store.snapshot?.queue.limit ?? 1))
-                    draftLimit = String(current > 1 ? current - 1 : 1)
-                }).labelsHidden().fixedSize()
-                Button("Apply") { applyLimit() }
-                    .disabled(store.actionsDisabled || !(1...8).contains(Int(draftLimit) ?? 0) || Int(draftLimit) == store.snapshot?.queue.limit)
-                Spacer(minLength: 0)
-            }.disabled(store.fixtureMode || store.isMutating || store.snapshot == nil || store.error != nil)
-            Text("Choose 1 to 8 jobs. Lowering the limit lets active jobs finish.").font(.caption2).foregroundStyle(.secondary)
-            if let scheduler = store.snapshot?.scheduler {
-                HStack(spacing: 8) {
-                    Picker("Scheduling", selection: $draftMode) {
+            HStack(spacing: 14) {
+                Picker("Parallel", selection: limitSelection) {
+                    ForEach(1...8, id: \.self) { Text(String($0)).tag($0) }
+                }
+                .fixedSize()
+                .help("How many jobs run at a time, 1 to 8. Lowering the limit lets active jobs finish.")
+                .accessibilityLabel("Parallel job limit")
+                if store.snapshot?.scheduler != nil {
+                    Picker("Scheduling", selection: modeSelection) {
                         ForEach(SchedulingMode.allCases, id: \.self) { mode in Text(mode.label).tag(mode) }
-                    }.pickerStyle(.menu)
-                    Button("Set mode") { store.dispatchScheduling(draftMode) }
-                        .disabled(store.actionsDisabled || scheduler.mode == draftMode)
-                }.disabled(store.fixtureMode || store.actionsDisabled)
-                Text("Adaptive fits jobs within your parallel limit. Learn only records predictions. Running jobs are never stopped automatically.")
-                    .font(.caption2).foregroundStyle(.secondary)
-                Text(scheduler.summary).font(.caption2).foregroundStyle(.secondary)
-                if !scheduler.reason.isEmpty { Text(scheduler.reason).font(.caption2).foregroundStyle(.secondary) }
-                Text(scheduler.host?.summary ?? "Host measurements unavailable.")
-                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    .fixedSize()
+                    .help("Adaptive fits jobs within your parallel limit. Learn only records predictions. Running jobs are never stopped automatically.")
+                }
+                Spacer(minLength: 0)
+            }
+            .pickerStyle(.menu).font(.caption)
+            .disabled(store.fixtureMode || store.actionsDisabled || store.snapshot == nil)
+            if let scheduler = store.snapshot?.scheduler {
+                hostLine(scheduler)
             } else {
                 Text("Resource monitoring unavailable. Update the queue controller to enable scheduling controls.")
                     .font(.caption2).foregroundStyle(.secondary)
             }
-        }.padding(18)
+        }.padding(.horizontal, 16).padding(.vertical, 12)
+    }
+
+    private func hostLine(_ scheduler: QueueScheduler) -> some View {
+        let details = [scheduler.host?.summary, scheduler.summary, scheduler.reason.isEmpty ? nil : scheduler.reason]
+            .compactMap { $0 }.joined(separator: "\n")
+        return VStack(alignment: .leading, spacing: 3) {
+            if let host = scheduler.host {
+                HStack(spacing: 6) {
+                    Text("Memory")
+                    meter(1 - Double(host.availableMemoryBytes) / Double(max(host.totalMemoryBytes, 1)),
+                          tint: ["normal": .green, "warning": .orange, "critical": .red][host.memoryPressure] ?? .secondary)
+                    Text("\(resourceBytes(host.availableMemoryBytes)) free")
+                    Text("·")
+                    Text("CPU")
+                    meter(host.cpuBusyCores / Double(max(host.cpuCores, 1)), tint: .accentColor)
+                    Text("\(host.cpuBusyCores.formatted(.number.precision(.fractionLength(1))))/\(host.cpuCores)")
+                }
+                .lineLimit(1)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel([host.summary, scheduler.reason].filter { !$0.isEmpty }.joined(separator: ". "))
+            } else {
+                Text("Host measurements unavailable.")
+            }
+            if !scheduler.available {
+                Text(scheduler.reason.isEmpty ? "Resource monitoring unavailable." : scheduler.reason).foregroundStyle(.orange)
+            }
+        }
+        .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+        .help(details)
+    }
+
+    private func meter(_ fraction: Double, tint: Color) -> some View {
+        // Drawn rather than a ProgressView, which ignores the tint in inactive popovers.
+        Capsule().fill(.quaternary).frame(width: 44, height: 4)
+            .overlay(alignment: .leading) { Capsule().fill(tint).frame(width: 44 * min(max(fraction, 0), 1)) }
     }
 
     private var queueList: some View {
-        List {
-            if store.isPaused {
-                HStack(spacing: 12) {
-                    Label("Queue paused. Waiting jobs will not start automatically.", systemImage: "pause.circle")
-                        .foregroundStyle(.orange)
-                    Spacer(minLength: 0)
-                    Button(store.isResuming ? "Resuming…" : "Resume", systemImage: "play.fill") {
-                        store.dispatchResume()
-                    }
-                    .buttonStyle(.bordered)
-                    .fixedSize()
-                    .disabled(store.actionsDisabled)
-                    .accessibilityLabel("Resume queue")
-                    .accessibilityIdentifier("queue.resume")
-                    .help("Resume automatic starts for waiting jobs.")
-                }.font(.callout).padding(.vertical, 5)
-            }
-            if store.snapshot?.queue.legacyOccupied == true {
-                Label("A legacy validation batch holds the shared slot.", systemImage: "hourglass")
-                    .font(.callout).foregroundStyle(.secondary).padding(.vertical, 5)
-            }
-            Section {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if store.isPaused {
+                    HStack(spacing: 12) {
+                        Label("Queue paused. Waiting jobs will not start automatically.", systemImage: "pause.circle")
+                            .foregroundStyle(.orange)
+                        Spacer(minLength: 0)
+                        Button(store.isResuming ? "Resuming…" : "Resume", systemImage: "play.fill") {
+                            store.dispatchResume()
+                        }
+                        .buttonStyle(.bordered)
+                        .fixedSize()
+                        .disabled(store.actionsDisabled)
+                        .accessibilityLabel("Resume queue")
+                        .accessibilityIdentifier("queue.resume")
+                        .help("Resume automatic starts for waiting jobs.")
+                    }.font(.callout).padding(.top, 10)
+                }
+                if store.snapshot?.queue.legacyOccupied == true {
+                    Label("A legacy validation batch holds the shared slot.", systemImage: "hourglass")
+                        .font(.callout).foregroundStyle(.secondary).padding(.top, 10)
+                }
+                sectionHeader("Running", count: store.running.count)
                 if store.running.isEmpty {
                     HStack(spacing: 10) {
                         Image(systemName: store.isPaused ? "pause.circle" : store.waiting.isEmpty ? "checkmark.circle" : "hourglass")
@@ -1683,126 +1737,144 @@ struct QueuePanel: View {
                                  : store.waiting.isEmpty ? "Heavy jobs appear here when agents submit them." : "Queued jobs start automatically when the slot is available.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
-                    }.padding(.vertical, 10)
+                    }.padding(.vertical, 8)
                 }
                 ForEach(store.running) { job in row(job) }
-            } header: { sectionHeader("Running", count: store.running.count) }
-            Section {
+                sectionHeader("Up next", count: store.waiting.count)
                 if store.waiting.isEmpty {
                     Text("No waiting jobs").font(.callout).foregroundStyle(.secondary).padding(.vertical, 8)
                 }
                 ForEach(store.waiting) { job in row(job) }
-            } header: { sectionHeader("Up next", count: store.waiting.count) }
-            if !store.recent.isEmpty {
-                Section {
+                if !store.recent.isEmpty {
+                    sectionHeader("Recent", count: store.recent.count)
                     ForEach(store.recent) { job in row(job) }
-                } header: { sectionHeader("Recent", count: store.recent.count) }
-            }
-        }.listStyle(.inset).scrollContentBackground(.hidden)
+                }
+            }.padding(.horizontal, 16).padding(.bottom, 10)
+        }
     }
 
     private func sectionHeader(_ title: String, count: Int) -> some View {
-        HStack { Text(title); Spacer(); Text(String(count)).monospacedDigit() }.font(.caption.weight(.semibold))
+        VStack(spacing: 4) {
+            HStack { Text(title.uppercased()); Spacer(); Text(String(count)).monospacedDigit() }
+                .font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
+            Divider()
+        }.padding(.top, 12).accessibilityElement(children: .combine).accessibilityAddTraits(.isHeader)
     }
 
     private func row(_ job: QueueJob) -> some View {
-        HStack(alignment: .top, spacing: 11) {
-            Group {
-                if let position = job.queuePosition, job.isWaiting {
-                    Text(String(position)).font(.system(size: 13, weight: .semibold, design: .rounded)).foregroundStyle(.secondary)
-                } else {
-                    Image(systemName: job.isRunning ? "play.fill" : (job.state == "failed" || (job.exitCode ?? 0) != 0 ? "exclamationmark.circle" : "checkmark.circle"))
-                        .font(.system(size: 14)).foregroundStyle(job.color)
-                }
-            }.frame(width: 22, height: 23)
-            VStack(alignment: .leading, spacing: 5) {
-                Button { navigation.show(job) } label: {
-                    Text(job.name).font(.system(size: 13, weight: .semibold)).foregroundStyle(.primary)
-                        .multilineTextAlignment(.leading).lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
-                }.buttonStyle(.plain).help("View details and output for job #\(job.id)")
-                if !job.context.isEmpty { Text(job.context).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
-                HStack(spacing: 7) {
-                    Text("#\(job.id)").monospacedDigit()
-                    Text("·")
-                    Text(job.stateLabel).foregroundStyle(job.color)
-                    if job.isRunning, let startedAt = job.startedAt, let date = parseDate(startedAt) {
+        VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 10) {
+                Group {
+                    if let position = job.queuePosition, job.isWaiting {
+                        Text(String(position)).font(.system(size: 12, weight: .semibold, design: .rounded)).foregroundStyle(.secondary)
+                    } else {
+                        Image(systemName: job.isRunning ? "play.fill" : (job.state == "failed" || (job.exitCode ?? 0) != 0 ? "exclamationmark.circle" : "checkmark.circle"))
+                            .font(.system(size: 12)).foregroundStyle(job.color)
+                    }
+                }.frame(width: 18, height: 18)
+                VStack(alignment: .leading, spacing: 3) {
+                    Button { navigation.show(job) } label: {
+                        Text(job.name).font(.system(size: 13, weight: .semibold)).foregroundStyle(.primary)
+                            .multilineTextAlignment(.leading).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+                    }.buttonStyle(.plain).help("View details and output for job #\(job.id)")
+                    HStack(spacing: 5) {
+                        if !job.context.isEmpty {
+                            Text(job.context).lineLimit(1).truncationMode(.middle)
+                            Text("·")
+                        }
+                        Text("#\(job.id)").fixedSize()
                         Text("·")
-                        Text(date, style: .relative).monospacedDigit()
-                    }
-                }.font(.caption2).foregroundStyle(.secondary)
-                if let phase = job.distinctPhase {
-                    Text(phase)
-                        .font(.caption2).foregroundStyle(.secondary).lineLimit(2)
-                }
-                if let resources = job.resources {
-                    Text(resources.prediction.summary).font(.caption2).foregroundStyle(.secondary)
-                    if let observed = resources.observed { Text(observed.summary).font(.caption2).foregroundStyle(.secondary) }
-                    if job.isWaiting, let decision = resources.decision {
-                        Text(decision.reason).font(.caption2).foregroundStyle(.secondary)
-                    }
-                }
-                if job.canReorder || job.permitsStart {
-                    HStack(spacing: 8) {
-                        if job.canReorder {
-                        Button("Run next", systemImage: "arrow.up.to.line") { store.dispatch("next", job: job) }
-                            .help("Run job #\(job.id) after the current job finishes")
-                        Button("Move to end", systemImage: "arrow.down.to.line") { store.dispatch("last", job: job) }
+                        Text(job.stateLabel).foregroundStyle(job.color).fixedSize()
+                        if job.isRunning, let startedAt = job.startedAt, let date = parseDate(startedAt) {
+                            Text("·")
+                            Text(date, style: .relative).fixedSize()
                         }
-                        if job.permitsStart {
-                        Button("Start now", systemImage: "play.fill") { navigation.request(.start, job: job) }
-                            .help("Bypass the parallel limit and adaptive resource checks")
-                        }
-                    }.font(.caption).buttonStyle(.borderless).disabled(store.actionsDisabled)
-                }
-            }
-            Menu {
-                Button("View details and output", systemImage: "doc.text") { navigation.show(job) }
-                if let learning = job.resources?.learning {
-                    Button("View learned workload", systemImage: "chart.bar.doc.horizontal") {
-                        AppRuntime.showLearningWindow(profileID: learning.id)
+                    }.font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    if let line = job.resourceLine {
+                        Text(line.text).font(.caption2).foregroundStyle(.secondary).lineLimit(1).help(line.details)
                     }
                 }
-                if job.canReorder || job.permitsStart {
-                    Divider()
+                HStack(spacing: 2) {
+                    // Icon buttons keep every row the same height; titles are in the tooltips and the ⋯ menu.
                     if job.canReorder {
-                    Button("Run next", systemImage: "arrow.up.to.line") { store.dispatch("next", job: job) }.disabled(store.actionsDisabled)
-                    Button("Move to end", systemImage: "arrow.down.to.line") { store.dispatch("last", job: job) }.disabled(store.actionsDisabled)
+                        iconAction("Run job \(job.id) next", symbol: "arrow.up.to.line", help: "Run job #\(job.id) after the current job finishes") {
+                            store.dispatch("next", job: job)
+                        }
+                        iconAction("Move job \(job.id) to the end", symbol: "arrow.down.to.line", help: "Move job #\(job.id) to the end of the queue") {
+                            store.dispatch("last", job: job)
+                        }
                     }
                     if job.permitsStart {
-                    Button("Start now…", systemImage: "play.fill") { navigation.request(.start, job: job) }.disabled(store.actionsDisabled)
+                        iconAction("Start job \(job.id) now", symbol: "play.fill", help: "Start job #\(job.id) now, bypassing the parallel limit and adaptive resource checks") {
+                            navigation.request(.start, job: job)
+                        }
                     }
+                    Menu {
+                        Button("View details and output", systemImage: "doc.text") { navigation.show(job) }
+                        if let learning = job.resources?.learning {
+                            Button("View learned workload", systemImage: "chart.bar.doc.horizontal") {
+                                AppRuntime.showLearningWindow(profileID: learning.id)
+                            }
+                        }
+                        if job.canReorder || job.permitsStart {
+                            Divider()
+                            if job.canReorder {
+                                Button("Run next", systemImage: "arrow.up.to.line") { store.dispatch("next", job: job) }.disabled(store.actionsDisabled)
+                                Button("Move to end", systemImage: "arrow.down.to.line") { store.dispatch("last", job: job) }.disabled(store.actionsDisabled)
+                            }
+                            if job.permitsStart {
+                                Button("Start now…", systemImage: "play.fill") { navigation.request(.start, job: job) }.disabled(store.actionsDisabled)
+                            }
+                        }
+                        if job.canCancel {
+                            Divider()
+                            Button("Cancel job…", systemImage: "stop.circle", role: .destructive) { navigation.request(.cancel, job: job) }.disabled(store.actionsDisabled)
+                        }
+                    } label: { Image(systemName: "ellipsis").frame(width: 22, height: 22) }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Actions for job #\(job.id)")
+                        .accessibilityLabel("Actions for job \(job.id)")
                 }
-                if job.canCancel {
-                    Divider()
-                    Button("Cancel job…", systemImage: "stop.circle", role: .destructive) { navigation.request(.cancel, job: job) }.disabled(store.actionsDisabled)
-                }
-            } label: { Image(systemName: "ellipsis").frame(width: 22, height: 22) }
-                .menuStyle(.borderlessButton).fixedSize().help("Actions for job #\(job.id)")
-                .accessibilityLabel("Actions for job \(job.id)")
-        }.padding(.vertical, 9)
+            }.padding(.vertical, 8)
+            Divider().padding(.leading, 28)
+        }
+    }
+
+    private func iconAction(_ title: String, symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: symbol).frame(width: 22, height: 22) }
+            .buttonStyle(.borderless).foregroundStyle(.secondary)
+            .help(help).accessibilityLabel(title)
+            .disabled(store.actionsDisabled)
     }
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            if let notice = store.notice { Label(notice, systemImage: "checkmark.circle").font(.caption).foregroundStyle(.secondary) }
-            HStack(spacing: 8) {
+        HStack(spacing: 8) {
+            // A notice briefly takes the status line's place so the list never changes height.
+            if let notice = store.notice {
+                Label(notice, systemImage: "checkmark.circle").foregroundStyle(.primary).lineLimit(1).truncationMode(.tail)
+            } else {
                 Circle().fill(store.error != nil ? Color.orange : Color.green).frame(width: 6, height: 6)
                 if store.isMutating { Text("Updating queue…") }
                 else if let updated = store.lastRefreshed { Text("Updated \(updated.formatted(date: .omitted, time: .shortened))") }
                 else { Text("Connecting…") }
-                Spacer()
-                if !fullWindow { Button(QueueAppAction.openWindow.title, systemImage: QueueAppAction.openWindow.symbol) { AppRuntime.perform(.openWindow) }.buttonStyle(.borderless) }
-                Menu {
-                    ForEach(QueueAppAction.settings) { action in
-                        Button(action.title, systemImage: action.symbol) { AppRuntime.perform(action) }
-                    }
-                    Divider()
-                    Text(QueueAppAction.quitExplanation)
-                    Divider()
-                    Button(QueueAppAction.quit.title, systemImage: QueueAppAction.quit.symbol) { AppRuntime.perform(.quit) }.keyboardShortcut("q")
-                } label: { Image(systemName: "gearshape") }.menuStyle(.borderlessButton).allowsWindowActivationEvents(true).fixedSize().help("Application options").accessibilityLabel("Application options")
-            }.font(.caption).foregroundStyle(.secondary)
-        }.padding(.horizontal, 18).padding(.vertical, 12)
+            }
+            Spacer(minLength: 8)
+            if !fullWindow { Button(QueueAppAction.openWindow.title, systemImage: QueueAppAction.openWindow.symbol) { AppRuntime.perform(.openWindow) }.buttonStyle(.borderless) }
+            Menu {
+                ForEach(QueueAppAction.settings) { action in
+                    Button(action.title, systemImage: action.symbol) { AppRuntime.perform(action) }
+                }
+                Divider()
+                Text(QueueAppAction.quitExplanation)
+                Divider()
+                Button(QueueAppAction.quit.title, systemImage: QueueAppAction.quit.symbol) { AppRuntime.perform(.quit) }.keyboardShortcut("q")
+            } label: { Image(systemName: "gearshape") }.menuStyle(.borderlessButton).allowsWindowActivationEvents(true).fixedSize().help("Application options").accessibilityLabel("Application options")
+        }
+        .font(.caption).foregroundStyle(.secondary)
+        .padding(.horizontal, 16).padding(.vertical, 10)
+        .task(id: store.notice) {
+            guard let shown = store.notice, (try? await Task.sleep(for: .seconds(5))) != nil, store.notice == shown else { return }
+            store.notice = nil
+        }
     }
 }
 

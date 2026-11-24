@@ -408,8 +408,16 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         controller.activate(.accessible)
         try await settle()
         NotificationCenter.default.post(name: NSApplication.didResignActiveNotification, object: NSApp)
-        try check(!controller.popover.isShown, "applicationDeactivationDismissesPopover")
         try await settle()
+        try check(controller.popover.isShown, "anotherAppTakingFocusKeepsPopoverOpen")
+        let shownTitle = controller.statusItem.button?.title
+        AppRuntime.store.error = "Simulated unavailable queue"
+        try check(shownTitle != "!" && controller.statusItem.button?.title == shownTitle, "statusTitleHoldsWidthWhilePopoverShown")
+        controller.closePopover()
+        try await settle()
+        try check(controller.statusItem.button?.title == "!", "heldStatusTitleAppliesOnClose")
+        AppRuntime.store.error = nil
+        try check(controller.statusItem.button?.title == shownTitle, "closedStatusTitleUpdatesImmediately")
         try check(AppRuntime.store.visibleSurfaces == 0, "repeatedPopoverDismissalsLeaveNoVisibleQueueSurface")
     }
 
