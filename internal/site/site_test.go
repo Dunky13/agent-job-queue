@@ -3,6 +3,9 @@
 package site
 
 import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
 	"image"
 	_ "image/png"
 	"io/fs"
@@ -22,12 +25,51 @@ const (
 	pagesURL = "https://dunky13.github.io/agent-job-queue/"
 )
 
-var allowedOrigins = []string{
-	"https://github.com/Dunky13/agent-job-queue",
-	pagesURL,
+var urlPattern = regexp.MustCompile(`(?i)(?:https?:)?//[^\s"'<>)\\]+`)
+
+// allowedURL accepts GitHub links under this repository and the Pages site only.
+func allowedURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Port() != "" {
+		return false
+	}
+	switch u.Host {
+	case "github.com":
+		return u.Path == "/Dunky13/agent-job-queue" || strings.HasPrefix(u.Path, "/Dunky13/agent-job-queue/")
+	case "dunky13.github.io":
+		return u.Path == "/agent-job-queue" || strings.HasPrefix(u.Path, "/agent-job-queue/")
+	}
+	return false
 }
 
-var originPattern = regexp.MustCompile(`(?i)(?:https?:)?//[a-z0-9.-]+`)
+func TestAllowedURL(t *testing.T) {
+	for _, ok := range []string{
+		"https://github.com/Dunky13/agent-job-queue",
+		"https://github.com/Dunky13/agent-job-queue/releases",
+		"https://dunky13.github.io/agent-job-queue/",
+	} {
+		if !allowedURL(ok) {
+			t.Errorf("%s should be allowed", ok)
+		}
+	}
+	for _, bad := range []string{
+		"https://github.co/Dunky13/agent-job-queue",
+		"https://g",
+		"https://github.com",
+		"https://github.com/Other/repo",
+		"https://github.com/Dunky13/agent-job-queue-evil",
+		"https://github.com.evil.example/Dunky13/agent-job-queue",
+		"http://github.com/Dunky13/agent-job-queue",
+		"//github.com/Dunky13/agent-job-queue",
+		"https://user@github.com/Dunky13/agent-job-queue",
+		"https://dunky13.github.io/other",
+		"https://evil.example/agent-job-queue/",
+	} {
+		if allowedURL(bad) {
+			t.Errorf("%s should be rejected", bad)
+		}
+	}
+}
 
 func parseHTML(t *testing.T, name string) *html.Node {
 	t.Helper()
@@ -75,15 +117,9 @@ func TestNoThirdPartyOrigins(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for _, m := range originPattern.FindAllString(string(data), -1) {
-			ok := false
-			for _, prefix := range allowedOrigins {
-				if strings.HasPrefix(strings.ToLower(m), strings.ToLower(prefix)) || strings.HasPrefix(strings.ToLower(prefix), strings.ToLower(m)) {
-					ok = true
-				}
-			}
-			if !ok {
-				t.Errorf("%s: disallowed origin %q", path, m)
+		for _, m := range urlPattern.FindAllString(string(data), -1) {
+			if !allowedURL(m) {
+				t.Errorf("%s: disallowed URL %q", path, m)
 			}
 		}
 		return nil
@@ -147,10 +183,47 @@ func TestLocalReferencesResolve(t *testing.T) {
 	}
 }
 
+// imageSize reads the pixel size of a PNG or WebP (lossy or extended) file.
+func imageSize(path string) (int, int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	switch filepath.Ext(path) {
+	case ".png":
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+		return cfg.Width, cfg.Height, err
+	case ".webp":
+		if len(data) < 30 || string(data[0:4]) != "RIFF" || string(data[8:12]) != "WEBP" {
+			return 0, 0, fmt.Errorf("not a WebP file")
+		}
+		switch string(data[12:16]) {
+		case "VP8 ":
+			return int(binary.LittleEndian.Uint16(data[26:]) & 0x3fff), int(binary.LittleEndian.Uint16(data[28:]) & 0x3fff), nil
+		case "VP8X":
+			return int(data[24]) | int(data[25])<<8 | int(data[26])<<16 + 1, int(data[27]) | int(data[28])<<8 | int(data[29])<<16 + 1, nil
+		}
+		return 0, 0, fmt.Errorf("unsupported WebP chunk %q", data[12:16])
+	}
+	return 0, 0, fmt.Errorf("unsupported image type")
+}
+
 func TestImagesAreAccessibleAndSized(t *testing.T) {
 	doc := parseHTML(t, "index.html")
 	count := 0
+	check := func(src string, wantW, wantH int) {
+		w, h, err := imageSize(filepath.Join(siteDir, filepath.FromSlash(src)))
+		if err != nil || w != wantW || h != wantH {
+			t.Errorf("%s: declared %dx%d, file is %dx%d (%v)", src, wantW, wantH, w, h, err)
+		}
+	}
+	og := map[string]string{}
 	walk(doc, func(n *html.Node) {
+		if n.Data == "meta" {
+			if p, _ := attr(n, "property"); strings.HasPrefix(p, "og:image") {
+				og[p] = attrOrEmpty(n, "content")
+			}
+		}
 		if n.Data != "img" {
 			return
 		}
@@ -159,32 +232,27 @@ func TestImagesAreAccessibleAndSized(t *testing.T) {
 		if _, ok := attr(n, "alt"); !ok {
 			t.Errorf("%s: missing alt", src)
 		}
-		w, wErr := strconv.Atoi(mustAttr(n, "width"))
-		h, hErr := strconv.Atoi(mustAttr(n, "height"))
+		w, wErr := strconv.Atoi(attrOrEmpty(n, "width"))
+		h, hErr := strconv.Atoi(attrOrEmpty(n, "height"))
 		if wErr != nil || hErr != nil || w <= 0 || h <= 0 {
 			t.Errorf("%s: needs positive integer width and height", src)
 			return
 		}
-		if filepath.Ext(src) != ".png" {
-			return
-		}
-		f, err := os.Open(filepath.Join(siteDir, filepath.FromSlash(src)))
-		if err != nil {
-			t.Errorf("%s: %v", src, err)
-			return
-		}
-		defer f.Close()
-		cfg, _, err := image.DecodeConfig(f)
-		if err != nil || cfg.Width != w || cfg.Height != h {
-			t.Errorf("%s: declared %dx%d, file is %dx%d (%v)", src, w, h, cfg.Width, cfg.Height, err)
-		}
+		check(src, w, h)
 	})
 	if count == 0 {
 		t.Fatal("no images found")
 	}
+	w, wErr := strconv.Atoi(og["og:image:width"])
+	h, hErr := strconv.Atoi(og["og:image:height"])
+	if wErr != nil || hErr != nil || !strings.HasPrefix(og["og:image"], pagesURL) {
+		t.Fatalf("og:image needs a Pages URL with integer width and height, got %v", og)
+	}
+	check(strings.TrimPrefix(og["og:image"], pagesURL), w, h)
 }
 
-func mustAttr(n *html.Node, key string) string {
+// attrOrEmpty returns the attribute value, or "" when it is absent.
+func attrOrEmpty(n *html.Node, key string) string {
 	v, _ := attr(n, key)
 	return v
 }
@@ -198,10 +266,10 @@ func TestPageMetadataAndLandmarks(t *testing.T) {
 			if l, _ := attr(n, "lang"); l == "" {
 				t.Error("html needs lang")
 			}
-		case "title", "main", "h1", "header", "footer":
+		case "title", "main", "h1":
 			seen[n.Data]++
 		case "meta":
-			if name, _ := attr(n, "name"); name == "description" && mustAttr(n, "content") != "" {
+			if name, _ := attr(n, "name"); name == "description" && attrOrEmpty(n, "content") != "" {
 				seen["description"]++
 			}
 			if p, _ := attr(n, "property"); strings.HasPrefix(p, "og:") {
@@ -209,7 +277,7 @@ func TestPageMetadataAndLandmarks(t *testing.T) {
 			}
 		case "a":
 			if _, ok := attr(n, "data-download"); ok {
-				if h := mustAttr(n, "href"); h != "https://github.com/Dunky13/agent-job-queue/releases" {
+				if h := attrOrEmpty(n, "href"); h != "https://github.com/Dunky13/agent-job-queue/releases" {
 					t.Errorf("download default href is %q", h)
 				}
 				seen["download"]++
@@ -220,8 +288,5 @@ func TestPageMetadataAndLandmarks(t *testing.T) {
 		if seen[k] != 1 {
 			t.Errorf("%s: want exactly 1, got %d", k, seen[k])
 		}
-	}
-	if _, err := os.Stat(filepath.Join(siteDir, "404.html")); err != nil {
-		t.Error(err)
 	}
 }

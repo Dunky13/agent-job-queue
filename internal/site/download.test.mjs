@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseLatest } from "../../site/download.js";
+import { enhance, parseLatest } from "../../site/download.js";
 
 const base = "https://github.com/Dunky13/agent-job-queue/releases/download/v1.2.3/";
 const valid = () => ({
@@ -39,19 +39,51 @@ test("rejects missing or mistyped fields", () => {
   }
 });
 
-test("rejects URLs outside https github.com releases", () => {
+test("rejects URLs outside the exact GitHub release paths", () => {
+  const dl = "/Dunky13/agent-job-queue/releases/download/v1/x";
   const bad = [
-    "http://github.com/Dunky13/agent-job-queue/releases/x.dmg",
-    "https://evil.example/Dunky13/agent-job-queue/releases/x.dmg",
-    "https://github.com.evil.example/Dunky13/agent-job-queue/releases/x.dmg",
-    "https://user@github.com/Dunky13/agent-job-queue/releases/x.dmg",
-    "https://github.com:8443/Dunky13/agent-job-queue/releases/x.dmg",
-    "https://github.com/Other/agent-job-queue/releases/x.dmg",
+    `http://github.com${dl}.dmg`,
+    `https://evil.example${dl}.dmg`,
+    `https://github.com.evil.example${dl}.dmg`,
+    `https://user@github.com${dl}.dmg`,
+    `https://github.com:8443${dl}.dmg`,
+    "https://github.com/Other/agent-job-queue/releases/download/v1/x.dmg",
+    "https://github.com/dunky13/agent-job-queue/releases/download/v1/x.dmg",
     "https://github.com/Dunky13/agent-job-queue/archive/x.dmg",
+    "https://github.com/Dunky13/agent-job-queue/releases/tag/v1/x.dmg",
+    `https://github.com${dl}.zip`,
     "javascript:alert(1)",
     "not a url",
   ];
-  for (const field of ["dmgUrl", "zipUrl", "releaseUrl"]) {
-    for (const url of bad) assert.equal(parseLatest({ ...valid(), [field]: url }), null, `${field} ${url}`);
+  for (const url of bad) assert.equal(parseLatest({ ...valid(), dmgUrl: url }), null, `dmgUrl ${url}`);
+  assert.equal(parseLatest({ ...valid(), zipUrl: `https://github.com${dl}.dmg` }), null, "zip must end in .zip");
+  assert.equal(parseLatest({ ...valid(), releaseUrl: `https://github.com${dl}.zip` }), null, "release must be under tag/");
+  assert.equal(parseLatest({ ...valid(), releaseUrl: "https://evil.example/Dunky13/agent-job-queue/releases/tag/v1" }), null);
+});
+
+const response = (body, ok = true) => ({ ok, json: async () => body });
+const releases = "https://github.com/Dunky13/agent-job-queue/releases";
+const fresh = () => ({ button: { href: releases }, note: { textContent: "macOS 15 or later." } });
+
+test("enhance keeps the default link and note on every failure", async () => {
+  const fetchers = [
+    async () => { throw new Error("offline"); },
+    async () => response(valid(), false),
+    async () => ({ ok: true, json: async () => { throw new SyntaxError("bad json"); } }),
+    async () => response({ ...valid(), schemaVersion: 2 }),
+    async () => response([]),
+  ];
+  for (const fetcher of fetchers) {
+    const { button, note } = fresh();
+    await enhance(button, note, fetcher);
+    assert.equal(button.href, releases);
+    assert.equal(note.textContent, "macOS 15 or later.");
   }
+});
+
+test("enhance points the button at the DMG and keeps the requirements", async () => {
+  const { button, note } = fresh();
+  await enhance(button, note, async () => response(valid()));
+  assert.equal(button.href, valid().dmgUrl);
+  assert.equal(note.textContent, "macOS 15 or later. Version 1.2.3 (build 45).");
 });

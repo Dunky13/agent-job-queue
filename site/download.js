@@ -1,12 +1,13 @@
 // Points the download button at the latest DMG named by same-origin latest.json.
 // Any failure leaves the default releases link in place.
-const RELEASES_PREFIX = "/Dunky13/agent-job-queue/releases/";
+const REPO = "/Dunky13/agent-job-queue/releases/";
 const STRING_FIELDS = ["version", "commit", "tag", "publishedAt", "releaseUrl", "dmgUrl", "dmgSha256", "zipUrl", "zipSha256"];
 
-function isReleaseUrl(value) {
+// https on github.com, no credentials or port, path under prefix and ending in suffix.
+function isGithubUrl(value, prefix, suffix = "") {
   try {
     const url = new URL(value);
-    return url.protocol === "https:" && url.hostname === "github.com" && url.username === "" && url.password === "" && url.port === "" && url.pathname.startsWith(RELEASES_PREFIX);
+    return url.protocol === "https:" && url.hostname === "github.com" && url.username === "" && url.password === "" && url.port === "" && url.pathname.startsWith(REPO + prefix) && url.pathname.endsWith(suffix);
   } catch {
     return false;
   }
@@ -20,25 +21,27 @@ export function parseLatest(data) {
     if (typeof data[field] !== "string" || data[field] === "") return null;
   }
   if (!Number.isInteger(data.build) || data.build < 1) return null;
-  if (!isReleaseUrl(data.releaseUrl) || !isReleaseUrl(data.dmgUrl) || !isReleaseUrl(data.zipUrl)) return null;
+  if (!isGithubUrl(data.releaseUrl, "tag/") || !isGithubUrl(data.dmgUrl, "download/", ".dmg") || !isGithubUrl(data.zipUrl, "download/", ".zip")) return null;
   if (!/^[0-9a-f]{64}$/.test(data.dmgSha256) || !/^[0-9a-f]{64}$/.test(data.zipSha256)) return null;
   return { version: data.version, build: String(data.build), dmgUrl: data.dmgUrl };
 }
 
-async function enhance() {
-  const button = document.querySelector("[data-download]");
-  const note = document.querySelector("[data-download-note]");
-  if (!button || !note) return;
+// Any failure leaves the button and note untouched.
+export async function enhance(button, note, fetchFn = fetch) {
   try {
-    const response = await fetch("latest.json", { cache: "no-cache" });
+    const response = await fetchFn("latest.json", { cache: "no-cache" });
     if (!response.ok) return;
     const latest = parseLatest(await response.json());
     if (!latest) return;
     button.href = latest.dmgUrl;
-    note.textContent = `Version ${latest.version} (build ${latest.build})`;
+    note.textContent = `${note.textContent} Version ${latest.version} (build ${latest.build}).`;
   } catch {
     // Keep the default link.
   }
 }
 
-if (typeof document !== "undefined") void enhance();
+if (typeof document !== "undefined") {
+  const button = document.querySelector("[data-download]");
+  const note = document.querySelector("[data-download-note]");
+  if (button && note) void enhance(button, note);
+}
