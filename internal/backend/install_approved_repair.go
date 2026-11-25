@@ -240,7 +240,7 @@ func (install *installer) repairAndExecute(ctx context.Context) error {
 	if !previous {
 		// Automatic setup tolerates customized legacy service settings, which it
 		// backs up and retires. The operator reviews them first, so stop before any
-		// change. Definitions Go restores later are absent here and stay exempt.
+		// change. Definitions Go restored use only standard values and pass.
 		report := inspect(run)
 		if err := run.Err(); err != nil {
 			return err

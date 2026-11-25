@@ -797,8 +797,10 @@ struct BootstrapTests {
         }) { approvedCompletions += 1 }
         await ordinary.start()?.value
         let ordinaryInstalls = await ordinaryExecutor.installations
+        let ordinaryRepairs = await ordinaryExecutor.requests.filter { $0.arguments.contains("--repair-and-continue") }.count
         try check(ordinary.phase == .reviewing && ordinary.message == "Review these requirements before continuing." &&
-            ordinary.issues == [configIssue] && ordinaryInstalls == 0,
+            ordinary.issues == [configIssue] && ordinaryInstalls == 0 && ordinaryRepairs == 1 &&
+            ordinary.output.contains("Automatic setup requires review"),
             "An ordinary launch stopped for review shows the requirements and installs nothing")
 
         let waitingRepairFixture = try fixture()

@@ -10,7 +10,7 @@ The setup window's "Repair and continue" used a Swift copy of the approved-repai
 - The window gets the final installation, legacy service backup and approval or relocation waits by construction, and issues no separate plain install.
 - Progress lines name the repair by its human title. The window's headline follows the last progress line.
 - The button is offered whenever requirements are listed and no action is running; the controller decides and reports.
-- Ordinary launches no longer pre-check the mapping in Swift. Go does it instead: before changing anything, `--repair-and-continue` checks the plain preflight report and every legacy service definition present, so customized legacy service settings, which automatic setup would back up and retire, still stop for review (owner decision, 25 November 2026). The legacy definition check now treats the standard environment values that restoring a missing definition writes as standard, so definitions Go restores are still retired automatically.
+- Ordinary launches no longer pre-check the mapping in Swift. Go does it instead: before changing anything, `--repair-and-continue` checks the plain preflight report and every legacy service definition present, so customized legacy service settings, which automatic setup would back up and retire, still stop for review (owner decision, 25 November 2026). The legacy definition check now treats the standard environment values that restoring a missing definition accepts (for example a `PATH` of system directories only, in any order) as standard, so definitions Go restores, and hand-edited ones that use only those values, are still retired automatically.
 
 ## Evidence
 
