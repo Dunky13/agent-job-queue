@@ -15,7 +15,7 @@ The Homebrew cask and the Sparkle appcast are now committed to this repository's
 
 ## Human steps still required
 
-1. Generate the EdDSA key and store it as the Actions secret without pasting it anywhere: run `"$dir/bin/generate_keys"`, then `"$dir/bin/generate_keys" -x sparkle-private-key`, then `gh secret set SPARKLE_ED_PRIVATE_KEY --repo Dunky13/agent-job-queue < sparkle-private-key`, then `rm sparkle-private-key` (`dir` is the output of `packaging/sparkle/fetch.sh "$TMPDIR/sparkle"`). Commit the public key to `packaging/sparkle/public-ed-key.txt` (package A).
+1. Generate the EdDSA key and store it as the Actions secret without pasting it anywhere: run `"$dir/bin/generate_keys"`, then `"$dir/bin/generate_keys" -x sparkle-private-key`, then `gh secret set SPARKLE_ED_PRIVATE_KEY --repo Dunky13/agent-job-queue < sparkle-private-key`, then `rm sparkle-private-key` (`dir` is the output of `packaging/sparkle/fetch.sh "$TMPDIR/sparkle"`). Commit the public key (one base64 line) to `packaging/sparkle/public-ed-key.txt` (package A). It must exist before the first delivery: the job verifies both Sparkle signatures against it and fails if the file is missing, malformed or does not match the secret.
 2. Install the Homebrew-sync App on this repository with **Contents: Read and write**, and add it as a bypass actor on the `main` and `main-ci` rulesets. Keep the existing `HOMEBREW_SYNC_APP_CLIENT_ID` variable and `HOMEBREW_SYNC_APP_PRIVATE_KEY` secret.
 3. After the first successful delivery: disable the old tap's refresh workflow, then archive `homebrew-agent-job-queue` with a pointer here.
 4. Acceptance gate: once two Sparkle builds are published, update from build N to N+1 on the SentinelOne Mac.
