@@ -1,17 +1,18 @@
-# Spec: Sparkle updates and in-repository Homebrew tap
+# Spec: Sparkle updates, GitHub Pages feed and homepage
 
-Decisions: [ADR 0001](../adr/0001-sparkle-updates-in-place.md) and [ADR 0002](../adr/0002-homebrew-tap-in-source-repository.md). The pinned Sparkle 2.10.1 download is `packaging/sparkle/fetch.sh`, which verifies its SHA-256 and prints the extracted directory. Both packages use it, so don't add another download path.
+Decisions: [ADR 0001](../adr/0001-sparkle-updates-in-place.md) and [ADR 0003](../adr/0003-drop-homebrew-feed-on-github-pages.md), which supersedes ADR 0002. The pinned Sparkle 2.10.1 download is `packaging/sparkle/fetch.sh`, which verifies its SHA-256 and prints the extracted directory. All packages use it, so don't add another download path.
 
-This work ships as two pull requests that are developed in parallel and merged in this order:
+This work ships as stacked pull requests, merged in this order:
 
-1. **B (tap and feed)**.
-2. **A (Sparkle in the app)**. Merging A first would ship builds whose feed returns 404.
+1. **B (drop Homebrew, Pages delivery)**.
+2. **C (homepage)**, the `site/` content B deploys.
+3. **A (Sparkle in the app)**. Merging A before B would ship builds whose feed returns 404.
 
 ## Rules for both packages
 
 - Follow `AGENTS.md` and `CONTRIBUTING.md`: Conventional Commits, signed commits with DCO sign-off, no em dashes, and no machine-local paths.
 - Run heavy validation through `agent-heavy run --label '...' -- <cmd>`, with at most 2 Go workers (`-p 2`).
-- Keep `agent-job-queue.json`, the release asset names and the publish script's fixed `names=(...)` list unchanged. Installed builds use them for their last manual hop to the first Sparkle build.
+- Keep `agent-job-queue.json` and the ZIP and DMG asset names unchanged; only `agent-job-queue.rb` is dropped from the publish script's `names=(...)` list. Installed builds use them for their last manual hop to the first Sparkle build.
 - Keep the signing, notarization, checkpoint and resume flow fail-closed. Don't weaken any existing test or check. Update tests that pin shapes you deliberately change, such as `internal/tooling/workflow_test.go`.
 - Where docs or tests contradict this spec, update them to match. That includes every statement that the updater never writes into Applications, that it quarantines its copy, that it delivers to Downloads, or that `agent-heavy updates` exists.
 
@@ -30,7 +31,7 @@ This work ships as two pull requests that are developed in parallel and merged i
 
 - `scripts/build-app.sh` copies `Sparkle.framework` into `Contents/Frameworks` with `ditto`, preserving the symlinks. It then deletes `XPCServices` (the app is not sandboxed) and `PrivateHeaders`, `Headers` and `Modules` (not needed at runtime).
 - It adds these `Info.plist` keys:
-  - `SUFeedURL` = `https://raw.githubusercontent.com/Dunky13/agent-job-queue/main/appcast.xml`.
+  - `SUFeedURL` = `https://dunky13.github.io/agent-job-queue/appcast.xml`.
   - `SUPublicEDKey` from the committed file `packaging/sparkle/public-ed-key.txt`, one base64 line.
   - `SURequireSignedFeed` = true.
   - `SUVerifyUpdateBeforeExtraction` = true.
@@ -89,63 +90,63 @@ This work ships as two pull requests that are developed in parallel and merged i
 - Delegate refuses while the marker exists.
 - Undrain runs only with the flow's marker.
 
-## B: Tap and feed on main
+## B: Drop Homebrew and deliver through GitHub Pages
 
-### Repository layout
+### Removals
 
-- Add `Casks/agent-job-queue.rb` and `Casks/agent-job-queue.json` with the current content of `Dunky13/homebrew-agent-job-queue` at branch `tap`. Fetch them with `gh api`.
-- The cask template gains `auto_updates true`.
+- `Casks/`, cask rendering (`tooling.RenderCask` and its callers), `packaging/homebrew/`, the Homebrew DSL checks and the notarized Homebrew install test in `distribution.yml`, and the cask-only tests (`managed_cask_*`, `notarized_cask_test.go`, `homebrew_lifecycle_test.go` and the cask parts of other tests).
+- `agent-job-queue.rb` as a release asset. Remove it from `scripts/distribution-publish.sh` and its tests.
+- The GitHub App token step, `createCommitOnBranch`, the CAS and readback code, and the CI `paths-ignore` guard.
+- Keep runtime handling of Homebrew-installed apps in `internal/backend` and `internal/remote`, and its tests. Rename nothing there.
 
-### Delivery
+### Delivery job (`Publish Sparkle feed and homepage`, `macos-15`)
 
-- Replace the tap dispatch (the `Verify Homebrew delivery` job, `cmd/queue-delivery` and `internal/delivery`) with an in-repository delivery job on `macos-15`.
-- Reuse `packaging/homebrew/refresh.go` logic, moved into a normal package with its tests. Delete the parity and sync tooling, which no longer has a second repository to match.
-- The job:
-  1. Verifies the published release and ZIP checksum, as `refresh.go` does.
-  2. Selects the highest published build and never regresses.
-  3. Renders the cask and checks it through the real Homebrew DSL.
-  4. Signs the published ZIP with `sign_update --ed-key-file - -p`. The secret `SPARKLE_ED_PRIVATE_KEY` goes in on stdin only, never as an argument or in logs.
-  5. Renders `appcast.xml` with one item for that build:
-     - `sparkle:version` = build number.
-     - `sparkle:shortVersionString` = version.
-     - `sparkle:minimumSystemVersion` = `15.0`.
-     - `enclosure` with the immutable release ZIP URL, its `length`, `type="application/octet-stream"` and `sparkle:edSignature`.
-     - The release page as `link`.
-  6. Signs the feed with `sign_update --ed-key-file - <appcast.xml>`.
-  7. Commits all three files in one GitHub-signed `createCommitOnBranch` on `main`. The commit uses the App token (`contents: write` on this repository only), the DCO trailer and `expectedHeadOid`.
-     - On a head mismatch caused by a concurrent merge, it re-reads `main` and retries a bounded number of times.
-     - If `main` already has identical content, it verifies and makes no commit.
-  8. Reads the commit back by SHA: content, signature verified, author.
-- A missing secret, App configuration or App permission fails the job visibly, with a pointer to the docs.
-- `scripts/distribution-recover.sh` keeps its retry classification for the renamed delivery job.
+1. Bind the public release to this run's notarized artifact (the existing `bindArtifact`), and select the newest build. An older run reports "Superseded" and deploys nothing.
+2. Fetch the live `https://dunky13.github.io/agent-job-queue/latest.json`. If it names a newer build, report "Superseded". If it names the same build with identical feed content (signatures ignored), report "Already current" and skip the deploy. Only a missing site (404) counts as empty; any other fetch failure fails the job.
+3. Sign the ZIP and render and sign `appcast.xml` as now. Verify both signatures against `packaging/sparkle/public-ed-key.txt` with `crypto/ed25519` as now. The key goes on stdin only.
+4. Write `latest.json` with strict fields: `schemaVersion`, `version`, `build`, `commit`, `tag`, `publishedAt`, `releaseUrl`, `dmgUrl`, `dmgSha256`, `zipUrl`, `zipSha256`. Use the manifest and the release.
+5. Assemble the site: copy `site/` from the automation commit, then add `appcast.xml` and `latest.json`. The assembler refuses anything outside `site/`, and refuses symlinks and files over a size bound.
+6. Deploy with SHA-pinned `actions/upload-pages-artifact` and `actions/deploy-pages`. Use job permissions `pages: write` and `id-token: write`, plus `contents: read`, in the `github-pages` environment. Pass the Sparkle secret only to the signing step.
+7. Read back: the live `latest.json` names this build, and the live `appcast.xml` parses and verifies against the public key. Retry the readback for a bounded time to allow for Pages propagation.
 
-### CI loop guard
-
-`.github/workflows/ci.yml` push to `main` uses `paths-ignore: ['Casks/**', 'appcast.xml']`. Leave `pull_request` unfiltered so required checks still report on PRs.
+- `scripts/distribution-recover.sh` classifies the renamed job as `delivery` and keeps accepting the old job names for historical runs.
+- The workflow-shape and secret-leak tests are updated for the new job.
 
 ### Docs
 
-- Rewrite `docs/homebrew-delivery.md`, and its HTML, covering:
-  - The new tap command.
-  - `brew tap --custom-remote` migration.
-  - App setup: install the App on this repository, and add it as bypass actor on the `main` and `main-ci` rulesets.
-  - The EdDSA secret.
+- Replace `docs/homebrew-delivery.md` and its HTML with `docs/pages-delivery.md` and its HTML. Cover:
+  - Enabling Pages with source "GitHub Actions".
+  - The EdDSA key commands.
   - Recovery.
-- README install instructions.
-- Add a handoff in `docs/handoffs/in-repo-tap.md`.
+  - What existing Homebrew users do: nothing is required, since Sparkle updates the app. `brew untap dunky13/agent-job-queue` is optional, and they must never run `brew uninstall`, which deletes the app.
+- README install instructions: the homepage, the DMG and the release page.
+- Update `CONTRIBUTING.md`, `apple-signing.md`, `upgrade-recovery.md` and their HTML where they mention Homebrew delivery.
+- Replace `docs/handoffs/in-repo-tap.md` with `docs/handoffs/pages-delivery.md`.
+- Leave historical handoffs untouched.
 
 ### Tests
 
-- Appcast rendering against a golden file.
-- The signature step never puts the key on argv. Test this with an inert fake `sign_update`.
-- CAS retry on head mismatch.
-- No commit on identical content.
-- Workflow shape tests updated.
+- The superseded and already-current paths: a live newer build, the same build, a 404 counting as empty, and other fetch errors failing.
+- The `latest.json` golden file.
+- The assembler rejects files outside `site/`, symlinks and oversized files.
+- Readback mismatches fail.
+- Existing signing, artifact-binding and leak-guard tests are kept.
+
+## C: Homepage (`site/`)
+
+- A static, dependency-free homepage in `site/`: `index.html`, CSS, and images optimized from `docs/screenshots` and the app icon. No build step, no external fonts, scripts or trackers, and nothing fetched from third-party origins.
+- **Content:**
+  - What Agent Queue is: a macOS menu-bar queue for heavy agent commands, with adaptive scheduling, learning and phone access. Take facts only from `README.md` and `docs/`; invent no claims.
+  - A primary **Download for macOS** button.
+  - Requirements: macOS 15 or later, Apple Silicon and Intel.
+  - Screenshots, a short "how it works", the CLI basics (`agent-heavy run ...`), and links to the GitHub repo, the docs on GitHub, the releases and the license.
+- **Download button:** the button's `href` is the release page by default. A small script fetches same-origin `latest.json`, validates its shape, and then points the button at `dmgUrl`, showing the version and build. If the fetch or validation fails, the button keeps the release-page link.
+- **Accessibility and quality:** semantic HTML, keyboard and screen-reader accessible, responsive from 360 px to wide desktop, light and dark via `prefers-color-scheme`, reduced motion respected, real `alt` text, good contrast, fast with no layout shift, and correct `<title>`, description and Open Graph tags.
+- **Tests:** a lightweight check, in Go or the existing web test tooling, that `site/` has no external origins, every local link and image resolves, and the `latest.json` handling has fallback behavior. Use the repo's existing lint for HTML, CSS and JS where configured.
 
 ## Human-only steps (not done by agents)
 
-1. Generate the EdDSA key and commit the public key to `packaging/sparkle/public-ed-key.txt`.
-2. Store the private key as the Actions secret `SPARKLE_ED_PRIVATE_KEY`.
-3. Install the Homebrew-sync App on this repository and add it as a bypass actor on the `main` and `main-ci` rulesets.
-4. After B is live: disable the old tap's refresh workflow, then archive `homebrew-agent-job-queue`.
-5. The acceptance gate: once two Sparkle builds are published, update Agent Queue from build N to N+1 on the SentinelOne Mac.
+1. Generate the EdDSA key, store the private key as the Actions secret `SPARKLE_ED_PRIVATE_KEY`, and give the public key for `packaging/sparkle/public-ed-key.txt`.
+2. Enable GitHub Pages with source "GitHub Actions".
+3. After the first successful deployment: disable the old tap's refresh workflow, add the README notice, and archive `homebrew-agent-job-queue`.
+4. Acceptance gate: once two Sparkle builds are published, update Agent Queue from build N to N+1 on the SentinelOne Mac.

@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0003
 ---
 
 # The Homebrew tap and Sparkle feed live on this repository's main branch
