@@ -367,7 +367,9 @@ jobs:
           permission-contents: write
       - name: Fetch the pinned Sparkle signing tool
         id: sparkle
-        run: echo "dir=$(packaging/sparkle/fetch.sh "$RUNNER_TEMP/sparkle")" >> "$GITHUB_OUTPUT"
+        run: |
+          dir=$(packaging/sparkle/fetch.sh "$RUNNER_TEMP/sparkle")
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
       - name: Publish the verified cask and signed Sparkle feed to main
         shell: bash
         env:

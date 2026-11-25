@@ -24,7 +24,7 @@ The Homebrew cask and the Sparkle appcast are now committed to this repository's
 
 - The first run after merge commits the new template (`auto_updates true`) and `appcast.xml` for the build already on `main`, because the seed predates both. Later runs with identical content create no commit.
 - A delivery for build N when build N+1 is already public delivers N+1 (superseded), after verifying release ancestry.
-- The publish step sets `HOMEBREW_NO_INSTALL_FROM_API=1` so `brew ruby` can load a cask from a path.
+- The publish step sets `HOMEBREW_NO_INSTALL_FROM_API=1`, mirroring the cask test harness environment; this could not be confirmed locally, see below.
 - The commit author is expected to be `<app-slug>[bot]` with email `<bot id>+<app-slug>[bot]@users.noreply.github.com`, computed in the job; the readback fails visibly if GitHub attributes the commit differently.
 
 ## Not verified

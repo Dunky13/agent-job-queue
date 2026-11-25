@@ -18,7 +18,7 @@ brew tap --custom-remote dunky13/agent-job-queue https://github.com/Dunky13/agen
 brew update
 ```
 
-The cask declares `auto_updates true` because Sparkle updates the app in place. `brew upgrade` only replaces the app when the cask version moves ahead of the installed one, or with `--greedy`.
+The cask declares `auto_updates true` because Sparkle updates the app in place. A bare `brew upgrade` skips casks that declare it unless `--greedy` is given; `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` names the cask and upgrades it.
 
 ## Delivery contract
 

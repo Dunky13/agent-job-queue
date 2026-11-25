@@ -3,6 +3,7 @@ package tap
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -59,7 +60,7 @@ func deliveryFiles(t testing.TB, data manifest) files {
 	}
 	body, _ := json.MarshalIndent(data, "", "  ")
 	archive := fmt.Sprintf("archive-%d", data.Build)
-	return files{caskPath: []byte(cask), manifestPath: append(body, '\n'), appcastPath: []byte(renderAppcast(data, int64(len(archive)), testSignature) + "<!-- signed -->\n")}
+	return files{caskPath: []byte(cask), manifestPath: append(body, '\n'), appcastPath: []byte(renderAppcast(data, int64(len(archive)), testSignature) + "<!-- sparkle-signatures:\nedSignature: test\n-->\n")}
 }
 
 type fixture struct {
@@ -173,7 +174,7 @@ func newFixture(t *testing.T) *fixture {
 			if err != nil {
 				return nil, err
 			}
-			return nil, os.WriteFile(path, append(body, "<!-- signed -->\n"...), 0600)
+			return nil, os.WriteFile(path, append(body, "<!-- sparkle-signatures:\nedSignature: test\n-->\n"...), 0600)
 		}
 		return nil, fmt.Errorf("unexpected fixture command %v", arguments)
 	}
@@ -351,7 +352,7 @@ func TestSignerReceivesKeyOnStdinNeverArguments(t *testing.T) {
 	script := `#!/bin/bash
 printf '%s\n' "$@" >> "$FAKE_ARGS"
 cat >> "$FAKE_STDIN"
-if [[ " $* " == *" -p "* ]]; then printf '%s\n' "$FAKE_SIGNATURE"; else printf '<!-- signed -->\n' >> "${@: -1}"; fi
+if [[ " $* " == *" -p "* ]]; then printf '%s\n' "$FAKE_SIGNATURE"; else printf '<!-- sparkle-signatures:\nedSignature: test\n-->\n' >> "${@: -1}"; fi
 `
 	if err := os.WriteFile(tool, []byte(script), 0700); err != nil {
 		t.Fatal(err)
@@ -370,7 +371,7 @@ if [[ " $* " == *" -p "* ]]; then printf '%s\n' "$FAKE_SIGNATURE"; else printf '
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasSuffix(appcast, "<!-- signed -->\n") || !strings.Contains(appcast, `length="7"`) || !strings.Contains(appcast, `sparkle:edSignature="`+testSignature+`"`) {
+	if !strings.HasSuffix(appcast, "<!-- sparkle-signatures:\nedSignature: test\n-->\n") || !strings.Contains(appcast, `length="7"`) || !strings.Contains(appcast, `sparkle:edSignature="`+testSignature+`"`) {
 		t.Fatal(appcast)
 	}
 	argv, _ := os.ReadFile(args)
@@ -606,5 +607,33 @@ func TestRunRequiresPublicationConfiguration(t *testing.T) {
 	t.Setenv("TAP_BOT_EMAIL", "someone@example.invalid")
 	if err := Run([]string{"--publish", "--sign-update", "sign_update"}, io.Discard); err == nil || !strings.Contains(err.Error(), "docs/homebrew-delivery.md") {
 		t.Fatal("non-bot identity accepted", err)
+	}
+}
+
+// Opt-in: SPARKLE_SIGN_UPDATE names the real pinned sign_update. A throwaway key
+// is generated here and never leaves memory, stdin or the test.
+func TestRealSparkleSignerAcceptedAndDeterministic(t *testing.T) {
+	tool := os.Getenv("SPARKLE_SIGN_UPDATE")
+	if tool == "" {
+		t.Skip("set SPARKLE_SIGN_UPDATE to the pinned sign_update to run")
+	}
+	_, private, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	archive := filepath.Join(directory, "archive.zip")
+	if err := os.WriteFile(archive, []byte("archive"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f := newPublisher(context.Background(), directory, io.Discard)
+	f.signTool, f.signKey = tool, base64.StdEncoding.EncodeToString(private.Seed())
+	first, err := f.signedAppcast(fixtureManifest(2), archive, directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.signedAppcast(fixtureManifest(2), archive, directory)
+	if err != nil || first != second {
+		t.Fatal("real signing must be deterministic so identical content never recommits", err)
 	}
 }

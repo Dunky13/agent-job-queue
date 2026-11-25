@@ -18,7 +18,7 @@ brew install --cask dunky13/agent-job-queue/agent-job-queue
 brew update
 </code></pre>
 
-<p>The cask declares <code>auto_updates true</code> because Sparkle updates the app in place. <code>brew upgrade</code> only replaces the app when the cask version moves ahead of the installed one, or with <code>--greedy</code>.</p>
+<p>The cask declares <code>auto_updates true</code> because Sparkle updates the app in place. A bare <code>brew upgrade</code> skips casks that declare it unless <code>--greedy</code> is given; <code>brew upgrade --cask dunky13/agent-job-queue/agent-job-queue</code> names the cask and upgrades it.</p>
 
 <h2 id="delivery-contract">Delivery contract<span><a href="#delivery-contract">&para;</a> <a href="#top">&uarr;</a></span></h2>
 

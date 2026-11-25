@@ -368,7 +368,7 @@ administration credential is required. The same complete assets are checked agai
 after publication. An existing identical public release is verified read-only;
 a conflicting draft, tag or asset fails closed. Unfinished provider uploads are
 retained for explicit reconciliation. Homebrew delivery remains a separate
-exact-build gate using the existing narrowly scoped App token and trusted tap.
+exact-build gate using the Homebrew-sync App token scoped to this repository.
 
 ## Local use
 
@@ -412,9 +412,8 @@ Do not submit the same pending build repeatedly to try to accelerate processing.
 The notarized app runs setup itself on first launch and executes its signed Go
 helpers from inside the bundle. New Homebrew casks deliver only the app, with no
 installer script or setup hook; the user opens it to finish setup. The cask
-preserves quarantine. Historical ad hoc casks remain unchanged until the next numbered release; the trusted tap
-helper validates their original cask as bounded data. Merge the companion trusted
-tap update before the source release, as documented in [Homebrew delivery](homebrew-delivery.md).
+preserves quarantine. After publication, the distribution workflow commits the verified cask and
+signed Sparkle feed to `main`, as documented in [Homebrew delivery](homebrew-delivery.md).
 
 Acceptance requires valid signatures on the app, both bundled helpers and the DMG, Apple
 acceptance and logs for both stages, valid stapled tickets on the app and DMG,

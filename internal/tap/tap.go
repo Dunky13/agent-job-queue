@@ -513,8 +513,12 @@ func (f *publisher) signedAppcast(data manifest, archive, work string) (string, 
 	if err != nil {
 		return "", err
 	}
-	if !bytes.HasPrefix(signed, []byte(unsigned)) || len(signed) == len(unsigned) {
-		return "", errors.New("The Sparkle signing tool did not sign the feed")
+	// Sparkle re-serializes the XML and appends its signature comment, so the
+	// signed feed is checked for that signature and for the release identity.
+	for _, required := range []string{"sparkle-signatures:", "edSignature: ", fmt.Sprintf("<sparkle:version>%d</sparkle:version>", data.Build), fmt.Sprintf(`sparkle:edSignature="%s"`, signature), fmt.Sprintf("/download/%s/%s\"", data.Tag, data.Asset)} {
+		if !bytes.Contains(signed, []byte(required)) {
+			return "", errors.New("The Sparkle signing tool did not produce the expected signed feed")
+		}
 	}
 	return string(signed), nil
 }
