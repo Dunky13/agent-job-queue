@@ -10,7 +10,7 @@ This work ships as two pull requests that are developed in parallel and merged i
 ## Rules for both packages
 
 - Follow `AGENTS.md` and `CONTRIBUTING.md`: Conventional Commits, signed commits with DCO sign-off, no em dashes, and no machine-local paths.
-- Run heavy validation through `/Users/developwent/.local/bin/agent-heavy run --label '...' -- <cmd>`, with at most 2 Go workers (`-p 2`).
+- Run heavy validation through `agent-heavy run --label '...' -- <cmd>`, with at most 2 Go workers (`-p 2`).
 - Keep `agent-job-queue.json`, the release asset names and the publish script's fixed `names=(...)` list unchanged. Installed builds use them for their last manual hop to the first Sparkle build.
 - Keep the signing, notarization, checkpoint and resume flow fail-closed. Don't weaken any existing test or check. Update tests that pin shapes you deliberately change, such as `internal/tooling/workflow_test.go`.
 - Where docs or tests contradict this spec, update them to match. That includes every statement that the updater never writes into Applications, that it quarantines its copy, that it delivers to Downloads, or that `agent-heavy updates` exists.
