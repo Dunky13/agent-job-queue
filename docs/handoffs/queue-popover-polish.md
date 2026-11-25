@@ -17,6 +17,7 @@ The operator reported that the menu-bar popover felt cramped and jumped, skipped
 
 - **Native suite:** `scripts/test-native.sh` passes, including the new row-summary checks in `BehaviorTests`.
 - **Menu-bar UI suite:** `native/tests/run-menu-bar-ui-tests.sh` passes, including the inverted focus check and the held-title checks. Its eight system-click checks skip on hosts without event-posting permission.
+- **Resume UI fixture:** the list is no longer a table, so `ResumeUITests` clicks the paused banner's Resume button relative to the list's scroll content and checks that the content shrinks after resume. `native/tests/run-resume-ui-tests.sh` passes all ten checks locally; hosted CI first failed on "Paused fixture list missing".
 - **Screenshots:** `scripts/capture-native-screenshots.sh` regenerated `mac-queue.png` and `mac-start-now.png`.
 - **Reviews:** independent Standards and Spec reviews ran on the change, and their findings were fixed before delivery.
 
