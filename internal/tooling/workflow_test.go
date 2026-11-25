@@ -540,8 +540,10 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 		if item.Env["SPARKLE_ED_PRIVATE_KEY"] != "" && item.Name != "Publish the verified cask and signed Sparkle feed to main" {
 			t.Errorf("Sparkle key leaked into step %q", item.Name)
 		}
-		if strings.Contains(item.Run, "SPARKLE_ED_PRIVATE_KEY") && strings.Contains(item.Run, "echo") {
-			t.Errorf("step %q may print the key", item.Name)
+		for _, line := range strings.Split(item.Run, "\n") {
+			if strings.Contains(line, "echo") && (strings.Contains(line, "$SPARKLE") || strings.Contains(line, "secrets.")) {
+				t.Errorf("step %q may print the key: %s", item.Name, line)
+			}
 		}
 	}
 	if token == nil || token.With["repositories"] != "agent-job-queue" || token.With["permission-contents"] != "write" || len(token.With) != 5 {
