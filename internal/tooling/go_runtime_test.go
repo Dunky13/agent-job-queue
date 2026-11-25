@@ -574,7 +574,8 @@ func TestGoRuntimeCoreShardsBalanceMeasuredWeights(t *testing.T) {
 			t.Fatalf("%s: %v: %s", shard.scope, err, output)
 		}
 		want := [][]string{{"test", "-p", "2", "-parallel", "2", "-race", "-v", goRuntimeModule + "/internal/backend", "-run", shard.pattern, "-timeout", "12m"}}
-		if got := goRuntimeTestCalls(t, root); !reflect.DeepEqual(got, want) || !strings.Contains(output, shard.weights) {
+		if got := goRuntimeTestCalls(t, root); !reflect.DeepEqual(got, want) || !strings.Contains(output, shard.weights) ||
+			!strings.Contains(output, "Backend weights: 1 recorded tests are no longer listed") {
 			t.Fatalf("%s did not balance measured weights: got %q, want %q: %s", shard.scope, got, want, output)
 		}
 	}
@@ -582,21 +583,24 @@ func TestGoRuntimeCoreShardsBalanceMeasuredWeights(t *testing.T) {
 
 func TestGoRuntimeCoreShardsRefuseInvalidWeights(t *testing.T) {
 	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n" + goRuntimeModule + "/internal/remote\n"
-	for _, test := range []struct{ name, weights string }{
-		{"missing file", ""},
-		{"zero", "TestAlpha\t0\n"},
-		{"fraction", "TestAlpha\t1.5\n"},
-		{"space separated", "TestAlpha 10\n"},
-		{"extra field", "TestAlpha\t10\t1\n"},
-		{"duplicate", "TestAlpha\t10\nTestAlpha\t20\n"},
-		{"benchmark", "BenchmarkAlpha\t10\n"},
-		{"unsafe name", "TestAlpha|TestBeta\t10\n"},
+	for _, test := range []struct {
+		name, weights string
+		missing       bool
+	}{
+		{"missing file", "", true},
+		{"zero", "TestAlpha\t0\n", false},
+		{"fraction", "TestAlpha\t1.5\n", false},
+		{"space separated", "TestAlpha 10\n", false},
+		{"extra field", "TestAlpha\t10\t1\n", false},
+		{"duplicate", "TestAlpha\t10\nTestAlpha\t20\n", false},
+		{"benchmark", "BenchmarkAlpha\t10\n", false},
+		{"unsafe name", "TestAlpha|TestBeta\t10\n", false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			for _, scope := range []string{"core-1", "core-2"} {
 				config := goRuntimeDefaultConfig(packages, "0", "0")
 				config.inventory = "TestAlpha\nTestBeta\n" + goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary
-				config.weights, config.missingWeights = test.weights, test.weights == ""
+				config.weights, config.missingWeights = test.weights, test.missing
 				root, err, output := goRuntimeConfiguredFixture(t, config, scope)
 				var exit *exec.ExitError
 				if !errors.As(err, &exit) || !strings.Contains(strings.ToLower(output), "backend weight") || len(goRuntimeTestCalls(t, root)) != 0 {

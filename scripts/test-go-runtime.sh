@@ -66,8 +66,8 @@ while IFS= read -r package || [[ -n "$package" ]]; do
     runtime+=("$package")
   elif [[ "$package" == "$backend" ]]; then
     if [[ "$scope" != https ]]; then runtime+=("$package"); fi
-  # The other runtime packages share the HTTPS job's race-built caddy dependencies.
   elif [[ "$scope" == https ]]; then
+    # The other runtime packages share the HTTPS job's race-built caddy dependencies.
     runtime+=("$package")
   fi
 done <<< "$packages"
@@ -153,25 +153,32 @@ if [[ "$scope" == core || "$scope" == core-1 || "$scope" == core-2 ]]; then
         while ((status = (getline line < weights)) > 0) {
           if (line == "" || line ~ /^#/) continue
           if (split(line, field, "\t") != 2 || field[1] !~ /^(Test|Example|Fuzz)[a-zA-Z0-9_]*$/ || field[2] !~ /^[1-9][0-9]*$/ || field[1] in weight) {
-            print "Invalid backend weight record: " line > "/dev/stderr"; exit 2
+            print "Invalid backend weight record: " line > "/dev/stderr"; failed = 1; exit 2
           }
           weight[field[1]] = field[2]
         }
-        if (status < 0) { print "Backend weights are unreadable: " weights > "/dev/stderr"; exit 2 }
+        if (status < 0) { print "Backend weights are unreadable: " weights > "/dev/stderr"; failed = 1; exit 2 }
       }
-      { print ($0 in weight ? weight[$0] : 1000) "\t" $0 "\t" ($0 in weight ? "" : "unweighted") }' |
+      { listed[$0] = 1; print ($0 in weight ? weight[$0] : 1000) "\t" $0 "\t" ($0 in weight ? "" : "unweighted") }
+      END {
+        # exit in BEGIN still runs END.
+        if (failed) exit 2
+        for (name in weight) if (!(name in listed)) stale++
+        printf "Backend weights: %d recorded tests are no longer listed\n", stale > "/dev/stderr"
+      }' |
       LC_ALL=C sort -t "$tab" -k1,1nr -k2,2 |
       LC_ALL=C awk -F '\t' '{ if (first <= second) { first += $1; part = 1 } else { second += $1; part = 2 }; print part "\t" $2 "\t" $3 }
         END { printf "sums\t%d\t%d\n", first, second }')
     selected=()
     sums=()
     unweighted=0
-    while IFS="$tab" read -r part name detail; do
-      if [[ "$part" == sums ]]; then
-        sums=("$name" "$detail")
-      elif [[ "$part" == "$shard" ]]; then
-        selected+=("$name")
-        if [[ "$detail" == unweighted ]]; then unweighted=$((unweighted + 1)); fi
+    # Records are "shard, test, unweighted marker", then "sums, first, second".
+    while IFS="$tab" read -r first second third; do
+      if [[ "$first" == sums ]]; then
+        sums=("$second" "$third")
+      elif [[ "$first" == "$shard" ]]; then
+        selected+=("$second")
+        if [[ "$third" == unweighted ]]; then unweighted=$((unweighted + 1)); fi
       fi
     done <<< "$weighted"
     [[ ${#selected[@]} -gt 0 && ${#sums[@]} -eq 2 ]] || { printf 'Empty backend inventory shard.\n' >&2; exit 1; }

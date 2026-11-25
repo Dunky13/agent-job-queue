@@ -21,7 +21,8 @@ Local `core` now means the unsharded backend only. `core` + `https` + `installer
 ## Validation
 
 - `go test -p 2 ./internal/tooling -run 'TestMacOS|TestWorkflow|TestValidateBatch|TestDistribution|TestNotarization|TestGoRuntime|TestStage'` passed.
-- New tests cover the measured-weight split, the per-shard unweighted count, stale and missing weights, and refusal of malformed weights before any test runs. Updated tests pin the two `https` invocations and the backend-only core.
+- `TestGoCachesAreRestoredPerJobAndSavedOnlyFromMain` requires every Go job to disable setup-go's cache, restore its own SHA-keyed entry, and save only last and only on main pushes. Changing one save condition makes it fail.
+- New tests cover the measured-weight split, the stale-weight count, the per-shard unweighted count, stale and missing weights, and refusal of malformed weights before any test runs. Updated tests pin the two `https` invocations and the backend-only core.
 - `actionlint`, `shellcheck` and `queue-tool check-source` passed.
 - A stub `go` run over the real 717-test inventory gave shards of 359 and 358 tests, weighted 474 585 ms and 474 584 ms, with 0 unweighted.
 - Lint and both tooling shards: see the PR description for the queued result.
@@ -31,4 +32,5 @@ Local `core` now means the unsharded backend only. `core` + `https` + `installer
 1. **After merge,** compare per-phase times on the second main run, the first one that restores a main-saved cache, on both architectures. The PR's own run is cold, because no main cache exists yet under the new keys.
 2. **Refresh `scripts/backend-test-weights.tsv`** from both core shard logs when the printed weight sums drift apart, or once the backend speedup work lands.
 3. **Watch total backend time.** It grew about 16 s per shard per week between Nov 4 and Nov 25. The remaining headroom on a slow Intel runner (about 150 s) lasts about 9 weeks unless the slow tests get faster. Faster tests are tracked separately as the backend test speed work.
-4. **`distribution.yml`** still uses setup-go's cache. It has 39% headroom, so it was left unchanged.
+4. **Check the cache budget after the first few main pushes:** `gh api repos/Dunky13/agent-job-queue/actions/cache/usage`. Every Go job saves its own entry on main, and the investigation report had suggested restore-only for the light jobs. Those light jobs compile non-race sets that no heavy job produces, so restore-only would have left them cold. Main pushes write about 17 entries. GitHub evicts unused entries after 7 days and the least recently used ones above 10 GB, so the previous main's entries go first. If eviction starts to hit the newest set, make lint, vuln, commit-policy and web-tests restore-only.
+5. **`distribution.yml`** still uses setup-go's cache. It has 39% headroom, so it was left unchanged.
