@@ -32,6 +32,14 @@ def verify_delivery_cask_contract(cask)
   end
 end
 
+# Homebrew 2026-11 stopped loading cask files by path through CaskLoader.load and
+# added from_path; older Homebrew only has load.
+def load_delivery_cask(path)
+  return Cask::CaskLoader.from_path(Pathname(path)) if Cask::CaskLoader.respond_to?(:from_path)
+
+  Cask::CaskLoader.load(Pathname(path))
+end
+
 # Allow regressions to load the contract check without running the fixture.
 return if __FILE__ != $PROGRAM_NAME
 
@@ -69,7 +77,7 @@ if ARGV[1]
 
   Cask::Caskroom.instance_variable_set(:@path, fixture/"Caskroom")
 end
-cask = Cask::CaskLoader.load(cask_path)
+cask = load_delivery_cask(cask_path)
 application = Pathname(Dir.home)/"Applications"/APP_NAME
 cask.config = Cask::Config.new(explicit: { appdir: application.dirname.to_s }) if fixture
 verify_delivery_cask_contract(cask)

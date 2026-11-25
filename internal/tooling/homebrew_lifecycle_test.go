@@ -85,7 +85,7 @@ shared_modes = [caskroom.parent, caskroom].map { |path| path.stat.mode & 0o777 }
 Cask::Caskroom.instance_variable_set(:@path, caskroom)
 
 def load_cask(fixture, build)
-  cask = Cask::CaskLoader.load(fixture/build.to_s/"agent-job-queue.rb")
+  cask = load_delivery_cask(fixture/build.to_s/"agent-job-queue.rb")
   cask.config = Cask::Config.new(explicit: { appdir: (fixture/"User With Spaces/Applications").to_s })
   verify_delivery_cask_contract(cask)
   cask
