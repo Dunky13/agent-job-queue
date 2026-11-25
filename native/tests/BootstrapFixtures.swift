@@ -284,7 +284,6 @@ actor BootstrapPreflightExecutorFixture {
     private(set) var installations = 0
     private var report: QueueBootstrapReport
     private var afterRecovery: QueueBootstrapReport
-    private var recoveryReports: [QueueBootstrapReport] = []
     private var holdNext = false
     private var held: CheckedContinuation<Void, Never>?
     private var holdNextRecovery = false
@@ -318,12 +317,11 @@ actor BootstrapPreflightExecutorFixture {
                 await withCheckedContinuation { recoveryHeld = $0 }
             }
             if failRecovery { throw ClientError.message("Fixture recovery failed ownership verification.") }
-            if !recoveryReports.isEmpty { afterRecovery = recoveryReports.removeFirst() }
             if !returnOnlyClearedRecovery { report = afterRecovery }
             return try JSONEncoder().encode(afterRecovery)
         }
         if request.arguments.contains("--repair-and-continue") && repairReviews {
-            throw ClientError.message(QueueSetupProgress.reviewMarker + "\nAgent Queue setup: Automatic setup requires review: Fixture requirement. Nothing was changed.")
+            throw ClientError.message(QueueSetupProgress.reviewMarker + "\nAgent Queue setup: Automatic setup requires review: Fixture requirement. The controller stopped before changing it.")
         }
         if request.arguments.contains("--keep-custom-callback") {
             // Stands in for the backend's approved repair; its ordering and waiting rules have Go tests.
@@ -331,7 +329,7 @@ actor BootstrapPreflightExecutorFixture {
             while waitingInRepair { try await Task.sleep(for: .milliseconds(1)) }
             if !report.issues.isEmpty {
                 mutations += 1
-                output(Data((QueueSetupProgress.installingMarker + "\nRunning verified setup repair: fixture").utf8))
+                output(Data((QueueSetupProgress.installingMarker + "\nRunning verified setup repair: Fixture repair").utf8))
                 if holdNextRecovery {
                     holdNextRecovery = false
                     await withCheckedContinuation { recoveryHeld = $0 }
@@ -352,7 +350,6 @@ actor BootstrapPreflightExecutorFixture {
 
     func update(_ report: QueueBootstrapReport) { self.report = report }
     func updateAfterRecovery(_ report: QueueBootstrapReport) { afterRecovery = report }
-    func queueRecoveryReports(_ reports: [QueueBootstrapReport]) { recoveryReports = reports }
     func holdPreflight() { holdNext = true }
     func releasePreflight() { held?.resume(); held = nil }
     var isHeld: Bool { held != nil }

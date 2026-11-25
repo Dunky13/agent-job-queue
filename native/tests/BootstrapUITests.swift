@@ -451,7 +451,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             delegate.setupWindow == nil && AppRuntime.store.fixtureMode,
             "One accepted dialog runs the controller's repair once and verifies normal startup without further intervention")
         guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Approved repair did not start the simulated queue") }
-        try snapshot(queue, name: "04-approved-startup")
+        try snapshot(queue, name: "03-approved-startup")
     }
 
     private func verifyCancellableWait(_ notification: Notification) async throws {

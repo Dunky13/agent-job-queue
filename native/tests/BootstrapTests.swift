@@ -149,6 +149,11 @@ struct BootstrapTests {
         let resumed = QueueSetupProgress.parse(QueueSetupProgress.approvalMarker + "\nWaiting\n" + QueueSetupProgress.installingMarker + "\nInstalling")
         try check(!resumed.isWaiting && !resumed.requiresServiceApproval && !resumed.output.contains("AGENT_QUEUE_"),
             "A resumed mutation clears historical waiting and approval markers")
+        try check(!QueueSetupProgress.parse("Diagnostic contains " + QueueSetupProgress.reviewMarker).requiresReview,
+            "Review hints require their exact protocol line")
+        let reviewed = QueueSetupProgress.parse(QueueSetupProgress.reviewMarker + "\nStopped\n" + QueueSetupProgress.installingMarker + "\nInstalling")
+        try check(!reviewed.requiresReview && !reviewed.output.contains("AGENT_QUEUE_"),
+            "A later installing marker overrides an earlier review marker")
 
         let stalled = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try stalled.installManaged()

@@ -352,6 +352,7 @@ func TestInstallerApprovedRepairKnownIssueContract(t *testing.T) {
 		{"custom", approvedTestIssue("custom-callback", "reset-callback"), true},
 		{"cancel", approvedTestIssue("legacy-jobs", "cancel-job", installRecoveryJob{ID: 7, Status: "Running"}), false},
 		{"negative-job", approvedTestIssue("pending-cleanup", "cleanup-job", installRecoveryJob{ID: -1, Status: "Done"}), false},
+		{"cleanup-without-jobs", approvedTestIssue("pending-cleanup", "cleanup-job"), false},
 		{"foreign-action", approvedTestIssue("service-definitions-missing", "reset-callback"), false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -374,6 +375,27 @@ func TestInstallerAutomaticCallbackRequiresExactRevisionAndNoOtherBlockers(t *te
 	report.Revision = strings.Repeat("a", 64)
 	if _, err := installApprovedNext(report); err == nil {
 		t.Fatal("automatic callback repair ignored uncertain file ownership")
+	}
+}
+
+func TestInstallerApprovedRepairUnknownIssueAfterRepairStopsForReview(t *testing.T) {
+	stage, repairs, installs := 0, 0, 0
+	err := installRunApprovedRepair(context.Background(), func(context.Context) installPreflightReport {
+		if stage == 0 {
+			return approvedTestReport(approvedTestIssue("service-definitions-missing", installRestoreServices))
+		}
+		return approvedTestReport(approvedTestIssue("unknown-ownership", "wait"))
+	}, func(context.Context, string, *int, string) error {
+		repairs++
+		stage++
+		return nil
+	}, func(context.Context) error {
+		installs++
+		return nil
+	}, func(context.Context) error { return nil }, func(string) {})
+	var review *installReviewError
+	if !errors.As(err, &review) || repairs != 1 || installs != 0 {
+		t.Fatalf("unknown requirement after a repair did not stop for review: repairs=%d installs=%d error=%v", repairs, installs, err)
 	}
 }
 
@@ -582,5 +604,27 @@ func TestInstallerApprovedRepairPriorityAndLimit(t *testing.T) {
 	}, func(context.Context) error { t.Fatal("unexpected wait"); return nil }, func(string) {})
 	if err == nil || mutations != 128 || !strings.Contains(err.Error(), "repair limit") {
 		t.Fatalf("unbounded repair work: mutations=%d error=%v", mutations, err)
+	}
+}
+
+func TestInstallerAutomaticSetupStopsForCustomizedLegacyServiceOptions(t *testing.T) {
+	m := managedTestFixture(t)
+	m.legacy(t)
+	filename := filepath.Join(m.installer.launch, "io.went.agent-resources.plist")
+	definition, err := updatePlist(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition["ThrottleInterval"] = 30
+	if err := m.installer.writePlist(filename, definition); err != nil {
+		t.Fatal(err)
+	}
+	before := installTreeWitness(t, m.installer.home)
+	var review *installReviewError
+	if err := m.installer.repairAndExecute(context.Background()); !errors.As(err, &review) {
+		t.Fatalf("customized legacy service options were retired without review: %v", err)
+	}
+	if !reflect.DeepEqual(before, installTreeWitness(t, m.installer.home)) {
+		t.Fatal("review stop changed installation files")
 	}
 }

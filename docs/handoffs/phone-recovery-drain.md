@@ -27,4 +27,4 @@
 ## Next steps
 
 1. Merge after hosted CI passes and the operator approves.
-2. Move the setup window's repair onto `agent-heavy install --repair-and-continue`, with a flag that holds back callback replacement, and delete the Swift loop in `native/AgentBootstrap.swift`.
+2. (Done by the approved-repair-owner follow-up, see `approved-repair-owner.md`.) Move the setup window's repair onto `agent-heavy install --repair-and-continue`, with a flag that holds back callback replacement, and delete the Swift loop in `native/AgentBootstrap.swift`.

@@ -609,7 +609,7 @@ final class QueueBootstrapModel: ObservableObject {
                     request = setup
                     serviceSetupRequest = setup
                     if try await preflight(setup, current: current, automatic: true) {
-                        try await install(setup.repairAndContinue,
+                        try await install(environment.arguments.contains("--setup") ? setup.repairKeepingCustomCallback : setup.repairAndContinue,
                             reason: "Retiring background services from an older version…", current: current)
                     }
                 } else {
@@ -806,7 +806,8 @@ final class QueueBootstrapModel: ObservableObject {
                 let progress = QueueSetupProgress.parse(String(decoding: data, as: UTF8.self))
                 self.phase = progress.isWaiting ? .waiting : .installing
                 self.output = String(decoding: progress.output.utf8.suffix(8_000), as: UTF8.self)
-                if let line = progress.output.components(separatedBy: .newlines).last(where: { !$0.isEmpty }) { self.message = line }
+                if request.arguments.contains("--repair-and-continue"),
+                   let line = progress.output.components(separatedBy: .newlines).last(where: { !$0.isEmpty }) { self.message = line }
                 if progress.isWaiting { self.onSetupRequired?() }
             }
         }
@@ -852,7 +853,7 @@ final class QueueBootstrapModel: ObservableObject {
         let progress = QueueSetupProgress.parse(error.localizedDescription)
         let lines = progress.output.components(separatedBy: .newlines)
         legacyPhoneAccess = lines.contains(Self.phoneAccessRecovery)
-        if wasMutation && !legacyPhoneAccess && !Task.isCancelled, let request {
+        if (wasMutation || progress.requiresReview) && !legacyPhoneAccess && !Task.isCancelled, let request {
             issues = []
             revision = nil
             do {
@@ -867,12 +868,12 @@ final class QueueBootstrapModel: ObservableObject {
             }
         }
         guard attempt == current else { return }
-        if progress.requiresReview && !legacyPhoneAccess {
-            // The backend changed nothing and named an unsupported requirement.
+        if progress.requiresReview && !legacyPhoneAccess && !issues.isEmpty {
+            // The controller stopped before changing the requirement under review.
             phase = .reviewing
             canDisablePhoneAccess = issues.contains(where: { $0.actions.contains(where: { $0.id == "disable-phone-access" }) })
             message = environment.arguments.contains("--setup") ? "A requirement needs review. The approved automatic repair has stopped." : "Review these requirements before continuing."
-            output = ""
+            output = String(lines.joined(separator: "\n").suffix(8_000))
             onSetupRequired?()
             return
         }
