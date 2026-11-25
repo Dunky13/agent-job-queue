@@ -144,12 +144,12 @@ struct RefreshTests {
         let resumeFixture = ResumeFixture(status: resumeStatus, commandGate: commandGate)
         let resumable = QueueStore(statusLoader: { try await resumeStatus.load() },
                                    command: { try await resumeFixture.command($0.arguments) })
-        try check(resumable.dispatchResume() == nil, "An unknown queue cannot be resumed")
+        try check(resumable.dispatch(.resume) == nil, "An unknown queue cannot be resumed")
         await resumable.refresh()
         await commandGate.holdNextRead()
-        let resuming = resumable.dispatchResume()
+        let resuming = resumable.dispatch(.resume)
         try check(resuming != nil && resumable.isMutating && resumable.isResuming
-                  && resumable.dispatchResume() == nil && resumable.dispatchLimit(2) == nil,
+                  && resumable.dispatch(.resume) == nil && resumable.dispatch(.limit(2)) == nil,
                   "Resume reserves the shared mutation guard and rejects duplicate actions")
         await commandGate.waitUntilReadHeld()
         await commandGate.releaseRead()
@@ -158,17 +158,17 @@ struct RefreshTests {
         try check(resumedCommands == [["resume"]] && !resumable.isPaused && !resumable.isMutating
                   && !resumable.isResuming && resumable.notice == "Queue resumed." && resumable.error == nil,
                   "Resume sends the exact CLI action and refreshes confirmed queue state")
-        try check(resumable.dispatchResume() == nil, "An already running queue does not dispatch Resume")
+        try check(resumable.dispatch(.resume) == nil, "An already running queue does not dispatch Resume")
         await resumeStatus.set(pausedData)
         await resumable.refresh()
         await resumeFixture.setFailure(true)
-        await resumable.dispatchResume()?.value
+        await resumable.dispatch(.resume)?.value
         try check(resumable.isPaused && !resumable.isMutating && !resumable.isResuming && resumable.notice == nil
-                  && resumable.error?.contains("Resume rejected") == true && resumable.dispatchResume() == nil,
+                  && resumable.error?.contains("Resume rejected") == true && resumable.dispatch(.resume) == nil,
                   "Failed Resume preserves paused state, displays the error and releases busy state")
         await resumeFixture.setFailure(false)
         await resumable.refresh()
-        await resumable.dispatchResume()?.value
+        await resumable.dispatch(.resume)?.value
         try check(!resumable.isPaused && resumable.error == nil, "Resume can retry after connection recovery")
 
         var telemetry = try JSONDecoder().decode(QueueSnapshot.self, from: snapshot("2026-10-19T10:00:00Z"))
@@ -192,8 +192,8 @@ struct RefreshTests {
         await scheduling.refresh()
         try check(telemetryPublishes == 0, "Scheduler acquisition timestamp alone does not republish unchanged data")
         telemetrySubscription.cancel()
-        let change = scheduling.dispatchScheduling(.adaptive)
-        try check(change != nil && scheduling.isMutating && scheduling.dispatchScheduling(.shadow) == nil,
+        let change = scheduling.dispatch(.scheduling(.adaptive))
+        try check(change != nil && scheduling.isMutating && scheduling.dispatch(.scheduling(.shadow)) == nil,
                   "Scheduling mutation reserves before I/O and rejects duplicate changes")
         await change?.value
         let commands = await schedulingFixture.commands
@@ -202,9 +202,9 @@ struct RefreshTests {
         telemetry.scheduler = QueueScheduler(mode: .fixed, available: false, reason: "Sampling failed", updatedAt: nil, host: nil)
         await schedulingFixture.set(try JSONEncoder().encode(telemetry))
         await scheduling.refresh()
-        await scheduling.dispatchScheduling(.shadow)?.value
+        await scheduling.dispatch(.scheduling(.shadow))?.value
         try check(scheduling.snapshot?.scheduler?.mode == .shadow, "Learning mode remains available without sampler")
-        await scheduling.dispatchScheduling(.adaptive)?.value
+        await scheduling.dispatch(.scheduling(.adaptive))?.value
         try check(scheduling.error?.contains("Resource sampler unavailable") == true && scheduling.snapshot?.scheduler?.mode == .shadow,
                   "Unavailable adaptive mode reports failure and preserves confirmed mode")
         let olderData = try snapshot("2026-10-19T10:00:01Z")
@@ -212,7 +212,7 @@ struct RefreshTests {
             throw ClientError.message("Unsupported controller must never mutate")
         })
         await unsupported.refresh()
-        try check(unsupported.dispatchScheduling(.adaptive) == nil, "Older controller cannot receive unsupported scheduling mutation")
+        try check(unsupported.dispatch(.scheduling(.adaptive)) == nil, "Older controller cannot receive unsupported scheduling mutation")
 
         let preparation = PreparationFixture()
         let preparedFixture = StatusFixture(try snapshot("initial"))
@@ -225,7 +225,7 @@ struct RefreshTests {
         let preparedRead = Task { await preparedStore.refresh() }
         await preparation.waitUntilHeld()
         await preparedFixture.set(try snapshot("new mutation", limit: 3))
-        await preparedStore.dispatchLimit(3)?.value
+        await preparedStore.dispatch(.limit(3))?.value
         await preparation.release()
         await preparedRead.value
         // Mutation completion coalesces one fresh refresh behind the obsolete one.

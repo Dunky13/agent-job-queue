@@ -71,26 +71,26 @@ struct BehaviorTests {
             queue: QueueSummary(status: "paused", limit: original.queue.limit, running: 0,
                                 waiting: original.queue.waiting, legacyOccupied: false), jobs: original.jobs)
         let beforeResume = recorder.actions.count
-        try check(store.dispatchResume() == nil && recorder.actions.count == beforeResume,
+        try check(store.dispatch(.resume) == nil && recorder.actions.count == beforeResume,
                   "Read-only fixtures cannot dispatch Resume even with an action recorder")
         store.snapshot = original
         navigation.show(queued)
         navigation.back()
         try check(navigation.selected == nil, "Done returns to queue navigation")
-        for action in [ConfirmationAction.start, .cancel] {
+        for action in [QueueAction.start(queued), .cancel(queued)] {
             let before = recorder.actions.count
-            navigation.request(action, job: queued)
+            navigation.request(action)
             try check(recorder.actions.count == before, "Opening confirmation sends no action")
             navigation.decline()
             try check(recorder.actions.count == before && navigation.confirmation == nil, "Declining confirmation sends no action")
-            navigation.request(action, job: queued)
+            navigation.request(action)
             let task = navigation.confirm(in: store)
             try check(task != nil && store.isMutating, "Confirm reserves action before I/O")
             try check(navigation.confirm(in: store) == nil, "Duplicate confirmation is rejected")
             await task?.value
             try check(recorder.actions.count == before + 1, "Confirmed action dispatches exactly once")
         }
-        navigation.request(.start, job: queued)
+        navigation.request(.start(queued))
         store.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [])
         try check(navigation.unavailability(in: store) != nil && navigation.confirm(in: store) == nil, "A stale job cannot be confirmed")
         store.snapshot = original
@@ -111,11 +111,50 @@ struct BehaviorTests {
         try check(decoded.canStart == false && !decoded.permitsStart,
                   "Native decoding preserves explicit start denial")
         store.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [measured])
-        navigation.request(.start, job: queued)
+        navigation.request(.start(queued))
         try check(navigation.unavailability(in: store) != nil && navigation.confirm(in: store) == nil,
                   "Start confirmation rechecks explicit permission")
         store.snapshot = original
         navigation.decline()
+        func job(_ id: Int, state: String, canReorder: Bool, canCancel: Bool, canStart: Bool? = nil) -> QueueJob {
+            var job = QueueJob(id: id, state: state, title: "Action rules", project: "Fixture", branch: "", directory: "",
+                executable: "", priority: 0, queuePosition: nil, submittedAt: nil, startedAt: nil, finishedAt: nil,
+                exitCode: nil, logPath: "", canReorder: canReorder, canCancel: canCancel, phase: state)
+            job.canStart = canStart
+            return job
+        }
+        let movable = job(7, state: "queued", canReorder: true, canCancel: true)
+        let pinned = job(8, state: "waiting", canReorder: false, canCancel: true)
+        let denied = job(9, state: "waiting", canReorder: true, canCancel: true, canStart: false)
+        let running = job(10, state: "running", canReorder: true, canCancel: true)
+        let finished = job(11, state: "succeeded", canReorder: false, canCancel: false)
+        let pausedQueue = QueueSnapshot(updatedAt: original.updatedAt, queue: QueueSummary(status: "Paused", limit: 2,
+            running: 0, waiting: 1, legacyOccupied: false), jobs: [movable])
+        var activeQueue = QueueSnapshot(updatedAt: original.updatedAt, queue: QueueSummary(status: "running", limit: 2,
+            running: 0, waiting: 1, legacyOccupied: false), jobs: [movable])
+        activeQueue.scheduler = QueueScheduler(mode: .fixed, available: true, reason: "", updatedAt: nil, host: nil)
+        try check([movable, pinned, denied, running, finished].map { QueueAction.next($0).isAllowed(in: nil) }
+                  == [true, false, true, false, false] && QueueAction.last(movable).isAllowed(in: nil)
+                  && !QueueAction.last(running).isAllowed(in: nil), "Run next and Move to end need a waiting, reorderable job")
+        try check(QueueAction.start(movable).isAllowed(in: nil) && !QueueAction.start(denied).isAllowed(in: nil)
+                  && !QueueAction.start(running).isAllowed(in: nil), "Start now follows the job's start permission, not reorderability")
+        try check([movable, pinned, running, finished].map { QueueAction.cancel($0).isAllowed(in: nil) } == [true, true, true, false],
+                  "Cancel follows the job's cancel permission")
+        try check(QueueAction.resume.isAllowed(in: pausedQueue) && !QueueAction.resume.isAllowed(in: activeQueue)
+                  && !QueueAction.resume.isAllowed(in: nil), "Resume needs a paused queue")
+        try check((1...8).allSatisfy { QueueAction.limit($0).isAllowed(in: nil) }
+                  && !QueueAction.limit(0).isAllowed(in: nil) && !QueueAction.limit(9).isAllowed(in: nil), "Limit accepts one to eight")
+        try check(QueueAction.scheduling(.adaptive).isAllowed(in: activeQueue) && !QueueAction.scheduling(.fixed).isAllowed(in: activeQueue)
+                  && !QueueAction.scheduling(.adaptive).isAllowed(in: pausedQueue), "Scheduling needs a reported, different mode")
+        let sent: [(QueueAction, [String])] = [(.next(movable), ["next", "7"]), (.last(movable), ["last", "7"]),
+            (.start(movable), ["start", "7"]), (.cancel(movable), ["cancel", "7"]), (.resume, ["resume"]),
+            (.limit(3), ["limit", "3"]), (.scheduling(.shadow), ["scheduling", "shadow"])]
+        try check(sent.allSatisfy { $0.0.command.arguments == $0.1 }, "Each action sends its controller arguments")
+        try check(sent.map { $0.0.needsConfirmation } == [false, false, true, true, false, false, false],
+                  "Only Start now and Cancel need confirmation")
+        try check(QueueAction.confirming(named: "start")?(movable) == .start(movable)
+                  && QueueAction.confirming(named: "cancel")?(movable) == .cancel(movable)
+                  && QueueAction.confirming(named: "next") == nil, "Confirmation names map to confirming actions")
         let passwords: [(String, Bool)] = [("", false), ("abc", false), ("word", true), ("2468", true),
             ("simple", true), (String(repeating: "a", count: 72), true),
             (String(repeating: "a", count: 73), false), (String(repeating: "é", count: 36), true),
