@@ -49,7 +49,7 @@ CI and Distribution then establish separate evidence for universal packaging,
 Developer ID signing, Apple notarization and stapling, Apple Silicon and Intel
 artifact acceptance, public publication, and exact Homebrew tap readback.
 
-Follow [Homebrew delivery](../homebrew-delivery.md) and
+Follow [Homebrew delivery](https://github.com/Dunky13/agent-job-queue/blob/8015b73531218665d4ac216b76fa34ba7d9ae177/docs/homebrew-delivery.md) and
 [Apple signing and notarization](../apple-signing.md) for delivery and bounded
 recovery. A published release alone does not prove tap delivery or installation
 on the operator's Mac. Python migration still requires a drained legacy queue
