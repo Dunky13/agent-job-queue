@@ -346,16 +346,22 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.notarize.outputs.artifact_name }}
+          path: dist
       - name: Require Homebrew-sync App and Sparkle signing configuration
         env:
-          APP_CLIENT_ID: ${{ vars.HOMEBREW_SYNC_APP_CLIENT_ID }}
-          APP_PRIVATE_KEY: ${{ secrets.HOMEBREW_SYNC_APP_PRIVATE_KEY }}
-          SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          HAS_APP_CLIENT_ID: ${{ vars.HOMEBREW_SYNC_APP_CLIENT_ID != '' }}
+          HAS_APP_PRIVATE_KEY: ${{ secrets.HOMEBREW_SYNC_APP_PRIVATE_KEY != '' }}
+          HAS_SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}
         run: |
-          if [[ -z "$APP_CLIENT_ID" || -z "$APP_PRIVATE_KEY" || -z "$SPARKLE_KEY" ]]; then
+          if [[ "$HAS_APP_CLIENT_ID" != true || "$HAS_APP_PRIVATE_KEY" != true || "$HAS_SPARKLE_KEY" != true ]]; then
             echo '::error::Configure HOMEBREW_SYNC_APP_CLIENT_ID, HOMEBREW_SYNC_APP_PRIVATE_KEY and SPARKLE_ED_PRIVATE_KEY before delivery. See docs/homebrew-delivery.md.'
             exit 1
           fi
+      - name: Build the delivery tool before any secret is in the environment
+        run: go build -p 2 -trimpath -o "$RUNNER_TEMP/queue-tap" ./cmd/queue-tap
       - name: Create token for this repository only
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -383,5 +389,5 @@ jobs:
         run: |
           bot_id=$(gh api "users/${APP_SLUG}%5Bbot%5D" --jq .id)
           export TAP_BOT_NAME="${APP_SLUG}[bot]" TAP_BOT_EMAIL="${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
-          go run -p 2 ./cmd/queue-tap --publish --expected-tag "$BUILD_TAG" --expected-commit "$BUILD_SHA" \
-            --sign-update "$SPARKLE_DIR/bin/sign_update" | tee -a "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/queue-tap" --publish --expected-tag "$BUILD_TAG" --expected-commit "$BUILD_SHA" \
+            --artifact-dir dist --sign-update "$SPARKLE_DIR/bin/sign_update" | tee -a "$GITHUB_STEP_SUMMARY"

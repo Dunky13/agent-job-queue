@@ -297,7 +297,7 @@ func TestNotarizationUsesTrustedAttemptScopedArtifacts(t *testing.T) {
 	if !reflect.DeepEqual(stages, []string{"app", "dmg"}) || !reflect.DeepEqual(slots, []string{"01", "02", "03", "07", "08", "09"}) {
 		t.Fatalf("incorrect checkpoint ordering: stages=%v slots=%v", stages, slots)
 	}
-	for _, job := range []string{"notarized-tests", "publish"} {
+	for _, job := range []string{"notarized-tests", "publish", "tap-delivery"} {
 		found := false
 		for _, step := range workflow.Jobs[job].Steps {
 			if strings.HasPrefix(step.Uses, "actions/download-artifact@") {
@@ -534,14 +534,25 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 		if strings.HasPrefix(item.Uses, "actions/create-github-app-token@") {
 			token = &job.Steps[index]
 		}
-		if strings.Contains(item.Run, "queue-tap") {
+		if strings.Contains(item.Run, "--publish") {
 			publish = &job.Steps[index]
 		}
-		if item.Env["SPARKLE_ED_PRIVATE_KEY"] != "" && item.Name != "Publish the verified cask and signed Sparkle feed to main" {
-			t.Errorf("Sparkle key leaked into step %q", item.Name)
+		// Only the publish step may hold the key. Other steps may test it for presence as a boolean.
+		for name, value := range item.Env {
+			holdsKey := strings.Contains(value, "secrets.SPARKLE_ED_PRIVATE_KEY")
+			if holdsKey && item.Name != "Publish the verified cask and signed Sparkle feed to main" && value != "${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}" {
+				t.Errorf("Sparkle key leaked into step %q through %s", item.Name, name)
+			}
+		}
+		// A shell script never receives the key by expression expansion, and never echoes secrets.
+		if strings.Contains(item.Run, "${{") && strings.Contains(item.Run, "secrets.") {
+			t.Errorf("step %q expands a secret into its script", item.Name)
+		}
+		if item.With["private-key"] != "" && !strings.HasPrefix(item.Uses, "actions/create-github-app-token@") {
+			t.Errorf("step %q receives a private key", item.Name)
 		}
 		for _, line := range strings.Split(item.Run, "\n") {
-			if strings.Contains(line, "echo") && (strings.Contains(line, "$SPARKLE") || strings.Contains(line, "secrets.")) {
+			if strings.Contains(line, "echo") && (strings.Contains(line, "$SPARKLE") || strings.Contains(line, "$HAS_") || strings.Contains(line, "secrets.")) {
 				t.Errorf("step %q may print the key: %s", item.Name, line)
 			}
 		}
@@ -549,7 +560,7 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 	if token == nil || token.With["repositories"] != "agent-job-queue" || token.With["permission-contents"] != "write" || len(token.With) != 5 {
 		t.Fatalf("App token must be limited to this repository's contents: %+v", token)
 	}
-	if publish == nil || publish.Shell != "bash" || publish.Env["SPARKLE_ED_PRIVATE_KEY"] != "${{ secrets.SPARKLE_ED_PRIVATE_KEY }}" || !strings.Contains(publish.Run, "--expected-tag \"$BUILD_TAG\"") || !strings.Contains(publish.Run, "sign_update") {
+	if publish == nil || publish.Shell != "bash" || publish.Env["SPARKLE_ED_PRIVATE_KEY"] != "${{ secrets.SPARKLE_ED_PRIVATE_KEY }}" || !strings.Contains(publish.Run, "--expected-tag \"$BUILD_TAG\"") || !strings.Contains(publish.Run, "--artifact-dir dist") || !strings.Contains(publish.Run, "sign_update") || strings.Contains(publish.Run, "go run") {
 		t.Fatalf("publish step: %+v", publish)
 	}
 	for _, flag := range []string{"-s ", "--ed-key "} {
