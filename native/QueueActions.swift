@@ -16,6 +16,19 @@ enum QueueAction: Equatable {
         }
     }
 
+    /// The controller verb; for confirmations it is also the command-line spelling.
+    var name: String {
+        switch self {
+        case .next: "next"
+        case .last: "last"
+        case .start: "start"
+        case .cancel: "cancel"
+        case .resume: "resume"
+        case .limit: "limit"
+        case .scheduling: "scheduling"
+        }
+    }
+
     /// The same action aimed at a fresher copy of its job.
     func refreshed(with job: QueueJob) -> QueueAction {
         switch self {
@@ -27,65 +40,38 @@ enum QueueAction: Equatable {
         }
     }
 
-    /// The controller verb for job actions; also the command-line spelling of confirmations.
-    var name: String? {
+    /// The one list of actions that ask for confirmation.
+    var confirmation: QueueConfirmationKind? {
         switch self {
-        case .next: "next"
-        case .last: "last"
-        case .start: "start"
-        case .cancel: "cancel"
-        case .resume, .limit, .scheduling: nil
+        case .start: .start
+        case .cancel: .cancel
+        case .next, .last, .resume, .limit, .scheduling: nil
         }
     }
 
-    /// The job action with this name that asks for confirmation, if any.
-    static func confirming(named name: String) -> ((QueueJob) -> QueueAction)? {
-        let make: ((QueueJob) -> QueueAction)? = switch name {
-        case "start": { .start($0) }
-        case "cancel": { .cancel($0) }
-        default: nil
-        }
-        return make
-    }
-
-    var needsConfirmation: Bool {
-        switch self {
-        case .start, .cancel: true
-        case .next, .last, .resume, .limit, .scheduling: false
-        }
-    }
+    var needsConfirmation: Bool { confirmation != nil }
 
     /// Whether the job and queue state permit this action. Store-level busy and read-only
     /// states are separate and apply on top.
     func isAllowed(in snapshot: QueueSnapshot?) -> Bool {
         switch self {
         case .next(let job), .last(let job): job.isWaiting && job.canReorder
-        case .start(let job): job.permitsStart
+        case .start(let job): job.isWaiting && (job.canStart ?? job.canReorder)
         case .cancel(let job): job.canCancel
         case .resume: snapshot?.queue.status.lowercased() == "paused"
-        case .limit(let limit): (1...8).contains(limit)
+        case .limit(let limit): Self.limits.contains(limit) && limit != snapshot?.queue.limit
         case .scheduling(let mode): snapshot?.scheduler.map { $0.mode != mode } ?? false
         }
     }
 
-    /// Why a confirmation can no longer proceed.
-    var unavailableMessage: String {
-        switch self {
-        case .start: "This job cannot be started from its current state. Return to the queue to see its latest status."
-        case .cancel: "This job is no longer available to cancel."
-        default: "This action is not available."
-        }
-    }
+    static let limits = 1...8
 
     var command: QueueClient.Command {
         switch self {
-        case .next(let job): .jobAction("next", id: job.id)
-        case .last(let job): .jobAction("last", id: job.id)
-        case .start(let job): .jobAction("start", id: job.id)
-        case .cancel(let job): .jobAction("cancel", id: job.id)
         case .resume: .resume
         case .limit(let limit): .limit(limit)
         case .scheduling(let mode): .scheduling(mode)
+        case .next(let job), .last(let job), .start(let job), .cancel(let job): .jobAction(name, id: job.id)
         }
     }
 
@@ -98,6 +84,26 @@ enum QueueAction: Equatable {
         case .resume: "Queue resumed."
         case .limit(let limit): "Parallel job limit changed to \(limit)."
         case .scheduling(let mode): "Scheduling changed to \(mode.label)."
+        }
+    }
+}
+
+/// The actions that need a second step before they are sent.
+enum QueueConfirmationKind: String {
+    case start, cancel
+
+    func action(for job: QueueJob) -> QueueAction {
+        switch self {
+        case .start: .start(job)
+        case .cancel: .cancel(job)
+        }
+    }
+
+    /// Why the confirmation can no longer proceed.
+    var unavailableMessage: String {
+        switch self {
+        case .start: "This job cannot be started from its current state. Return to the queue to see its latest status."
+        case .cancel: "This job is no longer available to cancel."
         }
     }
 }

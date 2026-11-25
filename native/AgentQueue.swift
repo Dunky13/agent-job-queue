@@ -170,7 +170,6 @@ struct QueueJob: Codable, Identifiable, Sendable, Equatable {
     var name: String { title.isEmpty ? executable : title }
     var isWaiting: Bool { state == "queued" || state == "waiting" }
     var isRunning: Bool { state == "running" || state == "starting" || state == "cancelling" }
-    var permitsStart: Bool { isWaiting && (canStart ?? canReorder) }
     var distinctPhase: String? {
         let display = phase.replacingOccurrences(of: "_", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -691,7 +690,7 @@ final class QueueStore: ObservableObject {
     var running: [QueueJob] { prepared?.running ?? [] }
     var waiting: [QueueJob] { prepared?.waiting ?? [] }
     var recent: [QueueJob] { prepared?.recent ?? [] }
-    var isPaused: Bool { snapshot?.queue.status.lowercased() == "paused" }
+    var isPaused: Bool { QueueAction.resume.isAllowed(in: snapshot) }
     var actionsDisabled: Bool {
         #if AGENT_QUEUE_TEST_HOOKS
         if fixtureMode && fixtureRecorder == nil { return true }
@@ -770,9 +769,10 @@ final class QueueStore: ObservableObject {
 
     private func complete(_ action: QueueAction) async {
         #if AGENT_QUEUE_TEST_HOOKS
-        if fixtureMode, let name = action.name, let job = action.job {
+        if fixtureMode {
             // Fixture actions can only reach this recorder, never the live CLI.
-            fixtureRecorder?.record(action: name, jobID: job.id)
+            if let job = action.job { fixtureRecorder?.record(action: action.name, jobID: job.id) }
+            isResuming = false
             isMutating = false
             return
         }
@@ -1424,7 +1424,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
 }
 
 struct QueueConfirmation {
-    let action: QueueAction
+    let kind: QueueConfirmationKind
     let job: QueueJob
 }
 
@@ -1434,10 +1434,9 @@ final class QueueNavigation: ObservableObject {
     @Published var confirmation: QueueConfirmation?
     func show(_ job: QueueJob) { selected = job }
     func back() { selected = nil }
-    func request(_ action: QueueAction) {
-        guard action.needsConfirmation, let job = action.job else { return }
+    func request(_ kind: QueueConfirmationKind, job: QueueJob) {
         selected = nil
-        confirmation = QueueConfirmation(action: action, job: job)
+        confirmation = QueueConfirmation(kind: kind, job: job)
     }
     func decline() { confirmation = nil }
 
@@ -1446,8 +1445,7 @@ final class QueueNavigation: ObservableObject {
         guard let current = store.snapshot?.jobs.first(where: { $0.id == confirmation.job.id }) else {
             return "This job is no longer in the current queue. Return to the queue to see its latest status."
         }
-        let action = confirmation.action.refreshed(with: current)
-        if !action.isAllowed(in: store.snapshot) { return action.unavailableMessage }
+        if !confirmation.kind.action(for: current).isAllowed(in: store.snapshot) { return confirmation.kind.unavailableMessage }
         return nil
     }
 
@@ -1456,7 +1454,7 @@ final class QueueNavigation: ObservableObject {
         guard !store.actionsDisabled, unavailability(in: store) == nil,
               let confirmation,
               let current = store.snapshot?.jobs.first(where: { $0.id == confirmation.job.id }) else { return nil }
-        guard let dispatch = store.dispatch(confirmation.action.refreshed(with: current)) else { return nil }
+        guard let dispatch = store.dispatch(confirmation.kind.action(for: current)) else { return nil }
         // Reservation and consumption both finish before yielding the main actor.
         self.confirmation = nil
         return dispatch
@@ -1512,7 +1510,7 @@ struct QueuePanel: View {
             .opacity(overlaid ? 0 : 1).disabled(overlaid).accessibilityHidden(overlaid)
             if let confirmation = navigation.confirmation {
                 let currentJob = store.snapshot?.jobs.first(where: { $0.id == confirmation.job.id }) ?? confirmation.job
-                JobConfirmationPanel(action: confirmation.action, job: currentJob,
+                JobConfirmationPanel(kind: confirmation.kind, job: currentJob,
                     unavailable: navigation.unavailability(in: store), error: store.error,
                     disabled: store.actionsDisabled, onDecline: navigation.decline,
                     onConfirm: { navigation.confirm(in: store) })
@@ -1537,7 +1535,7 @@ struct QueuePanel: View {
     private var limitSelection: Binding<Int> {
         Binding(get: { pendingLimit ?? store.snapshot?.queue.limit ?? 1 },
                 set: { value in
-                    guard value != store.snapshot?.queue.limit, store.dispatch(.limit(value)) != nil else { return }
+                    guard store.dispatch(.limit(value)) != nil else { return }
                     pendingLimit = value
                 })
     }
@@ -1564,7 +1562,7 @@ struct QueuePanel: View {
             }.font(.system(size: 12, weight: .medium))
             HStack(spacing: 14) {
                 Picker("Parallel", selection: limitSelection) {
-                    ForEach(1...8, id: \.self) { Text(String($0)).tag($0) }
+                    ForEach(QueueAction.limits, id: \.self) { Text(String($0)).tag($0) }
                 }
                 .fixedSize()
                 .help("How many jobs run at a time, 1 to 8. Lowering the limit lets active jobs finish.")
@@ -1727,7 +1725,7 @@ struct QueuePanel: View {
                     }
                     if QueueAction.start(job).isAllowed(in: store.snapshot) {
                         iconAction("Start job \(job.id) now", symbol: "play.fill", help: "Start job #\(job.id) now, bypassing the parallel limit and adaptive resource checks") {
-                            navigation.request(.start(job))
+                            navigation.request(.start, job: job)
                         }
                     }
                     Menu {
@@ -1744,12 +1742,12 @@ struct QueuePanel: View {
                                 Button("Move to end", systemImage: "arrow.down.to.line") { store.dispatch(.last(job)) }.disabled(store.actionsDisabled)
                             }
                             if QueueAction.start(job).isAllowed(in: store.snapshot) {
-                                Button("Start now…", systemImage: "play.fill") { navigation.request(.start(job)) }.disabled(store.actionsDisabled)
+                                Button("Start now…", systemImage: "play.fill") { navigation.request(.start, job: job) }.disabled(store.actionsDisabled)
                             }
                         }
                         if QueueAction.cancel(job).isAllowed(in: store.snapshot) {
                             Divider()
-                            Button("Cancel job…", systemImage: "stop.circle", role: .destructive) { navigation.request(.cancel(job)) }.disabled(store.actionsDisabled)
+                            Button("Cancel job…", systemImage: "stop.circle", role: .destructive) { navigation.request(.cancel, job: job) }.disabled(store.actionsDisabled)
                         }
                     } label: { Image(systemName: "ellipsis").frame(width: 22, height: 22) }
                         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Actions for job #\(job.id)")
@@ -1916,7 +1914,7 @@ struct RemoteAccessSettings: View {
 }
 
 struct JobConfirmationPanel: View {
-    let action: QueueAction
+    let kind: QueueConfirmationKind
     let job: QueueJob
     let unavailable: String?
     let error: String?
@@ -1924,7 +1922,7 @@ struct JobConfirmationPanel: View {
     let onDecline: () -> Void
     let onConfirm: () -> Void
 
-    private var starts: Bool { if case .start = action { true } else { false } }
+    private var starts: Bool { kind == .start }
     private var title: String { starts ? "Start this job now?" : "Cancel this job?" }
     private var confirmLabel: String { starts ? "Start now" : "Cancel job" }
     private var declineLabel: String { starts ? "Keep waiting" : "Keep job" }
@@ -1974,7 +1972,7 @@ struct JobConfirmationPanel: View {
                 Button(confirmLabel, action: onConfirm).buttonStyle(.borderedProminent)
                     .tint(starts ? Color.accentColor : Color.red)
                     .disabled(disabled || unavailable != nil)
-                    .accessibilityIdentifier("confirm-\(action.name ?? "")-job")
+                    .accessibilityIdentifier("confirm-\(kind.rawValue)-job")
             }.padding(18)
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }

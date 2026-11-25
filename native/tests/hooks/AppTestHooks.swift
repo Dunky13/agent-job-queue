@@ -33,15 +33,15 @@ extension AppDelegate {
         let remoteStopVerificationPath = remoteStopVerifyIndex.flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
         let confirmIndex = arguments.firstIndex(of: "--snapshot-confirmation")
         let requestedConfirmation = confirmIndex.flatMap {
-            arguments.indices.contains($0 + 1) ? QueueAction.confirming(named: arguments[$0 + 1]) : nil
+            arguments.indices.contains($0 + 1) ? QueueConfirmationKind(rawValue: arguments[$0 + 1]) : nil
         }
-        if let make = requestedConfirmation ?? (confirmationVerificationPath == nil ? nil : QueueAction.confirming(named: "start")) {
+        if let kind = requestedConfirmation ?? (confirmationVerificationPath == nil ? nil : .start) {
             guard let job = AppRuntime.store.snapshot?.jobs.first(where: {
-                make($0).isAllowed(in: AppRuntime.store.snapshot)
+                kind.action(for: $0).isAllowed(in: AppRuntime.store.snapshot)
             }) else {
                 diagnostic("Confirmation snapshot requires an eligible job in the fixture."); exit(EXIT_FAILURE)
             }
-            navigation.request(make(job))
+            navigation.request(kind, job: job)
         } else if let detailIndex = arguments.firstIndex(of: "--snapshot-detail"), arguments.indices.contains(detailIndex + 1) {
             guard let jobID = Int(arguments[detailIndex + 1]),
                   let job = AppRuntime.store.snapshot?.jobs.first(where: { $0.id == jobID }) else {
@@ -186,7 +186,7 @@ extension AppDelegate {
     private func verifyConfirmations(navigation: QueueNavigation, store: QueueStore,
                                      window: NSWindow, view: NSView) async throws -> ConfirmationVerification {
         guard store.fixtureMode, let recorder = store.fixtureRecorder, let original = store.snapshot,
-              let queued = original.jobs.first(where: { $0.isWaiting && $0.canReorder && $0.canCancel }) else {
+              let queued = original.jobs.first(where: { QueueAction.next($0).isAllowed(in: original) && QueueAction.cancel($0).isAllowed(in: original) }) else {
             throw ClientError.message("Confirmation verification requires a fixture with an eligible waiting job.")
         }
         let paused = QueueJob(id: -100, state: "paused", title: "Paused cancellation regression",
@@ -200,11 +200,11 @@ extension AppDelegate {
             window.isVisible && window.contentView === view && window.attachedSheet == nil
         }
         var results: [ConfirmationCaseVerification] = []
-        var cases: [(QueueAction, QueueJob)] = [(.start(queued), queued), (.cancel(queued), queued), (.cancel(paused), paused)]
-        if let running = original.jobs.first(where: { $0.isRunning && $0.canCancel }) { cases.append((.cancel(running), running)) }
-        for (action, job) in cases {
+        var cases: [(QueueConfirmationKind, QueueJob)] = [(.start, queued), (.cancel, queued), (.cancel, paused)]
+        if let running = original.jobs.first(where: { $0.isRunning && QueueAction.cancel($0).isAllowed(in: original) }) { cases.append((.cancel, running)) }
+        for (kind, job) in cases {
             let before = recorder.actions.count
-            navigation.request(action)
+            navigation.request(kind, job: job)
             try await Task.sleep(for: .milliseconds(60))
             var surfaceStayedVisible = sameSurface()
             let openingDidNotDispatch = recorder.actions.count == before
@@ -213,7 +213,7 @@ extension AppDelegate {
             surfaceStayedVisible = surfaceStayedVisible && sameSurface()
             let declineDidNotDispatch = recorder.actions.count == before && navigation.confirmation == nil
 
-            navigation.request(action)
+            navigation.request(kind, job: job)
             try await Task.sleep(for: .milliseconds(60))
             surfaceStayedVisible = surfaceStayedVisible && sameSurface()
             let firstDispatch = navigation.confirm(in: store)
@@ -227,15 +227,15 @@ extension AppDelegate {
             store.isRefreshing = false
             try await Task.sleep(for: .milliseconds(60))
             surfaceStayedVisible = surfaceStayedVisible && sameSurface()
-            let expected = [RecordedQueueAction(action: action.name ?? "", jobID: job.id)]
+            let expected = [RecordedQueueAction(action: kind.rawValue, jobID: job.id)]
             let exactlyOneExpectedAction = Array(recorder.actions.dropFirst(before)) == expected
 
-            navigation.request(action)
+            navigation.request(kind, job: job)
             store.isMutating = true
             let busyWasRejected = navigation.confirm(in: store) == nil
             store.isMutating = false
             navigation.decline()
-            results.append(ConfirmationCaseVerification(action: action.name ?? "", jobID: job.id,
+            results.append(ConfirmationCaseVerification(action: kind.rawValue, jobID: job.id,
                 openingDidNotDispatch: openingDidNotDispatch, declineDidNotDispatch: declineDidNotDispatch,
                 exactlyOneExpectedAction: exactlyOneExpectedAction, duplicateWasRejected: duplicateWasRejected,
                 reservationHeldBeforeIO: reservationHeldBeforeIO, competingActionWasRejected: competingActionWasRejected,
@@ -245,7 +245,7 @@ extension AppDelegate {
         }
 
         let beforeStale = recorder.actions.count
-        navigation.request(.start(queued))
+        navigation.request(.start, job: queued)
         // The same ID has become paused while the confirmation panel was open.
         let transitioned = QueueJob(id: queued.id, state: "paused", title: queued.title, project: queued.project,
             branch: queued.branch, directory: queued.directory, executable: queued.executable, priority: queued.priority,
@@ -257,8 +257,8 @@ extension AppDelegate {
         let staleJobRejected = navigation.confirm(in: store) == nil && recorder.actions.count == beforeStale
         navigation.decline()
         // The recorder makes every fixture action inert, including accidental limit changes.
-        store.dispatch(.limit(2))
-        let fixtureLimitDidNotDispatch = recorder.actions.count == beforeStale
+        let fixtureLimitDidNotDispatch = store.dispatch(.limit(original.queue.limit % 8 + 1)) == nil && !store.isMutating
+            && recorder.actions.count == beforeStale
         let restoredSurface = sameSurface()
         store.snapshot = original
         try await Task.sleep(for: .milliseconds(80))
