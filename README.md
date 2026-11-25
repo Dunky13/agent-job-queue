@@ -51,10 +51,11 @@ Use the app's actual location if it differs. Private data under `~/.local/share/
 ### Homebrew
 
 ```sh
+brew tap dunky13/agent-job-queue https://github.com/Dunky13/agent-job-queue
 brew install --cask dunky13/agent-job-queue/agent-job-queue
 ```
 
-The cask places `Agent Queue.app` in Applications and nothing else; open it to use the menu bar while setup finishes automatically. `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` replaces the app, and the next launch immediately shows the menu bar and completes the upgrade in the background. Homebrew verifies the download's SHA-256 and keeps quarantine so macOS assesses the notarized app. Maintainer setup is documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
+The tap lives in this repository, so it needs the explicit URL. If you tapped the former `homebrew-agent-job-queue` repository, switch its remote once with `brew tap --custom-remote dunky13/agent-job-queue https://github.com/Dunky13/agent-job-queue`. The cask places `Agent Queue.app` in Applications and nothing else; open it to use the menu bar while setup finishes automatically. `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` replaces the app, and the next launch immediately shows the menu bar and completes the upgrade in the background. Homebrew verifies the download's SHA-256 and keeps quarantine so macOS assesses the notarized app. Maintainer setup is documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
 
 ### Signing, Gatekeeper and endpoint security
 

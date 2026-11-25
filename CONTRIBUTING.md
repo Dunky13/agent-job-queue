@@ -15,7 +15,7 @@ Run the complete finite validation batch through your shared heavy-job queue:
 agent-heavy run --label "Agent Queue validation" -- bash scripts/validate.sh
 ```
 
-The batch checks source portability, Go formatting and vet, known reachable Go vulnerabilities, shell and workflow lint, Go race tests run as the same partitions hosted CI requires (`scripts/test-go-runtime.sh core-1`, `core-2`, `https` and `installer`, then `scripts/test-go-tooling.sh 1` and `2`; `-timeout` applies per package, so one `go test` over `internal/backend` or `internal/tooling` cannot fit the 12-minute budget, which stays unchanged), standalone trusted tap tests, Linux compilation of CI tools, browser schema and interaction tests, native regressions, and the universal installer. Hosted CI runs separate required runtime, tooling/installer, and native test matrices on Apple Silicon and Intel Macs. Each keeps its 20-minute job budget; Go tests retain race detection, two package/test workers and the 12-minute test timeout. The runtime adapter dynamically enumerates the original Go scope and excludes only `internal/tooling`, which runs completely in its own matrix. Tooling emits per-test timings for timeout diagnosis. All matrices remain required by `ci-required`.
+The batch checks source portability, Go formatting and vet, known reachable Go vulnerabilities, shell and workflow lint, Go race tests run as the same partitions hosted CI requires (`scripts/test-go-runtime.sh core-1`, `core-2`, `https` and `installer`, then `scripts/test-go-tooling.sh 1` and `2`; `-timeout` applies per package, so one `go test` over `internal/backend` or `internal/tooling` cannot fit the 12-minute budget, which stays unchanged), tap delivery tests, Linux compilation of CI tools, browser schema and interaction tests, native regressions, and the universal installer. Hosted CI runs separate required runtime, tooling/installer, and native test matrices on Apple Silicon and Intel Macs. Each keeps its 20-minute job budget; Go tests retain race detection, two package/test workers and the 12-minute test timeout. The runtime adapter dynamically enumerates the original Go scope and excludes only `internal/tooling`, which runs completely in its own matrix. Tooling emits per-test timings for timeout diagnosis. All matrices remain required by `ci-required`.
 
 The tooling matrix uses two deterministic shards on each architecture, invoked with `bash scripts/test-go-tooling.sh 1` and `bash scripts/test-go-tooling.sh 2`. Their complete discovered test, example and fuzz-seed inventory is partitioned exactly once; malformed or incomplete enumeration fails before testing. Every shard remains required, with the same race detection, worker limits and time budgets.
 
@@ -29,7 +29,7 @@ For focused development, these commands use only this checkout and private fixtu
 go test -p 2 -parallel 2 ./internal/backend -run TestResults
 go test -p 2 -parallel 2 ./internal/backend -run TestRealDaemon
 go test -p 2 -parallel 2 ./internal/remote
-go test -p 2 ./internal/tooling ./internal/delivery ./packaging/homebrew
+go test -p 2 ./internal/tooling ./internal/tap
 bash scripts/build-go.sh
 npm run test:web
 npm run test:browser
@@ -110,7 +110,7 @@ Private regressions cover waiting for active jobs, resuming an older release's j
 
 The command queue uses the existing pure Go SQLite driver. A durable attempt is claimed before process creation, and detached workers publish their own outcomes. Never automatically retry an attempt with an uncertain outcome. An unclean daemon restart pauses automatic dispatch; verified process ownership and explicit operator recovery remain required. Queue RPC handlers must not acquire backend filesystem locks already held by the scheduler or submitting process.
 
-Go dependencies are pinned in `go.mod` and `go.sum`; run `go mod tidy` after deliberate dependency changes. App builds omit Go debug sections to keep universal binaries and downloads within the existing size limits; developer builds keep them. Installer builds collect the runtime and dependency notices into `source/licenses`. The standalone tap helper has no external dependencies. Trusted tap changes require a companion reviewed tap update before the source release, as described in [Homebrew delivery](docs/homebrew-delivery.md).
+Go dependencies are pinned in `go.mod` and `go.sum`; run `go mod tidy` after deliberate dependency changes. App builds omit Go debug sections to keep universal binaries and downloads within the existing size limits; developer builds keep them. Installer builds collect the runtime and dependency notices into `source/licenses`. The Homebrew cask and Sparkle feed are committed to `main` by the distribution workflow's Homebrew-sync App after each release, as described in [Homebrew delivery](docs/homebrew-delivery.md); never edit `Casks/` or `appcast.xml` by hand.
 
 ## Commit policy
 

@@ -1,20 +1,39 @@
 # Verified Homebrew delivery
 
-The tap follows the latest successfully published main build. Main CI validates and retains the self-contained app. The separate distribution workflow signs, notarizes, tests and publishes that exact build before its **Verify Homebrew delivery** job starts. A failed app build or distribution attempt leaves the prior Homebrew build available.
+The Homebrew tap and the Sparkle update feed live on this repository's `main` branch ([ADR 0002](adr/0002-homebrew-tap-in-source-repository.md)). Main CI validates and retains the self-contained app. The separate distribution workflow signs, notarizes, tests and publishes that exact build as a GitHub prerelease, and only then runs its **Publish Homebrew tap and Sparkle feed** job. A failed app build or distribution attempt leaves the previous cask and feed in place.
+
+## Installing and migrating
+
+Homebrew clones a tap's default branch, so tap this repository with its explicit URL:
+
+```sh
+brew tap dunky13/agent-job-queue https://github.com/Dunky13/agent-job-queue
+brew install --cask dunky13/agent-job-queue/agent-job-queue
+```
+
+Users who tapped the old `homebrew-agent-job-queue` repository switch the remote once, keeping the tap name:
+
+```sh
+brew tap --custom-remote dunky13/agent-job-queue https://github.com/Dunky13/agent-job-queue
+brew update
+```
+
+The cask declares `auto_updates true` because Sparkle updates the app in place. `brew upgrade` only replaces the app when the cask version moves ahead of the installed one, or with `--greedy`.
 
 ## Delivery contract
 
-The source job verifies the published manifest and checks that the tap's trusted helpers match this source revision. It dispatches the tap's refresh workflow with the exact release tag and source commit, then waits for the run ID returned by GitHub. A missing credential, failed refresh, timeout or mismatched readback fails delivery visibly. Successful app validation and release publication remain distinct from successful Homebrew delivery.
+The delivery job runs on `macos-15` from the exact automation commit of the distribution run (`go run ./cmd/queue-tap`, package `internal/tap`). It:
 
-The tap validates the requested public release, selects the highest published numbered build through a bounded paginated search, downloads the release app ZIP, verifies its checksum, regenerates the cask through its trusted local template, and checks the real Homebrew DSL. It publishes using a GitHub-signed API commit with an author-matching DCO trailer and expected-head compare-and-swap. Downloaded Ruby is never evaluated.
+1. Verifies the requested public release, its manifest and the app ZIP checksum, and selects the highest published numbered build through a bounded paginated search. Overlapping builds cannot downgrade the delivery: a newer build counts as **superseded** delivery only after its public release and source ancestry have been verified.
+2. Renders `Casks/agent-job-queue.rb` from the trusted template and loads it through the real Homebrew DSL (`packaging/homebrew/test-cask.rb`). Downloaded Ruby is never evaluated.
+3. Signs the published ZIP with Sparkle's `sign_update --ed-key-file - -p`. The private key `SPARKLE_ED_PRIVATE_KEY` goes in on stdin only, never as an argument or in logs.
+4. Renders `appcast.xml` with one item for that build (`sparkle:version` is the build number, `sparkle:shortVersionString` the version, `sparkle:minimumSystemVersion` 15.0, an enclosure with the immutable release ZIP URL, its length, type and `sparkle:edSignature`, and the release page as link), then signs the feed with `sign_update --ed-key-file - appcast.xml`.
+5. Commits `Casks/agent-job-queue.rb`, `Casks/agent-job-queue.json` and `appcast.xml` in one GitHub-signed `createCommitOnBranch` on `main`, using the App token, a `Signed-off-by` trailer for the App bot and `expectedHeadOid` as compare-and-swap. On a head mismatch caused by a concurrent merge it re-reads `main` and retries, up to four attempts. If `main` already holds identical content it verifies and creates no commit. A template or feed change for an already delivered build is committed once; the release and its assets stay untouched.
+6. Reads the commit back by SHA: Verified signature, App bot author, DCO trailer, the expected parent and the exact content of all three files.
 
-The source independently checks the tap's signed commit, manifest and exact rendered cask at one pinned branch head. Overlapping builds cannot downgrade the tap. A newer build counts as **superseded** delivery only after its public release and source ancestry have been verified. The source reports **current** when the exact requested manifest is present.
+A missing secret, App installation or App permission fails the job visibly and points here. The feed URL baked into the app is `https://raw.githubusercontent.com/Dunky13/agent-job-queue/main/appcast.xml`.
 
-Refresh jobs serialize separately from PR validation. A 15-minute schedule and manual dispatch reconcile missed delivery. GitHub can delay or drop scheduled events; the release-driven job is the primary path. No-op refreshes still verify current public metadata, app ZIP and cask, so drift cannot hide behind an unchanged build number.
-
-When trusted templates change before a new app release, the tap retains a cask that matches its own historical public artifact, checked only as bounded data. It reports that the template change awaits a newer release. The next numbered build uses the updated trusted template. This preserves provenance across repeated tooling changes without rewriting a cask at the same build number.
-
-A tap that still holds metadata for a release built with the earlier installer wrapper is accepted as the current state and checked against its public release and archive checksum. Its cask must match either the frozen trusted managed-app template or the bounded cask attached to that historical public release. Both are compared only as data, never executed or republished. This covers taps whose trusted template advanced after the old release was published. The first app ZIP release replaces that predecessor; arbitrary cask drift and a latest public release that still uses the installer asset name fail visibly.
+CI ignores pushes that change only `Casks/**` and `appcast.xml` (`paths-ignore` on the `push` trigger), so a delivery commit cannot start another release. Pull requests are unfiltered so required checks still report.
 
 ## App installation and upgrade recovery
 
@@ -44,71 +63,43 @@ Users of the installer-era cask have `~/Applications/Agent Queue.app` recorded a
 ~/.local/bin/agent-heavy install --app-bundle "$HOME/Applications/Agent Queue.app" --unregister-services
 ```
 
-Existing releases and casks remain immutable, and the first transition from a historical cask still runs that predecessor's own removal rules. Setup can retire and back up legacy `~/Library/LaunchAgents/io.went.agent-*.plist` definitions during migration; it applies its own drain and ownership checks first. Merge the companion tap tooling before the source change and publish a new validated numbered release.
+Existing releases and casks remain immutable, and the first transition from a historical cask still runs that predecessor's own removal rules. Setup can retire and back up legacy `~/Library/LaunchAgents/io.went.agent-*.plist` definitions during migration; it applies its own drain and ownership checks first. Publish a new validated numbered release to move users from the historical cask.
 
-## Syncing tap tooling before merging this change
+## One-time setup
 
-The app change replaces the tap's trusted tooling and cask template. The tap must receive it first, through a companion PR:
+App and key creation need the repository owner's GitHub session. Keep private key contents out of chat and source files.
 
-1. From `packaging/homebrew/`, copy `refresh.go`, `refresh_test.go`, `test-cask.rb` and `.github/workflows/refresh.yml` into the tap checkout, together with the root `LICENSE`. Keep them byte-identical to this source revision; do not copy `SEED.txt`.
-2. When the cask template changes, also set `Casks/agent-job-queue.rb` to the `agent-job-queue.rb` release asset of the tap's current build, byte for byte. Otherwise, a tap cask that drifted from that asset passes only while the old template still renders it, and every refresh then fails with `Current tap cask differs from its historical published release`.
-3. In the tap checkout, run `go test -p 2 refresh.go refresh_test.go`, `go vet refresh.go` and `HOMEBREW_DEVELOPER=1 go run -p 2 refresh.go` (Go 1.26 or later, with `gh` and `brew`). The tests do not read the cask, so only the last command shows this failure. It publishes nothing and must exit 0, printing `Validated ...; publication disabled`, or `Published build verified; template change awaits a newer app release` if the tap is already on the latest release. The variable is required: without it, brew rejects a cask outside a tap and the command fails with `Required brew operation failed` even when the cask is right.
-4. Open a PR against the tap's `tap` branch with signed, DCO-signed-off commits. Before merging, check that the tap's scheduled refresh has not moved to a newer build, and repeat from step 2 if it has. Then merge.
-5. Dispatch `refresh.yml` on the `tap` branch and confirm it succeeds.
-6. Only then merge the source change. The delivery job compares the tap's helpers byte for byte (`internal/delivery/sync.go`), so a missing or stale sync fails `Verify Homebrew delivery` visibly, before it dispatches a refresh. Nothing depends on that job and the release is already published by then, so publishing continues through the tap's scheduled refresh, but every distribution run stays red until the tap catches up. A failed job is also retried automatically (`scripts/distribution-recover.sh`): a red `Verify Homebrew delivery` with signing and acceptance green is classed as `delivery` and rerun, first immediately and then at least 15 minutes apart, up to attempt 48 or 7 days for each run. A mismatch stops before dispatch, in about 20 seconds per retry, but a failure after dispatch starts a macOS tap run on each retry. The observer requests at most five reruns per pass and reaches older builds first, so five or more red runs can delay an Apple signing continuation on a newer build. Once the tap catches up, a rerun should turn green within that budget.
+1. Generate the Sparkle EdDSA key pair with the pinned Sparkle tooling (`packaging/sparkle/fetch.sh` prints its directory; run `bin/generate_keys`). Commit only the public key to `packaging/sparkle/public-ed-key.txt`. Store the private key as the repository Actions secret `SPARKLE_ED_PRIVATE_KEY`.
+2. Register or reuse the private Homebrew-sync GitHub App under Dunky13. Grant repository **Contents: Read and write** plus GitHub's automatic metadata access, and install it on **this repository** (`Dunky13/agent-job-queue`). The old tap repository no longer needs it.
+3. Save the App's public Client ID as the Actions variable `HOMEBREW_SYNC_APP_CLIENT_ID` and its private key PEM as the Actions secret `HOMEBREW_SYNC_APP_PRIVATE_KEY`.
+4. Add the App as a bypass actor on the `main` and `main-ci` rulesets. This is a deliberate, owner-approved exception limited to that App; the rulesets still require signed commits, no force pushes and no deletion. Human changes keep going through pull requests.
+5. After the first delivery is live, disable the old tap's scheduled refresh workflow, then archive `homebrew-agent-job-queue` with a pointer to this repository.
 
-## One-time GitHub App setup
+The workflow uses the SHA-pinned official `actions/create-github-app-token`, limits its installation token to this repository with `contents: write`, and revokes it after the job. PRs receive neither App credential nor the Sparkle key.
 
-Complete this before merging the source workflow change. The companion tap tooling PR (see above) must also merge first. App creation and installation require the repository owner's GitHub session.
+## Recovery
 
-1. Register a private GitHub App under Dunky13. Use the app repository as its homepage. Disable webhooks; callback URLs, OAuth and device flow are unnecessary. Grant only repository **Actions: Read and write**, plus GitHub's automatic metadata access. Restrict installation to the owner account.
-2. Install it on **homebrew-agent-job-queue only**. The source repository does not need the App installed. Keep all optional content-write, administration and organization permissions disabled.
-3. In the source repository's Actions variables, save its public Client ID as `HOMEBREW_SYNC_APP_CLIENT_ID`. Under the App's **Credentials > Key pairs**, choose **New key**. Store the downloaded PEM directly as the source repository's encrypted Actions secret `HOMEBREW_SYNC_APP_PRIVATE_KEY`. Keep private key contents out of chat and source files.
+Inspect the failed distribution **Publish Homebrew tap and Sparkle feed** job. Rerun failed distribution jobs to retry unchanged automation: a repeated run verifies already-delivered content without creating another commit. A red delivery job with signing and acceptance green is classed as `delivery` and retried automatically by `scripts/distribution-recover.sh`, first immediately and then at least 15 minutes apart, up to attempt 48 or 7 days for each run. The observer requests at most five reruns per pass and reaches older builds first.
 
-The workflow uses the SHA-pinned official `actions/create-github-app-token` action, limits its installation token to the tap repository and Actions write permission, and revokes it after the job. Public/source readback uses the source workflow's read-only token. The tap uses its own contents-write Actions token for signed cask publication. PRs receive neither App credential.
+If the automation itself needs a fix, merge the repair and dispatch distribution against the original build run ID as documented in [Apple signing and notarization](apple-signing.md#resuming-a-pending-ci-submission). A matching immutable release is verified rather than overwritten.
 
-## Recovery and tooling changes
+Common failures:
 
-Inspect the failed distribution **Verify Homebrew delivery** job and its linked exact tap run. Rerun failed distribution jobs to retry unchanged automation. If the automation itself needs a fix, merge the repair and dispatch distribution against the original build run ID as documented in [Apple signing and notarization](apple-signing.md#resuming-a-pending-ci-submission). A matching immutable release is verified rather than overwritten. A repeated refresh verifies an already-current cask without creating another commit.
+- `Configure HOMEBREW_SYNC_APP_CLIENT_ID, HOMEBREW_SYNC_APP_PRIVATE_KEY and SPARKLE_ED_PRIVATE_KEY`: a secret or variable is missing.
+- Token creation fails: the App is not installed on this repository or lacks **Contents: Read and write**.
+- `Publishing to main failed`: the App is not a bypass actor on the `main` or `main-ci` ruleset, or its permission was reduced.
+- `would downgrade` or `conflicting release metadata`: `main` holds a newer or different build than the public releases show. Do not edit `Casks/` or `appcast.xml` by hand; investigate the releases first.
 
-An owner can reconcile the latest published build without supplying release inputs:
+Never edit generated `Casks/` files or `appcast.xml` manually, and never execute code from a release to repair drift.
 
-```sh
-gh workflow run refresh.yml --repo Dunky13/homebrew-agent-job-queue --ref tap
-```
-
-To inspect the workflow runs:
-
-```sh
-gh run list --repo Dunky13/homebrew-agent-job-queue --workflow refresh.yml --limit 5
-```
-
-Changes to the trusted tap files need a reviewed companion tap PR. Copy the standalone `refresh.go`, `refresh_test.go`, `test-cask.rb`, and `.github/workflows/refresh.yml` from `packaging/homebrew/`, together with the root `LICENSE`. The tap helper uses only the Go standard library and never downloads application source or dependencies to execute. Merge the tap PR before the corresponding source change. Mandatory byte comparison makes future helper drift a delivery error. Never edit generated `Casks/` files manually or execute arbitrary code from a release to repair drift. The one exception is the reset above, which restores the exact bytes of a published release asset.
-
-After verified delivery, Homebrew users can upgrade normally:
-
-```sh
-brew update
-brew upgrade --cask dunky13/agent-job-queue/agent-job-queue
-```
-
-Publishing a release or updating the tap does not modify the operator's Mac. Running the updated cask's install or upgrade command places the app only; open it to use the menu bar while services prepare automatically in the background. Version visibility requires the new app to be installed and running; open its gear menu and choose **About and updates**.
+Publishing a release or updating the feed does not modify the operator's Mac. Version visibility requires the new app to be installed and running; open its gear menu and choose **About and updates**.
 
 ## Validation
 
-Source-side tests simulate exact-run dispatch, failures, deadline expiry, token routing, signed readback, canonical helper/cask comparison, conflicting identities and verified supersession. Tap tests simulate pagination, requested release validation, checksum failures, stale heads, idempotence, ancestry and signed publication. They do not call GitHub, install an app or use the live queue.
-
-From the app source checkout:
+The tests simulate pagination, requested release validation, checksum failures, conflicting identities, verified supersession, signed readback, expected-head retries, identical content, appcast rendering against a golden file and signing with an inert fake `sign_update` that proves the key never appears in arguments. They do not call GitHub, install an app or use the live queue. From the source checkout:
 
 ```sh
-go test -p 2 ./internal/delivery ./internal/tooling ./packaging/homebrew -v
+go test -p 2 ./internal/tap ./internal/tooling -v
 ```
 
-From the standalone tap checkout, using Go 1.26 or later:
-
-```sh
-go test -p 2 refresh.go refresh_test.go
-go vet refresh.go
-```
-
-This guide has a complete standalone [HTML version](homebrew-delivery.html). API and setup references: [workflow dispatch](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event), [App registration](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app), [App keys](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/managing-private-keys-for-github-apps), and [schedule behavior](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+This guide has a complete standalone [HTML version](homebrew-delivery.html).
