@@ -6,6 +6,7 @@ package tap
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -170,9 +171,10 @@ type files map[string][]byte
 type delivery struct {
 	ctx          context.Context
 	output       io.Writer
-	checkDir     string // directory holding test-cask.rb
-	signTool     string // Sparkle sign_update
-	signKey      string // EdDSA private key, passed on stdin only
+	checkDir     string            // directory holding test-cask.rb
+	signTool     string            // Sparkle sign_update
+	signKey      string            // EdDSA private key, passed on stdin only
+	publicKey    ed25519.PublicKey // the key the app trusts
 	bot          bot
 	command      func([]string, []byte) ([]byte, error)
 	api          func(string) ([]byte, error)
@@ -658,7 +660,6 @@ func (s *session) checked(tag string) (checkedRelease, error) {
 // build when this run is superseded.
 type selection struct {
 	target checkedRelease
-	latest manifest
 	later  *manifest
 }
 
@@ -676,7 +677,7 @@ func (s *session) selectBuild(want tagCommit) (selection, error) {
 	if err != nil {
 		return selection{}, err
 	}
-	result := selection{target: newest, latest: newest.data}
+	result := selection{target: newest}
 	if want.Tag == "" {
 		return result, nil
 	}
@@ -704,8 +705,9 @@ func (s *session) selectBuild(want tagCommit) (selection, error) {
 }
 
 // rejectOrYield compares main's current build with the one being delivered. It
-// reports true when main already holds a newer verified build, and fails on a
-// real regression such as a build newer than any public release.
+// reports true when main already holds a newer build, which a concurrent newer
+// run delivered after this run was selected. That build was just verified as a
+// public release above, so it is never treated as a regression.
 func (s *session) rejectOrYield(current *manifest, sel selection) (bool, error) {
 	if current == nil {
 		return false, nil
@@ -719,8 +721,6 @@ func (s *session) rejectOrYield(current *manifest, sel selection) (bool, error) 
 	}
 	data := sel.target.data
 	switch {
-	case current.Build > sel.latest.Build:
-		return false, errors.New("Main holds a build newer than any public release")
 	case current.Build > data.Build:
 		return true, nil
 	case current.Build == data.Build && *current != data:
@@ -743,6 +743,13 @@ func (s *session) build(target checkedRelease) (files, error) {
 	}
 	appcast, err := s.d.signedAppcast(data, target.zip, s.work)
 	if err != nil {
+		return nil, err
+	}
+	archive, err := os.ReadFile(target.zip)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifySignatures(s.d.publicKey, archive, []byte(appcast)); err != nil {
 		return nil, err
 	}
 	body, err := json.MarshalIndent(data, "", "  ")
@@ -854,6 +861,7 @@ func Run(arguments []string, output io.Writer) error {
 	artifact := flags.String("artifact-dir", "", "Directory of this run's notarized artifact")
 	checkDir := flags.String("check-dir", "packaging/homebrew", "Directory containing test-cask.rb")
 	signTool := flags.String("sign-update", "", "Path to Sparkle sign_update")
+	publicKey := flags.String("public-key", "packaging/sparkle/public-ed-key.txt", "File holding the base64 Sparkle public key the app trusts")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
@@ -879,6 +887,11 @@ func Run(arguments []string, output io.Writer) error {
 		if !d.bot.valid() {
 			return errors.New("TAP_BOT_NAME and TAP_BOT_EMAIL must name the Homebrew-sync App bot. " + docsPointer)
 		}
+		key, err := loadPublicKey(*publicKey)
+		if err != nil {
+			return err
+		}
+		d.publicKey = key
 	}
 	return d.refresh(request{tagCommit{*tag, *commit}, *artifact, *publish})
 }

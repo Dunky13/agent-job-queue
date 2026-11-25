@@ -63,8 +63,28 @@ func deliveryFiles(t testing.TB, data manifest) files {
 		t.Fatal(err)
 	}
 	body, _ := json.MarshalIndent(data, "", "  ")
-	archive := fmt.Sprintf("archive-%d", data.Build)
-	return files{caskPath: []byte(cask), manifestPath: append(body, '\n'), appcastPath: []byte(renderAppcast(data, int64(len(archive)), testSignature) + signedComment())}
+	archive := []byte(fmt.Sprintf("archive-%d", data.Build))
+	feed := renderAppcast(data, int64(len(archive)), testArchiveSignature(archive))
+	return files{caskPath: []byte(cask), manifestPath: append(body, '\n'), appcastPath: []byte(testSignFeed(feed))}
+}
+
+// A throwaway keypair stands in for the owner's key; no real key is committed.
+var testPublic, testPrivate = func() (ed25519.PublicKey, ed25519.PrivateKey) {
+	public, private, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		panic(err)
+	}
+	return public, private
+}()
+
+func testArchiveSignature(archive []byte) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(testPrivate, archive))
+}
+
+// testSignFeed signs the way Sparkle does: the comment length is the byte count it signs.
+func testSignFeed(feed string) string {
+	signature := base64.StdEncoding.EncodeToString(ed25519.Sign(testPrivate, []byte(feed)))
+	return fmt.Sprintf("%s<!-- sparkle-signatures:\nedSignature: %s\nlength: %d\n-->\n", feed, signature, len(feed))
 }
 
 type fixture struct {
@@ -86,6 +106,7 @@ type fixture struct {
 	artifactBuild  int // build in the notarized artifact; 0 follows the request
 	tamperManifest bool
 	tamperArchive  bool
+	loseResponse   bool
 	signCalls      [][]string
 	signInputs     []string
 	brewCalls      int
@@ -96,7 +117,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	x := &fixture{t: t, data: map[string]manifest{}, source: map[string]map[string]any{}, head: testHead, state: files{}, commits: map[string]files{}}
 	x.d = newDelivery(context.Background(), t.TempDir(), &x.output)
-	x.d.signTool, x.d.signKey, x.d.bot = "sign-update", "TEST-PRIVATE-KEY", bot{testBot, testEmail}
+	x.d.signTool, x.d.signKey, x.d.bot, x.d.publicKey = "sign-update", "TEST-PRIVATE-KEY", bot{testBot, testEmail}, testPublic
 	for _, build := range []int{1, 2, 3} {
 		data := fixtureManifest(build)
 		x.data[data.Tag] = data
@@ -172,15 +193,15 @@ func newFixture(t *testing.T) *fixture {
 		case arguments[0] == "sign-update":
 			x.signCalls = append(x.signCalls, arguments)
 			x.signInputs = append(x.signInputs, string(input))
-			if slices.Contains(arguments, "-p") {
-				return []byte(testSignature + "\n"), nil
-			}
 			path := arguments[len(arguments)-1]
 			body, err := os.ReadFile(path)
 			if err != nil {
 				return nil, err
 			}
-			return nil, os.WriteFile(path, append(body, signedComment()...), 0600)
+			if slices.Contains(arguments, "-p") {
+				return []byte(testArchiveSignature(body) + "\n"), nil
+			}
+			return nil, os.WriteFile(path, []byte(testSignFeed(string(body))), 0600)
 		}
 		return nil, fmt.Errorf("unexpected fixture command %v", arguments)
 	}
@@ -201,6 +222,11 @@ func newFixture(t *testing.T) *fixture {
 			published[addition.Path] = body
 		}
 		x.commits[testPublished] = published
+		if x.loseResponse {
+			// The commit landed on main but the response never arrived.
+			x.state, x.head = published, testMoved
+			return "", errors.New("fixture lost the commit response")
+		}
 		return testPublished, nil
 	}
 	return x
@@ -305,26 +331,135 @@ func TestSupersededRunDeliversNothing(t *testing.T) {
 	}
 }
 
-// When main already holds a newer verified build, the run yields instead of failing.
-func TestMainAlreadyNewerYields(t *testing.T) {
+// A newer run lands on main while this run (the latest build when it started)
+// is still signing: the release listing never showed build 3, but main holds it
+// and it is a verified public release. The run must yield, not fail.
+func TestRunYieldsWhenNewerRunLandedOnMainAfterSelection(t *testing.T) {
 	x := newFixture(t)
-	s := &session{d: x.d, work: t.TempDir(), cache: map[string]checkedRelease{}}
-	newer, older := fixtureManifest(3), fixtureManifest(2)
-	for _, data := range []manifest{newer, older} {
-		checked, err := x.d.downloadRelease(typedRelease(data), s.work)
-		if err != nil {
+	x.install(fixtureManifest(3))
+	latest := fixtureManifest(2)
+	if err := x.run(true, latest.Tag, latest.Commit); err != nil {
+		t.Fatal(err)
+	}
+	if len(x.inputs) != 0 || !strings.Contains(x.output.String(), "Superseded: main already holds build 3") {
+		t.Fatal("expected to yield to the newer main", x.output.String())
+	}
+	// A main build that is not a verified public release is still rejected.
+	y := newFixture(t)
+	y.install(fixtureManifest(3))
+	delete(y.source, fixtureManifest(3).Tag)
+	if err := y.run(true, latest.Tag, latest.Commit); err == nil || len(y.inputs) != 0 {
+		t.Fatal("accepted a main build that is not a public release", err)
+	}
+}
+
+// The commit landed but its response was lost: the retry finds identical
+// content, verifies that commit and creates no second commit.
+func TestLostCommitResponseIsRecoveredWithoutASecondCommit(t *testing.T) {
+	latest := fixtureManifest(2)
+	x := newFixture(t)
+	x.loseResponse = true
+	if err := x.run(true, latest.Tag, latest.Commit); err != nil {
+		t.Fatal(err)
+	}
+	if len(x.inputs) != 1 || !strings.Contains(x.output.String(), "No commit created") {
+		t.Fatal("expected one commit and a verified current report", len(x.inputs), x.output.String())
+	}
+	for _, scenario := range []string{"unverified", "wrong-author", "no-dco"} {
+		y := newFixture(t)
+		y.loseResponse = true
+		y.commitResponse = func(response map[string]any) {
+			commit := response["commit"].(map[string]any)
+			switch scenario {
+			case "unverified":
+				commit["verification"] = map[string]any{"verified": false}
+			case "wrong-author":
+				commit["author"] = map[string]any{"name": "someone", "email": "someone@example.invalid"}
+			case "no-dco":
+				commit["message"] = "chore: no trailer"
+			}
+		}
+		if err := y.run(true, latest.Tag, latest.Commit); err == nil || len(y.inputs) != 1 {
+			t.Fatal("accepted an unverified recovered commit", scenario, err, len(y.inputs))
+		}
+	}
+}
+
+func TestSignaturesAreVerifiedAgainstThePublicKeyBeforeCommitting(t *testing.T) {
+	latest := fixtureManifest(2)
+	otherPublic, _, _ := ed25519.GenerateKey(nil)
+	x := newFixture(t)
+	x.d.publicKey = otherPublic // the secret does not match the committed public key
+	err := x.run(true, latest.Tag, latest.Commit)
+	if err == nil || !strings.Contains(err.Error(), "does not verify against the Sparkle public key") || len(x.inputs) != 0 {
+		t.Fatal("a mismatched key must fail before committing", err, len(x.inputs))
+	}
+	y := newFixture(t)
+	y.d.publicKey = nil
+	if err := y.run(true, latest.Tag, latest.Commit); err == nil || len(y.inputs) != 0 {
+		t.Fatal("delivery without a public key must fail", err)
+	}
+}
+
+func TestVerifySignaturesRejectsTamperedContent(t *testing.T) {
+	data := fixtureManifest(2)
+	archive := []byte("archive-2")
+	feed := renderAppcast(data, int64(len(archive)), testArchiveSignature(archive))
+	good := testSignFeed(feed)
+	if err := verifySignatures(testPublic, archive, []byte(good)); err != nil {
+		t.Fatal(err)
+	}
+	// Sparkle writes the comment directly after the root element.
+	if err := verifySignatures(testPublic, archive, []byte(testSignFeed(strings.TrimSuffix(feed, "\n")))); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]func() ([]byte, []byte){
+		"archive bytes": func() ([]byte, []byte) { return []byte("archive-2x"), []byte(good) },
+		"feed content": func() ([]byte, []byte) {
+			return archive, []byte(strings.Replace(good, "Agent Queue updates", "Changed", 1))
+		},
+		"length field":     func() ([]byte, []byte) { return archive, []byte(strings.Replace(good, "length: ", "length: 1", 1)) },
+		"missing comment":  func() ([]byte, []byte) { return archive, []byte(feed) },
+		"wrong enclosure":  func() ([]byte, []byte) { return archive, []byte(testSignFeed(renderAppcast(data, 9, testSignature))) },
+		"malformed feed":   func() ([]byte, []byte) { return archive, []byte("not xml") },
+		"signature of nil": func() ([]byte, []byte) { return archive, nil },
+	}
+	for name, build := range cases {
+		a, f := build()
+		if err := verifySignatures(testPublic, a, f); err == nil {
+			t.Fatalf("accepted %s", name)
+		}
+	}
+	other, _, _ := ed25519.GenerateKey(nil)
+	if err := verifySignatures(other, archive, []byte(good)); err == nil {
+		t.Fatal("accepted a signature from another key")
+	}
+	if err := verifySignatures(nil, archive, []byte(good)); err == nil {
+		t.Fatal("accepted a missing key")
+	}
+}
+
+func TestLoadPublicKey(t *testing.T) {
+	directory := t.TempDir()
+	write := func(name, body string) string {
+		path := filepath.Join(directory, name)
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
 			t.Fatal(err)
 		}
-		s.cache[data.Tag] = checked
+		return path
 	}
-	sel := selection{target: s.cache[older.Tag], latest: newer}
-	yield, err := s.rejectOrYield(&newer, sel)
-	if err != nil || !yield {
-		t.Fatal("expected to yield to a newer main", yield, err)
+	good := base64.StdEncoding.EncodeToString(testPublic)
+	key, err := loadPublicKey(write("good", good+"\n"))
+	if err != nil || !key.Equal(testPublic) {
+		t.Fatal(key, err)
 	}
-	future := fixtureManifest(4)
-	if _, err := s.rejectOrYield(&future, sel); err == nil {
-		t.Fatal("accepted a main newer than any public release")
+	for name, body := range map[string]string{"empty": "", "notbase64": "not base64!", "short": base64.StdEncoding.EncodeToString(testPublic[:16]), "two lines": good + "\n" + good + "\n", "private seed length plus": good + good} {
+		if _, err := loadPublicKey(write(strings.ReplaceAll(name, " ", "-"), body)); err == nil || !strings.Contains(err.Error(), "docs/homebrew-delivery.md") {
+			t.Fatalf("accepted %s: %v", name, err)
+		}
+	}
+	if _, err := loadPublicKey(filepath.Join(directory, "missing")); err == nil || !strings.Contains(err.Error(), "docs/homebrew-delivery.md") {
+		t.Fatal("accepted a missing key file", err)
 	}
 }
 
@@ -349,7 +484,7 @@ func TestRefreshExpectedIdentityBeforeIO(t *testing.T) {
 }
 
 func TestRefreshRejectsConflictingStaleAndUnsafeState(t *testing.T) {
-	for _, scenario := range []string{"missing-expected", "expected-full-commit", "expected-newer", "current-downgrade", "current-metadata-drift", "current-missing-release", "unpaired-manifest", "unpaired-cask", "archive-corrupt", "draft", "target", "duplicate-assets", "unrelated", "brew-failure", "invalid-current-manifest", "artifact-manifest-replaced", "artifact-archive-replaced", "artifact-other-build"} {
+	for _, scenario := range []string{"missing-expected", "expected-full-commit", "expected-newer", "current-metadata-drift", "current-missing-release", "unpaired-manifest", "unpaired-cask", "archive-corrupt", "draft", "target", "duplicate-assets", "unrelated", "brew-failure", "invalid-current-manifest", "artifact-manifest-replaced", "artifact-archive-replaced", "artifact-other-build"} {
 		t.Run(scenario, func(t *testing.T) {
 			x := newFixture(t)
 			tag, commit := fixtureManifest(2).Tag, fixtureManifest(2).Commit
@@ -361,8 +496,6 @@ func TestRefreshRejectsConflictingStaleAndUnsafeState(t *testing.T) {
 				tag, commit = fixtureManifest(1).Tag, fixtureManifest(1).Commit[:7]+strings.Repeat("f", 33)
 			case "expected-newer":
 				tag, commit = fixtureManifest(3).Tag, fixtureManifest(3).Commit
-			case "current-downgrade":
-				x.install(fixtureManifest(3))
 			case "current-metadata-drift":
 				current := fixtureManifest(2)
 				current.SHA256 = strings.Repeat("f", 64)
@@ -815,7 +948,15 @@ func TestRunRequiresPublicationConfigurationAndScrubsKey(t *testing.T) {
 	}
 	t.Setenv(keyVariable, "key")
 	t.Setenv("TAP_BOT_EMAIL", testEmail)
-	if err := Run([]string{"--publish", "--sign-update", "sign_update"}, io.Discard); err == nil || !strings.Contains(err.Error(), "--artifact-dir") {
+	missing := filepath.Join(t.TempDir(), "public-ed-key.txt")
+	if err := Run([]string{"--publish", "--sign-update", "sign_update", "--public-key", missing}, io.Discard); err == nil || !strings.Contains(err.Error(), "public key file") {
+		t.Fatal("publication without the Sparkle public key accepted", err)
+	}
+	if err := os.WriteFile(missing, []byte(base64.StdEncoding.EncodeToString(testPublic)+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(keyVariable, "key")
+	if err := Run([]string{"--publish", "--sign-update", "sign_update", "--public-key", missing}, io.Discard); err == nil || !strings.Contains(err.Error(), "--artifact-dir") {
 		t.Fatal("publication without an expected release and artifact accepted", err)
 	}
 }
@@ -848,5 +989,12 @@ func TestRealSparkleSignerAcceptedAndDeterministic(t *testing.T) {
 	}
 	if !sameFeed([]byte(first), []byte(renderAppcast(fixtureManifest(2), 7, "x"))) {
 		t.Fatal("real signed feed must compare equal to the unsigned rendering")
+	}
+	// The real tool's byte range and comment format are what verifySignatures checks.
+	if err := verifySignatures(private.Public().(ed25519.PublicKey), []byte("archive"), []byte(first)); err != nil {
+		t.Fatal("real Sparkle signatures must verify with the matching public key", err)
+	}
+	if err := verifySignatures(testPublic, []byte("archive"), []byte(first)); err == nil {
+		t.Fatal("real Sparkle signatures must not verify with another key")
 	}
 }
