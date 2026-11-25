@@ -78,15 +78,21 @@ func parseLatest(body []byte) (latest, error) {
 	return value, nil
 }
 
+// liveRedirects follows at most two redirects and only over HTTPS.
+func liveRedirects(req *http.Request, via []*http.Request) error {
+	if len(via) >= 3 {
+		return errors.New("Too many redirects")
+	}
+	if req.URL.Scheme != "https" {
+		return errors.New("Refusing a redirect away from HTTPS")
+	}
+	return nil
+}
+
 // liveFetcher reads the deployed site, bypassing caches, with bounded sizes.
 func liveFetcher(client *http.Client) func(string) ([]byte, error) {
 	if client == nil {
-		client = &http.Client{Timeout: 20 * time.Second, CheckRedirect: func(_ *http.Request, via []*http.Request) error {
-			if len(via) >= 3 {
-				return errors.New("Too many redirects")
-			}
-			return nil
-		}}
+		client = &http.Client{Timeout: 20 * time.Second, CheckRedirect: liveRedirects}
 	}
 	return func(url string) ([]byte, error) {
 		request, err := http.NewRequest(http.MethodGet, url+"?cache="+strconv.FormatInt(time.Now().UnixNano(), 36), nil)

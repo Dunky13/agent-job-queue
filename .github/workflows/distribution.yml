@@ -322,6 +322,10 @@ jobs:
     needs: [source, publish, notarize]
     runs-on: macos-15
     timeout-minutes: 20
+    # One deployment at a time, so prepare re-checks the live site after any earlier deploy finished.
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
     permissions:
       contents: read
       pages: write
@@ -370,7 +374,10 @@ jobs:
         run: |
           "$RUNNER_TEMP/queue-pages" prepare --expected-tag "$BUILD_TAG" --expected-commit "$BUILD_SHA" \
             --artifact-dir dist --site-dir site --output-dir "$RUNNER_TEMP/site" --result-file "$GITHUB_OUTPUT" \
-            --sign-update "$SPARKLE_DIR/bin/sign_update" | tee -a "$GITHUB_STEP_SUMMARY"
+            --sign-update "$SPARKLE_DIR/bin/sign_update" >"$RUNNER_TEMP/prepare-summary.md"
+      - name: Summarize the delivery decision
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: tee -a "$GITHUB_STEP_SUMMARY" <"$RUNNER_TEMP/prepare-summary.md"
       - name: Upload the site
         if: steps.prepare.outputs.deploy == 'true'
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0

@@ -393,7 +393,7 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 		return f
 	}
 	ci, dist := read("ci.yml"), read("distribution.yml")
-	for _, name := range []string{"source", "notarize", "notarized-tests", "publish", "delivery", "tap-delivery"} {
+	for _, name := range []string{"source", "notarize", "notarized-tests", "publish", "delivery", "homebrew-sync"} {
 		if _, ok := ci.Jobs[name]; ok {
 			t.Errorf("CI still performs distribution: %s", name)
 		}
@@ -552,7 +552,7 @@ func TestDeliveryJobShapeAndPagesDeployment(t *testing.T) {
 	if len(ci.On["push"].PathsIgnore) != 0 || len(ci.On["pull_request"].PathsIgnore) != 0 {
 		t.Fatal("CI must not filter paths: delivery no longer commits to main")
 	}
-	if _, ok := dist.Jobs["tap-delivery"]; ok {
+	if _, ok := dist.Jobs["homebrew-sync"]; ok {
 		t.Fatal("the Homebrew delivery job must be gone")
 	}
 	job := dist.Jobs["delivery"]

@@ -42,7 +42,7 @@ additional container that receives its own ticket. Notarization has two stages,
 
 Final release assets are `Agent-Queue-VERSION-universal.zip` and
 `Agent-Queue-VERSION-universal.dmg`, each with a `.sha256` file, plus
-`agent-job-queue.json`, `agent-job-queue.rb` and `apple-notarization.json`.
+`agent-job-queue.json` and `apple-notarization.json`.
 Hosted Apple submissions are named `Agent-Queue-VERSION-build-N-SHA-universal.zip`
 (app stage) and `Agent-Queue-VERSION-build-N-SHA-universal.dmg` (dmg stage). `N` is the original
 CI build number and `SHA` is its seven-character source prefix. Local packaging

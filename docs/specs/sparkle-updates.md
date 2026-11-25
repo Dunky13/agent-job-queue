@@ -122,7 +122,7 @@ This work ships as stacked pull requests, merged in this order:
 - README install instructions: the homepage, the DMG and the release page.
 - Update `CONTRIBUTING.md`, `apple-signing.md`, `upgrade-recovery.md` and their HTML where they mention Homebrew delivery.
 - Replace `docs/handoffs/in-repo-tap.md` with `docs/handoffs/pages-delivery.md`.
-- Leave historical handoffs untouched.
+- Leave historical handoffs untouched, except that links to deleted guides point at their last revision.
 
 ### Tests
 

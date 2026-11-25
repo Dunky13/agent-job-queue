@@ -713,3 +713,23 @@ func TestLiveFetcherReadsBoundedNonCachedResponses(t *testing.T) {
 		t.Fatal("an unreachable site is a failure, not an empty site", err)
 	}
 }
+
+func TestLiveRedirectsStayOnHTTPS(t *testing.T) {
+	to := func(raw string) *http.Request {
+		request, err := http.NewRequest(http.MethodGet, raw, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return request
+	}
+	origin := []*http.Request{to("https://dunky13.github.io/agent-job-queue/appcast.xml")}
+	if err := liveRedirects(to("https://dunky13.github.io/agent-job-queue/"), origin); err != nil {
+		t.Fatalf("HTTPS redirect refused: %v", err)
+	}
+	if err := liveRedirects(to("http://dunky13.github.io/agent-job-queue/"), origin); err == nil {
+		t.Fatal("redirect to plain HTTP accepted")
+	}
+	if err := liveRedirects(to("https://dunky13.github.io/"), append(origin, origin[0], origin[0])); err == nil {
+		t.Fatal("third redirect accepted")
+	}
+}

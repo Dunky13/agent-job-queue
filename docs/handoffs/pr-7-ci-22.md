@@ -1,6 +1,6 @@
 # PR 8: shutdown recovery and verified Homebrew delivery
 
-[PR 8](https://github.com/Dunky13/agent-job-queue/pull/8) repairs the post-PR-7 shutdown race and implements the subsequently approved release-driven Homebrew synchronization. The complete setup and recovery procedure is in [Verified Homebrew delivery](https://github.com/Dunky13/agent-job-queue/blob/8015b73531218665d4ac216b76fa34ba7d9ae177/docs/homebrew-delivery.md), with a standalone [HTML guide](https://github.com/Dunky13/agent-job-queue/blob/8015b73531218665d4ac216b76fa34ba7d9ae177/docs/homebrew-delivery.md).
+[PR 8](https://github.com/Dunky13/agent-job-queue/pull/8) repairs the post-PR-7 shutdown race and implements the subsequently approved release-driven Homebrew synchronization. The complete setup and recovery procedure is in [Verified Homebrew delivery](https://github.com/Dunky13/agent-job-queue/blob/8015b73531218665d4ac216b76fa34ba7d9ae177/docs/homebrew-delivery.md), with a standalone [HTML guide](https://github.com/Dunky13/agent-job-queue/blob/8015b73531218665d4ac216b76fa34ba7d9ae177/docs/homebrew-delivery.html).
 
 ## Scope and diagnosis
 

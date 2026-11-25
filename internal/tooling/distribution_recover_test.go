@@ -497,7 +497,7 @@ func (f *distributionRecoveryFixture) ticket() {
 
 func TestDistributionRecoveryTicketAndDeliveryOnlyRetries(t *testing.T) {
 	t.Parallel()
-	for _, variant := range []string{"ticket accepted", "ticket finished", "ticket legacy filename", "ticket bound filename", "publish", "pages", "legacy tap job", "retained signing", "publish validation failed", "pages signing failed", "missing intel", "delivery other failure", "legacy delivery", "ticket missing acceptance"} {
+	for _, variant := range []string{"ticket accepted", "ticket finished", "ticket legacy filename", "ticket bound filename", "publish", "pages", "homebrew job", "retained signing", "publish validation failed", "pages signing failed", "missing intel", "delivery other failure", "legacy delivery", "ticket missing acceptance"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newDistributionRecoveryFixture(t)
 			f.ticket()
@@ -520,11 +520,11 @@ func TestDistributionRecoveryTicketAndDeliveryOnlyRetries(t *testing.T) {
 					job["conclusion"] = "success"
 				}
 				f.jobs[4]["conclusion"] = "failure"
-				if variant == "pages" || variant == "legacy tap job" {
+				if variant == "pages" || variant == "homebrew job" {
 					f.jobs[4]["conclusion"] = "success"
 					f.jobs[5]["conclusion"] = "failure"
-					if variant == "legacy tap job" {
-						f.jobs[5]["name"] = "Publish Homebrew tap and Sparkle feed"
+					if variant == "homebrew job" {
+						f.jobs[5]["name"] = "Verify Homebrew delivery"
 					}
 				}
 				switch variant {

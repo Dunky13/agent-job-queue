@@ -97,7 +97,7 @@ recovery_candidate() (
   distribution_inventory "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?filter=latest" jobs "$temporary/jobs"
   mode=$(jq -s -er --arg id "$id" --arg sha "$sha" --argjson attempt "$attempt" '
     def signing: .name == "Sign and notarize main installer";
-    def delivery: .name == "Publish main installer" or .name == "Verify Homebrew delivery" or .name == "Publish Homebrew tap and Sparkle feed" or .name == "Publish Sparkle feed and homepage";
+    def delivery: .name == "Publish main installer" or .name == "Verify Homebrew delivery" or .name == "Publish Sparkle feed and homepage";
     def success: .status == "completed" and .conclusion == "success";
     if all(.[]; (.run_id|tostring) == $id and .head_sha == $sha and (.run_attempt|type) == "number" and
       .run_attempt >= 1 and .run_attempt <= $attempt and .run_attempt == (.run_attempt|floor) and .status == "completed") and
