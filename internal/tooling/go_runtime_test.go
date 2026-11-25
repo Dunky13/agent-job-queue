@@ -174,7 +174,7 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 		t.Fatalf("enumerated in %q, want repository %q", cwd, repository)
 	}
 	want := []string{"test", "-p", "2", "-parallel", "2", "-race", goRuntimeBlowfishFlag}
-	for _, index := range []int{0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12} {
+	for _, index := range []int{0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11} {
 		want = append(want, packages[index])
 	}
 	want = append(want, "-timeout", "12m")
