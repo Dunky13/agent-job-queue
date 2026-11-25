@@ -114,7 +114,7 @@ func TestManagedCaskLoaderRejectsHookDrift(t *testing.T) {
 ARGV.each_with_index do |path, index|
   rejected = false
   begin
-    cask = Cask::CaskLoader.load(Pathname(path))
+    cask = load_delivery_cask(path)
     verify_delivery_cask_contract(cask)
   rescue RuntimeError, MethodDeprecatedError
     rejected = true
