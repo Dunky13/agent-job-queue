@@ -3,6 +3,7 @@ package tooling
 import (
 	"os"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -504,6 +505,7 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 			Name        string
 			RunsOn      string `yaml:"runs-on"`
 			Permissions map[string]string
+			Env         map[string]string
 			Steps       []step
 		}
 	}
@@ -529,6 +531,11 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 	if job.Name != "Publish Homebrew tap and Sparkle feed" || job.RunsOn != "macos-15" || !reflect.DeepEqual(job.Permissions, map[string]string{"contents": "read"}) {
 		t.Fatalf("delivery job identity: %+v", job)
 	}
+	for name, value := range job.Env {
+		if strings.Contains(value, "secrets.") {
+			t.Errorf("job env %s binds a secret for every step", name)
+		}
+	}
 	var token, publish *step
 	for index, item := range job.Steps {
 		if strings.HasPrefix(item.Uses, "actions/create-github-app-token@") {
@@ -544,17 +551,8 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 				t.Errorf("Sparkle key leaked into step %q through %s", item.Name, name)
 			}
 		}
-		// A shell script never receives the key by expression expansion, and never echoes secrets.
-		if strings.Contains(item.Run, "${{") && strings.Contains(item.Run, "secrets.") {
-			t.Errorf("step %q expands a secret into its script", item.Name)
-		}
-		if item.With["private-key"] != "" && !strings.HasPrefix(item.Uses, "actions/create-github-app-token@") {
-			t.Errorf("step %q receives a private key", item.Name)
-		}
-		for _, line := range strings.Split(item.Run, "\n") {
-			if strings.Contains(line, "echo") && (strings.Contains(line, "$SPARKLE") || strings.Contains(line, "$HAS_") || strings.Contains(line, "secrets.")) {
-				t.Errorf("step %q may print the key: %s", item.Name, line)
-			}
+		for _, leak := range secretLeaks(item.Env, item.Run, item.Shell) {
+			t.Errorf("step %q: %s", item.Name, leak)
 		}
 	}
 	if token == nil || token.With["repositories"] != "agent-job-queue" || token.With["permission-contents"] != "write" || len(token.With) != 5 {
@@ -567,5 +565,70 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 		if strings.Contains(publish.Run, flag) {
 			t.Fatalf("the key must never be an argument: %s", flag)
 		}
+	}
+}
+
+var secretTracing = regexp.MustCompile(`(^|[\s;&|(])(printenv|env|compgen|export\s+-p|declare\s+-[a-zA-Z]*x|set\s+-[a-zA-Z]*[xv][a-zA-Z]*|set\s+-o\s+(xtrace|verbose))($|[\s;&|)])`)
+
+// secretLeaks reports how a step's script could expose an environment variable
+// bound to a secret or to the App token: any reference to its name, an
+// environment dump, or shell tracing. Presence tests (`!=`) are not secrets.
+func secretLeaks(env map[string]string, run, shell string) []string {
+	var leaks []string
+	holds := false
+	for name, value := range env {
+		if (!strings.Contains(value, "secrets.") || strings.Contains(value, "!=")) && !strings.Contains(value, "steps.app-token.outputs.token") {
+			continue
+		}
+		holds = true
+		if regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`).MatchString(run) {
+			leaks = append(leaks, "script references secret variable "+name)
+		}
+	}
+	if holds && secretTracing.MatchString(run) {
+		leaks = append(leaks, "script dumps the environment or enables tracing")
+	}
+	if holds && (strings.Contains(shell, " -x") || strings.Contains(shell, "xtrace") || strings.Contains(shell, " -v")) {
+		leaks = append(leaks, "shell traces commands")
+	}
+	return leaks
+}
+
+func TestSecretLeakGuardRejectsEveryForm(t *testing.T) {
+	env := map[string]string{"SPARKLE_ED_PRIVATE_KEY": "${{ secrets.SPARKLE_ED_PRIVATE_KEY }}", "HAS_KEY": "${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}"}
+	for _, run := range []string{
+		"echo $SPARKLE_ED_PRIVATE_KEY",
+		"echo \"${SPARKLE_ED_PRIVATE_KEY}\"",
+		"printf '%s' \"$SPARKLE_ED_PRIVATE_KEY\"",
+		"cat <<< \"$SPARKLE_ED_PRIVATE_KEY\"",
+		"printenv SPARKLE_ED_PRIVATE_KEY",
+		"printenv",
+		"env | sort",
+		"x=1; env",
+		"export -p",
+		"declare -x",
+		"set -x\nrun",
+		"set -ex",
+		"set -o xtrace",
+		"set -v",
+	} {
+		if len(secretLeaks(env, run, "bash")) == 0 {
+			t.Errorf("guard missed %q", run)
+		}
+	}
+	if len(secretLeaks(env, "run", "bash -x {0}")) == 0 || len(secretLeaks(env, "run", "bash -o xtrace {0}")) == 0 {
+		t.Error("guard missed shell tracing")
+	}
+	token := map[string]string{"GH_TOKEN": "${{ steps.app-token.outputs.token }}"}
+	if len(secretLeaks(token, "echo $GH_TOKEN", "bash")) == 0 {
+		t.Error("guard missed the App token")
+	}
+	for _, run := range []string{"\"$RUNNER_TEMP/queue-tap\" --publish | tee -a \"$GITHUB_STEP_SUMMARY\"", "set -eu\ngh api users/x --jq .id", "echo \"dir=$dir\" >> \"$GITHUB_OUTPUT\""} {
+		if leaks := secretLeaks(env, run, "bash"); len(leaks) != 0 {
+			t.Errorf("false positive on %q: %v", run, leaks)
+		}
+	}
+	if len(secretLeaks(map[string]string{"HAS_KEY": env["HAS_KEY"]}, "echo $HAS_KEY; env", "bash")) != 0 {
+		t.Error("a presence boolean is not a secret")
 	}
 }
