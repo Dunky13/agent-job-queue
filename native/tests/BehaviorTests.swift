@@ -173,18 +173,30 @@ struct BehaviorTests {
         for (action, arguments, notice, confirms) in sent {
             try check(action.command.arguments == arguments, "\(action.name) sends its controller arguments")
             try check(action.notice == notice, "\(action.name) shows its notice")
-            try check(action.needsConfirmation == confirms, "\(action.name) confirmation need")
+            try check((action.confirmation != nil) == confirms, "\(action.name) confirmation need")
         }
         for kind in [QueueConfirmationKind.start, .cancel] {
             try check(kind.action(for: movable).confirmation == kind && kind.action(for: movable).name == kind.rawValue,
                       "\(kind.rawValue) confirmation builds the matching action")
         }
-        // Any command reaching this store would fail and set its error.
-        let rejecting = QueueStore(statusLoader: { Data() }, command: { _ in throw ClientError.message("A command was sent") })
+        // Any command reaching this store fails and sets its error; it ignores the CLI fixture.
+        let rejecting = QueueStore(statusLoader: { Data() }, command: { _ in throw ClientError.message("A command was sent") },
+                                   arguments: [])
         rejecting.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [running])
         try check(rejecting.dispatch(.next(running)) == nil && !rejecting.isMutating, "The store rejects a disallowed action")
-        await Task.yield()
-        try check(rejecting.error == nil && rejecting.notice == nil, "A rejected action sends no command")
+        await rejecting.dispatch(.cancel(running))?.value
+        try check(rejecting.error?.contains("A command was sent") == true, "The rejecting store sends an allowed action")
+        // Surfaces go through navigation: confirming actions only ask, the others are sent.
+        let surface = QueueNavigation()
+        rejecting.error = nil
+        surface.perform(.cancel(running), in: rejecting)
+        try check(surface.confirmation?.kind == .cancel && !rejecting.isMutating, "A confirming action asks before sending")
+        surface.decline()
+        rejecting.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [movable])
+        surface.perform(.next(movable), in: rejecting)
+        try check(surface.confirmation == nil && rejecting.isMutating, "A non-confirming action is sent without asking")
+        for _ in 0..<1_000 where rejecting.isMutating { await Task.yield() }
+        try check(!rejecting.isMutating, "The sent action settles")
         let passwords: [(String, Bool)] = [("", false), ("abc", false), ("word", true), ("2468", true),
             ("simple", true), (String(repeating: "a", count: 72), true),
             (String(repeating: "a", count: 73), false), (String(repeating: "é", count: 36), true),

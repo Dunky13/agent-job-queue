@@ -1440,6 +1440,11 @@ final class QueueNavigation: ObservableObject {
     }
     func decline() { confirmation = nil }
 
+    /// The one entry point for surfaces: asks first when the action needs confirmation.
+    func perform(_ action: QueueAction, in store: QueueStore) {
+        if let kind = action.confirmation, let job = action.job { request(kind, job: job) } else { store.dispatch(action) }
+    }
+
     func unavailability(in store: QueueStore) -> String? {
         guard let confirmation else { return "No action is awaiting confirmation." }
         guard let current = store.snapshot?.jobs.first(where: { $0.id == confirmation.job.id }) else {
@@ -1717,15 +1722,15 @@ struct QueuePanel: View {
                     // Icon buttons keep every row the same height; titles are in the tooltips and the ⋯ menu.
                     if QueueAction.next(job).isAllowed(in: store.snapshot) {
                         iconAction("Run job \(job.id) next", symbol: "arrow.up.to.line", help: "Run job #\(job.id) after the current job finishes") {
-                            store.dispatch(.next(job))
+                            navigation.perform(.next(job), in: store)
                         }
                         iconAction("Move job \(job.id) to the end", symbol: "arrow.down.to.line", help: "Move job #\(job.id) to the end of the queue") {
-                            store.dispatch(.last(job))
+                            navigation.perform(.last(job), in: store)
                         }
                     }
                     if QueueAction.start(job).isAllowed(in: store.snapshot) {
                         iconAction("Start job \(job.id) now", symbol: "play.fill", help: "Start job #\(job.id) now, bypassing the parallel limit and adaptive resource checks") {
-                            navigation.request(.start, job: job)
+                            navigation.perform(.start(job), in: store)
                         }
                     }
                     Menu {
@@ -1738,16 +1743,16 @@ struct QueuePanel: View {
                         if QueueAction.next(job).isAllowed(in: store.snapshot) || QueueAction.start(job).isAllowed(in: store.snapshot) {
                             Divider()
                             if QueueAction.next(job).isAllowed(in: store.snapshot) {
-                                Button("Run next", systemImage: "arrow.up.to.line") { store.dispatch(.next(job)) }.disabled(store.actionsDisabled)
-                                Button("Move to end", systemImage: "arrow.down.to.line") { store.dispatch(.last(job)) }.disabled(store.actionsDisabled)
+                                Button("Run next", systemImage: "arrow.up.to.line") { navigation.perform(.next(job), in: store) }.disabled(store.actionsDisabled)
+                                Button("Move to end", systemImage: "arrow.down.to.line") { navigation.perform(.last(job), in: store) }.disabled(store.actionsDisabled)
                             }
                             if QueueAction.start(job).isAllowed(in: store.snapshot) {
-                                Button("Start now…", systemImage: "play.fill") { navigation.request(.start, job: job) }.disabled(store.actionsDisabled)
+                                Button("Start now…", systemImage: "play.fill") { navigation.perform(.start(job), in: store) }.disabled(store.actionsDisabled)
                             }
                         }
                         if QueueAction.cancel(job).isAllowed(in: store.snapshot) {
                             Divider()
-                            Button("Cancel job…", systemImage: "stop.circle", role: .destructive) { navigation.request(.cancel, job: job) }.disabled(store.actionsDisabled)
+                            Button("Cancel job…", systemImage: "stop.circle", role: .destructive) { navigation.perform(.cancel(job), in: store) }.disabled(store.actionsDisabled)
                         }
                     } label: { Image(systemName: "ellipsis").frame(width: 22, height: 22) }
                         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Actions for job #\(job.id)")

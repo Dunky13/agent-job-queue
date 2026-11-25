@@ -256,7 +256,7 @@ extension AppDelegate {
         let staleJobExplained = navigation.unavailability(in: store) != nil
         let staleJobRejected = navigation.confirm(in: store) == nil && recorder.actions.count == beforeStale
         navigation.decline()
-        // The recorder makes every fixture action inert, including accidental limit changes.
+        // Fixtures refuse queue-level changes before any recorder or command.
         let fixtureLimitDidNotDispatch = store.dispatch(.limit(original.queue.limit % 8 + 1)) == nil && !store.isMutating
             && recorder.actions.count == beforeStale
         let restoredSurface = sameSurface()

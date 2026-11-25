@@ -29,17 +29,6 @@ enum QueueAction: Equatable {
         }
     }
 
-    /// The same action aimed at a fresher copy of its job.
-    func refreshed(with job: QueueJob) -> QueueAction {
-        switch self {
-        case .next: .next(job)
-        case .last: .last(job)
-        case .start: .start(job)
-        case .cancel: .cancel(job)
-        case .resume, .limit, .scheduling: self
-        }
-    }
-
     /// The one list of actions that ask for confirmation.
     var confirmation: QueueConfirmationKind? {
         switch self {
@@ -48,8 +37,6 @@ enum QueueAction: Equatable {
         case .next, .last, .resume, .limit, .scheduling: nil
         }
     }
-
-    var needsConfirmation: Bool { confirmation != nil }
 
     /// Whether the job and queue state permit this action. Store-level busy and read-only
     /// states are separate and apply on top.
