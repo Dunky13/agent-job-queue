@@ -51,17 +51,19 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
         print("PASS \(name)")
     }
 
-    private func table(in root: NSView) -> NSTableView? {
-        if let table = root as? NSTableView { return table }
-        for child in root.subviews { if let table = table(in: child) { return table } }
+    private func list(in root: NSView) -> NSView? {
+        if let list = (root as? NSScrollView)?.documentView { return list }
+        for child in root.subviews { if let list = list(in: child) { return list } }
         return nil
     }
 
-    private func pressResume(in table: NSTableView, window: NSWindow) throws {
-        // The paused banner is the first list row. Click its trailing native button,
-        // relative to the actual row, so header height and window size do not matter.
-        let row = table.rect(ofRow: 0)
-        let point = table.convert(NSPoint(x: row.maxX - 40, y: row.midY), to: nil)
+    private func pressResume(in list: NSView, window: NSWindow) throws {
+        // The paused banner is the first list row: a 24 pt bordered button below 10 pt
+        // of padding, trailing. Click it relative to the list's actual content, so
+        // header height and window size do not matter. SwiftUI exposes no public
+        // view or accessibility element for the button without an assistive client.
+        let top = list.isFlipped ? list.bounds.minY + 22 : list.bounds.maxY - 22
+        let point = list.convert(NSPoint(x: list.bounds.maxX - 40, y: top), to: nil)
         guard let down = NSEvent.mouseEvent(with: .leftMouseDown, location: point, modifierFlags: [],
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
             context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
@@ -120,10 +122,10 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
             try check(store.snapshot?.queue.status == "paused", "\(name): paused fixture loaded")
             try capture(view, to: output.appendingPathComponent("paused-\(name).png"))
             if !captureOnly {
-                guard let list = table(in: view), list.numberOfRows > 0 else {
+                guard let list = list(in: view), list.bounds.height > 0 else {
                     throw ClientError.message("Paused fixture list missing")
                 }
-                let pausedRows = list.numberOfRows
+                let pausedHeight = list.bounds.height
                 window.makeKeyAndOrderFront(nil)
                 try pressResume(in: list, window: window)
                 let deadline = ContinuousClock.now + .seconds(5)
@@ -134,10 +136,10 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
                           "\(name): Resume refreshes state and preserves jobs")
                 try check(await backend.commands == [["resume"]], "\(name): one exact resume command")
                 let renderDeadline = ContinuousClock.now + .seconds(5)
-                while list.numberOfRows == pausedRows && ContinuousClock.now < renderDeadline {
+                while list.bounds.height == pausedHeight && ContinuousClock.now < renderDeadline {
                     try await Task.sleep(for: .milliseconds(10))
                 }
-                try check(list.numberOfRows == pausedRows - 1, "\(name): paused control disappears after resume")
+                try check(list.bounds.height < pausedHeight, "\(name): paused control disappears after resume")
                 try capture(view, to: output.appendingPathComponent("resumed-\(name).png"))
             }
             window.orderOut(nil)
