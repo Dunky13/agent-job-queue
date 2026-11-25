@@ -15,7 +15,7 @@ The Homebrew cask and the Sparkle appcast are now committed to this repository's
 
 ## Human steps still required
 
-1. Generate the EdDSA key, commit the public key to `packaging/sparkle/public-ed-key.txt` (package A) and store the private key as the Actions secret `SPARKLE_ED_PRIVATE_KEY`.
+1. Generate the EdDSA key and store it as the Actions secret without pasting it anywhere: run `"$dir/bin/generate_keys"`, then `"$dir/bin/generate_keys" -x sparkle-private-key`, then `gh secret set SPARKLE_ED_PRIVATE_KEY --repo Dunky13/agent-job-queue < sparkle-private-key`, then `rm sparkle-private-key` (`dir` is the output of `packaging/sparkle/fetch.sh "$TMPDIR/sparkle"`). Commit the public key to `packaging/sparkle/public-ed-key.txt` (package A).
 2. Install the Homebrew-sync App on this repository with **Contents: Read and write**, and add it as a bypass actor on the `main` and `main-ci` rulesets. Keep the existing `HOMEBREW_SYNC_APP_CLIENT_ID` variable and `HOMEBREW_SYNC_APP_PRIVATE_KEY` secret.
 3. After the first successful delivery: disable the old tap's refresh workflow, then archive `homebrew-agent-job-queue` with a pointer here.
 4. Acceptance gate: once two Sparkle builds are published, update from build N to N+1 on the SentinelOne Mac.
@@ -23,7 +23,8 @@ The Homebrew cask and the Sparkle appcast are now committed to this repository's
 ## Behaviour worth knowing
 
 - The first run after merge commits the new template (`auto_updates true`) and `appcast.xml` for the build already on `main`, because the seed predates both. Later runs with identical content create no commit.
-- A delivery for build N when build N+1 is already public delivers N+1 (superseded), after verifying release ancestry.
+- A delivery for build N when build N+1 is already public is superseded: it delivers nothing, after verifying release ancestry, and the N+1 run publishes N+1. The job downloads this run's notarized artifact and refuses to sign unless it matches the public manifest and ZIP exactly.
+- The delivery tool is built before secrets exist, reads the Sparkle key once and unsets it; only `gh` gets the App token, `brew` and `sign_update` run with a minimal environment.
 - The publish step sets `HOMEBREW_NO_INSTALL_FROM_API=1`, mirroring the cask test harness environment; this could not be confirmed locally, see below.
 - The commit author is expected to be `<app-slug>[bot]` with email `<bot id>+<app-slug>[bot]@users.noreply.github.com`, computed in the job; the readback fails visibly if GitHub attributes the commit differently.
 
