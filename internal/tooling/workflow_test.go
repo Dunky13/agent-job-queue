@@ -78,7 +78,11 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 				step.Uses == "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9" &&
 				step.Run == "" && (step.If == "${{ !cancelled() && steps.bootstrap-ui.outcome != 'skipped' }}" ||
 				step.If == "${{ !cancelled() && steps.resume-ui.outcome != 'skipped' }}")
-			if step.ContinueOnError || (step.If != "" && !retainsFailedFixture) {
+			// The Go cache is saved only from main, after every validation step passed.
+			savesMainCache := name != "native-tests" &&
+				step.Uses == "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9" && step.Run == "" &&
+				step.If == "github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'"
+			if step.ContinueOnError || (step.If != "" && !retainsFailedFixture && !savesMainCache) {
 				t.Fatalf("%s may skip or ignore a validation failure", name)
 			}
 			found = found || strings.TrimSpace(step.Run) == command
