@@ -1441,6 +1441,41 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 	return install.managedStopped(ctx)
 }
 
+// Disabling phone access only unblocks an upgrade that must still wait for the
+// queue to drain, so doing it earlier would only cut phone control of live jobs.
+func (install *installer) requirePhoneAccessDrained(ctx context.Context, node *yaml.Node) error {
+	if install.embeddedDefinition() {
+		snapshot, err := install.managedSnapshot(ctx)
+		if err != nil {
+			return err
+		}
+		if obj(snapshot["tasks"]) == nil {
+			return errors.New("Invalid queue snapshot during phone access recovery")
+		}
+		if err := installRequireDrained(obj(snapshot["tasks"])); err != nil {
+			return err
+		}
+	} else {
+		output, loaded, err := install.inspectService(ctx, "io.went.agent-heavy")
+		if err != nil {
+			return err
+		}
+		if loaded {
+			if err := install.matchQueueService(output); err != nil {
+				return err
+			}
+		}
+		tasks, err := install.tasks(ctx, node, loaded)
+		if err != nil {
+			return err
+		}
+		if err := installRequireDrained(tasks); err != nil {
+			return err
+		}
+	}
+	return install.requireLegacyCleanup()
+}
+
 func (install *installer) executeManaged(ctx context.Context) error {
 	if err := install.managedPublicationAccess(); err != nil {
 		return err
@@ -1461,30 +1496,10 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if install.embeddedDefinition() {
-			snapshot, err := install.managedSnapshot(ctx)
-			if err != nil {
-				return err
-			}
-			if obj(snapshot["tasks"]) == nil {
-				return errors.New("Invalid queue snapshot during phone access recovery")
-			}
-			if err := installRequireDrained(obj(snapshot["tasks"])); err != nil {
-				return err
-			}
-		} else {
-			tasks, err := install.tasks(ctx, node, install.loaded(ctx, "io.went.agent-heavy"))
-			if err != nil {
-				return err
-			}
-			if err := installRequireDrained(tasks); err != nil {
-				return err
-			}
-		}
-		if err := install.requireLegacyCleanup(); err != nil {
+		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
 			return err
 		}
-		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
+		if err := install.requirePhoneAccessDrained(ctx, node); err != nil {
 			return err
 		}
 		if _, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-remote"), "disable"); err != nil {

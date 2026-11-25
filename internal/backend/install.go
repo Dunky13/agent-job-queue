@@ -688,6 +688,9 @@ func installLock(state, name string) (*os.File, error) {
 }
 
 func installYAMLValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil {
+		return nil
+	}
 	if node.Kind == yaml.DocumentNode {
 		if len(node.Content) != 1 {
 			return nil

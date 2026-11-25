@@ -705,9 +705,14 @@ final class QueueBootstrapModel: ObservableObject {
                     }
                     let steps = issues.compactMap(Self.approvedRepairStep)
                     let coordinationBusy = issues.contains { ["installer-busy", "scheduling-busy", "remote-busy", "controller-stopping"].contains($0.id) }
+                    // The backend refuses phone changes until the queue drains, so wait for it, as --repair-and-continue does.
+                    let draining = issues.contains { issue in
+                        guard case .wait? = Self.approvedRepairStep(issue) else { return false }
+                        return ["legacy-jobs", "managed-jobs", "pending-cleanup", "service-approval"].contains(issue.id)
+                    }
                     var next: (String, Int?)?
                     if !coordinationBusy {
-                        for priority in ["finish-pending-installation", "restore-service-definitions", "repair-service", "cleanup-job", "disable-phone-access"] {
+                        for priority in ["finish-pending-installation", "restore-service-definitions", "repair-service", "cleanup-job", "disable-phone-access"] where !(draining && priority == "disable-phone-access") {
                             for case let .recovery(actionID, jobID) in steps where actionID == priority {
                                 next = (actionID, jobID)
                                 break

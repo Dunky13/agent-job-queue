@@ -89,7 +89,7 @@ agent-heavy install --app-bundle ABSOLUTE_APP_PATH --recover disable-phone-acces
 agent-heavy install --app-bundle ABSOLUTE_APP_PATH --recover reset-callback --expected-revision REVIEWED_SHA256
 ```
 
-Each recovery rechecks current eligibility and ownership, then returns a fresh preflight report. Manual callback replacement requires the exact revision from that report. Unknown action IDs, invalid paths and malformed job IDs are rejected. Installation never relaxes filesystem ownership, signature checks, Gatekeeper, or shared directory permissions.
+Each recovery rechecks current eligibility and ownership, then returns a fresh preflight report. Manual callback replacement requires the exact revision from that report. Callback replacement and disabling phone access both refuse until the queue is drained, with no unfinished jobs or pending cleanup; automatic repair waits for that instead. Unknown action IDs, invalid paths and malformed job IDs are rejected. Installation never relaxes filesystem ownership, signature checks, Gatekeeper, or shared directory permissions.
 
 ## Verification
 
