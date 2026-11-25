@@ -628,3 +628,29 @@ func TestInstallerAutomaticSetupStopsForCustomizedLegacyServiceOptions(t *testin
 		t.Fatal("review stop changed installation files")
 	}
 }
+
+func TestInstallerAutomaticSetupReviewsCustomizedServiceBesideMissingDefinition(t *testing.T) {
+	m := managedTestFixture(t)
+	m.legacy(t)
+	filename := filepath.Join(m.installer.launch, "io.went.agent-resources.plist")
+	definition, err := updatePlist(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition["ThrottleInterval"] = 30
+	if err := m.installer.writePlist(filename, definition); err != nil {
+		t.Fatal(err)
+	}
+	// The plain report then lists only the missing definition, which Go restores.
+	if err := os.Remove(filepath.Join(m.installer.launch, "io.went.agent-heavy.plist")); err != nil {
+		t.Fatal(err)
+	}
+	before := installTreeWitness(t, m.installer.home)
+	var review *installReviewError
+	if err := m.installer.repairAndExecute(context.Background()); !errors.As(err, &review) {
+		t.Fatalf("a customized service beside a missing definition was retired without review: %v", err)
+	}
+	if !reflect.DeepEqual(before, installTreeWitness(t, m.installer.home)) {
+		t.Fatal("review stop changed installation files")
+	}
+}

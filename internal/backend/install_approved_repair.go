@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"time"
@@ -238,10 +239,31 @@ func (install *installer) repairAndExecute(ctx context.Context) error {
 	}
 	if !previous {
 		// Automatic setup tolerates customized legacy service settings, which it
-		// backs up and retires. The operator reviews them first: an unsupported
-		// requirement in the plain report stops before any change.
-		if _, err := installApprovedNext(inspect(run)); err != nil {
+		// backs up and retires. The operator reviews them first, so stop before any
+		// change. Definitions Go restores later are absent here and stay exempt.
+		report := inspect(run)
+		if err := run.Err(); err != nil {
 			return err
+		}
+		if _, err := installApprovedNext(report); err != nil {
+			return err
+		}
+		for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-queue"} {
+			filename := filepath.Join(install.launch, label+".plist")
+			exists, err := updateExists(filename)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				continue
+			}
+			definition, err := updatePlist(filename)
+			if err != nil {
+				return err
+			}
+			if err := install.managedLegacyDefinition(label, definition); err != nil {
+				return &installReviewError{"Review managed service setup", err.Error()}
+			}
 		}
 	}
 	install.automaticSetup = true

@@ -776,6 +776,31 @@ struct BootstrapTests {
             callbackMutations == 0 && callbackInstalls == 0,
             "The window's repair holds back callback replacement, so the backend stops for review without changes")
 
+        for aftermath in [BootstrapPreflightExecutorFixture.ReviewAftermath.clear, .failRefresh] {
+            let staleFixture = try fixture()
+            let staleExecutor = BootstrapPreflightExecutorFixture(staleFixture, report: .init(schemaVersion: 1, issues: [configIssue]))
+            let stale = QueueBootstrapModel(environment: staleFixture.environment, execute: { request, output in
+                try await staleExecutor.execute(request, output: output)
+            }) { approvedCompletions += 1 }
+            await stale.start()?.value
+            await staleExecutor.reviewRepairs(then: aftermath)
+            await stale.repairAndContinue(confirmed: true)?.value
+            try check(stale.phase == .failed && stale.output.contains("Automatic setup requires review"),
+                "A review stop without refreshed requirements fails visibly and keeps the controller's line (\(aftermath))")
+        }
+
+        let ordinaryFixture = try BootstrapFixture(parent: temporary)
+        let ordinaryExecutor = BootstrapPreflightExecutorFixture(ordinaryFixture, report: .init(schemaVersion: 1, issues: [configIssue]))
+        await ordinaryExecutor.reviewRepairs()
+        let ordinary = QueueBootstrapModel(environment: ordinaryFixture.environment, execute: { request, output in
+            try await ordinaryExecutor.execute(request, output: output)
+        }) { approvedCompletions += 1 }
+        await ordinary.start()?.value
+        let ordinaryInstalls = await ordinaryExecutor.installations
+        try check(ordinary.phase == .reviewing && ordinary.message == "Review these requirements before continuing." &&
+            ordinary.issues == [configIssue] && ordinaryInstalls == 0,
+            "An ordinary launch stopped for review shows the requirements and installs nothing")
+
         let waitingRepairFixture = try fixture()
         let waitingRepairExecutor = BootstrapPreflightExecutorFixture(waitingRepairFixture, report: .init(schemaVersion: 1, issues: [waitIssue]))
         let waitingRepair = QueueBootstrapModel(environment: waitingRepairFixture.environment, execute: { request, output in

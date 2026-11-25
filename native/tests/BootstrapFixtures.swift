@@ -293,6 +293,9 @@ actor BootstrapPreflightExecutorFixture {
     private var failedInstallationReport: QueueBootstrapReport?
     private var waitingInRepair = false
     private var repairReviews = false
+    private var afterReview = ReviewAftermath.keep
+    private var preflightFails = false
+    enum ReviewAftermath { case keep, clear, failRefresh }
 
     init(_ fixture: BootstrapFixture, report: QueueBootstrapReport, afterRecovery: QueueBootstrapReport = .clear) {
         self.fixture = fixture
@@ -304,6 +307,7 @@ actor BootstrapPreflightExecutorFixture {
         requests.append(request)
         if request.arguments.suffix(2) == ["--preflight", "--json"] {
             checks += 1
+            if preflightFails { throw ClientError.message("Fixture preflight could not run.") }
             if holdNext {
                 holdNext = false
                 await withCheckedContinuation { held = $0 }
@@ -321,6 +325,11 @@ actor BootstrapPreflightExecutorFixture {
             return try JSONEncoder().encode(afterRecovery)
         }
         if request.arguments.contains("--repair-and-continue") && repairReviews {
+            switch afterReview {
+            case .keep: break
+            case .clear: report = .clear
+            case .failRefresh: preflightFails = true
+            }
             throw ClientError.message(QueueSetupProgress.reviewMarker + "\nAgent Queue setup: Automatic setup requires review: Fixture requirement. The controller stopped before changing it.")
         }
         if request.arguments.contains("--keep-custom-callback") {
@@ -357,7 +366,7 @@ actor BootstrapPreflightExecutorFixture {
     func releaseRecovery() { recoveryHeld?.resume(); recoveryHeld = nil }
     var isRecoveryHeld: Bool { recoveryHeld != nil }
     func setFailure() { failRecovery = true }
-    func reviewRepairs() { repairReviews = true }
+    func reviewRepairs(then aftermath: ReviewAftermath = .keep) { repairReviews = true; afterReview = aftermath }
     func holdRepairWaiting(_ waiting: Bool) { waitingInRepair = waiting }
     func setStaleRecovery() { returnOnlyClearedRecovery = true }
     func failInstallation(with report: QueueBootstrapReport) { failedInstallationReport = report }

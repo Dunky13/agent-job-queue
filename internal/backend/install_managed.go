@@ -157,7 +157,9 @@ func (install *installer) managedLegacyDefinition(label string, value Object) er
 			allowed := install.serviceEnvironment(nil)
 			allowed["PATH"] = ToolPath
 			for name, field := range env {
-				if !reflect.DeepEqual(field, allowed[name]) {
+				// A standard value, as restoring a missing definition writes it, is not a customization.
+				value, isText := field.(string)
+				if !reflect.DeepEqual(field, allowed[name]) && (!isText || install.validateRestoredEnvironment(label, name, value) != nil) {
 					if install.automaticSetup {
 						continue // The verified legacy definition is backed up and retired after drain.
 					}
