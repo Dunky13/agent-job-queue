@@ -2,14 +2,14 @@
 
 ## Result
 
-The slowest `internal/backend` tests were slow mostly because of one fixed cost, not because of the work they do. A race-built Go binary sleeps about one second before it exits (`atexit_sleep_ms`, default 1000). Every real-daemon, installer and removal test starts several race-built children: the daemon, each `run` client, each worker and each restart. So each test paid roughly one second per child exit.
+The slowest `internal/backend` tests were slow mostly because of one fixed cost, not because of the work they do. A race-built Go binary that exits with status 0 sleeps one second first (`atexit_sleep_ms`, default 1000), so goroutines still running can hit a race before the process ends. Every real-daemon, installer and removal test starts several race-built children: the daemon, each `run` client, each worker and each restart. So each test paid roughly one second per child exit.
 
 ## Change
 
-- `TestMain` (`queue_test.go`) appends `atexit_sleep_ms=0` to `GORACE` for the processes this test binary starts. The test process and every child stay race-instrumented and still report races when they find them. Only the pause at exit goes away. Children that are built by `go build -race` (the installer live fixtures) inherit it through `envMap()`.
+- `TestMain` (`queue_test.go`) appends `atexit_sleep_ms=0` to `GORACE` for the processes this test binary starts. Every child stays race-instrumented. A race found before exit still prints its report and exits 66. The only loss is detection during that last second after a child's work is done. No test inspects a child's exit status for 66, so a child race never failed a test before this change either. Go's own `runtime/race` tests set the same option. The test process reads `GORACE` at start, so its own detection is unchanged. Children that are built by `go build -race` (the installer live fixtures) inherit it through `envMap()`.
 - `fixtureUntil` polls every 10 ms instead of 40 ms. Its deadlines are unchanged.
-- `hookTimeout` is a variable so the four hook-deadline tests can run with a 4 s or 5 s deadline instead of waiting 10 s. The log line now reports the configured seconds. Production still uses 10 s.
-- `Cancel on a Done reading row reports no false cancel` ends its cleanup window after 3 s instead of 12 s (`queueCleanupWindow` was already a variable). The test still asserts the unconfirmed-cleanup error, that the row is unchanged and that the process lives.
+- Each hook runner carries its own `timeout`, set to the 10 s `hookTimeout` constant. The four hook-deadline tests shorten only their own runner, to 4 s, or 5 s where a background `sleep 2` must finish before the deadline. The log line reports the runner's seconds. `TestHookTimeoutTerminatesProcessGroup` pins the production 10 s that `docs/plugins.md` documents.
+- `Cancel on a Done reading row reports no false cancel` ends its cleanup window after 3 s instead of 12 s (`queueCleanupWindow` was already a variable). The test still asserts the unconfirmed-cleanup error, that the row is unchanged and that the process lives. The shorter window proves the same thing: the `Done` branch of `cancelJob` sends no signal, and the daemon's lane clock is frozen, so a longer wait observes nothing new.
 
 No timeout, budget or worker count was raised. No assertion was removed.
 
@@ -48,7 +48,7 @@ Whole package, sum of top-level test times, 715 tests, every test passing in bot
 - `TestInstallerManagedLiveResumeRetainsRunningAttempts` runs ten real installs, about 9 to 15 s each, and most of that is subprocess time.
 - `queue_corrupted_test.go` keeps its two one-second sleeps. Each proves that a row stays `running` while its process ignores SIGINT, and nothing event-driven can prove an absence, so shortening them would weaken the assertion.
 - `lanes_test.go` and `queue_worker_gone_test.go` keep their 300 ms sleeps for the same reason.
-- No `t.Parallel()` was added. The fixtures share `t.Setenv`, process-wide variables such as `queueCleanupWindow` and `hookTimeout`, and `HOME`, so parallel runs would risk flakiness. The package still has no parallel tests.
+- No `t.Parallel()` was added. The fixtures share `t.Setenv`, process-wide variables such as `queueCleanupWindow`, and `HOME`, so parallel runs would risk flakiness. The package still has no parallel tests.
 
 ## Next steps
 

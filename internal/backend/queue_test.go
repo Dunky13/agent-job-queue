@@ -30,11 +30,13 @@ func TestMain(m *testing.M) {
 		}
 	}
 	syscall.Umask(0o077)
-	// A race-built binary sleeps about a second before it exits so that late
-	// reports can print. Every fixture daemon, client and worker is such a child,
-	// so this single wait dominated the real-daemon tests. Children stay
-	// instrumented and report races when they find them; this process is unchanged.
-	os.Setenv("GORACE", strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0"))
+	// A race-built binary that exits zero sleeps a second first, so goroutines
+	// still running can hit a race. Every fixture daemon, client and worker is
+	// such a child, so that wait dominated the real-daemon tests. Races already
+	// found still print and exit 66; this process reads GORACE only at start.
+	if err := os.Setenv("GORACE", strings.TrimSpace(os.Getenv("GORACE")+" atexit_sleep_ms=0")); err != nil {
+		panic(err)
+	}
 	os.Exit(m.Run())
 }
 func testGate(t *testing.T) *Gate {
