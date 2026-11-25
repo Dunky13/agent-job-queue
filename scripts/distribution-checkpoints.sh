@@ -120,7 +120,7 @@ checkpoint_distribution_inventory() {
           any(.[]; signing) or
           (all(.[]; .name == "Notarized distribution (macos-15)" or
             .name == "Notarized distribution (macos-15-intel)" or
-            .name == "Publish main installer" or .name == "Verify Homebrew delivery" or .name == "Publish Homebrew tap and Sparkle feed") and
+            .name == "Publish main installer" or .name == "Verify Homebrew delivery" or .name == "Publish Homebrew tap and Sparkle feed" or .name == "Publish Sparkle feed and homepage") and
            any($jobs[]; signing and .custody_attempt < $attempt and .status == "completed" and .conclusion == "success"))))
       ' "$temporary/jobs-$id" >/dev/null || checkpoint_error 'Unknown signing execution; checkpoint custody cannot be established.'
     fi

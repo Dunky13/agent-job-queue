@@ -89,7 +89,7 @@ case "$method $endpoint" in
   'PATCH repos/owner/project/releases/70')
     [ "$fields" = ' draft=false prerelease=true make_latest=false' ] || exit 99
     [ "${PUBLISH_FAIL:-}" != publish ] || exit 91
-    [ "$(jq length assets.json)" = 7 ] || exit 99
+    [ "$(jq length assets.json)" = 6 ] || exit 99
     jq '.draft=false | .immutable=true' release.json > release.new
     mv release.new release.json
     if [ "$(jq length refs.json)" = 0 ]; then
@@ -137,7 +137,6 @@ func newPublishFixture(t *testing.T) checkpointFixture {
 		f.publishWrite(t, "dist/"+name+".sha256", []byte(fmt.Sprintf("%x  %s\n", sha256.Sum256(data), name)))
 	}
 	f.writeJSON(t, "dist/agent-job-queue.json", map[string]any{"schemaVersion": 1, "repository": "owner/project", "version": "0.1.0", "commit": checkpointSHA, "build": 45, "tag": "build-45-1111111", "asset": "Agent-Queue-0.1.0-universal.zip", "sha256": fmt.Sprintf("%x", sha256.Sum256([]byte("accepted zip bytes")))})
-	f.publishWrite(t, "dist/agent-job-queue.rb", []byte("accepted Homebrew cask\n"))
 	var stages, logs []map[string]any
 	for i, name := range []string{"app", "dmg"} {
 		id := fmt.Sprintf("00000000-0000-0000-0000-%012d", i+1)
@@ -224,7 +223,7 @@ func TestDistributionPublishDraftReadbackBeforeExposure(t *testing.T) {
 		t.Fatalf("unsafe publication ordering:\n%s", calls)
 	}
 	before, after, _ := strings.Cut(calls, "PATCH repos/owner/project/releases/70\n")
-	if strings.Count(before, "GET repos/owner/project/releases/assets/") != 7 || strings.Count(after, "GET repos/owner/project/releases/assets/") != 7 {
+	if strings.Count(before, "GET repos/owner/project/releases/assets/") != 6 || strings.Count(after, "GET repos/owner/project/releases/assets/") != 6 {
 		t.Fatalf("did not read all seven exact assets before and after publication:\n%s", calls)
 	}
 }
@@ -286,22 +285,22 @@ func TestDistributionPublishRejectsConflictingDraftWithoutMutation(t *testing.T)
 			case "tag":
 				f.writeJSON(t, "refs.json", []any{map[string]any{"ref": "refs/tags/build-45-1111111", "object": map[string]any{"type": "commit", "sha": strings.Repeat("2", 40)}}})
 			case "remote bytes":
-				f.publishWrite(t, "remote/agent-job-queue.rb", []byte("altered bytes"))
+				f.publishWrite(t, "remote/"+diskImage, []byte("altered bytes"))
 			case "source manifest":
 				f.changeJSON(t, "dist/agent-job-queue.json", func(v map[string]any) { v["commit"] = strings.Repeat("2", 40) })
 			case "candidate changed":
-				f.publishWrite(t, "dist/agent-job-queue.rb", []byte("new candidate"))
+				f.replaceDiskImage(t, "new candidate")
 			case "checksum":
 				f.publishWrite(t, "dist/Agent-Queue-0.1.0-universal.zip.sha256", []byte("wrong checksum"))
 			case "hidden asset":
 				f.publishWrite(t, "dist/.private", []byte("private"))
 			case "symlink", "missing asset":
-				path := filepath.Join(f.root, "dist/agent-job-queue.rb")
+				path := filepath.Join(f.root, "dist/"+diskImage)
 				if err := os.Remove(path); err != nil {
 					t.Fatal(err)
 				}
 				if variant == "symlink" {
-					if err := os.Symlink(filepath.Join(f.root, "remote/agent-job-queue.rb"), path); err != nil {
+					if err := os.Symlink(filepath.Join(f.root, "remote/"+diskImage), path); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -358,7 +357,7 @@ func TestDistributionPublishExistingPublicReleaseIsReadOnlyAndExact(t *testing.T
 				}
 				f.writeJSON(t, "assets.json", assets)
 			case "different":
-				f.publishWrite(t, "remote/agent-job-queue.rb", []byte("different bytes"))
+				f.publishWrite(t, "remote/"+diskImage, []byte("different bytes"))
 			case "tag missing":
 				f.writeJSON(t, "refs.json", []any{})
 			case "mutable":
@@ -416,9 +415,9 @@ func TestDistributionPublishBindsPartialDraftToWholeCandidate(t *testing.T) {
 	t.Parallel()
 	f := newPublishFixture(t)
 	f.publish(t, "upload after", false)
-	// This cask was not uploaded before the interruption. The draft's immutable
+	// This disk image was not uploaded before the interruption. The draft's immutable
 	// inventory must still reject it before uploading any new bytes.
-	f.publishWrite(t, "dist/agent-job-queue.rb", []byte("changed unuploaded asset"))
+	f.replaceDiskImage(t, "changed unuploaded asset")
 	f.publishWrite(t, "calls", nil)
 	f.publish(t, "", false)
 	if calls := f.publishCalls(t); strings.Contains(calls, "POST") || strings.Contains(calls, "PATCH") {
@@ -497,4 +496,13 @@ func TestDistributionPublishRejectsDuplicateEvidenceKeysBeforeProviderAccess(t *
 	if calls := f.publishCalls(t); calls != "" {
 		t.Fatalf("duplicate JSON keys reached GitHub: %s", calls)
 	}
+}
+
+const diskImage = "Agent-Queue-0.1.0-universal.dmg"
+
+// replaceDiskImage swaps the candidate disk image and keeps its checksum file consistent.
+func (f checkpointFixture) replaceDiskImage(t *testing.T, body string) {
+	t.Helper()
+	f.publishWrite(t, "dist/"+diskImage, []byte(body))
+	f.publishWrite(t, "dist/"+diskImage+".sha256", []byte(fmt.Sprintf("%x  %s\n", sha256.Sum256([]byte(body)), diskImage)))
 }

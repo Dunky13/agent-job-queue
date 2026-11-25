@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "version": "0.1.0",
+  "build": 7,
+  "commit": "7777777777777777777777777777777777777777",
+  "tag": "build-7-7777777",
+  "publishedAt": "2026-11-20T10:00:00Z",
+  "releaseUrl": "https://github.com/Dunky13/agent-job-queue/releases/tag/build-7-7777777",
+  "dmgUrl": "https://github.com/Dunky13/agent-job-queue/releases/download/build-7-7777777/Agent-Queue-0.1.0-universal.dmg",
+  "dmgSha256": "fd223611e389270a03031d4bff49a7e6b070a2ffe8b57aabb3f097644268fbb1",
+  "zipUrl": "https://github.com/Dunky13/agent-job-queue/releases/download/build-7-7777777/Agent-Queue-0.1.0-universal.zip",
+  "zipSha256": "a39f90e18435aa4afb6cfe3a549f173e4d0c54b6f167c2e99a7bc710f486da51"
+}

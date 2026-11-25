@@ -48,7 +48,7 @@ func buildArtifactFixture(t *testing.T, change func(map[string][]byte)) (string,
 		checkpointEntry{asset, inner, 0600}, checkpointEntry{image, []byte("original disk image"), 0600},
 		checkpointEntry{asset + ".sha256", []byte(fmt.Sprintf("%x  %s\n", sha256.Sum256(inner), asset)), 0600},
 		checkpointEntry{image + ".sha256", []byte(fmt.Sprintf("%x  %s\n", sha256.Sum256([]byte("original disk image")), image)), 0600},
-		checkpointEntry{"agent-job-queue.json", data, 0600}, checkpointEntry{"agent-job-queue.rb", []byte("original cask"), 0600})
+		checkpointEntry{"agent-job-queue.json", data, 0600})
 	root := t.TempDir()
 	archive := filepath.Join(root, "artifact.zip")
 	if err := os.WriteFile(archive, outer, 0600); err != nil {

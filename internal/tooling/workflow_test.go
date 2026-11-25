@@ -268,7 +268,7 @@ func TestNotarizationUsesTrustedAttemptScopedArtifacts(t *testing.T) {
 	var workflow struct {
 		Jobs map[string]struct {
 			If          string            `yaml:"if"`
-			Environment string            `yaml:"environment"`
+			Environment environmentName   `yaml:"environment"`
 			Permissions map[string]string `yaml:"permissions"`
 			Steps       []struct {
 				Run  string            `yaml:"run"`
@@ -298,7 +298,7 @@ func TestNotarizationUsesTrustedAttemptScopedArtifacts(t *testing.T) {
 	if !reflect.DeepEqual(stages, []string{"app", "dmg"}) || !reflect.DeepEqual(slots, []string{"01", "02", "03", "07", "08", "09"}) {
 		t.Fatalf("incorrect checkpoint ordering: stages=%v slots=%v", stages, slots)
 	}
-	for _, job := range []string{"notarized-tests", "publish", "tap-delivery"} {
+	for _, job := range []string{"notarized-tests", "publish", "delivery"} {
 		found := false
 		for _, step := range workflow.Jobs[job].Steps {
 			if strings.HasPrefix(step.Uses, "actions/download-artifact@") {
@@ -366,7 +366,7 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 	}
 	type job struct {
 		Needs       []string
-		Environment string
+		Environment environmentName
 		Permissions map[string]string
 		Steps       []step
 		Env         map[string]string
@@ -393,7 +393,7 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 		return f
 	}
 	ci, dist := read("ci.yml"), read("distribution.yml")
-	for _, name := range []string{"source", "notarize", "notarized-tests", "publish", "tap-delivery"} {
+	for _, name := range []string{"source", "notarize", "notarized-tests", "publish", "delivery", "tap-delivery"} {
 		if _, ok := ci.Jobs[name]; ok {
 			t.Errorf("CI still performs distribution: %s", name)
 		}
@@ -410,7 +410,7 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 	if !strings.HasPrefix(ci.Concurrency.Group, "ci-") || !strings.Contains(ci.Concurrency.Group, "github.run_id") || dist.Concurrency.Group != "ci-${{ inputs.build_run_id || github.event.workflow_run.id }}" {
 		t.Fatal("distribution must share the original main CI run's concurrency lock so legacy signing cannot overlap recovery")
 	}
-	for name, want := range map[string][]string{"notarize": {"source"}, "notarized-tests": {"source", "notarize"}, "publish": {"source", "notarize", "notarized-tests"}, "tap-delivery": {"source", "publish", "notarize"}} {
+	for name, want := range map[string][]string{"notarize": {"source"}, "notarized-tests": {"source", "notarize"}, "publish": {"source", "notarize", "notarized-tests"}, "delivery": {"source", "publish", "notarize"}} {
 		if !reflect.DeepEqual(dist.Jobs[name].Needs, want) {
 			t.Errorf("%s gate topology: %v", name, dist.Jobs[name].Needs)
 		}
@@ -419,6 +419,10 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 		if name == "notarize" {
 			if j.Environment != "apple-signing" {
 				t.Error("signing environment missing")
+			}
+		} else if name == "delivery" {
+			if j.Environment != "github-pages" {
+				t.Error("delivery must deploy through the github-pages environment")
 			}
 		} else if j.Environment != "" {
 			t.Errorf("%s unnecessarily receives Apple environment", name)
@@ -492,19 +496,37 @@ func TestWorkflowPipelinesFailWhenAnyCommandFails(t *testing.T) {
 	}
 }
 
-// The delivery job commits to main through the Homebrew-sync App only; the
-// Sparkle key reaches one step's environment and never an argument.
-func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
+// environmentName reads a job environment written as a name or as a mapping.
+type environmentName string
+
+func (e *environmentName) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		*e = environmentName(node.Value)
+		return nil
+	}
+	var mapping struct{ Name string }
+	if err := node.Decode(&mapping); err != nil {
+		return err
+	}
+	*e = environmentName(mapping.Name)
+	return nil
+}
+
+// The delivery job deploys through GitHub Pages only: no repository write, no
+// App token, and the Sparkle key reaches exactly one step's environment and
+// never an argument. CI no longer filters paths because nothing commits to main.
+func TestDeliveryJobShapeAndPagesDeployment(t *testing.T) {
 	type step struct {
-		Name, Uses, Run, Shell string
-		With                   map[string]string
-		Env                    map[string]string
+		Name, Uses, Run, Shell, If string
+		With                       map[string]string
+		Env                        map[string]string
 	}
 	var dist struct {
 		Jobs map[string]struct {
 			Name        string
 			RunsOn      string `yaml:"runs-on"`
 			Permissions map[string]string
+			Environment environmentName
 			Env         map[string]string
 			Steps       []step
 		}
@@ -523,12 +545,19 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 		if err := yaml.Unmarshal(data, target); err != nil {
 			t.Fatal(err)
 		}
+		if strings.Contains(string(data), "create-github-app-token") || strings.Contains(string(data), "HOMEBREW_SYNC") || strings.Contains(string(data), "createCommitOnBranch") {
+			t.Errorf("%s still uses the removed Homebrew-sync App", path)
+		}
 	}
-	if !reflect.DeepEqual(ci.On["push"].PathsIgnore, []string{"Casks/**", "appcast.xml"}) || len(ci.On["pull_request"].PathsIgnore) != 0 {
-		t.Fatal("pushes of delivery files must not start CI, and pull requests must stay unfiltered")
+	if len(ci.On["push"].PathsIgnore) != 0 || len(ci.On["pull_request"].PathsIgnore) != 0 {
+		t.Fatal("CI must not filter paths: delivery no longer commits to main")
 	}
-	job := dist.Jobs["tap-delivery"]
-	if job.Name != "Publish Homebrew tap and Sparkle feed" || job.RunsOn != "macos-15" || !reflect.DeepEqual(job.Permissions, map[string]string{"contents": "read"}) {
+	if _, ok := dist.Jobs["tap-delivery"]; ok {
+		t.Fatal("the Homebrew delivery job must be gone")
+	}
+	job := dist.Jobs["delivery"]
+	wantPermissions := map[string]string{"contents": "read", "pages": "write", "id-token": "write"}
+	if job.Name != "Publish Sparkle feed and homepage" || job.RunsOn != "macos-15" || job.Environment != "github-pages" || !reflect.DeepEqual(job.Permissions, wantPermissions) {
 		t.Fatalf("delivery job identity: %+v", job)
 	}
 	for name, value := range job.Env {
@@ -536,18 +565,25 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 			t.Errorf("job env %s binds a secret for every step", name)
 		}
 	}
-	var token, publish *step
+	var prepare, upload, deploy, verify *step
 	for index, item := range job.Steps {
-		if strings.HasPrefix(item.Uses, "actions/create-github-app-token@") {
-			token = &job.Steps[index]
+		switch {
+		case strings.Contains(item.Run, "queue-pages\" prepare"):
+			prepare = &job.Steps[index]
+		case strings.Contains(item.Run, "queue-pages\" verify-live"):
+			verify = &job.Steps[index]
+		case strings.HasPrefix(item.Uses, "actions/upload-pages-artifact@"):
+			upload = &job.Steps[index]
+		case strings.HasPrefix(item.Uses, "actions/deploy-pages@"):
+			deploy = &job.Steps[index]
 		}
-		if strings.Contains(item.Run, "--publish") {
-			publish = &job.Steps[index]
+		if item.Uses != "" && !strings.HasPrefix(item.Uses, "./") && !regexp.MustCompile(`@[0-9a-f]{40}$`).MatchString(item.Uses) {
+			t.Errorf("step %q does not pin its action by full commit SHA: %s", item.Name, item.Uses)
 		}
-		// Only the publish step may hold the key. Other steps may test it for presence as a boolean.
+		// Only the prepare step may hold the key. Other steps may test it for presence as a boolean.
 		for name, value := range item.Env {
 			holdsKey := strings.Contains(value, "secrets.SPARKLE_ED_PRIVATE_KEY")
-			if holdsKey && item.Name != "Publish the verified cask and signed Sparkle feed to main" && value != "${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}" {
+			if holdsKey && item.Name != "Verify the release, sign the feed and assemble the site" && value != "${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}" {
 				t.Errorf("Sparkle key leaked into step %q through %s", item.Name, name)
 			}
 		}
@@ -555,15 +591,28 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 			t.Errorf("step %q: %s", item.Name, leak)
 		}
 	}
-	if token == nil || token.With["repositories"] != "agent-job-queue" || token.With["permission-contents"] != "write" || len(token.With) != 5 {
-		t.Fatalf("App token must be limited to this repository's contents: %+v", token)
-	}
-	if publish == nil || publish.Shell != "bash" || publish.Env["SPARKLE_ED_PRIVATE_KEY"] != "${{ secrets.SPARKLE_ED_PRIVATE_KEY }}" || !strings.Contains(publish.Run, "--expected-tag \"$BUILD_TAG\"") || !strings.Contains(publish.Run, "--artifact-dir dist") || !strings.Contains(publish.Run, "sign_update") || strings.Contains(publish.Run, "go run") {
-		t.Fatalf("publish step: %+v", publish)
+	if prepare == nil || prepare.Shell != "bash" || prepare.Env["SPARKLE_ED_PRIVATE_KEY"] != "${{ secrets.SPARKLE_ED_PRIVATE_KEY }}" || prepare.Env["GH_TOKEN"] != "${{ github.token }}" ||
+		!strings.Contains(prepare.Run, "--expected-tag \"$BUILD_TAG\"") || !strings.Contains(prepare.Run, "--artifact-dir dist") || !strings.Contains(prepare.Run, "--site-dir site") ||
+		!strings.Contains(prepare.Run, "--result-file \"$GITHUB_OUTPUT\"") || !strings.Contains(prepare.Run, "sign_update") || strings.Contains(prepare.Run, "go run") {
+		t.Fatalf("prepare step: %+v", prepare)
 	}
 	for _, flag := range []string{"-s ", "--ed-key "} {
-		if strings.Contains(publish.Run, flag) {
+		if strings.Contains(prepare.Run, flag) {
 			t.Fatalf("the key must never be an argument: %s", flag)
+		}
+	}
+	// A superseded or already-current run deploys nothing and still succeeds.
+	for _, item := range []*step{upload, deploy, verify} {
+		if item == nil || item.If != "steps.prepare.outputs.deploy == 'true'" {
+			t.Fatalf("deployment steps must run only when prepare decided to deploy: %+v", item)
+		}
+	}
+	if upload.With["path"] != "${{ runner.temp }}/site" || !strings.Contains(verify.Run, "--output-dir \"$RUNNER_TEMP/site\"") || !strings.Contains(verify.Run, "--artifact-dir dist") || deploy.Name == "" {
+		t.Fatalf("assembled site must be uploaded and read back: %+v %+v", upload, verify)
+	}
+	for _, item := range []*step{deploy, verify} {
+		if len(item.Env) != 0 {
+			t.Errorf("step %q needs no environment: %v", item.Name, item.Env)
 		}
 	}
 }
@@ -571,13 +620,13 @@ func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
 var secretTracing = regexp.MustCompile(`(^|[\s;&|(])(printenv|env|compgen|export\s+-p|declare\s+-[a-zA-Z]*x|set\s+-[a-zA-Z]*[xv][a-zA-Z]*|set\s+-o\s+(xtrace|verbose))($|[\s;&|)])`)
 
 // secretLeaks reports how a step's script could expose an environment variable
-// bound to a secret or to the App token: any reference to its name, an
+// bound to a secret or to the workflow token: any reference to its name, an
 // environment dump, or shell tracing. Presence tests (`!=`) are not secrets.
 func secretLeaks(env map[string]string, run, shell string) []string {
 	var leaks []string
 	holds := false
 	for name, value := range env {
-		if (!strings.Contains(value, "secrets.") || strings.Contains(value, "!=")) && !strings.Contains(value, "steps.app-token.outputs.token") {
+		if (!strings.Contains(value, "secrets.") || strings.Contains(value, "!=")) && !strings.Contains(value, "github.token") {
 			continue
 		}
 		holds = true
@@ -619,11 +668,11 @@ func TestSecretLeakGuardRejectsEveryForm(t *testing.T) {
 	if len(secretLeaks(env, "run", "bash -x {0}")) == 0 || len(secretLeaks(env, "run", "bash -o xtrace {0}")) == 0 {
 		t.Error("guard missed shell tracing")
 	}
-	token := map[string]string{"GH_TOKEN": "${{ steps.app-token.outputs.token }}"}
+	token := map[string]string{"GH_TOKEN": "${{ github.token }}"}
 	if len(secretLeaks(token, "echo $GH_TOKEN", "bash")) == 0 {
-		t.Error("guard missed the App token")
+		t.Error("guard missed the workflow token")
 	}
-	for _, run := range []string{"\"$RUNNER_TEMP/queue-tap\" --publish | tee -a \"$GITHUB_STEP_SUMMARY\"", "set -eu\ngh api users/x --jq .id", "echo \"dir=$dir\" >> \"$GITHUB_OUTPUT\""} {
+	for _, run := range []string{"\"$RUNNER_TEMP/queue-pages\" prepare | tee -a \"$GITHUB_STEP_SUMMARY\"", "set -eu\ngh api users/x --jq .id", "echo \"dir=$dir\" >> \"$GITHUB_OUTPUT\""} {
 		if leaks := secretLeaks(env, run, "bash"); len(leaks) != 0 {
 			t.Errorf("false positive on %q: %v", run, leaks)
 		}

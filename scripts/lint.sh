@@ -16,4 +16,3 @@ while IFS= read -r -d '' path; do
   zsh -n "$path"
 done < <(git ls-files --cached --others --exclude-standard -z '*.sh')
 actionlint .github/workflows/*.yml
-ruby -c packaging/homebrew/test-cask.rb

@@ -61,37 +61,22 @@ exit "$HOOK_CHECK"
 		})
 	}
 }
-func TestHomebrewManifestAndCaskContracts(t *testing.T) {
+func TestRenderReleaseWritesOnlyTheManifest(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "Agent-Queue-0.1.0-universal.zip")
 	if err := os.WriteFile(archive, []byte("immutable archive"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	commit := strings.Repeat("a", 40)
-	manifest, err := CreateManifest(archive, "0.1.0", "build-123-aaaaaaa", commit, 123)
-	if err != nil {
+	output := filepath.Join(root, "out")
+	if err := RenderRelease(archive, "0.1.0", "build-123-aaaaaaa", strings.Repeat("a", 40), 123, output); err != nil {
 		t.Fatal(err)
 	}
-	body, err := RenderCask(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, expected := range []string{manifest.SHA256, "Agent-Queue-0.1.0-universal.zip\"", "\n  app \"Agent Queue.app\"\n", "\n  uninstall quit: \"io.went.agent-queue\"\n", "Open Agent Queue from Applications to use its menu bar.", "It quits the app and removes its login item", "--unregister-services", "Preserve quarantine so macOS can assess the notarized release."} {
-		if !strings.Contains(body, expected) {
-			t.Errorf("missing %s", expected)
-		}
-	}
-	for _, obsolete := range []string{"finish setup", "after setup completes", "depends_on formula:", "sudo: true", "preflight", "postflight", "/usr/bin/xattr", "com.apple.quarantine", "source/scripts/install-user.sh", "system_command", "installer script:", "uninstall script:", "binary \"", "target:", "--repair-and-continue", "Installer.app", "payload", "run \"", `delete: [`} {
-		if strings.Contains(body, obsolete) {
-			t.Errorf("obsolete dependency %s", obsolete)
-		}
-	}
-	manifest.Tag = "bad\"; system('unsafe')"
-	if _, err = RenderCask(manifest); err == nil {
-		t.Fatal("accepted injected release tag")
+	entries, err := os.ReadDir(output)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "agent-job-queue.json" {
+		t.Fatalf("expected only the manifest: %v %v", entries, err)
 	}
 }
-func TestHomebrewManifestRejectsUntrustedInputs(t *testing.T) {
+func TestManifestRejectsUntrustedInputs(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "unexpected.zip")
 	os.WriteFile(archive, nil, 0o600)

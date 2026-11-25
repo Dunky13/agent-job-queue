@@ -3,8 +3,6 @@ name: CI
 on:
   push:
     branches: [main, bootstrap]
-    # Delivery commits by the Homebrew-sync App must not start another release.
-    paths-ignore: ['Casks/**', 'appcast.xml']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -333,19 +331,12 @@ jobs:
           path: ${{ runner.temp }}/build-toolchain.json
           if-no-files-found: error
           retention-days: 90
-      - name: Generate immutable release manifest and Homebrew cask
+      - name: Generate immutable release manifest
         run: |
-          go run -p 2 ./cmd/queue-tool render-cask \
+          go run -p 2 ./cmd/queue-tool render-manifest \
             --archive "dist/Agent-Queue-$(cat VERSION)-universal.zip" \
             --version "$(cat VERSION)" --tag "build-${GITHUB_RUN_NUMBER}-${GITHUB_SHA:0:7}" \
             --commit "$GITHUB_SHA" --build "$GITHUB_RUN_NUMBER" --output dist
-      - name: Record Homebrew version used for packaging validation
-        run: brew --version
-      - name: Verify Homebrew manifest and the actual app artifact
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-          HOMEBREW_DEVELOPER: '1'
-        run: go test -p 2 ./internal/tooling -run TestHomebrew -v
       - name: Verify the packaged app, queue and HTTPS runtime
         run: scripts/test-installer.sh "dist/Agent-Queue-$(cat VERSION)-universal.zip"
       - name: Verify the app on the mounted disk image

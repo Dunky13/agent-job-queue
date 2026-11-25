@@ -208,9 +208,9 @@ jobs:
           path: ${{ runner.temp }}/receipts-export/*
           if-no-files-found: error
           retention-days: 90
-      - name: Generate final immutable manifest and Homebrew cask
+      - name: Generate final immutable manifest
         run: |
-          "$QUEUE_NOTARY_TOOL" render-cask \
+          "$QUEUE_NOTARY_TOOL" render-manifest \
             --archive "dist/Agent-Queue-$BUILD_VERSION-universal.zip" \
             --version "$BUILD_VERSION" --tag "$BUILD_TAG" \
             --commit "$BUILD_SHA" --build "$BUILD_RUN_NUMBER" --output dist
@@ -278,16 +278,6 @@ jobs:
           scripts/test-notarized-installer.sh "dist/Agent-Queue-$BUILD_VERSION-universal.zip" "dist/Agent-Queue-$BUILD_VERSION-universal.dmg" "$APPLE_TEAM_ID"
       - name: Exercise the hardened packaged queue and HTTPS gateway
         run: scripts/test-installer.sh "dist/Agent-Queue-$BUILD_VERSION-universal.zip"
-      - name: Install through the real Homebrew DSL with quarantine retained
-        env:
-          APPLE_TEAM_ID: ${{ needs.notarize.outputs.team_id }}
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-          HOMEBREW_DEVELOPER: '1'
-        run: |
-          mkdir prepared-signed-app
-          ditto -x -k "dist/Agent-Queue-$BUILD_VERSION-universal.zip" prepared-signed-app
-          export AGENT_QUEUE_TEST_NOTARIZED_APP="$PWD/prepared-signed-app/Agent Queue.app"
-          go test -p 2 -parallel 2 ./internal/tooling -run '^TestNotarizedHomebrew' -count=1 -v -timeout 3m
 
   publish:
     name: Publish main installer
@@ -327,13 +317,18 @@ jobs:
           QUEUE_NOTARY_TOOL: ${{ runner.temp }}/queue-notary-tool
         run: scripts/distribution-publish.sh dist
 
-  tap-delivery:
-    name: Publish Homebrew tap and Sparkle feed
+  delivery:
+    name: Publish Sparkle feed and homepage
     needs: [source, publish, notarize]
     runs-on: macos-15
     timeout-minutes: 20
     permissions:
       contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     env:
       BUILD_SHA: ${{ needs.source.outputs.sha }}
       BUILD_TAG: ${{ needs.source.outputs.tag }}
@@ -350,44 +345,43 @@ jobs:
         with:
           name: ${{ needs.notarize.outputs.artifact_name }}
           path: dist
-      - name: Require Homebrew-sync App and Sparkle signing configuration
+      - name: Require Sparkle signing configuration
         env:
-          HAS_APP_CLIENT_ID: ${{ vars.HOMEBREW_SYNC_APP_CLIENT_ID != '' }}
-          HAS_APP_PRIVATE_KEY: ${{ secrets.HOMEBREW_SYNC_APP_PRIVATE_KEY != '' }}
           HAS_SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}
         run: |
-          if [[ "$HAS_APP_CLIENT_ID" != true || "$HAS_APP_PRIVATE_KEY" != true || "$HAS_SPARKLE_KEY" != true ]]; then
-            echo '::error::Configure HOMEBREW_SYNC_APP_CLIENT_ID, HOMEBREW_SYNC_APP_PRIVATE_KEY and SPARKLE_ED_PRIVATE_KEY before delivery. See docs/homebrew-delivery.md.'
+          if [[ "$HAS_SPARKLE_KEY" != true ]]; then
+            echo '::error::Configure SPARKLE_ED_PRIVATE_KEY and enable GitHub Pages with the GitHub Actions source before delivery. See docs/pages-delivery.md.'
             exit 1
           fi
       - name: Build the delivery tool before any secret is in the environment
-        run: go build -p 2 -trimpath -o "$RUNNER_TEMP/queue-tap" ./cmd/queue-tap
-      - name: Create token for this repository only
-        id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ vars.HOMEBREW_SYNC_APP_CLIENT_ID }}
-          private-key: ${{ secrets.HOMEBREW_SYNC_APP_PRIVATE_KEY }}
-          owner: Dunky13
-          repositories: agent-job-queue
-          permission-contents: write
+        run: go build -p 2 -trimpath -o "$RUNNER_TEMP/queue-pages" ./cmd/queue-pages
       - name: Fetch the pinned Sparkle signing tool
         id: sparkle
         run: |
           dir=$(packaging/sparkle/fetch.sh "$RUNNER_TEMP/sparkle")
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
-      - name: Publish the verified cask and signed Sparkle feed to main
+      - name: Verify the release, sign the feed and assemble the site
+        id: prepare
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ github.token }}
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
           SPARKLE_DIR: ${{ steps.sparkle.outputs.dir }}
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-          HOMEBREW_NO_INSTALL_FROM_API: '1'
-          HOMEBREW_DEVELOPER: '1'
         run: |
-          bot_id=$(gh api "users/${APP_SLUG}%5Bbot%5D" --jq .id)
-          export TAP_BOT_NAME="${APP_SLUG}[bot]" TAP_BOT_EMAIL="${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
-          "$RUNNER_TEMP/queue-tap" --publish --expected-tag "$BUILD_TAG" --expected-commit "$BUILD_SHA" \
-            --artifact-dir dist --sign-update "$SPARKLE_DIR/bin/sign_update" | tee -a "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/queue-pages" prepare --expected-tag "$BUILD_TAG" --expected-commit "$BUILD_SHA" \
+            --artifact-dir dist --site-dir site --output-dir "$RUNNER_TEMP/site" --result-file "$GITHUB_OUTPUT" \
+            --sign-update "$SPARKLE_DIR/bin/sign_update" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload the site
+        if: steps.prepare.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        if: steps.prepare.outputs.deploy == 'true'
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+      - name: Read the live site back
+        if: steps.prepare.outputs.deploy == 'true'
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/queue-pages" verify-live --artifact-dir dist --output-dir "$RUNNER_TEMP/site" | tee -a "$GITHUB_STEP_SUMMARY"
