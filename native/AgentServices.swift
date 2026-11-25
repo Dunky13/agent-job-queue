@@ -9,16 +9,17 @@ import ServiceManagement
 enum QueueSetupProgress {
     static let approvalMarker = "AGENT_QUEUE_SETUP_STATE:requires-approval"
     static let waitingMarker = "AGENT_QUEUE_SETUP_STATE:waiting"
+    static let reviewMarker = "AGENT_QUEUE_SETUP_STATE:requires-review"
     static let installingMarker = "AGENT_QUEUE_SETUP_STATE:installing"
 
-    static func parse(_ text: String) -> (output: String, requiresServiceApproval: Bool, isWaiting: Bool) {
+    static func parse(_ text: String) -> (output: String, requiresServiceApproval: Bool, requiresReview: Bool, isWaiting: Bool) {
         let lines = text.components(separatedBy: .newlines)
-        let markers = [approvalMarker, waitingMarker, installingMarker]
+        let markers = [approvalMarker, waitingMarker, installingMarker, reviewMarker]
         let state = lines.last(where: { markers.contains($0) })
         let visible = lines.filter { line in
             !markers.contains(line) && !(line.hasPrefix("AGENT_QUEUE_") && markers.contains(where: { $0.hasPrefix(line) }))
         }
-        return (visible.joined(separator: "\n"), state == approvalMarker, state == approvalMarker || state == waitingMarker)
+        return (visible.joined(separator: "\n"), state == approvalMarker, state == reviewMarker, state == approvalMarker || state == waitingMarker)
     }
 }
 

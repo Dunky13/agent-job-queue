@@ -57,6 +57,7 @@ type installOptions struct {
 	disablePhoneAccess bool
 	unregisterServices bool
 	repairAndContinue  bool
+	keepCustomCallback bool
 	recovery           string
 	jobID              *int
 	revision           string
@@ -64,7 +65,7 @@ type installOptions struct {
 
 func installParseOptions(args []string) (installOptions, error) {
 	options := installOptions{}
-	usage := errors.New("Usage: agent-heavy install --app-bundle ABSOLUTE_APP_PATH [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access | --repair-and-continue | --unregister-services]")
+	usage := errors.New("Usage: agent-heavy install --app-bundle ABSOLUTE_APP_PATH [--preflight --json | --recover ACTION [--job-id ID] [--expected-revision SHA] | --disable-phone-access | --repair-and-continue [--keep-custom-callback] | --unregister-services]")
 	if len(args) < 2 || args[0] != "--app-bundle" || !integrationValidPath(args[1]) || filepath.Clean(args[1]) != args[1] {
 		return options, usage
 	}
@@ -86,6 +87,8 @@ func installParseOptions(args []string) (installOptions, error) {
 			options.unregisterServices = true
 		case "--repair-and-continue":
 			options.repairAndContinue = true
+		case "--keep-custom-callback":
+			options.keepCustomCallback = true
 		case "--recover", "--job-id", "--expected-revision":
 			if i+1 >= len(args) {
 				return options, usage
@@ -118,6 +121,9 @@ func installParseOptions(args []string) (installOptions, error) {
 		}
 	}
 	if options.preflight != seen["--json"] || options.preflight && (options.recovery != "" || options.disablePhoneAccess) || options.recovery != "" && options.disablePhoneAccess || options.recovery == "" && (options.jobID != nil || options.revision != "") {
+		return options, usage
+	}
+	if options.keepCustomCallback && !options.repairAndContinue {
 		return options, usage
 	}
 	if options.repairAndContinue && (options.preflight || options.recovery != "" || options.disablePhoneAccess) {

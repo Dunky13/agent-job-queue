@@ -292,6 +292,8 @@ actor BootstrapPreflightExecutorFixture {
     var failRecovery = false
     var returnOnlyClearedRecovery = false
     private var failedInstallationReport: QueueBootstrapReport?
+    private var waitingInRepair = false
+    private var repairReviews = false
 
     init(_ fixture: BootstrapFixture, report: QueueBootstrapReport, afterRecovery: QueueBootstrapReport = .clear) {
         self.fixture = fixture
@@ -320,6 +322,24 @@ actor BootstrapPreflightExecutorFixture {
             if !returnOnlyClearedRecovery { report = afterRecovery }
             return try JSONEncoder().encode(afterRecovery)
         }
+        if request.arguments.contains("--repair-and-continue") && repairReviews {
+            throw ClientError.message(QueueSetupProgress.reviewMarker + "\nAgent Queue setup: Automatic setup requires review: Fixture requirement. Nothing was changed.")
+        }
+        if request.arguments.contains("--keep-custom-callback") {
+            // Stands in for the backend's approved repair; its ordering and waiting rules have Go tests.
+            if waitingInRepair { output(Data((QueueSetupProgress.waitingMarker + "\nWaiting for queue work and setup requirements.").utf8)) }
+            while waitingInRepair { try await Task.sleep(for: .milliseconds(1)) }
+            if !report.issues.isEmpty {
+                mutations += 1
+                output(Data((QueueSetupProgress.installingMarker + "\nRunning verified setup repair: fixture").utf8))
+                if holdNextRecovery {
+                    holdNextRecovery = false
+                    await withCheckedContinuation { recoveryHeld = $0 }
+                }
+                if failRecovery { throw ClientError.message("Fixture recovery failed ownership verification.") }
+                report = .clear
+            }
+        }
         installations += 1
         if let failedInstallationReport {
             self.failedInstallationReport = nil
@@ -340,6 +360,8 @@ actor BootstrapPreflightExecutorFixture {
     func releaseRecovery() { recoveryHeld?.resume(); recoveryHeld = nil }
     var isRecoveryHeld: Bool { recoveryHeld != nil }
     func setFailure() { failRecovery = true }
+    func reviewRepairs() { repairReviews = true }
+    func holdRepairWaiting(_ waiting: Bool) { waitingInRepair = waiting }
     func setStaleRecovery() { returnOnlyClearedRecovery = true }
     func failInstallation(with report: QueueBootstrapReport) { failedInstallationReport = report }
 }

@@ -561,8 +561,9 @@ extension QueueClient.Command {
     }
     /// Waiting for existing work to drain has no aggregate deadline. It can stop
     /// only while its controller reports a wait; pending identity and custody survive.
-    static func installRepairAndContinue(_ target: QueueClient.InstallTarget) -> Self {
-        let arguments = target.arguments + ["--repair-and-continue"]
+    /// The setup window passes keepingCustomCallback so the backend never replaces a callback for it.
+    static func installRepairAndContinue(_ target: QueueClient.InstallTarget, keepingCustomCallback: Bool = false) -> Self {
+        let arguments = target.arguments + ["--repair-and-continue"] + (keepingCustomCallback ? ["--keep-custom-callback"] : [])
         return target.isExactPath ? setup(arguments, timeout: .infinity, cancellation: .stopWhileWaiting) : setup(arguments)
     }
     static func installDisablingPhoneAccess(_ target: QueueClient.InstallTarget) -> Self {

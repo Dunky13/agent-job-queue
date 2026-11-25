@@ -427,6 +427,7 @@ struct QueueBootstrapInstall: Equatable, Sendable {
     var plain: QueueBootstrapRequest { .init(executable: executable, command: .install(target)) }
     var preflight: QueueBootstrapRequest { .init(executable: executable, command: .installPreflight(target)) }
     var repairAndContinue: QueueBootstrapRequest { .init(executable: executable, command: .installRepairAndContinue(target)) }
+    var repairKeepingCustomCallback: QueueBootstrapRequest { .init(executable: executable, command: .installRepairAndContinue(target, keepingCustomCallback: true)) }
     var disablingPhoneAccess: QueueBootstrapRequest { .init(executable: executable, command: .installDisablingPhoneAccess(target)) }
     func recovery(action: String, jobID: Int?, expectedRevision: String? = nil) -> QueueBootstrapRequest {
         .init(executable: executable, command: .installRecovery(target, action: action, jobID: jobID, expectedRevision: expectedRevision))
@@ -541,43 +542,8 @@ final class QueueBootstrapModel: ObservableObject {
     private var revision: String?
     private var legacyPhoneAccess = false
 
-    private enum ApprovedRepairStep {
-        case recovery(String, Int?)
-        case wait
-    }
-
-    var canRepairAndContinue: Bool {
-        allowsInstallation && !isRunning && phase != .complete && !issues.isEmpty && issues.allSatisfy { Self.approvedRepairStep($0) != nil }
-    }
-
-    private static func approvedRepairStep(_ issue: QueueBootstrapIssue) -> ApprovedRepairStep? {
-        func has(_ id: String) -> Bool { issue.actions.contains { $0.id == id } }
-        switch issue.id {
-        case "pending-installation":
-            return has("finish-pending-installation") ? .recovery("finish-pending-installation", nil) : nil
-        case "service-definitions-missing":
-            return has("restore-service-definitions") ? .recovery("restore-service-definitions", nil) : nil
-        case "legacy-phone-access", "remote-migration":
-            return has("disable-phone-access") ? .recovery("disable-phone-access", nil) : nil
-        case "service-not-ready":
-            if has("repair-service") { return .recovery("repair-service", nil) }
-            return has("wait") ? .wait : nil
-        case "pending-cleanup":
-            if has("cleanup-job"), let job = issue.jobs?.first,
-               ["Cleanup pending", "Done"].contains(job.status) {
-                return .recovery("cleanup-job", job.id)
-            }
-            return has("wait") ? .wait : nil
-        case "legacy-jobs", "managed-jobs":
-            guard let jobs = issue.jobs, !jobs.isEmpty,
-                  jobs.allSatisfy({ ["Running", "Queued"].contains($0.status) }) else { return nil }
-            return has("wait") ? .wait : nil
-        case "installer-busy", "scheduling-busy", "remote-busy", "controller-stopping", "service-approval":
-            return has("wait") ? .wait : nil
-        default:
-            return nil
-        }
-    }
+    // The backend owns which requirements it repairs or waits for and reports what needs review.
+    var canRepairAndContinue: Bool { allowsInstallation && !isRunning && phase != .complete && !issues.isEmpty }
 
     init(environment: QueueBootstrapEnvironment,
          execute: @escaping Executor = QueueBootstrapModel.runInstaller,
@@ -687,65 +653,12 @@ final class QueueBootstrapModel: ObservableObject {
         guard confirmed, canRepairAndContinue else { return nil }
         let current = begin(.checking, message: "Checking the approved setup repairs…")
         let task = Task { [self] in
-            var performed = Set<String>()
             do {
-                while true {
-                    try Task.checkCancellation()
-                    let decision = try await inspectDecision(current)
-                    guard case let .install(request, reason) = decision else { finish(current); return }
-                    self.request = request
-                    if try await preflight(request, current: current, waiting: true) {
-                        try await install(request.plain, reason: reason, current: current)
-                        return
-                    }
-                    guard issues.allSatisfy({ Self.approvedRepairStep($0) != nil }) else {
-                        phase = .reviewing
-                        message = "A requirement needs review. The approved automatic repair has stopped."
-                        return
-                    }
-                    let steps = issues.compactMap(Self.approvedRepairStep)
-                    let coordinationBusy = issues.contains { ["installer-busy", "scheduling-busy", "remote-busy", "controller-stopping"].contains($0.id) }
-                    // The backend refuses phone changes until the queue drains, so wait for it, as --repair-and-continue does.
-                    let draining = issues.contains { issue in
-                        guard case .wait? = Self.approvedRepairStep(issue) else { return false }
-                        return ["legacy-jobs", "managed-jobs", "pending-cleanup", "service-approval"].contains(issue.id)
-                    }
-                    var next: (String, Int?)?
-                    if !coordinationBusy {
-                        for priority in ["finish-pending-installation", "restore-service-definitions", "repair-service", "cleanup-job", "disable-phone-access"] where !(draining && priority == "disable-phone-access") {
-                            for case let .recovery(actionID, jobID) in steps where actionID == priority {
-                                next = (actionID, jobID)
-                                break
-                            }
-                            if next != nil { break }
-                        }
-                    }
-                    if let (actionID, jobID) = next {
-                        let key = actionID + ":" + (jobID.map(String.init) ?? "")
-                        guard performed.insert(key).inserted else {
-                            throw ClientError.message("The approved repair did not clear its setup requirement. No repair was repeated. Review the current requirements before approving another attempt.")
-                        }
-                        guard performed.count <= 128 else {
-                            throw ClientError.message("Setup reached its verified repair limit. Review the remaining requirements before approving another attempt.")
-                        }
-                        phase = .recovering
-                        message = issues.flatMap(\.actions).first(where: { $0.id == actionID })?.title.appending("…") ?? "Repairing setup…"
-                        let data = try await execute(request.recovery(action: actionID, jobID: jobID)) { _ in }
-                        _ = try QueueBootstrapReport.decode(data)
-                        guard attempt == current else { return }
-                        phase = .checking
-                        message = "Checking the repaired installation…"
-                    } else {
-                        phase = .waiting
-                        message = "Waiting for queue work and setup requirements to finish. Setup will continue automatically."
-                        // Approval remains scoped to this task while normal work
-                        // finishes. Stop waiting cancels the read-only polling and
-                        // fences its eventual responses without stopping jobs.
-                        try await Task.sleep(for: waitInterval)
-                        guard attempt == current else { return }
-                        phase = .checking
-                    }
-                }
+                let decision = try await inspectDecision(current)
+                guard case let .install(request, reason) = decision else { finish(current); return }
+                self.request = request
+                // Callbacks stay out: the backend stops for review instead of replacing one.
+                try await install(request.repairKeepingCustomCallback, reason: reason, current: current)
             } catch { await fail(error, current: current) }
         }
         operation = task
@@ -869,13 +782,10 @@ final class QueueBootstrapModel: ObservableObject {
         issues = report.issues
         revision = report.revision
         canDisablePhoneAccess = issues.contains(where: { $0.actions.contains(where: { $0.id == "disable-phone-access" }) })
-        // Ordinary first launch delegates known repairs and waits to the backend,
-        // which rechecks the full report under its normal lifecycle locks. Explicit
-        // diagnostic setup keeps the reviewed, individual-action workflow.
-        if automatic && !environment.arguments.contains("--setup") && issues.allSatisfy({ issue in
-            Self.approvedRepairStep(issue) != nil || (issue.id == "custom-callback" && revision != nil &&
-                issue.actions.contains(where: { $0.id == "reset-callback" }))
-        }) { return true }
+        // Ordinary first launch delegates every requirement to the backend, which
+        // rechecks the full report under its lifecycle locks and stops for review
+        // before any change. Explicit diagnostic setup keeps the reviewed workflow.
+        if automatic && !environment.arguments.contains("--setup") { return true }
         if !issues.isEmpty {
             if !waiting { phase = .reviewing }
             message = waiting ? "Waiting for the listed requirements to clear…" : "Review these requirements before continuing."
@@ -896,6 +806,7 @@ final class QueueBootstrapModel: ObservableObject {
                 let progress = QueueSetupProgress.parse(String(decoding: data, as: UTF8.self))
                 self.phase = progress.isWaiting ? .waiting : .installing
                 self.output = String(decoding: progress.output.utf8.suffix(8_000), as: UTF8.self)
+                if let line = progress.output.components(separatedBy: .newlines).last(where: { !$0.isEmpty }) { self.message = line }
                 if progress.isWaiting { self.onSetupRequired?() }
             }
         }
@@ -956,6 +867,15 @@ final class QueueBootstrapModel: ObservableObject {
             }
         }
         guard attempt == current else { return }
+        if progress.requiresReview && !legacyPhoneAccess {
+            // The backend changed nothing and named an unsupported requirement.
+            phase = .reviewing
+            canDisablePhoneAccess = issues.contains(where: { $0.actions.contains(where: { $0.id == "disable-phone-access" }) })
+            message = environment.arguments.contains("--setup") ? "A requirement needs review. The approved automatic repair has stopped." : "Review these requirements before continuing."
+            output = ""
+            onSetupRequired?()
+            return
+        }
         phase = .failed
         canDisablePhoneAccess = legacyPhoneAccess || issues.contains(where: { $0.actions.contains(where: { $0.id == "disable-phone-access" }) })
         message = legacyPhoneAccess ? "Phone access must be disabled to continue setup." : "Agent Queue setup could not finish."

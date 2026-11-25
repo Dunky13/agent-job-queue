@@ -42,6 +42,7 @@ type installer struct {
 	disablePhoneAccess                           bool
 	unregisterServices                           bool
 	automaticSetup                               bool
+	keepCustomCallback                           bool
 	command                                      func(context.Context, []string) ([]byte, error)
 	notice                                       func(string)
 }
@@ -1614,6 +1615,10 @@ func installReportFailure(output io.Writer, err error) {
 		// The app waits for macOS approval, then runs setup again.
 		fmt.Fprintln(output, "AGENT_QUEUE_SETUP_STATE:requires-approval")
 	}
+	var review *installReviewError
+	if errors.As(err, &review) {
+		fmt.Fprintln(output, "AGENT_QUEUE_SETUP_STATE:requires-review")
+	}
 	fmt.Fprintf(output, "Agent Queue setup: %v\n", err)
 	if errors.Is(err, errInstallLegacyPhoneAccess) {
 		fmt.Fprintln(output, installDisablePhoneAccessRecovery)
@@ -1641,7 +1646,7 @@ func InstallMain(args []string) int {
 		}
 		path = tools + string(os.PathListSeparator) + path
 	}
-	install := &installer{home: home, root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: options.app, path: path, testing: testing, disablePhoneAccess: options.disablePhoneAccess, unregisterServices: options.unregisterServices}
+	install := &installer{home: home, root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: options.app, path: path, testing: testing, disablePhoneAccess: options.disablePhoneAccess, unregisterServices: options.unregisterServices, keepCustomCallback: options.keepCustomCallback}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if options.repairAndContinue {

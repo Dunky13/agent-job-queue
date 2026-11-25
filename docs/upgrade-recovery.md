@@ -67,13 +67,13 @@ An interrupted publication retains its candidate, backup and receipt. Automatic 
 
 Ordinary launches silently continue supported repairs through the bundled controller's `--repair-and-continue` flow. A current installation that still has a queue, resource or phone-access registration from an older version also completes setup, retiring it, without a second launch or **Check again**. Unknown requirements and failures remain visible in the menu with diagnostics, Retry and the official download link; a healthy launch shows only "Starting…". Reopen stays in the menu bar during preparation.
 
-Only the optional `--setup` app argument opens guided diagnosis and individual recovery controls. Ordinary launch, reopen and quit never open it automatically. It can show affected files and jobs, run a reviewed recovery, or perform a cancellable read-only wait. Destructive manual actions, including job cancellation and callback replacement, retain their confirmations. Fixtures and developer builds never install into the real queue.
+Only the optional `--setup` app argument opens guided diagnosis and individual recovery controls. Ordinary launch, reopen and quit never open it automatically. It can show affected files and jobs, run a reviewed recovery, or perform a cancellable read-only wait. Its single **Repair and continue** confirmation runs the same `--repair-and-continue` flow as an ordinary launch, with `--keep-custom-callback`, so the controller alone decides which requirements to repair or wait for, shows its progress, and also retires legacy service definitions during the final installation. With that flag a custom callback is never replaced: the controller stops with "Automatic setup requires review" and the window keeps its separately reviewed callback action for that. The window offers the repair whenever requirements are listed and no action is running; the controller reports anything it cannot repair. Destructive manual actions, including job cancellation and callback replacement, retain their confirmations. Fixtures and developer builds never install into the real queue.
 
 The bundled controller supports read-only preflight and automatic installation:
 
 ```sh
 agent-heavy install --app-bundle ABSOLUTE_APP_PATH --preflight --json
-agent-heavy install --app-bundle ABSOLUTE_APP_PATH --repair-and-continue
+agent-heavy install --app-bundle ABSOLUTE_APP_PATH --repair-and-continue [--keep-custom-callback]
 ```
 
 Preflight returns a schema-versioned JSON report with an `issues` array. Each issue has a stable ID, title, explanation, optional affected path or jobs, and supported actions. An empty array permits an installation attempt; it does not establish completed installation. Automatic setup emits progress and returns success only after installation completes.

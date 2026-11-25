@@ -259,6 +259,65 @@ func TestInstallerApprovedRepairOptions(t *testing.T) {
 	}
 }
 
+func TestInstallerKeepCustomCallbackOptionRequiresRepair(t *testing.T) {
+	app := []string{"--app-bundle", "/Applications/Agent Queue.app"}
+	options, err := installParseOptions(append(slices.Clone(app), "--repair-and-continue", "--keep-custom-callback"))
+	if err != nil || !options.repairAndContinue || !options.keepCustomCallback {
+		t.Fatalf("held callback repair not parsed: %+v, %v", options, err)
+	}
+	if options, err := installParseOptions(append(slices.Clone(app), "--repair-and-continue")); err != nil || options.keepCustomCallback {
+		t.Fatalf("callback hold-back must be opt-in: %+v, %v", options, err)
+	}
+	for _, args := range [][]string{
+		{"--keep-custom-callback"},
+		{"--preflight", "--json", "--keep-custom-callback"},
+		{"--recover", "reset-callback", "--expected-revision", strings.Repeat("a", 64), "--keep-custom-callback"},
+		{"--disable-phone-access", "--keep-custom-callback"},
+		{"--repair-and-continue", "--keep-custom-callback", "--keep-custom-callback"},
+	} {
+		if _, err := installParseOptions(append(slices.Clone(app), args...)); err == nil {
+			t.Fatalf("callback hold-back accepted outside approved repair: %v", args)
+		}
+	}
+}
+
+func TestInstallerReportFailureMarksReviewStops(t *testing.T) {
+	_, err := installApprovedNext(approvedTestReport(approvedTestIssue("unknown-ownership", "reveal")))
+	var out bytes.Buffer
+	installReportFailure(&out, err)
+	if !strings.HasPrefix(out.String(), "AGENT_QUEUE_SETUP_STATE:requires-review\nAgent Queue setup: Automatic setup requires review: ") {
+		t.Fatalf("review stop not marked: %q", out.String())
+	}
+	out.Reset()
+	installReportFailure(&out, errors.New("disk full"))
+	if strings.Contains(out.String(), "requires-review") {
+		t.Fatalf("ordinary failure marked for review: %q", out.String())
+	}
+}
+
+func TestInstallerKeepCustomCallbackStopsForReview(t *testing.T) {
+	f := installTestFixture(t)
+	f.legacy(t)
+	config := f.installer.freshConfig()
+	config["daemon"].(Object)["callback"] = "custom-hook {{ id }}"
+	path := filepath.Join(f.installer.config, "pueue.yml")
+	original := mustMetadataJSON(t, config)
+	integrationTestWrite(t, path, original)
+	f.installer.keepCustomCallback = true
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := f.installer.repairAndExecute(ctx)
+	if err == nil || !strings.Contains(err.Error(), "Automatic setup requires review") {
+		t.Fatalf("held callback replacement did not stop for review: %v", err)
+	}
+	if !bytes.Equal(original, integrationTestRead(t, path)) {
+		t.Fatal("held callback replacement changed the configuration")
+	}
+	if backups, _ := filepath.Glob(filepath.Join(f.installer.config, "pueue.before-upgrade-*.yml")); len(backups) != 0 {
+		t.Fatal("held callback replacement still ran the recovery")
+	}
+}
+
 func approvedTestIssue(id, action string, jobs ...installRecoveryJob) installPreflightIssue {
 	return installPreflightIssue{ID: id, Title: id, Actions: []installRecoveryAction{{ID: action}}, Jobs: jobs}
 }

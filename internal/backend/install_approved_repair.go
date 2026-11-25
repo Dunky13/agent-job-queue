@@ -11,6 +11,14 @@ import (
 	"time"
 )
 
+// installReviewError marks an unsupported requirement: nothing was changed and
+// the person must review it.
+type installReviewError struct{ title, detail string }
+
+func (err *installReviewError) Error() string {
+	return fmt.Sprintf("Automatic setup requires review: %s. %s", err.title, err.detail)
+}
+
 type installApprovedStep struct {
 	action   string
 	jobID    *int
@@ -74,7 +82,7 @@ func installApprovedNext(report installPreflightReport) (installApprovedStep, er
 	for _, issue := range report.Issues {
 		step, supported := installApprovedIssue(issue)
 		if !supported {
-			return installApprovedStep{}, fmt.Errorf("Automatic setup requires review: %s. %s", issue.Title, issue.Detail)
+			return installApprovedStep{}, &installReviewError{issue.Title, issue.Detail}
 		}
 		if step.action == "reset-callback" {
 			if decoded, err := hex.DecodeString(report.Revision); err != nil || len(decoded) != 32 {
@@ -216,6 +224,15 @@ func (install *installer) repairAndExecute(ctx context.Context) error {
 		operation, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 		report := install.preflight(operation)
+		if install.keepCustomCallback {
+			// The setup window never replaces a callback. Without its recovery
+			// the issue is unsupported, so the normal review stop applies.
+			for i, issue := range report.Issues {
+				if issue.ID == "custom-callback" {
+					report.Issues[i].Actions = slices.DeleteFunc(slices.Clone(issue.Actions), func(action installRecoveryAction) bool { return action.ID == "reset-callback" })
+				}
+			}
+		}
 		if err := operation.Err(); err != nil {
 			report.add("inspection-failed", "Installation inspection did not complete", err.Error(), "")
 		}

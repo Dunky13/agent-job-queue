@@ -402,13 +402,9 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let phone = QueueBootstrapIssue(id: "legacy-phone-access", title: "Phone access needs to be disabled",
             detail: "Credentials and trusted certificates are preserved. Phone access can be enabled again after setup.",
             actions: [.init(id: "disable-phone-access", title: "Disable phone access and continue", destructive: false)])
-        let active = QueueBootstrapIssue(id: "legacy-jobs", title: "Waiting for existing work",
-            detail: "Running jobs will finish normally. Setup will continue automatically.",
-            actions: [.init(id: "wait", title: "Wait and continue", destructive: false)],
-            jobs: [.init(id: 7, label: "Fixture validation", status: "Running")])
         let executor = BootstrapPreflightExecutorFixture(fixture,
             report: .init(schemaVersion: 1, issues: [busy, missing, phone]))
-        await executor.queueRecoveryReports([.init(schemaVersion: 1, issues: [phone]), .init(schemaVersion: 1, issues: [active])])
+        await executor.holdRepairWaiting(true)
         let delegate = AppDelegate(environment: fixture.environment) { request, output in
             try await executor.execute(request, output: output)
         }
@@ -444,20 +440,16 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         try await waitUntil { model.phase == .waiting }
         let busyMutations = await executor.mutations
         try check(busyMutations == 0 && model.canStopWaiting,
-            "One approval waits for an existing installer before changing anything")
+            "One approval waits for the controller before changing anything")
         try snapshot(setup, name: "02-approved-waiting")
-        await executor.update(.init(schemaVersion: 1, issues: [missing, phone]))
-        try await waitUntil { await executor.mutations == 2 && model.phase == .waiting }
-        try snapshot(setup, name: "03-repairs-complete-waiting")
-        await executor.update(.clear)
+        await executor.holdRepairWaiting(false)
         try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
         let requests = await executor.requests
         let installs = await executor.installations
-        try check(installs == 1 && requests.filter { $0.arguments.contains("--recover") }.count == 2 &&
-            requests.contains { $0.arguments.suffix(2) == ["--recover", "restore-service-definitions"] } &&
-            requests.contains { $0.arguments.suffix(2) == ["--recover", "disable-phone-access"] } &&
+        try check(installs == 1 && !requests.contains { $0.arguments.contains("--recover") } &&
+            requests.filter { $0.arguments.suffix(2) == ["--repair-and-continue", "--keep-custom-callback"] }.count == 1 &&
             delegate.setupWindow == nil && AppRuntime.store.fixtureMode,
-            "One accepted dialog repairs, waits and verifies normal startup without further intervention")
+            "One accepted dialog runs the controller's repair once and verifies normal startup without further intervention")
         guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Approved repair did not start the simulated queue") }
         try snapshot(queue, name: "04-approved-startup")
     }
@@ -571,6 +563,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let issue = QueueBootstrapIssue(id: "unknown-fixture-policy", title: "Platform policy needs attention",
             detail: "Private fixture: the required service was denied by platform policy.", actions: [])
         let executor = BootstrapPreflightExecutorFixture(fixture, report: .init(schemaVersion: 1, issues: [issue]))
+        await executor.reviewRepairs()
         let delegate = AppDelegate(environment: fixture.environment) { request, output in
             try await executor.execute(request, output: output)
         }
