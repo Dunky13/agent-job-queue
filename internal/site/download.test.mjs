@@ -20,7 +20,6 @@ const valid = () => ({
 test("accepts a valid manifest", () => {
   const v = valid();
   assert.deepEqual(parseLatest(v), { version: "1.2.3", build: "45", dmgUrl: v.dmgUrl });
-  assert.equal(parseLatest({ ...v, build: "45" }).build, "45");
 });
 
 test("rejects non-objects and wrong schema versions", () => {
@@ -35,7 +34,7 @@ test("rejects missing or mistyped fields", () => {
     delete missing[field];
     assert.equal(parseLatest(missing), null, `missing ${field}`);
   }
-  for (const [field, value] of [["version", 1], ["tag", ""], ["build", 0], ["build", 1.5], ["build", "x"], ["build", null], ["dmgSha256", "abc"], ["zipSha256", "G".repeat(64)]]) {
+  for (const [field, value] of [["version", 1], ["tag", ""], ["build", 0], ["build", 1.5], ["build", "45"], ["build", "x"], ["build", null], ["dmgSha256", "abc"], ["zipSha256", "G".repeat(64)]]) {
     assert.equal(parseLatest({ ...valid(), [field]: value }), null, `${field}=${value}`);
   }
 });

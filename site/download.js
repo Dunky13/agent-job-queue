@@ -19,8 +19,7 @@ export function parseLatest(data) {
   for (const field of STRING_FIELDS) {
     if (typeof data[field] !== "string" || data[field] === "") return null;
   }
-  const buildOk = Number.isInteger(data.build) ? data.build > 0 : typeof data.build === "string" && /^[1-9][0-9]*$/.test(data.build);
-  if (!buildOk) return null;
+  if (!Number.isInteger(data.build) || data.build < 1) return null;
   if (!isReleaseUrl(data.releaseUrl) || !isReleaseUrl(data.dmgUrl) || !isReleaseUrl(data.zipUrl)) return null;
   if (!/^[0-9a-f]{64}$/.test(data.dmgSha256) || !/^[0-9a-f]{64}$/.test(data.zipSha256)) return null;
   return { version: data.version, build: String(data.build), dmgUrl: data.dmgUrl };
