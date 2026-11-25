@@ -32,8 +32,9 @@ def verify_delivery_cask_contract(cask)
   end
 end
 
-# Homebrew 2026-11 stopped loading cask files by path through CaskLoader.load and
-# added from_path; older Homebrew only has load.
+# Homebrew 7.0.13 added from_path and 7.0.14 stopped CaskLoader.load accepting
+# paths; older Homebrew only has load. from_path is private to Homebrew with no
+# public replacement, so a change to it fails these checks loudly.
 def load_delivery_cask(path)
   return Cask::CaskLoader.from_path(Pathname(path)) if Cask::CaskLoader.respond_to?(:from_path)
 
