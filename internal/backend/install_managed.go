@@ -1456,6 +1456,9 @@ func (install *installer) requirePhoneAccessDrained(ctx context.Context, node *y
 			return err
 		}
 	} else {
+		if node == nil {
+			return errors.New("Cannot inspect the legacy queue without its dedicated configuration")
+		}
 		output, loaded, err := install.inspectService(ctx, "io.went.agent-heavy")
 		if err != nil {
 			return err

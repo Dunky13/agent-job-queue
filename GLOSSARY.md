@@ -6,7 +6,7 @@ Agent Queue runs heavy agent commands one at a time, or a few at a time, on one 
 
 **Job**:
 A unit of queued work, either a command submitted through `agent-heavy run` or a lease, owned by the queue daemon until it finishes.
-_Avoid_: Task (Pueue's word), process
+_Avoid_: Task, process
 
 **Lease**:
 A job without a process, acquired with `agent-heavy lane acquire`, that holds a lane slot while an agent does multi-step work.
@@ -35,11 +35,11 @@ An operator-declared window, started with `agent-heavy drain`, during which new 
 _Avoid_: Pause, freeze
 
 **Drained queue**:
-A queue with no unfinished jobs and no pending cleanup. Setup requires one before it changes queue configuration, replaces the queue service or disables phone access.
+A queue with no unfinished jobs and no pending cleanup.
 _Avoid_: Empty queue, idle queue
 
 **Handover**:
-Moving custody of running and queued work, and their callers, from the daemon of one build to another. Setup never starts one; it only finishes one an older release left behind.
+Moving custody of running and queued work, and their callers, from the daemon of one build to another.
 _Avoid_: Migration, takeover
 
 **Preflight**:
@@ -57,5 +57,5 @@ _Avoid_: Auto-fix, self-heal
 ## App
 
 **Surface**:
-Any window or popover that shows live queue data and so wants frequent refreshes while it is visible.
+Any window or popover that shows live queue data.
 _Avoid_: View, screen, panel

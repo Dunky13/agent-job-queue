@@ -441,6 +441,17 @@ func TestInstallerRecoveryPhoneAccessPreservesLegacyAndGoCredentials(t *testing.
 				t.Fatalf("phone access was disabled while jobs drain: %v", err)
 			}
 			f.tasks = Object{}
+			if kind == "legacy" {
+				receipt := filepath.Join(f.installer.state, "receipts/6.json")
+				integrationTestWrite(t, receipt, []byte(`{"task_id":6,"token":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`))
+				var cleanup *installCleanupPendingError
+				if err := f.installer.recover(context.Background(), "disable-phone-access", nil, ""); !errors.As(err, &cleanup) || calls != 0 {
+					t.Fatalf("phone access was disabled before legacy cleanup: %v", err)
+				}
+				if err := os.Remove(receipt); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if kind == "go" {
 				var cleanup *installCleanupPendingError
 				if err := f.installer.recover(context.Background(), "disable-phone-access", nil, ""); !errors.As(err, &cleanup) || calls != 0 {
@@ -465,15 +476,9 @@ func TestInstallerRecoveryPhoneAccessPreservesLegacyAndGoCredentials(t *testing.
 	}
 }
 
-func TestInstallerPhoneAccessDrainWithoutLegacyConfigurationReadsDefaultQueue(t *testing.T) {
+func TestInstallerPhoneAccessDrainRefusesLegacyQueueWithoutConfiguration(t *testing.T) {
 	f := installTestFixture(t)
-	if err := f.installer.requirePhoneAccessDrained(context.Background(), nil); err != nil {
-		t.Fatalf("an absent legacy queue was not treated as drained: %v", err)
-	}
-	f.tasks = Object{"5": Object{"id": 5, "status": Object{"Running": Object{}}}}
-	integrationTestWrite(t, filepath.Join(f.installer.state, "pueue/state.json"), mustMetadataJSON(t, f.snapshot()))
-	var drain *installDrainPendingError
-	if err := f.installer.requirePhoneAccessDrained(context.Background(), nil); !errors.As(err, &drain) {
-		t.Fatalf("default legacy queue state was ignored without its configuration: %v", err)
+	if err := f.installer.requirePhoneAccessDrained(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "dedicated configuration") {
+		t.Fatalf("legacy queue location was guessed without its configuration: %v", err)
 	}
 }
