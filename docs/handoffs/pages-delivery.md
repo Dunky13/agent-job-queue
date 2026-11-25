@@ -15,8 +15,8 @@ Homebrew is dropped. The Sparkle appcast and `latest.json` are deployed to GitHu
 
 ## Human steps still required
 
-1. Generate the EdDSA key and store it as the Actions secret without pasting it anywhere: run `"$dir/bin/generate_keys"`, then `"$dir/bin/generate_keys" -x sparkle-private-key`, then `gh secret set SPARKLE_ED_PRIVATE_KEY --repo Dunky13/agent-job-queue < sparkle-private-key`, then `rm sparkle-private-key` (`dir` is the output of `packaging/sparkle/fetch.sh "$TMPDIR/sparkle"`). Commit the public key (one base64 line) to `packaging/sparkle/public-ed-key.txt`.
-2. Enable Pages: **Settings > Pages > Build and deployment > Source: GitHub Actions**. Keep the `github-pages` environment limited to `main`.
+1. Done 2026-11-25: the EdDSA key was generated in the owner's login keychain under the account `agent-queue` (`generate_keys --account agent-queue`), the private key is the Actions secret `SPARKLE_ED_PRIVATE_KEY`, and the public key is committed in `packaging/sparkle/public-ed-key.txt`.
+2. Done 2026-11-25: Pages is enabled with the GitHub Actions source, and the `github-pages` environment allows only `main`.
 3. Merge the homepage so `site/` exists on `main`; delivery fails clearly without it.
 4. Optional cleanup: delete the `HOMEBREW_SYNC_APP_CLIENT_ID` variable and `HOMEBREW_SYNC_APP_PRIVATE_KEY` secret, uninstall the Homebrew-sync App from this repository, remove its bypass entries on the `main` and `main-ci` rulesets, and archive `homebrew-agent-job-queue` with a pointer to the homepage.
 5. Acceptance gate: once two Sparkle builds are published, update from build N to N+1 on the SentinelOne Mac.
