@@ -1,44 +1,14 @@
 package tooling
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
-
-func TestManagedCaskTemplateParity(t *testing.T) {
-	source, err := parser.ParseFile(token.NewFileSet(), "../../packaging/homebrew/refresh.go", nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var standalone string
-	ast.Inspect(source, func(node ast.Node) bool {
-		value, ok := node.(*ast.ValueSpec)
-		if !ok || len(value.Names) != 1 || value.Names[0].Name != "caskTemplate" || len(value.Values) != 1 {
-			return true
-		}
-		literal, ok := value.Values[0].(*ast.BasicLit)
-		if !ok {
-			t.Fatal("standalone cask template is not a string literal")
-		}
-		standalone, err = strconv.Unquote(literal.Value)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return false
-	})
-	if standalone == "" || standalone != caskTemplate {
-		t.Fatal("release and standalone Homebrew lifecycle templates differ")
-	}
-}
 
 func TestHomebrewAppCaskPreservesQuarantineWithFixtureApp(t *testing.T) {
 	if runtime.GOOS != "darwin" {

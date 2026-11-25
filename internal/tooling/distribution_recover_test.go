@@ -107,7 +107,7 @@ func distributionRecoveryCandidate(f checkpointFixture, id, build int) *distribu
 	r.jobs = []map[string]any{
 		job(10, id, "Verify original build provenance", "success", sha, 1), job(11, id, "Sign and notarize main installer", "failure", sha, 2),
 		job(12, id, "Notarized distribution (macos-15)", "skipped", sha, 2), job(13, id, "Notarized distribution (macos-15-intel)", "skipped", sha, 2),
-		job(14, id, "Publish main installer", "skipped", sha, 2), job(15, id, "Verify Homebrew delivery", "skipped", sha, 2),
+		job(14, id, "Publish main installer", "skipped", sha, 2), job(15, id, "Publish Homebrew tap and Sparkle feed", "skipped", sha, 2),
 	}
 	r.gates = []map[string]any{job(20, build, "ci-required", "success", checkpointSHA, 3)}
 	r.app = []map[string]any{job(21, build, "Universal app", "success", checkpointSHA, 1)}

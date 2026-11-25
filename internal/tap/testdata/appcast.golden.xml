@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>Agent Queue</title>
+    <link>https://github.com/Dunky13/agent-job-queue/releases</link>
+    <description>Agent Queue updates</description>
+    <language>en</language>
+    <item>
+      <title>Version 0.1.0 (7)</title>
+      <link>https://github.com/Dunky13/agent-job-queue/releases/tag/build-7-7777777</link>
+      <sparkle:version>7</sparkle:version>
+      <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/Dunky13/agent-job-queue/releases/download/build-7-7777777/Agent-Queue-0.1.0-universal.zip" length="12345678" type="application/octet-stream" sparkle:edSignature="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="/>
+    </item>
+  </channel>
+</rss>

@@ -297,7 +297,7 @@ func TestNotarizationUsesTrustedAttemptScopedArtifacts(t *testing.T) {
 	if !reflect.DeepEqual(stages, []string{"app", "dmg"}) || !reflect.DeepEqual(slots, []string{"01", "02", "03", "07", "08", "09"}) {
 		t.Fatalf("incorrect checkpoint ordering: stages=%v slots=%v", stages, slots)
 	}
-	for _, job := range []string{"notarized-tests", "publish", "homebrew-sync"} {
+	for _, job := range []string{"notarized-tests", "publish"} {
 		found := false
 		for _, step := range workflow.Jobs[job].Steps {
 			if strings.HasPrefix(step.Uses, "actions/download-artifact@") {
@@ -392,7 +392,7 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 		return f
 	}
 	ci, dist := read("ci.yml"), read("distribution.yml")
-	for _, name := range []string{"source", "notarize", "notarized-tests", "publish", "homebrew-sync"} {
+	for _, name := range []string{"source", "notarize", "notarized-tests", "publish", "tap-delivery"} {
 		if _, ok := ci.Jobs[name]; ok {
 			t.Errorf("CI still performs distribution: %s", name)
 		}
@@ -409,7 +409,7 @@ func TestDistributionWorkflowTrustAndTopology(t *testing.T) {
 	if !strings.HasPrefix(ci.Concurrency.Group, "ci-") || !strings.Contains(ci.Concurrency.Group, "github.run_id") || dist.Concurrency.Group != "ci-${{ inputs.build_run_id || github.event.workflow_run.id }}" {
 		t.Fatal("distribution must share the original main CI run's concurrency lock so legacy signing cannot overlap recovery")
 	}
-	for name, want := range map[string][]string{"notarize": {"source"}, "notarized-tests": {"source", "notarize"}, "publish": {"source", "notarize", "notarized-tests"}, "homebrew-sync": {"source", "publish", "notarize"}} {
+	for name, want := range map[string][]string{"notarize": {"source"}, "notarized-tests": {"source", "notarize"}, "publish": {"source", "notarize", "notarized-tests"}, "tap-delivery": {"source", "publish", "notarize"}} {
 		if !reflect.DeepEqual(dist.Jobs[name].Needs, want) {
 			t.Errorf("%s gate topology: %v", name, dist.Jobs[name].Needs)
 		}
@@ -470,7 +470,7 @@ func TestWorkflowPipelinesFailWhenAnyCommandFails(t *testing.T) {
 	type step struct {
 		Name, Run, Shell string
 	}
-	for _, name := range []string{".github/workflows/ci.yml", ".github/workflows/distribution.yml", "packaging/homebrew/.github/workflows/refresh.yml"} {
+	for _, name := range []string{".github/workflows/ci.yml", ".github/workflows/distribution.yml"} {
 		var flow struct {
 			Jobs map[string]struct{ Steps []step }
 		}
@@ -487,6 +487,72 @@ func TestWorkflowPipelinesFailWhenAnyCommandFails(t *testing.T) {
 					t.Errorf("%s job %s step %q pipes into tee without shell: bash", name, job, item.Name)
 				}
 			}
+		}
+	}
+}
+
+// The delivery job commits to main through the Homebrew-sync App only; the
+// Sparkle key reaches one step's environment and never an argument.
+func TestTapDeliveryJobShapeAndCILoopGuard(t *testing.T) {
+	type step struct {
+		Name, Uses, Run, Shell string
+		With                   map[string]string
+		Env                    map[string]string
+	}
+	var dist struct {
+		Jobs map[string]struct {
+			Name        string
+			RunsOn      string `yaml:"runs-on"`
+			Permissions map[string]string
+			Steps       []step
+		}
+	}
+	var ci struct {
+		On map[string]struct {
+			Branches    []string
+			PathsIgnore []string `yaml:"paths-ignore"`
+		}
+	}
+	for path, target := range map[string]any{"distribution.yml": &dist, "ci.yml": &ci} {
+		data, err := os.ReadFile("../../.github/workflows/" + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := yaml.Unmarshal(data, target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !reflect.DeepEqual(ci.On["push"].PathsIgnore, []string{"Casks/**", "appcast.xml"}) || len(ci.On["pull_request"].PathsIgnore) != 0 {
+		t.Fatal("pushes of delivery files must not start CI, and pull requests must stay unfiltered")
+	}
+	job := dist.Jobs["tap-delivery"]
+	if job.Name != "Publish Homebrew tap and Sparkle feed" || job.RunsOn != "macos-15" || !reflect.DeepEqual(job.Permissions, map[string]string{"contents": "read"}) {
+		t.Fatalf("delivery job identity: %+v", job)
+	}
+	var token, publish *step
+	for index, item := range job.Steps {
+		if strings.HasPrefix(item.Uses, "actions/create-github-app-token@") {
+			token = &job.Steps[index]
+		}
+		if strings.Contains(item.Run, "queue-tap") {
+			publish = &job.Steps[index]
+		}
+		if item.Env["SPARKLE_ED_PRIVATE_KEY"] != "" && item.Name != "Publish the verified cask and signed Sparkle feed to main" {
+			t.Errorf("Sparkle key leaked into step %q", item.Name)
+		}
+		if strings.Contains(item.Run, "SPARKLE_ED_PRIVATE_KEY") && strings.Contains(item.Run, "echo") {
+			t.Errorf("step %q may print the key", item.Name)
+		}
+	}
+	if token == nil || token.With["repositories"] != "agent-job-queue" || token.With["permission-contents"] != "write" || len(token.With) != 5 {
+		t.Fatalf("App token must be limited to this repository's contents: %+v", token)
+	}
+	if publish == nil || publish.Shell != "bash" || publish.Env["SPARKLE_ED_PRIVATE_KEY"] != "${{ secrets.SPARKLE_ED_PRIVATE_KEY }}" || !strings.Contains(publish.Run, "--expected-tag \"$BUILD_TAG\"") || !strings.Contains(publish.Run, "sign_update") {
+		t.Fatalf("publish step: %+v", publish)
+	}
+	for _, flag := range []string{"-s ", "--ed-key "} {
+		if strings.Contains(publish.Run, flag) {
+			t.Fatalf("the key must never be an argument: %s", flag)
 		}
 	}
 }

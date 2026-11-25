@@ -2,9 +2,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 go run -p 2 ./cmd/queue-tool check-source
-unformatted=$(gofmt -l cmd internal remote/static/embed.go packaging/homebrew/refresh.go packaging/homebrew/refresh_test.go)
+unformatted=$(gofmt -l cmd internal remote/static/embed.go)
 [[ -z "$unformatted" ]] || { printf 'Go files need formatting:\n%s\n' "$unformatted" >&2; exit 1; }
-go vet -p 2 ./cmd/... ./internal/... ./packaging/homebrew ./remote/static
+go vet -p 2 ./cmd/... ./internal/... ./remote/static
 npm run lint:web
 shellcheck bin/agent-heavy bin/agent-remote .githooks/pre-push
 while IFS= read -r -d '' path; do
@@ -15,5 +15,5 @@ while IFS= read -r -d '' path; do
   esac
   zsh -n "$path"
 done < <(git ls-files --cached --others --exclude-standard -z '*.sh')
-actionlint .github/workflows/*.yml packaging/homebrew/.github/workflows/refresh.yml
+actionlint .github/workflows/*.yml
 ruby -c packaging/homebrew/test-cask.rb

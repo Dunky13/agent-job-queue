@@ -385,6 +385,7 @@ const caskTemplate = `cask "agent-job-queue" do
   desc "Shared heavy-command queue with a macOS menu-bar app"
   homepage "https://github.com/%s"
 
+  auto_updates true
   depends_on macos: :sequoia
 
   # Preserve quarantine so macOS can assess the notarized release.

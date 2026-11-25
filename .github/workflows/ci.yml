@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main, bootstrap]
+    # Delivery commits by the Homebrew-sync App must not start another release.
+    paths-ignore: ['Casks/**', 'appcast.xml']
   pull_request:
     branches: [main]
   workflow_dispatch:

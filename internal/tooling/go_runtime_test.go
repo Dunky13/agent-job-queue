@@ -148,7 +148,6 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 		goRuntimeModule + "/internal/tooling/child",
 		goRuntimeModule + "/internal/tooling-extra",
 		goRuntimeModule + "/internal/new-package",
-		goRuntimeModule + "/packaging/homebrew",
 		goRuntimeModule + "/remote/static",
 		goRuntimeModule + "/cmd",
 		goRuntimeModule + "/internal",
@@ -160,7 +159,7 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runtime suite: %v: %s", err, output)
 	}
-	if got, want := goRuntimeArguments(t, root, "list"), []string{"list", "-p", "2", "./cmd/...", "./internal/...", "./packaging/homebrew", "./remote/static"}; !reflect.DeepEqual(got, want) {
+	if got, want := goRuntimeArguments(t, root, "list"), []string{"list", "-p", "2", "./cmd/...", "./internal/...", "./remote/static"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("enumeration scope: got %q, want %q", got, want)
 	}
 	cwd, err := os.ReadFile(filepath.Join(root, "cwd"))
