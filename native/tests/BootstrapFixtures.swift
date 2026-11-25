@@ -284,7 +284,6 @@ actor BootstrapPreflightExecutorFixture {
     private(set) var installations = 0
     private var report: QueueBootstrapReport
     private var afterRecovery: QueueBootstrapReport
-    private var recoveryReports: [QueueBootstrapReport] = []
     private var holdNext = false
     private var held: CheckedContinuation<Void, Never>?
     private var holdNextRecovery = false
@@ -292,6 +291,11 @@ actor BootstrapPreflightExecutorFixture {
     var failRecovery = false
     var returnOnlyClearedRecovery = false
     private var failedInstallationReport: QueueBootstrapReport?
+    private var waitingInRepair = false
+    private var repairReviews = false
+    private var afterReview = ReviewAftermath.keep
+    private var preflightFails = false
+    enum ReviewAftermath { case keep, clear, failRefresh }
 
     init(_ fixture: BootstrapFixture, report: QueueBootstrapReport, afterRecovery: QueueBootstrapReport = .clear) {
         self.fixture = fixture
@@ -303,6 +307,7 @@ actor BootstrapPreflightExecutorFixture {
         requests.append(request)
         if request.arguments.suffix(2) == ["--preflight", "--json"] {
             checks += 1
+            if preflightFails { throw ClientError.message("Fixture preflight could not run.") }
             if holdNext {
                 holdNext = false
                 await withCheckedContinuation { held = $0 }
@@ -316,9 +321,31 @@ actor BootstrapPreflightExecutorFixture {
                 await withCheckedContinuation { recoveryHeld = $0 }
             }
             if failRecovery { throw ClientError.message("Fixture recovery failed ownership verification.") }
-            if !recoveryReports.isEmpty { afterRecovery = recoveryReports.removeFirst() }
             if !returnOnlyClearedRecovery { report = afterRecovery }
             return try JSONEncoder().encode(afterRecovery)
+        }
+        if request.arguments.contains("--repair-and-continue") && repairReviews {
+            switch afterReview {
+            case .keep: break
+            case .clear: report = .clear
+            case .failRefresh: preflightFails = true
+            }
+            throw ClientError.message(QueueSetupProgress.reviewMarker + "\nAgent Queue setup: Automatic setup requires review: Fixture requirement. The controller stopped before changing it.")
+        }
+        if request.arguments.contains("--keep-custom-callback") {
+            // Stands in for the backend's approved repair; its ordering and waiting rules have Go tests.
+            if waitingInRepair { output(Data((QueueSetupProgress.waitingMarker + "\nWaiting for queue work and setup requirements.").utf8)) }
+            while waitingInRepair { try await Task.sleep(for: .milliseconds(1)) }
+            if !report.issues.isEmpty {
+                mutations += 1
+                output(Data((QueueSetupProgress.installingMarker + "\nRunning verified setup repair: Fixture repair").utf8))
+                if holdNextRecovery {
+                    holdNextRecovery = false
+                    await withCheckedContinuation { recoveryHeld = $0 }
+                }
+                if failRecovery { throw ClientError.message("Fixture recovery failed ownership verification.") }
+                report = .clear
+            }
         }
         installations += 1
         if let failedInstallationReport {
@@ -332,7 +359,6 @@ actor BootstrapPreflightExecutorFixture {
 
     func update(_ report: QueueBootstrapReport) { self.report = report }
     func updateAfterRecovery(_ report: QueueBootstrapReport) { afterRecovery = report }
-    func queueRecoveryReports(_ reports: [QueueBootstrapReport]) { recoveryReports = reports }
     func holdPreflight() { holdNext = true }
     func releasePreflight() { held?.resume(); held = nil }
     var isHeld: Bool { held != nil }
@@ -340,6 +366,8 @@ actor BootstrapPreflightExecutorFixture {
     func releaseRecovery() { recoveryHeld?.resume(); recoveryHeld = nil }
     var isRecoveryHeld: Bool { recoveryHeld != nil }
     func setFailure() { failRecovery = true }
+    func reviewRepairs(then aftermath: ReviewAftermath = .keep) { repairReviews = true; afterReview = aftermath }
+    func holdRepairWaiting(_ waiting: Bool) { waitingInRepair = waiting }
     func setStaleRecovery() { returnOnlyClearedRecovery = true }
     func failInstallation(with report: QueueBootstrapReport) { failedInstallationReport = report }
 }

@@ -149,6 +149,11 @@ struct BootstrapTests {
         let resumed = QueueSetupProgress.parse(QueueSetupProgress.approvalMarker + "\nWaiting\n" + QueueSetupProgress.installingMarker + "\nInstalling")
         try check(!resumed.isWaiting && !resumed.requiresServiceApproval && !resumed.output.contains("AGENT_QUEUE_"),
             "A resumed mutation clears historical waiting and approval markers")
+        try check(!QueueSetupProgress.parse("Diagnostic contains " + QueueSetupProgress.reviewMarker).requiresReview,
+            "Review hints require their exact protocol line")
+        let reviewed = QueueSetupProgress.parse(QueueSetupProgress.reviewMarker + "\nStopped\n" + QueueSetupProgress.installingMarker + "\nInstalling")
+        try check(!reviewed.requiresReview && !reviewed.output.contains("AGENT_QUEUE_"),
+            "A later installing marker overrides an earlier review marker")
 
         let stalled = try BootstrapFixture(parent: temporary, setupMode: false, managed: true)
         try stalled.installManaged()
@@ -666,8 +671,8 @@ struct BootstrapTests {
             "Finishing a retained pending installation requires consent regardless of the report flag")
         await pendingModel.repairAndContinue(confirmed: true)?.value
         let pendingRequests = await pendingExecutor.requests
-        try check(pendingModel.phase == .complete && pendingRequests.contains(where: { $0.arguments.suffix(2) == ["--recover", "finish-pending-installation"] }),
-            "Approved native setup finishes the retained build, rechecks requirements and installs")
+        try check(pendingModel.phase == .complete && pendingRequests.contains(where: { $0.arguments.suffix(2) == ["--repair-and-continue", "--keep-custom-callback"] }),
+            "Approved native setup delegates the retained build to the controller's repair-and-continue and installs")
 
         let missingDefinitions = QueueBootstrapIssue(id: "service-definitions-missing", title: "Restore missing background service files", detail: "Restore standard service files after verifying the loaded services. Running jobs stay active.",
             actions: [.init(id: "restore-service-definitions", title: "Restore verified service files", destructive: false)])
@@ -705,22 +710,14 @@ struct BootstrapTests {
         let waitIssue = QueueBootstrapIssue(id: "installer-busy", title: "Another installation is running", detail: "Wait for it to finish.",
             actions: [.init(id: "wait", title: "Wait and continue", destructive: false)])
 
-        let cleanupIssue = QueueBootstrapIssue(id: "pending-cleanup", title: "Wait for queue work and cleanup", detail: "A completed job has verified cleanup available.",
-            actions: [.init(id: "cleanup-job", title: "Run verified cleanup", destructive: false),
-                      .init(id: "wait", title: "Wait and continue", destructive: false)],
-            jobs: [.init(id: 9, label: "Fixture completed job", status: "Cleanup pending")])
+        // The backend owns repair ordering, waiting and the unsupported-requirement stop (Go tests). The
+        // window only confirms once, runs one controller request and shows its progress.
+        func isWindowRepair(_ request: QueueBootstrapRequest, _ fixture: BootstrapFixture) -> Bool {
+            request.arguments == ["install", "--app-bundle", fixture.environment.app.path, "--repair-and-continue", "--keep-custom-callback"]
+        }
         let approvedFixture = try fixture()
-        let activeWaitIssue = QueueBootstrapIssue(id: "legacy-jobs", title: "Queue work is running", detail: "Wait for the active job to finish.",
-            actions: [.init(id: "wait", title: "Wait", destructive: false), .init(id: "cancel-job", title: "Cancel", destructive: true)],
-            jobs: [.init(id: 10, label: "Active fixture job", status: "Running")])
         let approvedExecutor = BootstrapPreflightExecutorFixture(approvedFixture,
             report: .init(schemaVersion: 1, issues: [missingDefinitions]))
-        await approvedExecutor.queueRecoveryReports([
-            .init(schemaVersion: 1, issues: [cleanupIssue]),
-            .init(schemaVersion: 1, issues: [repairIssue]),
-            .init(schemaVersion: 1, issues: [phoneIssue]),
-            .init(schemaVersion: 1, issues: [activeWaitIssue]),
-        ])
         var approvedCompletions = 0
         let approved = QueueBootstrapModel(environment: approvedFixture.environment, execute: { request, output in
             try await approvedExecutor.execute(request, output: output)
@@ -728,59 +725,20 @@ struct BootstrapTests {
         await approved.start()?.value
         try check(approved.canRepairAndContinue && approved.repairAndContinue() == nil,
             "Automatic repair requires explicit consent independently of report destructive flags")
+        await approvedExecutor.holdRecovery()
         let approvedRepair = approved.repairAndContinue(confirmed: true)
-        try await waitUntil { await approvedExecutor.mutations == 4 && approved.phase == .waiting }
-        let checksBeforeWaiting = await approvedExecutor.checks
-        try await waitUntil { await approvedExecutor.checks >= checksBeforeWaiting + 3 }
-        try check(approved.isRunning && approved.canStopWaiting && approved.start() == nil &&
-            approved.repairAndContinue(confirmed: true) == nil,
-            "One approval waits beyond the manual wait budget and prevents concurrent setup attempts")
-        await approvedExecutor.update(.clear)
+        try await waitUntil { await approvedExecutor.isRecoveryHeld }
+        try await waitUntil { approved.message.contains("Running verified setup repair") }
+        try check(approved.isRunning && approved.start() == nil && approved.repairAndContinue(confirmed: true) == nil,
+            "One approval shows the controller's progress and prevents concurrent setup attempts")
+        await approvedExecutor.releaseRecovery()
         await approvedRepair?.value
         let approvedRequests = await approvedExecutor.requests
         let approvedInstalls = await approvedExecutor.installations
-        let approvedActions = approvedRequests.compactMap { request -> String? in
-            guard let index = request.arguments.firstIndex(of: "--recover"), index + 1 < request.arguments.count else { return nil }
-            return request.arguments[index + 1]
-        }
-        try check(approvedActions == ["restore-service-definitions", "cleanup-job", "repair-service", "disable-phone-access"] &&
-            approvedRequests.contains(where: { $0.arguments.suffix(4) == ["--recover", "cleanup-job", "--job-id", "9"] }) &&
+        try check(approvedRequests.filter({ isWindowRepair($0, approvedFixture) }).count == 1 &&
+            !approvedRequests.contains(where: { $0.arguments.contains("--recover") || $0.arguments == ["install", "--app-bundle", approvedFixture.environment.app.path] }) &&
             approved.phase == .complete && approvedInstalls == 1 && approvedCompletions == 1,
-            "A single approval repairs every verified stage, rechecks, installs once and continues normal startup")
-
-        let coordinatedFixture = try fixture()
-        let coordinatedExecutor = BootstrapPreflightExecutorFixture(coordinatedFixture,
-            report: .init(schemaVersion: 1, issues: [missingDefinitions, waitIssue]))
-        let coordinated = QueueBootstrapModel(environment: coordinatedFixture.environment, execute: { request, output in
-            try await coordinatedExecutor.execute(request, output: output)
-        }, waitInterval: .milliseconds(1)) { approvedCompletions += 1 }
-        await coordinated.start()?.value
-        let coordinatedTask = coordinated.repairAndContinue(confirmed: true)
-        try await waitUntil { coordinated.phase == .waiting }
-        let busyMutations = await coordinatedExecutor.mutations
-        try check(busyMutations == 0, "Approved recovery waits for coordination locks before attempting any repair")
-        await coordinatedExecutor.update(.init(schemaVersion: 1, issues: [missingDefinitions]))
-        await coordinatedTask?.value
-        let coordinatedMutations = await coordinatedExecutor.mutations
-        try check(coordinated.phase == .complete && coordinatedMutations == 1,
-            "Approval survives normal coordination waiting and completes without another prompt")
-
-        let drainingFixture = try fixture()
-        let drainingExecutor = BootstrapPreflightExecutorFixture(drainingFixture,
-            report: .init(schemaVersion: 1, issues: [phoneIssue, activeWaitIssue]))
-        let draining = QueueBootstrapModel(environment: drainingFixture.environment, execute: { request, output in
-            try await drainingExecutor.execute(request, output: output)
-        }, waitInterval: .milliseconds(1)) { approvedCompletions += 1 }
-        await draining.start()?.value
-        let drainingTask = draining.repairAndContinue(confirmed: true)
-        try await waitUntil { draining.phase == .waiting }
-        let drainingMutations = await drainingExecutor.mutations
-        try check(drainingMutations == 0, "Approved recovery waits for queue work before disabling phone access")
-        await drainingExecutor.update(.init(schemaVersion: 1, issues: [phoneIssue]))
-        await drainingTask?.value
-        let drainedMutations = await drainingExecutor.mutations
-        try check(draining.phase == .complete && drainedMutations == 1,
-            "Phone access is disabled once queue work finishes, without another prompt")
+            "A single approval runs the controller's repair-and-continue once, without a separate plain install, and continues normal startup")
 
         let acceptedFixture = try fixture()
         let acceptedExecutor = BootstrapPreflightExecutorFixture(acceptedFixture, report: .init(schemaVersion: 1, issues: [phoneIssue]))
@@ -792,83 +750,89 @@ struct BootstrapTests {
         let acceptedTask = accepted.repairAndContinue(confirmed: true)
         try await waitUntil { await acceptedExecutor.isRecoveryHeld }
         accepted.cancelWaiting()
-        try check(accepted.phase == .recovering && !accepted.canStopWaiting && accepted.stopForTermination() == nil,
+        try check(accepted.phase == .installing && !accepted.canStopWaiting && accepted.stopForTermination() == nil,
             "Stopping or quitting cannot cancel an accepted diagnostic repair mutation")
         await acceptedExecutor.releaseRecovery()
         await acceptedTask?.value
         let acceptedMutations = await acceptedExecutor.mutations
         let acceptedInstalls = await acceptedExecutor.installations
         try check(accepted.phase == .complete && acceptedMutations == 1 && acceptedInstalls == 1,
-            "An accepted repair completes, rechecks and installs exactly once")
+            "An accepted repair completes and installs exactly once")
 
-        let repeatedFixture = try fixture()
-        let repeatedExecutor = BootstrapPreflightExecutorFixture(repeatedFixture,
-            report: .init(schemaVersion: 1, issues: [phoneIssue]), afterRecovery: .init(schemaVersion: 1, issues: [phoneIssue]))
-        let repeated = QueueBootstrapModel(environment: repeatedFixture.environment, execute: { request, output in
-            try await repeatedExecutor.execute(request, output: output)
+        let callbackFixture = try fixture()
+        let callbackExecutor = BootstrapPreflightExecutorFixture(callbackFixture, report: .init(schemaVersion: 1, issues: [configIssue]))
+        let callback = QueueBootstrapModel(environment: callbackFixture.environment, execute: { request, output in
+            try await callbackExecutor.execute(request, output: output)
         }) { approvedCompletions += 1 }
-        await repeated.start()?.value
-        await repeated.repairAndContinue(confirmed: true)?.value
-        let repeatedMutations = await repeatedExecutor.mutations
-        let repeatedInstalls = await repeatedExecutor.installations
-        try check(repeated.phase == .failed && repeatedMutations == 1 && repeatedInstalls == 0 && repeated.output.contains("did not clear"),
-            "An unchanged approved repair stops with a diagnostic rather than repeating a mutation")
+        await callback.start()?.value
+        await callbackExecutor.reviewRepairs()
+        await callback.repairAndContinue(confirmed: true)?.value
+        let callbackRequests = await callbackExecutor.requests
+        let callbackMutations = await callbackExecutor.mutations
+        let callbackInstalls = await callbackExecutor.installations
+        try check(callbackRequests.filter({ isWindowRepair($0, callbackFixture) }).count == 1 &&
+            !callbackRequests.contains(where: { $0.arguments.contains("reset-callback") }) &&
+            callback.phase == .reviewing && callback.message.contains("needs review") && callback.issues == [configIssue] &&
+            callbackMutations == 0 && callbackInstalls == 0,
+            "The window's repair holds back callback replacement, so the backend stops for review without changes")
 
-        let unknownWait = QueueBootstrapIssue(id: "unknown-ownership", title: "Unknown service", detail: "Ownership cannot be verified.",
-            actions: [.init(id: "wait", title: "Wait", destructive: false)])
-        let runningCopy = QueueBootstrapIssue(id: "app-running", title: "Agent Queue is running", detail: "Quit it, then try setup again.", actions: [])
-        for unsafeIssue in [configIssue, unknownWait, runningCopy,
-            .init(id: "legacy-jobs", title: "Cancel job", detail: "Only cancellation is offered.",
-                  actions: [.init(id: "cancel-job", title: "Cancel job", destructive: false)], jobs: jobIssue.jobs),
-            .init(id: "pending-cleanup", title: "Cleanup", detail: "No eligible job is listed.",
-                  actions: [.init(id: "cleanup-job", title: "Cleanup", destructive: false)])] {
-            let unsafeFixture = try fixture()
-            let unsafeExecutor = BootstrapPreflightExecutorFixture(unsafeFixture, report: .init(schemaVersion: 1, issues: [unsafeIssue]))
-            let unsafe = QueueBootstrapModel(environment: unsafeFixture.environment, execute: { request, output in
-                try await unsafeExecutor.execute(request, output: output)
+        for aftermath in [BootstrapPreflightExecutorFixture.ReviewAftermath.clear, .failRefresh] {
+            let staleFixture = try fixture()
+            let staleExecutor = BootstrapPreflightExecutorFixture(staleFixture, report: .init(schemaVersion: 1, issues: [configIssue]))
+            let stale = QueueBootstrapModel(environment: staleFixture.environment, execute: { request, output in
+                try await staleExecutor.execute(request, output: output)
             }) { approvedCompletions += 1 }
-            await unsafe.start()?.value
-            try check(!unsafe.canRepairAndContinue && unsafe.repairAndContinue(confirmed: true) == nil,
-                "Aggregate approval excludes unknown ownership, a running copy, callback replacement, job cancellation and ineligible cleanup")
-            let unsafeInstalls = await unsafeExecutor.installations
-            try check(unsafe.phase == .reviewing && unsafeInstalls == 0,
-                "A requirement that automatic setup cannot clear stops for review without installing")
+            await stale.start()?.value
+            await staleExecutor.reviewRepairs(then: aftermath)
+            await stale.repairAndContinue(confirmed: true)?.value
+            try check(stale.phase == .failed && stale.output.contains("Automatic setup requires review"),
+                "A review stop without refreshed requirements fails visibly and keeps the controller's line (\(aftermath))")
         }
 
-        for changesBeforeApproval in [true, false] {
-            let changedFixture = try fixture()
-            let changedExecutor = BootstrapPreflightExecutorFixture(changedFixture,
-                report: .init(schemaVersion: 1, issues: [missingDefinitions]), afterRecovery: .init(schemaVersion: 1, issues: [configIssue]))
-            let changed = QueueBootstrapModel(environment: changedFixture.environment, execute: { request, output in
-                try await changedExecutor.execute(request, output: output)
-            }) { approvedCompletions += 1 }
-            await changed.start()?.value
-            if changesBeforeApproval { await changedExecutor.update(.init(schemaVersion: 1, issues: [configIssue])) }
-            await changed.repairAndContinue(confirmed: true)?.value
-            let changedMutations = await changedExecutor.mutations
-            let changedInstalls = await changedExecutor.installations
-            try check(changed.phase == .reviewing && changed.issues == [configIssue] &&
-                changedMutations == (changesBeforeApproval ? 0 : 1) && changedInstalls == 0,
-                "A newly discovered custom blocker revokes the repair approval before further changes")
-        }
+        let ordinaryFixture = try BootstrapFixture(parent: temporary)
+        let ordinaryExecutor = BootstrapPreflightExecutorFixture(ordinaryFixture, report: .init(schemaVersion: 1, issues: [configIssue]))
+        await ordinaryExecutor.reviewRepairs()
+        let ordinary = QueueBootstrapModel(environment: ordinaryFixture.environment, execute: { request, output in
+            try await ordinaryExecutor.execute(request, output: output)
+        }) { approvedCompletions += 1 }
+        await ordinary.start()?.value
+        let ordinaryInstalls = await ordinaryExecutor.installations
+        let ordinaryRepairs = await ordinaryExecutor.requests.filter { $0.arguments.contains("--repair-and-continue") }.count
+        try check(ordinary.phase == .reviewing && ordinary.message == "Review these requirements before continuing." &&
+            ordinary.issues == [configIssue] && ordinaryInstalls == 0 && ordinaryRepairs == 1 &&
+            ordinary.output.contains("Automatic setup requires review"),
+            "An ordinary launch stopped for review shows the requirements and installs nothing")
+
+        let waitingRepairFixture = try fixture()
+        let waitingRepairExecutor = BootstrapPreflightExecutorFixture(waitingRepairFixture, report: .init(schemaVersion: 1, issues: [waitIssue]))
+        let waitingRepair = QueueBootstrapModel(environment: waitingRepairFixture.environment, execute: { request, output in
+            try await waitingRepairExecutor.execute(request, output: output)
+        }) { approvedCompletions += 1 }
+        await waitingRepair.start()?.value
+        await waitingRepairExecutor.holdRepairWaiting(true)
+        let waitingRepairTask = waitingRepair.repairAndContinue(confirmed: true)
+        try await waitUntil { waitingRepair.phase == .waiting }
+        try check(waitingRepair.isRunning && waitingRepair.canStopWaiting && waitingRepair.repairAndContinue(confirmed: true) == nil,
+            "The controller's wait is shown and can be stopped")
+        await waitingRepairExecutor.holdRepairWaiting(false)
+        await waitingRepairTask?.value
+        try check(waitingRepair.phase == .complete, "Approval survives the controller's waiting and completes without another prompt")
 
         let cancelledRepairFixture = try fixture()
         let cancelledRepairExecutor = BootstrapPreflightExecutorFixture(cancelledRepairFixture, report: .init(schemaVersion: 1, issues: [waitIssue]))
         let cancelledRepair = QueueBootstrapModel(environment: cancelledRepairFixture.environment, execute: { request, output in
             try await cancelledRepairExecutor.execute(request, output: output)
-        }, waitInterval: .milliseconds(1)) { approvedCompletions += 1 }
+        }) { approvedCompletions += 1 }
         await cancelledRepair.start()?.value
-        await cancelledRepairExecutor.holdPreflight()
+        await cancelledRepairExecutor.holdRepairWaiting(true)
         let cancelledApprovedTask = cancelledRepair.repairAndContinue(confirmed: true)
-        try await waitUntil { await cancelledRepairExecutor.isHeld }
+        try await waitUntil { cancelledRepair.phase == .waiting }
         let cancelledRepairStop = cancelledRepair.cancelWaiting()
-        await cancelledRepairExecutor.update(.clear)
-        await cancelledRepairExecutor.releasePreflight()
         await cancelledApprovedTask?.value
         await cancelledRepairStop?.value
         let cancelledRepairInstalls = await cancelledRepairExecutor.installations
         try check(cancelledRepair.phase == .reviewing && cancelledRepairInstalls == 0,
-            "Stopping an approved read-only check revokes approval and fences its late clean result")
+            "Stopping the controller's wait revokes approval without installing")
 
         let repairErrorFixture = try fixture()
         let repairErrorExecutor = BootstrapPreflightExecutorFixture(repairErrorFixture, report: .init(schemaVersion: 1, issues: [phoneIssue]))

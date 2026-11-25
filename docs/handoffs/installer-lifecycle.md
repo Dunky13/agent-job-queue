@@ -83,6 +83,8 @@ What clears each one differs, so `managedRemovalGuidance` says so:
 
 **What the app does beside a running copy.** It stops and shows the message, with Retry in the startup menu and Check again in the `--setup` window. It does not wait, because only the user can clear this, and a silent wait would look like a hang. `app-running` therefore offers no `wait` action, and neither `install_approved_repair.go` nor `approvedRepairStep` recognises it, so both stop for review as they do for any unknown requirement. No Swift logic changed; `BootstrapTests` and `TestInstallerAutomaticSetupStopsForARunningApp` hold this. A newer copy opened beside the running recorded app gets the same report, because recognition checks the recorded app during a relocation. Either button then continues once the other copy has quit. The menu's wording for this has not been looked at on a real Mac.
 
+_Update 2026-11-25: the Swift `approvedRepairStep` mapping mentioned above was removed. The setup window now delegates to `--repair-and-continue --keep-custom-callback`, so Go alone decides which requirements stop for review; "No Swift logic changed" described the original change only. See `approved-repair-owner.md`._
+
 **What ran against the real thing.** `install_managed_running_app_test.go` uses a real process tree: copies of the test binary at the bundle's `AgentQueue` and `agent-heavy` paths, with the real daemon and scheduler as children, real `flock`, real `lsof`, real exec paths and parents from the kernel, and real daemon RPC. Mutations removing recognition, the parent check or the drain check, or moving the quit after unregistering, each fail these tests.
 
 **What has not run against the real thing:**

@@ -6,10 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"time"
 )
+
+// installReviewError marks an unsupported requirement. The controller stopped
+// before changing that requirement; earlier repairs in the same run may have
+// completed.
+type installReviewError struct{ title, detail string }
+
+func (err *installReviewError) Error() string {
+	return fmt.Sprintf("Automatic setup requires review: %s. %s", err.title, err.detail)
+}
 
 type installApprovedStep struct {
 	action   string
@@ -74,7 +84,7 @@ func installApprovedNext(report installPreflightReport) (installApprovedStep, er
 	for _, issue := range report.Issues {
 		step, supported := installApprovedIssue(issue)
 		if !supported {
-			return installApprovedStep{}, fmt.Errorf("Automatic setup requires review: %s. %s", issue.Title, issue.Detail)
+			return installApprovedStep{}, &installReviewError{issue.Title, issue.Detail}
 		}
 		if step.action == "reset-callback" {
 			if decoded, err := hex.DecodeString(report.Revision); err != nil || len(decoded) != 32 {
@@ -183,7 +193,7 @@ func installRunApprovedRepair(ctx context.Context, inspect func(context.Context)
 			return errors.New("Setup reached its verified repair limit; review the remaining requirements before approving another attempt")
 		}
 		performed[key] = true
-		reportProgress("AGENT_QUEUE_SETUP_STATE:installing\nRunning verified setup repair: " + step.action)
+		reportProgress("AGENT_QUEUE_SETUP_STATE:installing\nRunning verified setup repair: " + installAction(step.action).Title)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -195,7 +205,6 @@ func installRunApprovedRepair(ctx context.Context, inspect func(context.Context)
 
 func (install *installer) repairAndExecute(ctx context.Context) error {
 	previous := install.automaticSetup
-	install.automaticSetup = true
 	defer func() { install.automaticSetup = previous }()
 	// Stop waiting cancels inspections and waits only. An accepted mutation
 	// retains its original context until its response, even if progress lags.
@@ -212,15 +221,53 @@ func (install *installer) repairAndExecute(ctx context.Context) error {
 	}
 	// Queue drain can take as long as the running workload. Each individual
 	// inspection, repair and installation still has a finite execution budget.
-	return installRunApprovedRepair(run, func(ctx context.Context) installPreflightReport {
+	inspect := func(ctx context.Context) installPreflightReport {
 		operation, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		defer cancel()
 		report := install.preflight(operation)
+		if install.keepCustomCallback {
+			// The setup window never replaces a callback. Without its recovery
+			// any issue relying on it is unsupported, so the normal review stop applies.
+			for i, issue := range report.Issues {
+				report.Issues[i].Actions = slices.DeleteFunc(slices.Clone(issue.Actions), func(action installRecoveryAction) bool { return action.ID == "reset-callback" })
+			}
+		}
 		if err := operation.Err(); err != nil {
 			report.add("inspection-failed", "Installation inspection did not complete", err.Error(), "")
 		}
 		return report
-	}, func(_ context.Context, action string, jobID *int, revision string) error {
+	}
+	if !previous {
+		// Automatic setup tolerates customized legacy service settings, which it
+		// backs up and retires. The operator reviews them first, so stop before any
+		// change. Definitions Go restored use only standard values and pass.
+		report := inspect(run)
+		if err := run.Err(); err != nil {
+			return err
+		}
+		if _, err := installApprovedNext(report); err != nil {
+			return err
+		}
+		for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-queue"} {
+			filename := filepath.Join(install.launch, label+".plist")
+			exists, err := updateExists(filename)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				continue
+			}
+			definition, err := updatePlist(filename)
+			if err != nil {
+				return err
+			}
+			if err := install.managedLegacyDefinition(label, definition); err != nil {
+				return &installReviewError{"Review managed service setup", err.Error()}
+			}
+		}
+	}
+	install.automaticSetup = true
+	return installRunApprovedRepair(run, inspect, func(_ context.Context, action string, jobID *int, revision string) error {
 		if action == installFinishPending {
 			// Its retained installer owns bounded individual operations and
 			// may need an arbitrarily long drain or OS approval wait.
