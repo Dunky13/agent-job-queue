@@ -17,7 +17,10 @@ import (
 )
 
 const hookConcurrency = 4
-const hookTimeout = 10 * time.Second
+
+// A variable only so tests can exercise the deadline without waiting ten seconds.
+var hookTimeout = 10 * time.Second
+
 const hookOutputLimit = 64 * 1024
 const hookInputLimit = 16 * 1024
 const hookLogLimit = 1024 * 1024
@@ -216,7 +219,7 @@ exit "$status"`, "agent-queue-hook", path)
 		}
 	case <-deadline.C:
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		result = "timed out after 10 seconds; process group terminated"
+		result = fmt.Sprintf("timed out after %d seconds; process group terminated", int(hookTimeout/time.Second))
 	}
 	finish.Close()
 	// Only now may Wait reap the supervisor and release its numerical PID.

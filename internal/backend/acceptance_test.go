@@ -71,7 +71,7 @@ func fixtureUntil(t *testing.T, timeout time.Duration, predicate func() bool) {
 		if predicate() {
 			return
 		}
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("isolated queue condition did not become true before deadline")
 }

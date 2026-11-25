@@ -110,6 +110,16 @@ func hookRunnerFixture(t *testing.T, script string) (*hookRunner, queuePlugin) {
 	return newHookRunner(g), plugin
 }
 
+// shortHookTimeout lets a test reach the hook deadline quickly. Call it before
+// dispatch so the runner's goroutines see the value; the cleanup runs after the
+// fixture's own wait.
+func shortHookTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := hookTimeout
+	hookTimeout = d
+	t.Cleanup(func() { hookTimeout = old })
+}
+
 func hookLog(t *testing.T, r *hookRunner) string {
 	t.Helper()
 	body, err := os.ReadFile(filepath.Join(r.g.State, "plugins", "fixture", "hooks.log"))
@@ -122,6 +132,7 @@ func hookLog(t *testing.T, r *hookRunner) string {
 func processGone(pid int) bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }
 
 func TestHookTimeoutTerminatesProcessGroup(t *testing.T) {
+	shortHookTimeout(t, 4*time.Second)
 	output := t.TempDir()
 	r, plugin := hookRunnerFixture(t, fmt.Sprintf("#!/bin/sh\nsleep 60 &\necho $! > %q/child\nexec sleep 60\n", output))
 	started := time.Now()
@@ -136,12 +147,13 @@ func TestHookTimeoutTerminatesProcessGroup(t *testing.T) {
 	}
 	child, _ := strconv.Atoi(strings.TrimSpace(string(body)))
 	fixtureUntil(t, 2*time.Second, func() bool { return processGone(child) })
-	if log := hookLog(t, r); !strings.Contains(log, "timed out after 10 seconds") {
+	if log := hookLog(t, r); !strings.Contains(log, fmt.Sprintf("timed out after %d seconds", int(hookTimeout/time.Second))) {
 		t.Fatalf("timeout not logged: %q", log)
 	}
 }
 
 func TestHookBackgroundChildCannotOutliveTimeout(t *testing.T) {
+	shortHookTimeout(t, 4*time.Second)
 	output := t.TempDir()
 	r, plugin := hookRunnerFixture(t, fmt.Sprintf("#!/bin/sh\nsleep 60 &\necho $! > %q/child\nexit 0\n", output))
 	r.dispatch(plugin, "lease.granted", Object{"event": "lease.granted"})
@@ -159,6 +171,7 @@ func TestHookBackgroundChildCannotOutliveTimeout(t *testing.T) {
 }
 
 func TestHookRetainsGroupLeaderUntilFinalSignal(t *testing.T) {
+	shortHookTimeout(t, 5*time.Second)
 	output := t.TempDir()
 	r, plugin := hookRunnerFixture(t, fmt.Sprintf("#!/bin/sh\nsleep 2 &\nprintf '%%s %%s' \"$$\" \"$(ps -o pgid= -p $$)\" > %q/identity\n", output))
 	r.dispatch(plugin, "lease.granted", Object{"event": "lease.granted"})
@@ -190,6 +203,7 @@ func TestHookRetainsGroupLeaderUntilFinalSignal(t *testing.T) {
 }
 
 func TestHookDeadlineSurvivesSlowGroupInspection(t *testing.T) {
+	shortHookTimeout(t, 4*time.Second)
 	output := t.TempDir()
 	r, plugin := hookRunnerFixture(t, fmt.Sprintf("#!/bin/sh\nsleep 60 &\necho $! > %q/child\n", output))
 	inspecting, release := make(chan struct{}), make(chan struct{})
