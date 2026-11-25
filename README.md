@@ -28,7 +28,7 @@ Screenshots use sample jobs. The Mac image uses the app's safe preview mode.
 ### Drag and drop
 
 1. Use macOS 15 or later on an Apple Silicon or Intel Mac.
-2. Download `Agent-Queue-<version>-universal.dmg` (or the ZIP) from [Releases](https://github.com/Dunky13/agent-job-queue/releases).
+2. Download `Agent-Queue-<version>-universal.dmg` (or the ZIP) from the [homepage](https://dunky13.github.io/agent-job-queue/) or the [Releases](https://github.com/Dunky13/agent-job-queue/releases) page.
 3. Open the DMG and drag **Agent Queue** onto **Applications**. To install for your account only, drop it in `~/Applications` instead.
 4. Open Agent Queue from Applications. It sets itself up silently and appears in the menu bar.
 
@@ -40,7 +40,7 @@ To upgrade, quit Agent Queue, drag the new version over the old one and choose *
 
 If you move the app between `/Applications` and `~/Applications`, delete or replace the old copy first. Setup refuses to adopt a second copy while the recorded one still exists.
 
-To remove Agent Queue, finish queued and running jobs, then run this command and move the app to the Trash. It checks that the queue is drained, then quits the app, which stops its queue processes, and removes its login item. If jobs are still active it refuses and leaves the app running. If it refuses after quitting the app, open Agent Queue, then run the command again. If it cannot verify the login item, which can happen after a `brew upgrade` that was never opened or a reset of macOS background items, quit the app, run `agent-heavy install --app-bundle "/Applications/Agent Queue.app"` to register the item again, then run the command again.
+To remove Agent Queue, finish queued and running jobs, then run this command and move the app to the Trash. It checks that the queue is drained, then quits the app, which stops its queue processes, and removes its login item. If jobs are still active it refuses and leaves the app running. If it refuses after quitting the app, open Agent Queue, then run the command again. If it cannot verify the login item, which can happen after an update that was never opened or a reset of macOS background items, quit the app, run `agent-heavy install --app-bundle "/Applications/Agent Queue.app"` to register the item again, then run the command again.
 
 ```sh
 agent-heavy install --app-bundle "/Applications/Agent Queue.app" --unregister-services
@@ -50,12 +50,7 @@ Use the app's actual location if it differs. Private data under `~/.local/share/
 
 ### Homebrew
 
-```sh
-brew tap dunky13/agent-job-queue https://github.com/Dunky13/agent-job-queue
-brew install --cask dunky13/agent-job-queue/agent-job-queue
-```
-
-The tap lives in this repository, so it needs the explicit URL. If you tapped the former `homebrew-agent-job-queue` repository, switch its remote once with `brew tap --custom-remote dunky13/agent-job-queue https://github.com/Dunky13/agent-job-queue`. The cask places `Agent Queue.app` in Applications and nothing else; open it to use the menu bar while setup finishes automatically. `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` replaces the app, and the next launch immediately shows the menu bar and completes the upgrade in the background. Homebrew verifies the download's SHA-256 and keeps quarantine so macOS assesses the notarized app. Maintainer setup is documented in [Verified Homebrew delivery](docs/homebrew-delivery.md).
+Homebrew is no longer a supported install route and the cask is not updated. Install from the homepage, the DMG or the release page. If you installed with Homebrew earlier, nothing is required: the app keeps working and updates itself. Optionally run `brew untap dunky13/agent-job-queue`. Do not run `brew uninstall`, which deletes the app. See [Verified delivery through GitHub Pages](docs/pages-delivery.md).
 
 ### Signing, Gatekeeper and endpoint security
 
@@ -65,7 +60,7 @@ If macOS blocks a downloaded build you trust, open **System Settings > Privacy &
 
 ### Upgrading from the installer
 
-Earlier releases shipped `Agent Job Queue Installer.app`, which installed `~/Applications/Agent Queue.app` and ran the services from that copy. That location stays recorded as the managed one, and setup refuses a new copy placed anywhere else (for example `/Applications` from the new DMG or cask) while the recorded copy exists. Either:
+Earlier releases shipped `Agent Job Queue Installer.app`, which installed `~/Applications/Agent Queue.app` and ran the services from that copy. That location stays recorded as the managed one, and setup refuses a new copy placed anywhere else (for example `/Applications` from the new DMG) while the recorded copy exists. Either:
 
 - Quit Agent Queue, drag the new app over `~/Applications/Agent Queue.app` and choose **Replace**, then open it; or
 - Stop the old services, move the old app to the Trash, then open the new app wherever you installed it:
@@ -74,7 +69,7 @@ Earlier releases shipped `Agent Job Queue Installer.app`, which installed `~/App
   ~/.local/bin/agent-heavy install --app-bundle "$HOME/Applications/Agent Queue.app" --unregister-services
   ```
 
-Homebrew users upgrading from the installer cask must use the second route: the old cask left `~/Applications/Agent Queue.app` in place, so run the command above, move that app to the Trash, then `brew upgrade --cask dunky13/agent-job-queue/agent-job-queue` (or install it) and open the app from Applications. Queue history, settings, credentials and certificates are kept. If jobs are queued or running, finish them first or see [upgrade recovery](docs/upgrade-recovery.md).
+Users who installed the installer cask must use the second route: the old cask left `~/Applications/Agent Queue.app` in place, so run the command above, move that app to the Trash, then install the new app from the DMG and open it from Applications. Queue history, settings, credentials and certificates are kept. If jobs are queued or running, finish them first or see [upgrade recovery](docs/upgrade-recovery.md).
 
 ## Version and updates
 

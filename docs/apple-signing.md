@@ -38,7 +38,7 @@ additional container that receives its own ticket. Notarization has two stages,
 2. Require acceptance, fetch the log, then staple and validate the app.
 3. Recreate the distribution ZIP from the stapled app. It contains only `Agent Queue.app` at its top level.
 4. Package the stapled app and an `Applications` symlink in the DMG, sign the DMG, notarize it, and staple it.
-5. Generate final checksums and Homebrew metadata after all byte changes.
+5. Generate final checksums and the release manifest after all byte changes.
 
 Final release assets are `Agent-Queue-VERSION-universal.zip` and
 `Agent-Queue-VERSION-universal.dmg`, each with a `.sha256` file, plus
@@ -58,7 +58,7 @@ first launch of the complete installed product remains a separate test.
 These requirements come from Apple's
 [custom notarization workflow](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow).
 
-The app carries support metadata and documents without duplicate helper binaries; its only executables are the helpers in `Contents/MacOS`. Opening the app from `/Applications` or `~/Applications` runs setup (`agent-heavy install --app-bundle`) from inside the bundle. Setup writes the CLI wrappers to `~/.local/bin`, migrates state, unregisters queue, resource and phone-access registrations left by older versions, and never modifies the installed bundle or copies executables out of it. The app then runs the helpers in `Contents/MacOS` as its own child processes and registers only its login item. Helpers are signed before sealing the app. The ZIP and the DMG deliver the same stapled app, preserving signatures, tickets and quarantine. Homebrew delivers the app through a plain `app` cask; nothing runs at install time and the first launch completes setup.
+The app carries support metadata and documents without duplicate helper binaries; its only executables are the helpers in `Contents/MacOS`. Opening the app from `/Applications` or `~/Applications` runs setup (`agent-heavy install --app-bundle`) from inside the bundle. Setup writes the CLI wrappers to `~/.local/bin`, migrates state, unregisters queue, resource and phone-access registrations left by older versions, and never modifies the installed bundle or copies executables out of it. The app then runs the helpers in `Contents/MacOS` as its own child processes and registers only its login item. Helpers are signed before sealing the app. The ZIP and the DMG deliver the same stapled app, preserving signatures, tickets and quarantine. Nothing runs at install time and the first launch completes setup.
 
 The app is stapled only after its notarization is accepted, and no signed
 resource file changes afterward. Verification copies the app with
@@ -132,7 +132,7 @@ and never executes its signed target.
 
 Before publication, separate fresh Apple Silicon and Intel jobs verify final
 checksums, signatures, tickets and app-copy policy (a quarantine-preserving copy of the extracted app), exercise the hardened queue
-and HTTPS gateway, and exercise actual Homebrew delivery with quarantine kept.
+and HTTPS gateway.
 The runtime test then runs setup from inside the extracted, signed app. It owns
 private daemon processes and user directories,
 substitutes native lifecycle and launchctl readback, and bounds descendants
@@ -290,7 +290,7 @@ Recovery continues accepted stages and existing submission IDs without signing
 or uploading them again. Accepted Apple logs must match the submission ID and
 exact archive hash. Only the two completed stages (app and dmg) can export release assets. The final distribution artifact is `Agent-Queue-Notarized-App-N`; the workflow extracts its ZIP into `prepared-app/` and checks it with `queue-tool verify-app --app`. Installer-era checkpoints and builds (payload or installer stages, or a non-self-contained app layout) are refused by this automation and cannot be resumed or published.
 Fresh Apple Silicon and Intel acceptance jobs still precede publication and
-Homebrew delivery. Final artifacts use execution-specific names; downstream
+Pages delivery. Final artifacts use execution-specific names; downstream
 jobs consume the successful signing job's exact artifact.
 
 Checkpoints and original CI artifacts are retained for 90 days. Independent small
@@ -367,8 +367,8 @@ workflow uses its existing contents-write Actions token; no additional App or
 administration credential is required. The same complete assets are checked again
 after publication. An existing identical public release is verified read-only;
 a conflicting draft, tag or asset fails closed. Unfinished provider uploads are
-retained for explicit reconciliation. Homebrew delivery remains a separate
-exact-build gate using the Homebrew-sync App token scoped to this repository.
+retained for explicit reconciliation. Pages delivery remains a separate
+exact-build gate that deploys through GitHub Pages and commits nothing to `main`.
 
 ## Local use
 
@@ -410,10 +410,11 @@ Do not submit the same pending build repeatedly to try to accelerate processing.
 ## Distribution and acceptance
 
 The notarized app runs setup itself on first launch and executes its signed Go
-helpers from inside the bundle. New Homebrew casks deliver only the app, with no
-installer script or setup hook; the user opens it to finish setup. The cask
-preserves quarantine. After publication, the distribution workflow commits the verified cask and
-signed Sparkle feed to `main`, as documented in [Homebrew delivery](homebrew-delivery.md).
+helpers from inside the bundle. The DMG and ZIP deliver only the app, with no
+installer script or setup hook; the user opens it to finish setup, and quarantine
+is preserved. After publication, the distribution workflow deploys the verified,
+signed Sparkle feed and the homepage to GitHub Pages, as documented in
+[Verified delivery through GitHub Pages](pages-delivery.md).
 
 Acceptance requires valid signatures on the app, both bundled helpers and the DMG, Apple
 acceptance and logs for both stages, valid stapled tickets on the app and DMG,
@@ -426,8 +427,8 @@ teams, cleanup and quarantine preservation.
 Use `codesign --verify --check-notarization` with an explicit `notarized`
 requirement for the standalone Go executables. An app-oriented `spctl` check
 does not establish the correct behavior for every non-app code type. The
-quarantined Homebrew test delivers the extracted release app through the real
-cask DSL and verifies the app's and both helpers' notarization. It registers no
+quarantined installer test copies the extracted release app and verifies the
+app's and both helpers' notarization. It registers no
 Service Management jobs; signing and packaged job execution
 cannot certify live Service Management or endpoint-security acceptance. Apple documents these distinct checks in
 [Testing a Notarised Product](https://developer.apple.com/forums/thread/130560).
