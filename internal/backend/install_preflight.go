@@ -548,10 +548,10 @@ func (install *installer) preflightLegacy(ctx context.Context, report installPre
 		} else if loaded && install.validatePhoneAccessRecovery(ctx) != nil {
 			report.add("service-configuration", "Review loaded phone access ownership", "The loaded phone access service does not match a safe canonical definition. Setup will not stop it or replace its configuration.", filepath.Join(install.launch, "io.went.agent-remote.plist"), "reveal")
 		} else if legacy && (enabled || loaded) {
-			report.add("legacy-phone-access", "Phone access must be disabled", "Credentials, configuration and trusted certificates will be preserved. You can enable phone access in settings after setup.", "", "disable-phone-access")
+			report.add("legacy-phone-access", "Phone access must be disabled", "Credentials, configuration and trusted certificates will be preserved. You can enable phone access in settings after setup. Disabling is allowed only after jobs and cleanup have finished.", "", "disable-phone-access")
 		} else if !legacy && enabled {
 			if exists, _ := updateExists(filepath.Join(install.state, "remote/error.json")); exists {
-				report.add("remote-migration", "Phone access needs attention", "Review phone service diagnostics, or disable phone access and finish upgrading. Credentials and trusted certificates will be preserved.", filepath.Join(install.state, "remote/error.json"), "reveal", "disable-phone-access")
+				report.add("remote-migration", "Phone access needs attention", "Review phone service diagnostics, or disable phone access and finish upgrading. Credentials and trusted certificates will be preserved. Disabling is allowed only after jobs and cleanup have finished.", filepath.Join(install.state, "remote/error.json"), "reveal", "disable-phone-access")
 			}
 		}
 	}
@@ -920,6 +920,9 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 	switch action {
 	case "disable-phone-access":
 		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
+			return err
+		}
+		if err := install.requirePhoneAccessDrained(ctx, node); err != nil {
 			return err
 		}
 		_, err = install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-remote"), "disable")

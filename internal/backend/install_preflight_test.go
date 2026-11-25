@@ -435,6 +435,36 @@ func TestInstallerRecoveryPhoneAccessPreservesLegacyAndGoCredentials(t *testing.
 				}
 				integrationTestWrite(t, filepath.Join(f.installer.state, "remote/error.json"), []byte(`{"error":"fixture remote migration failure"}`))
 			}
+			f.tasks = Object{"4": Object{"id": 4, "status": Object{"Running": Object{}}}}
+			var drain *installDrainPendingError
+			if err := f.installer.recover(context.Background(), "disable-phone-access", nil, ""); !errors.As(err, &drain) || calls != 0 {
+				t.Fatalf("phone access was disabled while jobs drain: %v", err)
+			}
+			f.tasks = Object{}
+			if kind == "legacy" {
+				receipt := filepath.Join(f.installer.state, "receipts/6.json")
+				integrationTestWrite(t, receipt, []byte(`{"task_id":6,"token":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`))
+				var cleanup *installCleanupPendingError
+				if err := f.installer.recover(context.Background(), "disable-phone-access", nil, ""); !errors.As(err, &cleanup) || calls != 0 {
+					t.Fatalf("phone access was disabled before legacy cleanup: %v", err)
+				}
+				if err := os.Remove(receipt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if kind == "go" {
+				var cleanup *installCleanupPendingError
+				if err := f.installer.recover(context.Background(), "disable-phone-access", nil, ""); !errors.As(err, &cleanup) || calls != 0 {
+					t.Fatalf("phone access was disabled before job cleanup: %v", err)
+				}
+				if err := os.Remove(filepath.Join(f.installer.state, "receipts/9.json")); err != nil {
+					t.Fatal(err)
+				}
+				// A custom callback keeps the drained upgrade blocked, so recovery stays offered.
+				config := f.installer.freshConfig()
+				config["daemon"].(Object)["callback"] = "custom-hook {{ id }}"
+				integrationTestWrite(t, filepath.Join(f.installer.config, "pueue.yml"), mustMetadataJSON(t, config))
+			}
 			if err := f.installer.recover(context.Background(), "disable-phone-access", nil, ""); err != nil {
 				t.Fatal(err)
 			}
@@ -443,5 +473,12 @@ func TestInstallerRecoveryPhoneAccessPreservesLegacyAndGoCredentials(t *testing.
 				t.Fatalf("remote recovery changed credentials or CA: %+v %v", settings, err)
 			}
 		})
+	}
+}
+
+func TestInstallerPhoneAccessDrainRefusesLegacyQueueWithoutConfiguration(t *testing.T) {
+	f := installTestFixture(t)
+	if err := f.installer.requirePhoneAccessDrained(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "dedicated configuration") {
+		t.Fatalf("legacy queue location was guessed without its configuration: %v", err)
 	}
 }

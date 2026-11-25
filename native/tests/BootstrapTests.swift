@@ -765,6 +765,23 @@ struct BootstrapTests {
         try check(coordinated.phase == .complete && coordinatedMutations == 1,
             "Approval survives normal coordination waiting and completes without another prompt")
 
+        let drainingFixture = try fixture()
+        let drainingExecutor = BootstrapPreflightExecutorFixture(drainingFixture,
+            report: .init(schemaVersion: 1, issues: [phoneIssue, activeWaitIssue]))
+        let draining = QueueBootstrapModel(environment: drainingFixture.environment, execute: { request, output in
+            try await drainingExecutor.execute(request, output: output)
+        }, waitInterval: .milliseconds(1)) { approvedCompletions += 1 }
+        await draining.start()?.value
+        let drainingTask = draining.repairAndContinue(confirmed: true)
+        try await waitUntil { draining.phase == .waiting }
+        let drainingMutations = await drainingExecutor.mutations
+        try check(drainingMutations == 0, "Approved recovery waits for queue work before disabling phone access")
+        await drainingExecutor.update(.init(schemaVersion: 1, issues: [phoneIssue]))
+        await drainingTask?.value
+        let drainedMutations = await drainingExecutor.mutations
+        try check(draining.phase == .complete && drainedMutations == 1,
+            "Phone access is disabled once queue work finishes, without another prompt")
+
         let acceptedFixture = try fixture()
         let acceptedExecutor = BootstrapPreflightExecutorFixture(acceptedFixture, report: .init(schemaVersion: 1, issues: [phoneIssue]))
         let accepted = QueueBootstrapModel(environment: acceptedFixture.environment, execute: { request, output in
