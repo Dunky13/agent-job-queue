@@ -13,17 +13,14 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"html"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/Dunky13/agent-job-queue/internal/backend"
 	"github.com/Dunky13/agent-job-queue/internal/tooling"
@@ -34,10 +31,12 @@ const branch = "main"
 const caskPath = "Casks/agent-job-queue.rb"
 const manifestPath = "Casks/agent-job-queue.json"
 const appcastPath = "appcast.xml"
+const manifestAsset = "agent-job-queue.json"
 const metadataLimit = 16384
 const appcastLimit = 65536
 const publishAttempts = 4
 const docsPointer = "See docs/homebrew-delivery.md."
+const keyVariable = "SPARKLE_ED_PRIVATE_KEY"
 
 var commitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var tagPattern = regexp.MustCompile(`^build-([1-9][0-9]{0,8})-([0-9a-f]{7})$`)
@@ -74,72 +73,155 @@ func (m manifest) release() backend.Manifest {
 }
 func renderCask(data manifest) (string, error) { return tooling.RenderCask(data.release()) }
 
-// renderAppcast renders the unsigned single-item feed for the published ZIP.
-func renderAppcast(data manifest, length int64, signature string) string {
-	release := "https://github.com/" + repository + "/releases"
-	return fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
-  <channel>
-    <title>Agent Queue</title>
-    <link>%[1]s</link>
-    <description>Agent Queue updates</description>
-    <language>en</language>
-    <item>
-      <title>Version %[2]s (%[3]d)</title>
-      <link>%[1]s/tag/%[4]s</link>
-      <sparkle:version>%[3]d</sparkle:version>
-      <sparkle:shortVersionString>%[2]s</sparkle:shortVersionString>
-      <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
-      <enclosure url="%[1]s/download/%[4]s/%[5]s" length="%[6]d" type="application/octet-stream" sparkle:edSignature="%[7]s"/>
-    </item>
-  </channel>
-</rss>
-`, release, html.EscapeString(data.Version), data.Build, html.EscapeString(data.Tag), html.EscapeString(data.Asset), length, signature)
-}
+// tagCommit names a release by its tag and full source commit.
+type tagCommit struct{ Tag, Commit string }
 
-func expectedIdentity(tag, commit string) error {
-	if (tag == "") != (commit == "") {
+func (t tagCommit) validate() error {
+	if (t.Tag == "") != (t.Commit == "") {
 		return errors.New("Expected tag and commit must be supplied together")
 	}
-	if tag == "" {
+	if t.Tag == "" {
 		return nil
 	}
-	match := tagPattern.FindStringSubmatch(tag)
-	if match == nil || !commitPattern.MatchString(commit) || match[2] != commit[:7] {
+	match := tagPattern.FindStringSubmatch(t.Tag)
+	if match == nil || !commitPattern.MatchString(t.Commit) || match[2] != t.Commit[:7] {
 		return errors.New("Invalid expected release identity")
 	}
 	return nil
 }
 
+// bot is the Homebrew-sync App identity that authors and signs off commits.
+type bot struct{ Name, Email string }
+
+func (b bot) valid() bool {
+	return botNamePattern.MatchString(b.Name) && botEmailPattern.MatchString(b.Email)
+}
+func (b bot) signoff() string { return "Signed-off-by: " + b.Name + " <" + b.Email + ">" }
+
+// GitHub API shapes. GitHub adds fields freely, so unknown fields are ignored;
+// duplicate fields and malformed JSON are rejected by decode.
+type release struct {
+	TagName         string `json:"tag_name"`
+	TargetCommitish string `json:"target_commitish"`
+	Draft           *bool  `json:"draft"`
+	Assets          []struct {
+		Name string `json:"name"`
+	} `json:"assets"`
+}
+
+func (r release) published() bool { return r.Draft != nil && !*r.Draft }
+func (r release) count(name string) int {
+	total := 0
+	for _, asset := range r.Assets {
+		if asset.Name == name {
+			total++
+		}
+	}
+	return total
+}
+
+type sha struct {
+	SHA string `json:"sha"`
+}
+type branchRef struct {
+	Object sha `json:"object"`
+}
+type comparison struct {
+	Status          string `json:"status"`
+	MergeBaseCommit sha    `json:"merge_base_commit"`
+}
+type commitResponse struct {
+	SHA     string `json:"sha"`
+	Parents []sha  `json:"parents"`
+	Commit  struct {
+		Author struct {
+			Name  string `json:"name"`
+			Email string `json:"email"`
+		} `json:"author"`
+		Verification struct {
+			Verified bool `json:"verified"`
+		} `json:"verification"`
+		Message string `json:"message"`
+	} `json:"commit"`
+}
+
+// Typed createCommitOnBranch input.
+type commitInput struct {
+	Branch struct {
+		Repository string `json:"repositoryNameWithOwner"`
+		Name       string `json:"branchName"`
+	} `json:"branch"`
+	ExpectedHead string `json:"expectedHeadOid"`
+	Message      struct {
+		Headline string `json:"headline"`
+		Body     string `json:"body"`
+	} `json:"message"`
+	FileChanges struct {
+		Additions []fileAddition `json:"additions"`
+	} `json:"fileChanges"`
+}
+type fileAddition struct {
+	Path     string `json:"path"`
+	Contents string `json:"contents"`
+}
+
 type files map[string][]byte
 
-type publisher struct {
-	ctx      context.Context
-	output   io.Writer
-	checkDir string // directory holding test-cask.rb
-	signTool string // Sparkle sign_update
-	signKey  string // EdDSA private key, passed on stdin only
-	botName  string
-	botEmail string
-	command  func([]string, []byte) ([]byte, error)
-	api      func(string) (any, error)
-	raw      func(string) ([]byte, error)
-	graphql  func(string, map[string]any) (map[string]any, error)
+type delivery struct {
+	ctx          context.Context
+	output       io.Writer
+	checkDir     string // directory holding test-cask.rb
+	signTool     string // Sparkle sign_update
+	signKey      string // EdDSA private key, passed on stdin only
+	bot          bot
+	command      func([]string, []byte) ([]byte, error)
+	api          func(string) ([]byte, error)
+	raw          func(string) ([]byte, error)
+	createCommit func(commitInput) (string, error)
 }
 
-func newPublisher(ctx context.Context, checkDir string, output io.Writer) *publisher {
-	f := &publisher{ctx: ctx, checkDir: checkDir, output: output}
-	f.command = f.runCommand
-	f.api = f.request
-	f.raw = f.rawFile
-	f.graphql = f.graphQL
-	return f
+func newDelivery(ctx context.Context, checkDir string, output io.Writer) *delivery {
+	d := &delivery{ctx: ctx, checkDir: checkDir, output: output}
+	d.command = d.runCommand
+	d.api = func(endpoint string) ([]byte, error) { return d.gh(endpoint, false) }
+	d.raw = func(endpoint string) ([]byte, error) { return d.gh(endpoint, true) }
+	d.createCommit = d.graphqlCommit
+	return d
 }
-func (f *publisher) runCommand(arguments []string, input []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(f.ctx, 120*time.Second)
+
+// childEnvironment gives only gh the GitHub token. Every other tool, brew and
+// sign_update included, gets an explicit minimal environment, so neither the
+// token nor the Sparkle key can reach them.
+func childEnvironment(tool string) []string {
+	var result []string
+	if filepath.Base(tool) == "gh" {
+		for _, entry := range os.Environ() {
+			if !strings.HasPrefix(entry, keyVariable+"=") {
+				result = append(result, entry)
+			}
+		}
+		return result
+	}
+	for _, name := range []string{"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME"} {
+		if value, ok := os.LookupEnv(name); ok {
+			result = append(result, name+"="+value)
+		}
+	}
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(name, "HOMEBREW_") && !strings.Contains(name, "TOKEN") && !strings.Contains(name, "KEY") {
+			result = append(result, entry)
+		}
+	}
+	return result
+}
+
+func (d *delivery) runCommand(arguments []string, input []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(d.ctx, 120*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, arguments[0], arguments[1:]...)
 	cmd.WaitDelay = time.Second
+	cmd.Env = childEnvironment(arguments[0])
 	cmd.Stdin = bytes.NewReader(input)
 	diagnostics := &boundedOutput{limit: 4096}
 	cmd.Stderr = diagnostics
@@ -159,277 +241,150 @@ func (f *publisher) runCommand(arguments []string, input []byte) ([]byte, error)
 	return output.Bytes(), nil
 }
 
-func (f *publisher) request(endpoint string) (any, error) {
+func (d *delivery) gh(endpoint string, raw bool) ([]byte, error) {
 	if !strings.HasPrefix(endpoint, "repos/"+repository+"/") {
 		return nil, errors.New("Unexpected GitHub repository")
 	}
-	body, err := f.command([]string{"gh", "api", "--hostname", "github.com", endpoint}, nil)
-	if err != nil {
-		return nil, err
+	arguments := []string{"gh", "api", "--hostname", "github.com"}
+	if raw {
+		arguments = append(arguments, "-H", "Accept: application/vnd.github.raw+json")
 	}
-	return strictJSON(body)
+	return d.command(append(arguments, endpoint), nil)
 }
-func (f *publisher) rawFile(endpoint string) ([]byte, error) {
-	if !strings.HasPrefix(endpoint, "repos/"+repository+"/") {
-		return nil, errors.New("Unexpected GitHub repository")
-	}
-	return f.command([]string{"gh", "api", "--hostname", "github.com", "-H", "Accept: application/vnd.github.raw+json", endpoint}, nil)
-}
-func (f *publisher) graphQL(query string, variables map[string]any) (map[string]any, error) {
-	input, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
-	body, err := f.command([]string{"gh", "api", "--hostname", "github.com", "graphql", "--input", "-"}, input)
+func get[T any](d *delivery, endpoint string) (T, error) {
+	body, err := d.api(endpoint)
 	if err != nil {
-		return nil, err
+		var zero T
+		return zero, err
 	}
-	value, err := strictJSON(body)
-	if err != nil {
-		return nil, err
-	}
-	response := asObject(value)
-	if response["errors"] != nil || asObject(response["data"]) == nil {
-		return nil, errors.New("GitHub GraphQL operation failed")
-	}
-	return asObject(response["data"]), nil
+	return decode[T](body)
 }
 
-func strictJSON(body []byte) (any, error) {
-	if !utf8.Valid(body) {
-		return nil, errors.New("Invalid UTF-8 JSON metadata")
-	}
-	d := json.NewDecoder(bytes.NewReader(body))
-	d.UseNumber()
-	var parse func(int) (any, error)
-	parse = func(depth int) (any, error) {
-		if depth >= 64 {
-			return nil, errors.New("JSON nesting exceeds its bound")
-		}
-		token, err := d.Token()
-		if err != nil {
-			return nil, err
-		}
-		if delim, ok := token.(json.Delim); ok {
-			switch delim {
-			case '{':
-				value := map[string]any{}
-				for d.More() {
-					keyToken, err := d.Token()
-					if err != nil {
-						return nil, err
-					}
-					key, ok := keyToken.(string)
-					if !ok {
-						return nil, errors.New("Invalid JSON key")
-					}
-					if _, exists := value[key]; exists {
-						return nil, errors.New("Duplicate JSON field")
-					}
-					child, err := parse(depth + 1)
-					if err != nil {
-						return nil, err
-					}
-					value[key] = child
-				}
-				if _, err := d.Token(); err != nil {
-					return nil, err
-				}
-				return value, nil
-			case '[':
-				value := make([]any, 0)
-				for d.More() {
-					child, err := parse(depth + 1)
-					if err != nil {
-						return nil, err
-					}
-					value = append(value, child)
-				}
-				if _, err := d.Token(); err != nil {
-					return nil, err
-				}
-				return value, nil
-			default:
-				return nil, errors.New("Unexpected JSON delimiter")
-			}
-		}
-		return token, nil
-	}
-	value, err := parse(0)
+func (d *delivery) graphqlCommit(input commitInput) (string, error) {
+	request, err := json.Marshal(map[string]any{"query": "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }", "variables": map[string]any{"input": input}})
 	if err != nil {
-		return nil, errors.New("Invalid GitHub JSON metadata")
+		return "", err
 	}
-	if _, err := d.Token(); err != io.EOF {
-		return nil, errors.New("Invalid trailing JSON metadata")
+	body, err := d.command([]string{"gh", "api", "--hostname", "github.com", "graphql", "--input", "-"}, request)
+	if err != nil {
+		return "", err
 	}
-	return value, nil
-}
-func asObject(value any) map[string]any { object, _ := value.(map[string]any); return object }
-func asString(value any) string         { text, _ := value.(string); return text }
-func asInteger(value any) (int64, bool) {
-	number, ok := value.(json.Number)
-	if !ok {
-		return 0, false
+	response, err := decode[struct {
+		Errors json.RawMessage `json:"errors"`
+		Data   struct {
+			CreateCommitOnBranch struct {
+				Commit struct {
+					OID string `json:"oid"`
+				} `json:"commit"`
+			} `json:"createCommitOnBranch"`
+		} `json:"data"`
+	}](body)
+	if err != nil {
+		return "", err
 	}
-	n, err := strconv.ParseInt(string(number), 10, 64)
-	return n, err == nil
+	if len(response.Errors) != 0 && string(response.Errors) != "null" {
+		return "", errors.New("GitHub GraphQL operation failed")
+	}
+	return response.Data.CreateCommitOnBranch.Commit.OID, nil
 }
 
-type boundedOutput struct {
-	bytes.Buffer
-	limit int
-}
-
-func (b *boundedOutput) Write(value []byte) (int, error) {
-	if len(value) > b.limit-b.Len() {
-		return 0, errors.New("Output exceeds bound")
-	}
-	return b.Buffer.Write(value)
-}
-func (f *publisher) publishedReleases() ([]map[string]any, error) {
-	var releases []map[string]any
+// publishedReleases lists public releases through a bounded paginated search.
+func (d *delivery) publishedReleases() ([]release, error) {
+	var releases []release
 	for page := 1; page <= 10; page++ {
-		value, err := f.api(fmt.Sprintf("repos/%s/releases?per_page=100&page=%d", repository, page))
+		body, err := d.api(fmt.Sprintf("repos/%s/releases?per_page=100&page=%d", repository, page))
 		if err != nil {
 			return nil, err
 		}
-		batch, ok := value.([]any)
-		if !ok || len(batch) > 100 {
+		if !bytes.HasPrefix(bytes.TrimSpace(body), []byte("[")) {
 			return nil, errors.New("Unexpected source release response")
 		}
-		for _, item := range batch {
-			release := asObject(item)
-			if release == nil {
-				return nil, errors.New("Unexpected source release response")
-			}
-			releases = append(releases, release)
+		batch, err := decode[[]release](body)
+		if err != nil || len(batch) > 100 {
+			return nil, errors.New("Unexpected source release response")
 		}
+		releases = append(releases, batch...)
 		if len(batch) < 100 {
 			return releases, nil
 		}
 	}
 	return nil, errors.New("Public release listing exceeds its page bound; cannot prove the latest build")
 }
-func selectRelease(releases []map[string]any) (map[string]any, error) {
-	var newest map[string]any
+
+// numberedBuild returns the build of a published release carrying Homebrew metadata.
+func numberedBuild(r release) (int, bool) {
+	match := tagPattern.FindStringSubmatch(r.TagName)
+	if match == nil || !r.published() || r.count(manifestAsset) == 0 {
+		return 0, false
+	}
+	build, _ := strconv.Atoi(match[1])
+	return build, true
+}
+
+func selectRelease(releases []release) (release, error) {
+	var newest release
 	latest := 0
-	for _, release := range releases {
-		if release["draft"] != false {
-			continue
-		}
-		match := tagPattern.FindStringSubmatch(asString(release["tag_name"]))
-		if match == nil {
-			continue
-		}
-		assets, ok := release["assets"].([]any)
-		if !ok {
-			continue
-		}
-		hasManifest := false
-		for _, asset := range assets {
-			if asObject(asset)["name"] == "agent-job-queue.json" {
-				hasManifest = true
-			}
-		}
-		if !hasManifest {
-			continue
-		}
-		build, _ := strconv.Atoi(match[1])
-		if build > latest {
-			newest = release
-			latest = build
+	for _, r := range releases {
+		if build, ok := numberedBuild(r); ok && build > latest {
+			newest, latest = r, build
 		}
 	}
-	if newest == nil {
-		return nil, errors.New("No published app build with Homebrew metadata exists")
+	if latest == 0 {
+		return release{}, errors.New("No published app build with Homebrew metadata exists")
 	}
-	for _, release := range releases {
-		match := tagPattern.FindStringSubmatch(asString(release["tag_name"]))
-		if match == nil || release["draft"] != false || release["tag_name"] == newest["tag_name"] {
-			continue
-		}
-		build, _ := strconv.Atoi(match[1])
-		if build != latest {
-			continue
-		}
-		assets, _ := release["assets"].([]any)
-		for _, asset := range assets {
-			if asObject(asset)["name"] == "agent-job-queue.json" {
-				return nil, errors.New("Multiple public releases claim the latest build number")
-			}
+	for _, r := range releases {
+		if build, ok := numberedBuild(r); ok && build == latest && r.TagName != newest.TagName {
+			return release{}, errors.New("Multiple public releases claim the latest build number")
 		}
 	}
 	return newest, nil
 }
-func (f *publisher) releaseByTag(tag string) (map[string]any, error) {
-	value, err := f.api("repos/" + repository + "/releases/tags/" + tag)
+func (d *delivery) releaseByTag(tag string) (release, error) {
+	value, err := get[release](d, "repos/"+repository+"/releases/tags/"+tag)
 	if err != nil {
-		return nil, err
+		return release{}, err
 	}
-	release := asObject(value)
-	if release["draft"] != false || release["tag_name"] != tag {
-		return nil, errors.New("Expected public release is missing or has a different identity")
+	if !value.published() || value.TagName != tag {
+		return release{}, errors.New("Expected public release is missing or has a different identity")
 	}
-	return release, nil
+	return value, nil
 }
-func (f *publisher) verifySuccessor(older, newer manifest) error {
+func (d *delivery) verifySuccessor(older, newer manifest) error {
 	if newer.Build <= older.Build || newer.Commit == older.Commit {
 		return nil
 	}
-	value, err := f.api("repos/" + repository + "/compare/" + older.Commit + "..." + newer.Commit)
+	value, err := get[comparison](d, "repos/"+repository+"/compare/"+older.Commit+"..."+newer.Commit)
 	if err != nil {
 		return err
 	}
-	comparison := asObject(value)
-	if comparison["status"] != "ahead" || asObject(comparison["merge_base_commit"])["sha"] != older.Commit {
+	if value.Status != "ahead" || value.MergeBaseCommit.SHA != older.Commit {
 		return errors.New("Newer build is not a verified descendant of the previous release")
 	}
 	return nil
 }
-func boundedFile(path string, limit int) ([]byte, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Size() > int64(limit) {
-		return nil, errors.New("Required metadata is not a bounded regular file")
-	}
-	body, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(body) > limit {
-		return nil, errors.New("Required metadata exceeds its size limit")
-	}
-	return body, nil
-}
 
 type checkedRelease struct {
-	data    manifest
-	zip     string
-	release map[string]any
+	data manifest
+	zip  string
 }
 
 // downloadRelease verifies a public release against its manifest and the ZIP checksum.
-func (f *publisher) downloadRelease(release map[string]any, work string) (checkedRelease, error) {
-	tag := asString(release["tag_name"])
-	if !tagPattern.MatchString(tag) {
+func (d *delivery) downloadRelease(value release, work string) (checkedRelease, error) {
+	if !tagPattern.MatchString(value.TagName) {
 		return checkedRelease{}, errors.New("Invalid public release tag")
 	}
-	destination := filepath.Join(work, tag)
+	destination := filepath.Join(work, value.TagName)
 	if err := os.Mkdir(destination, 0700); err != nil {
 		return checkedRelease{}, err
 	}
 	download := func(name string) error {
-		_, err := f.command([]string{"gh", "release", "download", tag, "--repo", repository, "--pattern", name, "--dir", destination}, nil)
+		_, err := d.command([]string{"gh", "release", "download", value.TagName, "--repo", repository, "--pattern", name, "--dir", destination}, nil)
 		return err
 	}
-	if err := download("agent-job-queue.json"); err != nil {
+	if err := download(manifestAsset); err != nil {
 		return checkedRelease{}, err
 	}
-	body, err := boundedFile(filepath.Join(destination, "agent-job-queue.json"), metadataLimit)
+	body, err := boundedFile(filepath.Join(destination, manifestAsset), metadataLimit)
 	if err != nil {
 		return checkedRelease{}, err
 	}
@@ -437,59 +392,77 @@ func (f *publisher) downloadRelease(release map[string]any, work string) (checke
 	if err != nil {
 		return checkedRelease{}, err
 	}
-	if release["draft"] != false || release["tag_name"] != data.Tag || release["target_commitish"] != data.Commit {
+	if !value.published() || value.TagName != data.Tag || value.TargetCommitish != data.Commit {
 		return checkedRelease{}, errors.New("Release identity does not match manifest")
 	}
-	assets, ok := release["assets"].([]any)
-	if !ok {
-		return checkedRelease{}, errors.New("Unexpected source release assets")
-	}
-	names := map[string]int{}
-	for _, asset := range assets {
-		names[asString(asObject(asset)["name"])]++
-	}
-	if names["agent-job-queue.json"] != 1 || names[data.Asset] != 1 {
+	if value.count(manifestAsset) != 1 || value.count(data.Asset) != 1 {
 		return checkedRelease{}, errors.New("Release does not contain unique expected metadata and app assets")
 	}
 	if err := download(data.Asset); err != nil {
 		return checkedRelease{}, err
 	}
 	archive := filepath.Join(destination, data.Asset)
-	file, err := os.Open(archive)
-	if err != nil {
+	if err := verifyArchive(archive, data); err != nil {
 		return checkedRelease{}, err
 	}
-	hash := sha256.New()
-	_, err = io.Copy(hash, file)
-	_ = file.Close()
-	if err != nil {
-		return checkedRelease{}, err
-	}
-	if hex.EncodeToString(hash.Sum(nil)) != data.SHA256 {
-		return checkedRelease{}, errors.New("Downloaded app archive checksum does not match manifest")
-	}
-	return checkedRelease{data, archive, release}, nil
+	return checkedRelease{data, archive}, nil
 }
 
-// checkCask renders the cask and loads it through the real Homebrew DSL.
-func (f *publisher) checkCask(cask, work string) error {
+func verifyArchive(path string, data manifest) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return err
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != data.SHA256 {
+		return errors.New("App archive checksum does not match its manifest")
+	}
+	return nil
+}
+
+// bindArtifact requires the notarized artifact of this run to carry exactly the
+// public manifest, SHA-256 included, so a replaced release asset is never signed.
+func bindArtifact(directory string, public checkedRelease) error {
+	body, err := boundedFile(filepath.Join(directory, manifestAsset), metadataLimit)
+	if err != nil {
+		return err
+	}
+	artifact, err := parseManifest(body)
+	if err != nil {
+		return err
+	}
+	if artifact != public.data {
+		return errors.New("The notarized artifact manifest differs from the public release manifest")
+	}
+	if err := verifyArchive(filepath.Join(directory, artifact.Asset), artifact); err != nil {
+		return errors.New("The notarized artifact archive differs from the public release archive")
+	}
+	return nil
+}
+
+// checkCask loads the cask through the real Homebrew DSL.
+func (d *delivery) checkCask(cask, work string) error {
 	path := filepath.Join(work, "agent-job-queue.rb")
 	if err := os.WriteFile(path, []byte(cask), 0600); err != nil {
 		return err
 	}
-	_, err := f.command([]string{"brew", "ruby", filepath.Join(f.checkDir, "test-cask.rb"), path}, nil)
+	_, err := d.command([]string{"brew", "ruby", filepath.Join(d.checkDir, "test-cask.rb"), path}, nil)
 	return err
 }
 
 // sign never receives the key as an argument: it is written to stdin only.
-func (f *publisher) sign(arguments ...string) ([]byte, error) {
-	if f.signKey == "" || f.signTool == "" {
-		return nil, errors.New("The Sparkle signing tool and SPARKLE_ED_PRIVATE_KEY are required. " + docsPointer)
+func (d *delivery) sign(arguments ...string) ([]byte, error) {
+	if d.signKey == "" || d.signTool == "" {
+		return nil, errors.New("The Sparkle signing tool and " + keyVariable + " are required. " + docsPointer)
 	}
-	return f.command(append([]string{f.signTool, "--ed-key-file", "-"}, arguments...), []byte(f.signKey+"\n"))
+	return d.command(append([]string{d.signTool, "--ed-key-file", "-"}, arguments...), []byte(d.signKey+"\n"))
 }
-func (f *publisher) signedAppcast(data manifest, archive, work string) (string, error) {
-	output, err := f.sign("-p", archive)
+func (d *delivery) signedAppcast(data manifest, archive, work string) (string, error) {
+	output, err := d.sign("-p", archive)
 	if err != nil {
 		return "", err
 	}
@@ -501,45 +474,40 @@ func (f *publisher) signedAppcast(data manifest, archive, work string) (string, 
 	if !signaturePattern.MatchString(signature) {
 		return "", errors.New("The Sparkle signing tool returned an invalid archive signature")
 	}
-	unsigned := renderAppcast(data, info.Size(), signature)
 	path := filepath.Join(work, appcastPath)
-	if err := os.WriteFile(path, []byte(unsigned), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(renderAppcast(data, info.Size(), signature)), 0600); err != nil {
 		return "", err
 	}
-	if _, err := f.sign(path); err != nil {
+	if _, err := d.sign(path); err != nil {
 		return "", err
 	}
+	// Sparkle re-serializes the XML and appends its signature comment.
 	signed, err := boundedFile(path, appcastLimit)
 	if err != nil {
 		return "", err
 	}
-	// Sparkle re-serializes the XML and appends its signature comment, so the
-	// signed feed is checked for that signature and for the release identity.
-	for _, required := range []string{"sparkle-signatures:", "edSignature: ", fmt.Sprintf("<sparkle:version>%d</sparkle:version>", data.Build), fmt.Sprintf(`sparkle:edSignature="%s"`, signature), fmt.Sprintf("/download/%s/%s\"", data.Tag, data.Asset)} {
-		if !bytes.Contains(signed, []byte(required)) {
-			return "", errors.New("The Sparkle signing tool did not produce the expected signed feed")
-		}
+	if err := signedFeedMatches(signed, expectedItem(data, info.Size(), signature)); err != nil {
+		return "", err
 	}
 	return string(signed), nil
 }
 
-func (f *publisher) mainHead() (string, error) {
-	value, err := f.api("repos/" + repository + "/git/ref/heads/" + branch)
+func (d *delivery) mainHead() (string, error) {
+	value, err := get[branchRef](d, "repos/"+repository+"/git/ref/heads/"+branch)
 	if err != nil {
 		return "", err
 	}
-	sha := asString(asObject(asObject(value)["object"])["sha"])
-	if !commitPattern.MatchString(sha) {
+	if !commitPattern.MatchString(value.Object.SHA) {
 		return "", errors.New("Unexpected main branch reference")
 	}
-	return sha, nil
+	return value.Object.SHA, nil
 }
 
 // published reads the three delivery files at one commit; absent files are omitted.
-func (f *publisher) published(ref string) (files, error) {
+func (d *delivery) published(ref string) (files, error) {
 	result := files{}
 	for path, limit := range map[string]int{caskPath: metadataLimit, manifestPath: metadataLimit, appcastPath: appcastLimit} {
-		body, err := f.raw("repos/" + repository + "/contents/" + path + "?ref=" + ref)
+		body, err := d.raw("repos/" + repository + "/contents/" + path + "?ref=" + ref)
 		if errors.Is(err, errNotFound) {
 			continue
 		}
@@ -554,51 +522,83 @@ func (f *publisher) published(ref string) (files, error) {
 	return result, nil
 }
 
-func (f *publisher) commit(data manifest, want files, head string) (string, error) {
-	signoff := "Signed-off-by: " + f.botName + " <" + f.botEmail + ">"
-	var additions []map[string]any
+func (d *delivery) commit(data manifest, want files, head string) (string, error) {
+	var input commitInput
+	input.Branch.Repository, input.Branch.Name = repository, branch
+	input.ExpectedHead = head
+	input.Message.Headline = fmt.Sprintf("chore(release): publish build %d", data.Build)
+	input.Message.Body = d.bot.signoff()
 	for _, path := range []string{caskPath, manifestPath, appcastPath} {
-		additions = append(additions, map[string]any{"path": path, "contents": base64.StdEncoding.EncodeToString(want[path])})
+		input.FileChanges.Additions = append(input.FileChanges.Additions, fileAddition{path, base64.StdEncoding.EncodeToString(want[path])})
 	}
-	variables := map[string]any{"input": map[string]any{"branch": map[string]any{"repositoryNameWithOwner": repository, "branchName": branch}, "expectedHeadOid": head, "message": map[string]any{"headline": fmt.Sprintf("chore(release): publish build %d", data.Build), "body": signoff}, "fileChanges": map[string]any{"additions": additions}}}
-	result, err := f.graphql("mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }", variables)
+	oid, err := d.createCommit(input)
 	if err != nil {
 		return "", err
 	}
-	sha := asString(asObject(asObject(result["createCommitOnBranch"])["commit"])["oid"])
-	if !commitPattern.MatchString(sha) {
+	if !commitPattern.MatchString(oid) {
 		return "", errors.New("Publication returned an invalid commit identity")
 	}
-	return sha, nil
+	return oid, nil
 }
 
-// verifyCommit reads the new commit back by SHA: signature, author, DCO, parent and content.
-func (f *publisher) verifyCommit(sha, parent string, want files) error {
-	value, err := f.api("repos/" + repository + "/commits/" + sha)
+// verifySigned checks a commit's Verified signature, App author and DCO trailer,
+// and its parent when one is expected.
+func (d *delivery) verifySigned(oid, parent string) error {
+	value, err := get[commitResponse](d, "repos/"+repository+"/commits/"+oid)
 	if err != nil {
 		return err
 	}
-	response := asObject(value)
-	commit := asObject(response["commit"])
-	author := asObject(commit["author"])
-	parents, _ := response["parents"].([]any)
-	signoff := "Signed-off-by: " + f.botName + " <" + f.botEmail + ">"
-	if response["sha"] != sha || asObject(commit["verification"])["verified"] != true || author["name"] != f.botName || author["email"] != f.botEmail || !slices.Contains(strings.Split(asString(commit["message"]), "\n"), signoff) {
-		return fmt.Errorf("Published commit %s failed Verified signature or matching DCO verification", sha)
+	author := value.Commit.Author
+	signed := false
+	for _, line := range strings.Split(value.Commit.Message, "\n") {
+		signed = signed || line == d.bot.signoff()
 	}
-	if len(parents) != 1 || asObject(parents[0])["sha"] != parent {
-		return fmt.Errorf("Published commit %s does not extend the expected main head", sha)
+	if value.SHA != oid || !value.Commit.Verification.Verified || author.Name != d.bot.Name || author.Email != d.bot.Email || !signed {
+		return fmt.Errorf("Published commit %s failed Verified signature or matching DCO verification", oid)
 	}
-	got, err := f.published(sha)
+	if parent != "" && (len(value.Parents) != 1 || value.Parents[0].SHA != parent) {
+		return fmt.Errorf("Published commit %s does not extend the expected main head", oid)
+	}
+	return nil
+}
+
+// verifyCommit reads a new commit back by SHA, including the exact content.
+func (d *delivery) verifyCommit(oid, parent string, want files) error {
+	if err := d.verifySigned(oid, parent); err != nil {
+		return err
+	}
+	got, err := d.published(oid)
 	if err != nil {
 		return err
 	}
 	if !sameFiles(got, want) {
-		return fmt.Errorf("Published commit %s content differs from the verified delivery", sha)
+		return fmt.Errorf("Published commit %s content differs from the verified delivery", oid)
 	}
-	fmt.Fprintf(f.output, "Published verified, DCO-signed commit %s on %s.\n", sha, branch)
+	fmt.Fprintf(d.output, "Published verified, DCO-signed commit %s on %s.\n", oid, branch)
 	return nil
 }
+
+// verifyExisting covers a lost commit response: identical files already on main
+// are accepted only when the commits that last changed them are themselves verified.
+func (d *delivery) verifyExisting(head string) error {
+	seen := map[string]bool{}
+	for _, path := range []string{caskPath, manifestPath, appcastPath} {
+		latest, err := get[[]sha](d, "repos/"+repository+"/commits?sha="+head+"&path="+path+"&per_page=1")
+		if err != nil || len(latest) != 1 || !commitPattern.MatchString(latest[0].SHA) {
+			return errors.New("Could not identify the commit that last changed " + path)
+		}
+		if seen[latest[0].SHA] {
+			continue
+		}
+		seen[latest[0].SHA] = true
+		if err := d.verifySigned(latest[0].SHA, ""); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintln(d.output, "Delivery is already current; release, cask, feed and their signed commits verified. No commit created.")
+	return nil
+}
+
 func sameFiles(a, b files) bool {
 	if len(a) != len(b) {
 		return false
@@ -609,6 +609,12 @@ func sameFiles(a, b files) bool {
 		}
 	}
 	return true
+}
+
+// sameDelivery compares the cask and manifest exactly and the feed semantically.
+func sameDelivery(state, want files) bool {
+	feed, ok := state[appcastPath]
+	return ok && bytes.Equal(state[caskPath], want[caskPath]) && bytes.Equal(state[manifestPath], want[manifestPath]) && len(state) == len(want) && sameFeed(feed, want[appcastPath])
 }
 
 // currentManifest returns the build already on main, or nil for a first delivery.
@@ -625,90 +631,137 @@ func currentManifest(state files) (*manifest, error) {
 	return &item, err
 }
 
-func (f *publisher) refresh(publish bool, expectedTag, expectedCommit string) error {
-	if err := expectedIdentity(expectedTag, expectedCommit); err != nil {
-		return err
-	}
-	releases, err := f.publishedReleases()
-	if err != nil {
-		return err
-	}
-	latest, err := selectRelease(releases)
-	if err != nil {
-		return err
-	}
-	work, err := os.MkdirTemp("", "agent-queue-tap-")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(work)
-	cache := map[string]checkedRelease{}
-	checked := func(tag string) (checkedRelease, error) {
-		if result, ok := cache[tag]; ok {
-			return result, nil
-		}
-		release, err := f.releaseByTag(tag)
-		if err != nil {
-			return checkedRelease{}, err
-		}
-		result, err := f.downloadRelease(release, work)
-		if err != nil {
-			return checkedRelease{}, err
-		}
-		cache[tag] = result
+// session holds one run's scratch directory and verified-release cache.
+type session struct {
+	d     *delivery
+	work  string
+	cache map[string]checkedRelease
+}
+
+func (s *session) checked(tag string) (checkedRelease, error) {
+	if result, ok := s.cache[tag]; ok {
 		return result, nil
 	}
-	var requested checkedRelease
-	if expectedTag != "" {
-		if requested, err = checked(expectedTag); err != nil {
-			return err
-		}
-		if requested.data.Commit != expectedCommit {
-			return errors.New("Expected commit does not match its public release")
-		}
-	}
-	newest, err := checked(asString(latest["tag_name"]))
+	value, err := s.d.releaseByTag(tag)
 	if err != nil {
-		return err
+		return checkedRelease{}, err
 	}
-	data := newest.data
-	if expectedTag != "" {
-		if data.Build < requested.data.Build {
-			return errors.New("Latest public release is older than the requested delivery")
-		}
-		if data.Build == requested.data.Build && data != requested.data {
-			return errors.New("Requested build has conflicting public release identities")
-		}
-		if err := f.verifySuccessor(requested.data, data); err != nil {
-			return err
-		}
+	result, err := s.d.downloadRelease(value, s.work)
+	if err != nil {
+		return checkedRelease{}, err
 	}
+	s.cache[tag] = result
+	return result, nil
+}
+
+// selection is the verified build this run delivers; later is a newer public
+// build when this run is superseded.
+type selection struct {
+	target checkedRelease
+	latest manifest
+	later  *manifest
+}
+
+// selectBuild verifies the requested release and the latest public build.
+func (s *session) selectBuild(want tagCommit) (selection, error) {
+	releases, err := s.d.publishedReleases()
+	if err != nil {
+		return selection{}, err
+	}
+	top, err := selectRelease(releases)
+	if err != nil {
+		return selection{}, err
+	}
+	newest, err := s.checked(top.TagName)
+	if err != nil {
+		return selection{}, err
+	}
+	result := selection{target: newest, latest: newest.data}
+	if want.Tag == "" {
+		return result, nil
+	}
+	requested, err := s.checked(want.Tag)
+	if err != nil {
+		return selection{}, err
+	}
+	if requested.data.Commit != want.Commit {
+		return selection{}, errors.New("Expected commit does not match its public release")
+	}
+	if newest.data.Build < requested.data.Build {
+		return selection{}, errors.New("Latest public release is older than the requested delivery")
+	}
+	if newest.data.Build == requested.data.Build && newest.data != requested.data {
+		return selection{}, errors.New("Requested build has conflicting public release identities")
+	}
+	if err := s.d.verifySuccessor(requested.data, newest.data); err != nil {
+		return selection{}, err
+	}
+	result.target = requested
+	if newest.data.Build > requested.data.Build {
+		result.later = &newest.data
+	}
+	return result, nil
+}
+
+// rejectOrYield compares main's current build with the one being delivered. It
+// reports true when main already holds a newer verified build, and fails on a
+// real regression such as a build newer than any public release.
+func (s *session) rejectOrYield(current *manifest, sel selection) (bool, error) {
+	if current == nil {
+		return false, nil
+	}
+	published, err := s.checked(current.Tag)
+	if err != nil {
+		return false, err
+	}
+	if *current != published.data {
+		return false, errors.New("Current main metadata differs from its validated public release")
+	}
+	data := sel.target.data
+	switch {
+	case current.Build > sel.latest.Build:
+		return false, errors.New("Main holds a build newer than any public release")
+	case current.Build > data.Build:
+		return true, nil
+	case current.Build == data.Build && *current != data:
+		return false, errors.New("The same build number has conflicting release metadata")
+	case current.Build < data.Build:
+		return false, s.d.verifySuccessor(*current, data)
+	}
+	return false, nil
+}
+
+// build renders and checks the cask, then signs the ZIP and the feed.
+func (s *session) build(target checkedRelease) (files, error) {
+	data := target.data
 	cask, err := renderCask(data)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := f.checkCask(cask, work); err != nil {
-		return err
+	if err := s.d.checkCask(cask, s.work); err != nil {
+		return nil, err
 	}
-	if !publish {
-		fmt.Fprintf(f.output, "Validated %s, its app archive checksum and the cask; publication disabled.\n", data.Tag)
-		return nil
-	}
-	appcast, err := f.signedAppcast(data, newest.zip, work)
+	appcast, err := s.d.signedAppcast(data, target.zip, s.work)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	body, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	want := files{caskPath: []byte(cask), manifestPath: append(body, '\n'), appcastPath: []byte(appcast)}
+	return files{caskPath: []byte(cask), manifestPath: append(body, '\n'), appcastPath: []byte(appcast)}, nil
+}
+
+// deliver commits the files, re-reading main and retrying when it moved.
+func (s *session) deliver(sel selection, want files) error {
+	d := s.d
+	data := sel.target.data
 	for attempt := 1; ; attempt++ {
-		head, err := f.mainHead()
+		head, err := d.mainHead()
 		if err != nil {
 			return err
 		}
-		state, err := f.published(head)
+		state, err := d.published(head)
 		if err != nil {
 			return err
 		}
@@ -716,40 +769,77 @@ func (f *publisher) refresh(publish bool, expectedTag, expectedCommit string) er
 		if err != nil {
 			return err
 		}
-		if current != nil {
-			published, err := checked(current.Tag)
-			if err != nil {
-				return err
-			}
-			if *current != published.data {
-				return errors.New("Current main metadata differs from its validated public release")
-			}
-			if current.Build > data.Build {
-				return errors.New("Latest public release would downgrade the delivered build")
-			}
-			if current.Build == data.Build && *current != data {
-				return errors.New("The same build number has conflicting release metadata")
-			}
-			if current.Build < data.Build {
-				if err := f.verifySuccessor(*current, data); err != nil {
-					return err
-				}
-			}
+		yield, err := s.rejectOrYield(current, sel)
+		if err != nil {
+			return err
 		}
-		if sameFiles(state, want) {
-			fmt.Fprintln(f.output, "Delivery is already current; release, cask and signed feed verified. No commit created.")
+		if yield {
+			fmt.Fprintf(d.output, "Superseded: main already holds build %d, newer than build %d.\n", current.Build, data.Build)
 			return nil
 		}
-		sha, err := f.commit(data, want, head)
-		if err == nil {
-			return f.verifyCommit(sha, head, want)
+		if sameDelivery(state, want) {
+			return d.verifyExisting(head)
 		}
-		moved, headErr := f.mainHead()
+		oid, err := d.commit(data, want, head)
+		if err == nil {
+			return d.verifyCommit(oid, head, want)
+		}
+		moved, headErr := d.mainHead()
 		if headErr != nil || moved == head || attempt >= publishAttempts {
 			return errors.New("Publishing to main failed. Check the Homebrew-sync App installation, its contents write permission and its ruleset bypass. " + docsPointer)
 		}
-		fmt.Fprintf(f.output, "main moved to %s during publication; retrying (attempt %d of %d).\n", moved, attempt+1, publishAttempts)
+		fmt.Fprintf(d.output, "main moved to %s during publication; retrying (attempt %d of %d).\n", moved, attempt+1, publishAttempts)
 	}
+}
+
+type request struct {
+	want     tagCommit
+	artifact string // directory of this run's notarized artifact
+	publish  bool
+}
+
+func (d *delivery) refresh(req request) error {
+	if err := req.want.validate(); err != nil {
+		return err
+	}
+	if req.publish && (req.want.Tag == "" || req.artifact == "") {
+		return errors.New("Publication requires --expected-tag, --expected-commit and --artifact-dir")
+	}
+	work, err := os.MkdirTemp("", "agent-queue-tap-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(work)
+	s := &session{d: d, work: work, cache: map[string]checkedRelease{}}
+	sel, err := s.selectBuild(req.want)
+	if err != nil {
+		return err
+	}
+	if sel.later != nil {
+		fmt.Fprintf(d.output, "Superseded by build %d (%s); this run delivers nothing and the newer run publishes it.\n", sel.later.Build, sel.later.Tag)
+		return nil
+	}
+	if req.artifact != "" {
+		if err := bindArtifact(req.artifact, sel.target); err != nil {
+			return err
+		}
+	}
+	if !req.publish {
+		cask, err := renderCask(sel.target.data)
+		if err != nil {
+			return err
+		}
+		if err := d.checkCask(cask, work); err != nil {
+			return err
+		}
+		fmt.Fprintf(d.output, "Validated %s, its app archive checksum and the cask; publication disabled.\n", sel.target.data.Tag)
+		return nil
+	}
+	want, err := s.build(sel.target)
+	if err != nil {
+		return err
+	}
+	return s.deliver(sel, want)
 }
 
 func publicationAllowed(environment map[string]string) bool {
@@ -761,6 +851,7 @@ func Run(arguments []string, output io.Writer) error {
 	publish := flags.Bool("publish", false, "Sign, commit and verify the delivery on main")
 	tag := flags.String("expected-tag", "", "Requested public release tag")
 	commit := flags.String("expected-commit", "", "Requested full source commit")
+	artifact := flags.String("artifact-dir", "", "Directory of this run's notarized artifact")
 	checkDir := flags.String("check-dir", "packaging/homebrew", "Directory containing test-cask.rb")
 	signTool := flags.String("sign-update", "", "Path to Sparkle sign_update")
 	if err := flags.Parse(arguments); err != nil {
@@ -769,10 +860,7 @@ func Run(arguments []string, output io.Writer) error {
 	if flags.NArg() != 0 {
 		return errors.New("Unexpected delivery arguments")
 	}
-	if err := expectedIdentity(*tag, *commit); err != nil {
-		return err
-	}
-	f := newPublisher(context.Background(), *checkDir, output)
+	d := newDelivery(context.Background(), *checkDir, output)
 	if *publish {
 		environment := map[string]string{}
 		for _, name := range []string{"GITHUB_ACTIONS", "GITHUB_REPOSITORY", "GITHUB_REF"} {
@@ -781,16 +869,18 @@ func Run(arguments []string, output io.Writer) error {
 		if !publicationAllowed(environment) {
 			return errors.New("Publication is restricted to the distribution workflow on main")
 		}
-		f.signTool, f.signKey = *signTool, strings.TrimSpace(os.Getenv("SPARKLE_ED_PRIVATE_KEY"))
-		f.botName, f.botEmail = os.Getenv("TAP_BOT_NAME"), os.Getenv("TAP_BOT_EMAIL")
-		if f.signKey == "" || f.signTool == "" {
-			return errors.New("SPARKLE_ED_PRIVATE_KEY and --sign-update are required to publish. " + docsPointer)
+		d.signTool, d.signKey = *signTool, strings.TrimSpace(os.Getenv(keyVariable))
+		// The key travels on signer stdin only, so no child inherits it.
+		_ = os.Unsetenv(keyVariable)
+		d.bot = bot{os.Getenv("TAP_BOT_NAME"), os.Getenv("TAP_BOT_EMAIL")}
+		if d.signKey == "" || d.signTool == "" {
+			return errors.New(keyVariable + " and --sign-update are required to publish. " + docsPointer)
 		}
-		if !botNamePattern.MatchString(f.botName) || !botEmailPattern.MatchString(f.botEmail) {
+		if !d.bot.valid() {
 			return errors.New("TAP_BOT_NAME and TAP_BOT_EMAIL must name the Homebrew-sync App bot. " + docsPointer)
 		}
 	}
-	return f.refresh(*publish, *tag, *commit)
+	return d.refresh(request{tagCommit{*tag, *commit}, *artifact, *publish})
 }
 
 func Main(arguments []string) int {
