@@ -189,14 +189,14 @@ struct BehaviorTests {
         // Surfaces go through navigation: confirming actions only ask, the others are sent.
         let surface = QueueNavigation()
         rejecting.error = nil
-        surface.perform(.cancel(running), in: rejecting)
+        try check(surface.perform(.cancel(running), in: rejecting) == nil, "A confirming action sends nothing yet")
         try check(surface.confirmation?.kind == .cancel && !rejecting.isMutating, "A confirming action asks before sending")
         surface.decline()
         rejecting.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [movable])
-        surface.perform(.next(movable), in: rejecting)
-        try check(surface.confirmation == nil && rejecting.isMutating, "A non-confirming action is sent without asking")
-        for _ in 0..<1_000 where rejecting.isMutating { await Task.yield() }
-        try check(!rejecting.isMutating, "The sent action settles")
+        let sentTask = surface.perform(.next(movable), in: rejecting)
+        try check(sentTask != nil && surface.confirmation == nil && rejecting.isMutating, "A non-confirming action is sent without asking")
+        await sentTask?.value
+        try check(!rejecting.isMutating && rejecting.error?.contains("A command was sent") == true, "The sent action reaches the command")
         let passwords: [(String, Bool)] = [("", false), ("abc", false), ("word", true), ("2468", true),
             ("simple", true), (String(repeating: "a", count: 72), true),
             (String(repeating: "a", count: 73), false), (String(repeating: "é", count: 36), true),

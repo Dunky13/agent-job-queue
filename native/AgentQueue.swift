@@ -1441,8 +1441,11 @@ final class QueueNavigation: ObservableObject {
     func decline() { confirmation = nil }
 
     /// The one entry point for surfaces: asks first when the action needs confirmation.
-    func perform(_ action: QueueAction, in store: QueueStore) {
-        if let kind = action.confirmation, let job = action.job { request(kind, job: job) } else { store.dispatch(action) }
+    @discardableResult
+    func perform(_ action: QueueAction, in store: QueueStore) -> Task<Void, Never>? {
+        guard let kind = action.confirmation else { return store.dispatch(action) }
+        if let job = action.job { request(kind, job: job) }
+        return nil
     }
 
     func unavailability(in store: QueueStore) -> String? {

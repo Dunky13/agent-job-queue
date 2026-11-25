@@ -9,6 +9,7 @@ Queue actions had four copies of the mutation pipeline in the store, three store
 - **Rules live in the module:** Start now, Run next, Move to end, Cancel, Resume, the limit range and "limit differs", and "mode differs" are all decided in `isAllowed`. `QueueJob.permitsStart` is removed; the decoded `canReorder`, `canCancel` and `canStart` flags stay on the job as data. `QueueStore.isPaused` uses the Resume rule.
 - **Pipeline:** `QueueStore.dispatch(_:)` reserves the store, sends the command, sets the notice or error, and refreshes. It replaces `dispatch`, `dispatchResume`, `dispatchLimit` and `dispatchScheduling`. In fixture mode it never sends a command: job actions are recorded, everything else is refused or released.
 - **Behaviour difference:** the confirmation test hook chose its Start now job with `isWaiting && canReorder`. It now uses the shared start rule, so a waiting job with `canStart` false is no longer picked. Row buttons for Run next and Move to end also now require a waiting job, which matches what the store already enforced. Both backends report `canReorder` only for queued jobs, so this is not visible today.
+- **Older handoffs:** `docs/handoffs/swift-controller-commands.md` and `docs/handoffs/app-library-target.md` still name the removed store helpers as historical records.
 - **Untouched:** remote access, learning, integration and updates stores keep their own pipelines, and `fixtureMode` behaves as before.
 
 ## Evidence
@@ -23,5 +24,4 @@ Queue actions had four copies of the mutation pipeline in the store, three store
 ## Next steps
 
 1. Remove `fixtureMode` in the planned follow-up; the fixture branch in `dispatch` and `complete` goes with it.
-2. `docs/handoffs/swift-controller-commands.md` and `docs/handoffs/app-library-target.md` still name the removed store helpers; they are historical records.
-3. Confirm in a live session that the row buttons and menu look unchanged for waiting, running and finished jobs.
+2. Confirm in a live session that the row buttons and menu look unchanged for waiting, running and finished jobs.
