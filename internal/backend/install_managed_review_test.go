@@ -251,7 +251,7 @@ func TestManagedRefusedMenuShutdownPreservesPreviousBundle(t *testing.T) {
 			if _, err := os.Lstat(filepath.Join(i.root, "install-in-progress.json")); !errors.Is(err, os.ErrNotExist) {
 				t.Fatal("refused shutdown left a pending marker", err)
 			}
-			if err := updateCompleted(i.root); err != nil {
+			if err := requireCompleteInstallation(i.root); err != nil {
 				t.Fatal("refused shutdown made the running app look incomplete", err)
 			}
 			i.command = original

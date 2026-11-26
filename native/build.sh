@@ -5,6 +5,8 @@ source_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 output=${1:?Usage: native/build.sh OUTPUT_EXECUTABLE}
 architectures=${ARCHS:-"arm64 x86_64"}
 mkdir -p -- "$(dirname -- "$output")"
+# Sparkle.framework comes from the pinned, checksum-verified download.
+export SPARKLE_DIR=${SPARKLE_DIR:-$(bash "$source_dir/../packaging/sparkle/fetch.sh")}
 build_dir=$(mktemp -d)
 trap 'rm -rf -- "$build_dir"' EXIT
 binaries=()
@@ -14,7 +16,8 @@ for architecture in $architectures; do
   bash "$source_dir/build-library.sh" "$library" "$architecture" release
   # force_load keeps every object of the app in the binary, as one direct compile did.
   xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -O \
-    -target "$architecture-apple-macos15.0" -framework SwiftUI -framework AppKit -framework ServiceManagement \
+    -target "$architecture-apple-macos15.0" -framework SwiftUI -framework AppKit -framework ServiceManagement -F "$SPARKLE_DIR" -framework Sparkle \
+    -Xlinker -rpath -Xlinker @executable_path/../Frameworks \
     -I "$library" -Xlinker -force_load -Xlinker "$library/libAgentQueueCore.a" \
     "$source_dir/app/AgentQueueMain.swift" -o "$build_dir/$architecture"
   binaries+=("$build_dir/$architecture")

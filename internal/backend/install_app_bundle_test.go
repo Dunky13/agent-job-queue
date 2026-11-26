@@ -105,7 +105,7 @@ func TestInstallerAppBundlePreservesApplicationAndLaunchesSuppliedPath(t *testin
 		t.Fatal("self-install changed application bytes, ownership, mode, inode, timestamps, or sibling recovery artifacts")
 	}
 	assertInstallerNoAppCommands(t, f)
-	if _, err := updateInstalled(install.root, app); err != nil {
+	if _, err := installedVersionReport(install.root, app); err != nil {
 		t.Fatalf("setup did not complete: %v", err)
 	}
 }
@@ -368,10 +368,10 @@ func TestInstallerBundleRootOwnershipDoesNotRelaxPrivateReads(t *testing.T) {
 	if info.Uid != 0 || info.Nlink != 1 {
 		t.Skip("system fixture is not a single-link root-owned resource")
 	}
-	if _, err := installReadPayload("/usr", filename, updateMaxArchive); err != nil {
+	if _, err := installReadPayload("/usr", filename, maxArchiveBytes); err != nil {
 		t.Fatalf("immutable root-owned bundle resource refused: %v", err)
 	}
-	if _, err := updateReadOwned(filename, updateMaxArchive); err == nil {
+	if _, err := readOwnedFile(filename, maxArchiveBytes); err == nil {
 		t.Fatal("private metadata reader accepted a root-owned file")
 	}
 	if err := installValidateAppPath(integrationHome(), "/Applications/Agent Queue.app"); err != nil {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -305,14 +306,14 @@ func (install *installer) validateServices() (string, error) {
 	serviceSlot := ""
 	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
 		filename := filepath.Join(install.launch, label+".plist")
-		exists, err := updateExists(filename)
+		exists, err := pathExists(filename)
 		if err != nil {
 			return "", err
 		}
 		if !exists {
 			continue
 		}
-		value, err := updatePlist(filename)
+		value, err := readBundlePlist(filename)
 		if err != nil {
 			return "", err
 		}
@@ -387,7 +388,7 @@ func (install *installer) configuredSlot() (string, error) {
 }
 
 func installReadInfo(filename string) (BuildInfo, error) {
-	raw, err := updateReadOwned(filename, 16384)
+	raw, err := readOwnedFile(filename, 16384)
 	if err != nil {
 		return BuildInfo{}, err
 	}
@@ -482,6 +483,60 @@ func (install *installer) readPayload(filename string, limit int64) ([]byte, err
 	return installReadPayload(install.app, filename, limit)
 }
 
+// SparkleFramework and sparkleLinks describe the only symlinks an app bundle may
+// contain: the trimmed Sparkle.framework's version links, relative to the framework.
+const SparkleFramework = "Contents/Frameworks/Sparkle.framework"
+
+var sparkleLinks = map[string]string{
+	"Versions/Current": "B",
+	"Sparkle":          "Versions/Current/Sparkle",
+	"Resources":        "Versions/Current/Resources",
+	"Autoupdate":       "Versions/Current/Autoupdate",
+	"Updater.app":      "Versions/Current/Updater.app",
+}
+
+// SparkleLinks returns a copy of the allowed framework links, so no caller can widen
+// what setup accepts.
+func SparkleLinks() map[string]string {
+	return maps.Clone(sparkleLinks)
+}
+
+// installBundleLink returns the target of filename, a symlink inside the bundle
+// root, only when it is one of Sparkle's version links with its exact target. No
+// symlink is followed while checking it.
+func installBundleLink(root, filename string) (string, error) {
+	relative, err := filepath.Rel(root, filename)
+	if err != nil {
+		return "", err
+	}
+	inside, found := strings.CutPrefix(relative, SparkleFramework+"/")
+	want, known := sparkleLinks[inside]
+	if !found || !known {
+		return "", errors.New("Application payload contains a symlink or special file")
+	}
+	parent, err := installPayloadParent(root, filename)
+	if err != nil {
+		return "", err
+	}
+	defer parent.Close()
+	var info unix.Stat_t
+	if err := unix.Fstatat(int(parent.Fd()), filepath.Base(filename), &info, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return "", err
+	}
+	if uint32(info.Mode)&unix.S_IFMT != unix.S_IFLNK || (info.Uid != uint32(os.Getuid()) && info.Uid != 0) {
+		return "", errors.New("Installer payload has unsafe ownership, permissions, or file type")
+	}
+	buffer := make([]byte, 256)
+	size, err := unix.Readlinkat(int(parent.Fd()), filepath.Base(filename), buffer)
+	if err != nil {
+		return "", err
+	}
+	if string(buffer[:size]) != want {
+		return "", errors.New("Application payload contains an unexpected symlink")
+	}
+	return want, nil
+}
+
 func installValidatePayloadTree(root string) error {
 	count := 0
 	var total int64
@@ -500,6 +555,10 @@ func installValidatePayloadTree(root string) error {
 			}
 			return parent.Close()
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			_, err := installBundleLink(root, filename)
+			return err
+		}
 		if !entry.Type().IsRegular() {
 			return errors.New("Application payload contains a symlink or special file")
 		}
@@ -517,7 +576,7 @@ func installValidatePayloadTree(root string) error {
 			return errors.New("Installer payload has unsafe ownership, permissions, or file type")
 		}
 		total += info.Size
-		if info.Size > updateMaxArchive || total > updateMaxExpanded {
+		if info.Size > maxArchiveBytes || total > maxExpandedBytes {
 			return errors.New("Application payload exceeds its size limit")
 		}
 		return nil
@@ -530,7 +589,7 @@ func (install *installer) validateMarkedBundle() error {
 	if err := installValidateAppPath(install.home, install.app); err != nil {
 		return err
 	}
-	if exists, err := updateExists(filepath.Join(install.app, "Contents/Resources/payload/Agent Queue.app")); err != nil {
+	if exists, err := pathExists(filepath.Join(install.app, "Contents/Resources/payload/Agent Queue.app")); err != nil {
 		return err
 	} else if exists {
 		return errors.New("App bundle payload must not contain a recursive Agent Queue.app")
@@ -567,7 +626,7 @@ func (install *installer) validateBundle() (BuildInfo, error) {
 		return BuildInfo{}, err
 	}
 	filename := filepath.Join(app, "Contents/MacOS/AgentQueue")
-	if _, err := install.readPayload(filename, updateMaxArchive); err != nil {
+	if _, err := install.readPayload(filename, maxArchiveBytes); err != nil {
 		return BuildInfo{}, err
 	}
 	stat, err := os.Lstat(filename)
@@ -626,7 +685,7 @@ func (install *installer) validateBundle() (BuildInfo, error) {
 		return BuildInfo{}, errors.New("Installer app version differs from its build identity")
 	}
 	for _, marker := range []string{filepath.Join(install.root, "build-info.json"), filepath.Join(install.root, "install-in-progress.json")} {
-		exists, err := updateExists(marker)
+		exists, err := pathExists(marker)
 		if err != nil {
 			return BuildInfo{}, err
 		}
@@ -707,7 +766,7 @@ func installYAMLValue(node *yaml.Node, key string) *yaml.Node {
 }
 
 func installConfig(filename string) (*yaml.Node, error) {
-	raw, err := updateReadOwned(filename, 4*1024*1024)
+	raw, err := readOwnedFile(filename, 4*1024*1024)
 	if err != nil {
 		return nil, err
 	}
@@ -846,12 +905,12 @@ func (install *installer) legacySnapshot(ctx context.Context, node *yaml.Node, l
 		}
 	}
 	filename := filepath.Join(directory, "state.json")
-	exists, err := updateExists(filename)
+	exists, err := pathExists(filename)
 	if err != nil {
 		return nil, err
 	}
 	if !exists {
-		if compressed, err := updateExists(filepath.Join(directory, "state.json.gz")); err != nil {
+		if compressed, err := pathExists(filepath.Join(directory, "state.json.gz")); err != nil {
 			return nil, err
 		} else if compressed {
 			filename = filepath.Join(directory, "state.json.gz")
@@ -859,7 +918,7 @@ func (install *installer) legacySnapshot(ctx context.Context, node *yaml.Node, l
 			return Object{"tasks": Object{}, "groups": Object{"default": Object{"parallel_tasks": 1, "status": "Running"}}}, nil
 		}
 	}
-	raw, err := updateReadOwned(filename, installLegacySnapshotLimit)
+	raw, err := readOwnedFile(filename, installLegacySnapshotLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -898,12 +957,12 @@ func (install *installer) tasks(ctx context.Context, node *yaml.Node, loaded boo
 
 func (install *installer) queueMigration(ctx context.Context, node *yaml.Node) (bool, error) {
 	filename := filepath.Join(install.launch, "io.went.agent-heavy.plist")
-	exists, err := updateExists(filename)
+	exists, err := pathExists(filename)
 	if err != nil {
 		return false, err
 	}
 	if exists {
-		definition, err := updatePlist(filename)
+		definition, err := readBundlePlist(filename)
 		if err != nil {
 			return false, err
 		}
@@ -918,14 +977,14 @@ func (install *installer) queueMigration(ctx context.Context, node *yaml.Node) (
 		return false, errors.New("Cannot establish ownership of the running queue without its launch agent definition")
 	} else if node == nil {
 		for _, name := range []string{"state.json", "state.json.gz"} {
-			if exists, err := updateExists(filepath.Join(install.state, "pueue", name)); err != nil {
+			if exists, err := pathExists(filepath.Join(install.state, "pueue", name)); err != nil {
 				return false, err
 			} else if exists {
 				return false, errors.New("Legacy queue state exists without its dedicated configuration; restore the configuration before retrying installation")
 			}
 		}
 		return false, nil
-	} else if database, err := updateExists(filepath.Join(install.state, "queue.sqlite3")); err != nil {
+	} else if database, err := pathExists(filepath.Join(install.state, "queue.sqlite3")); err != nil {
 		return false, err
 	} else if database {
 		return false, nil
@@ -999,7 +1058,7 @@ func (install *installer) requireLegacyCleanup() error {
 }
 
 func (install *installer) embeddedDefinition() bool {
-	definition, err := updatePlist(filepath.Join(install.launch, "io.went.agent-heavy.plist"))
+	definition, err := readBundlePlist(filepath.Join(install.launch, "io.went.agent-heavy.plist"))
 	if err != nil {
 		return false
 	}
@@ -1154,7 +1213,7 @@ func installValidateSlot(raw []byte) (string, error) {
 
 func (install *installer) legacySlot() (string, error) {
 	setting := filepath.Join(install.state, "legacy-slot.json")
-	exists, err := updateExists(setting)
+	exists, err := pathExists(setting)
 	if err != nil {
 		return "", err
 	}
@@ -1171,11 +1230,11 @@ func (install *installer) legacySlot() (string, error) {
 		return "", err
 	}
 	previous := filepath.Join(install.root, "agent_heavy.py")
-	exists, err = updateExists(previous)
+	exists, err = pathExists(previous)
 	if err != nil || !exists {
 		return "", err
 	}
-	raw, err := updateReadOwned(previous, 4*1024*1024)
+	raw, err := readOwnedFile(previous, 4*1024*1024)
 	if err != nil {
 		return "", err
 	}
@@ -1202,7 +1261,7 @@ func (install *installer) legacySlot() (string, error) {
 }
 
 func (install *installer) pythonMigration(ctx context.Context, node *yaml.Node) (bool, error) {
-	oldSource, err := updateExists(filepath.Join(install.root, "agent_heavy.py"))
+	oldSource, err := pathExists(filepath.Join(install.root, "agent_heavy.py"))
 	if err != nil {
 		return false, err
 	}
@@ -1215,10 +1274,10 @@ func (install *installer) pythonMigration(ctx context.Context, node *yaml.Node) 
 	}
 	old := oldSource || strings.Contains(callback, "agent_heavy.py") || strings.Contains(callback, ".venv/")
 	controllerPath := filepath.Join(install.launch, "io.went.agent-resources.plist")
-	if exists, err := updateExists(controllerPath); err != nil {
+	if exists, err := pathExists(controllerPath); err != nil {
 		return false, err
 	} else if exists {
-		info, err := updatePlist(controllerPath)
+		info, err := readBundlePlist(controllerPath)
 		if err != nil {
 			return false, err
 		}
@@ -1239,7 +1298,7 @@ func (install *installer) pythonMigration(ctx context.Context, node *yaml.Node) 
 		return true, nil
 	}
 	remote := filepath.Join(install.config, "remote.json")
-	if exists, err := updateExists(remote); err != nil {
+	if exists, err := pathExists(remote); err != nil {
 		return false, err
 	} else if exists {
 		settings, err := ReadPrivate(remote)
@@ -1259,7 +1318,7 @@ func (install *installer) pythonMigration(ctx context.Context, node *yaml.Node) 
 	}
 	loaded := install.loaded(ctx, "io.went.agent-heavy")
 	if loaded {
-		if exists, err := updateExists(filepath.Join(install.launch, "io.went.agent-heavy.plist")); err != nil {
+		if exists, err := pathExists(filepath.Join(install.launch, "io.went.agent-heavy.plist")); err != nil {
 			return false, err
 		} else if !exists {
 			return false, errors.New("Cannot establish ownership of the running legacy queue without its launch agent definition")
@@ -1281,7 +1340,7 @@ func (install *installer) pythonMigration(ctx context.Context, node *yaml.Node) 
 
 func (install *installer) remoteEnabled() (bool, error) {
 	filename := filepath.Join(install.config, "remote.json")
-	exists, err := updateExists(filename)
+	exists, err := pathExists(filename)
 	if err != nil || !exists {
 		return false, err
 	}
@@ -1302,7 +1361,7 @@ func (install *installer) disabledRemoteCleanup(ctx context.Context) (bool, erro
 	}
 	remoteState := filepath.Join(install.state, "remote")
 	filename := filepath.Join(remoteState, "processes.json")
-	if exists, err := updateExists(filename); err != nil {
+	if exists, err := pathExists(filename); err != nil {
 		return false, err
 	} else if exists {
 		record, err := ReadPrivate(filename)
@@ -1340,7 +1399,7 @@ func (install *installer) disabledRemoteCleanup(ctx context.Context) (bool, erro
 func (install *installer) validatePhoneAccessRecovery(ctx context.Context) error {
 	const label = "io.went.agent-remote"
 	filename := filepath.Join(install.launch, label+".plist")
-	exists, err := updateExists(filename)
+	exists, err := pathExists(filename)
 	if err != nil {
 		return err
 	}
@@ -1355,7 +1414,7 @@ func (install *installer) validatePhoneAccessRecovery(ctx context.Context) error
 		}
 		return nil
 	}
-	definition, err := updatePlist(filename)
+	definition, err := readBundlePlist(filename)
 	if err != nil {
 		return err
 	}
@@ -1431,7 +1490,7 @@ func (install *installer) stopLegacy(ctx context.Context, node *yaml.Node) error
 	stoppedQueue := false
 	for _, label := range []string{"io.went.agent-resources", "io.went.agent-heavy"} {
 		if install.loaded(ctx, label) {
-			definition, err := updatePlist(filepath.Join(install.launch, label+".plist"))
+			definition, err := readBundlePlist(filepath.Join(install.launch, label+".plist"))
 			if err != nil {
 				return err
 			}
@@ -1550,7 +1609,7 @@ func (install *installer) removeLegacy() error {
 	defer root.Close()
 	for _, name := range installLegacyFiles {
 		filename := filepath.Join(install.root, name)
-		exists, err := updateExists(filename)
+		exists, err := pathExists(filename)
 		if err != nil {
 			return err
 		}
@@ -1576,7 +1635,7 @@ func (install *installer) removeLegacy() error {
 	}
 	for _, name := range installLegacyDirectories {
 		filename := filepath.Join(install.root, name)
-		exists, err := updateExists(filename)
+		exists, err := pathExists(filename)
 		if err != nil {
 			return err
 		}

@@ -22,7 +22,7 @@ func (install *installer) managedBackupLegacyDefinitions(plan *managedPlan) erro
 			continue // Its historical cask already removed the definition.
 		}
 		filename := filepath.Join(install.launch, label+".plist")
-		raw, err := updateReadOwned(filename, 16384)
+		raw, err := readOwnedFile(filename, 16384)
 		if err != nil {
 			return err
 		}
@@ -35,7 +35,7 @@ func (install *installer) managedBackupLegacyDefinitions(plan *managedPlan) erro
 		}
 		hash := sha256.Sum256(raw)
 		backup := filepath.Join(install.config, "legacy-service-"+label+"-"+hex.EncodeToString(hash[:])+".plist")
-		if retained, err := updateReadOwned(backup, 16384); err == nil {
+		if retained, err := readOwnedFile(backup, 16384); err == nil {
 			if !bytes.Equal(retained, raw) {
 				return errors.New("The retained legacy service backup has changed")
 			}
@@ -55,7 +55,7 @@ func (install *installer) managedBackupLegacyDefinitions(plan *managedPlan) erro
 				return err
 			}
 		}
-		latest, err := updateReadOwned(filename, 16384)
+		latest, err := readOwnedFile(filename, 16384)
 		if err != nil {
 			return err
 		}

@@ -250,14 +250,14 @@ func (install *installer) repairAndExecute(ctx context.Context) error {
 		}
 		for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-queue"} {
 			filename := filepath.Join(install.launch, label+".plist")
-			exists, err := updateExists(filename)
+			exists, err := pathExists(filename)
 			if err != nil {
 				return err
 			}
 			if !exists {
 				continue
 			}
-			definition, err := updatePlist(filename)
+			definition, err := readBundlePlist(filename)
 			if err != nil {
 				return err
 			}

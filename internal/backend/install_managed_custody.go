@@ -172,14 +172,14 @@ func (install *installer) managedReceiptSuperseded(receipt *managedPublicationRe
 		receipt.Candidate.Inode == 0 || receipt.Candidate.Digest == [32]byte{} {
 		return false, nil
 	}
-	if pending, err := updateExists(filepath.Join(install.root, "install-in-progress.json")); err != nil || pending {
+	if pending, err := pathExists(filepath.Join(install.root, "install-in-progress.json")); err != nil || pending {
 		return false, err
 	}
 	for _, app := range []string{install.app, receipt.App} {
 		if !filepath.IsAbs(app) || filepath.Clean(app) != app {
 			return false, nil
 		}
-		if retained, err := updateExists(filepath.Join(filepath.Dir(app), ".Agent Queue.previous.app")); err != nil || retained {
+		if retained, err := pathExists(filepath.Join(filepath.Dir(app), ".Agent Queue.previous.app")); err != nil || retained {
 			return false, err
 		}
 	}
@@ -213,7 +213,7 @@ func (install *installer) managedBackupAccess() error {
 	if err != nil {
 		return err
 	}
-	exists, err := updateExists(install.managedPreviousPath())
+	exists, err := pathExists(install.managedPreviousPath())
 	if err != nil {
 		return err
 	}
@@ -228,7 +228,7 @@ func (install *installer) managedBackupAccess() error {
 	if receipt == nil {
 		return nil
 	}
-	present, err := updateExists(install.app)
+	present, err := pathExists(install.app)
 	if err != nil {
 		return err
 	}
@@ -296,7 +296,7 @@ func (install *installer) managedCleanupBackup() error {
 		return err
 	}
 	defer parent.Close()
-	if exists, err := updateExists(install.managedPreviousPath()); err != nil {
+	if exists, err := pathExists(install.managedPreviousPath()); err != nil {
 		return err
 	} else if exists {
 		if receipt.Backup == nil {

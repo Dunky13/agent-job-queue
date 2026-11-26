@@ -1,6 +1,8 @@
 package tooling
 
 import (
+	"bytes"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,7 +28,7 @@ func verificationWrite(t *testing.T, path, content string, mode os.FileMode) {
 
 func verificationSource(t *testing.T, source string) {
 	t.Helper()
-	for _, name := range []string{"README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/Go-LICENSE"} {
+	for _, name := range []string{"README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/Go-LICENSE", "licenses/Sparkle-LICENSE"} {
 		verificationWrite(t, filepath.Join(source, name), "Fixture notice\n", 0600)
 	}
 	verificationWrite(t, filepath.Join(source, "VERSION"), "1.2.3\n", 0600)
@@ -43,10 +45,34 @@ func verificationBundle(t *testing.T, app, name, identifier string) {
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>AgentQueueEmbeddedPayload</key><true/>
 <key>AgentQueueServiceManagement</key><true/>
-</dict></plist>`, name, identifier)
+<key>SUFeedURL</key><string>https://dunky13.github.io/agent-job-queue/appcast.xml</string>
+<key>SURequireSignedFeed</key><true/>
+<key>SUVerifyUpdateBeforeExtraction</key><true/>
+<key>SUPublicEDKey</key><string>%s</string>
+</dict></plist>`, name, identifier, verificationSparkleKey)
 	verificationWrite(t, filepath.Join(app, "Contents/Info.plist"), info, 0600)
 	verificationWrite(t, filepath.Join(app, "Contents/Resources/build-info.json"), verificationBuildInfo, 0600)
 	verificationWrite(t, filepath.Join(app, "Contents/MacOS", name), "Fixture native executable", 0700)
+}
+
+// verificationSparkleKey is a well-formed base64 Ed25519 public key. It is not a real key.
+var verificationSparkleKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+
+// verificationSparkle writes the trimmed framework layout build-app.sh produces.
+func verificationSparkle(t *testing.T, app string) {
+	t.Helper()
+	framework := filepath.Join(app, "Contents/Frameworks/Sparkle.framework")
+	for path, mode := range map[string]os.FileMode{
+		"Versions/B/Sparkle": 0700, "Versions/B/Autoupdate": 0700, "Versions/B/Updater.app/Contents/MacOS/Updater": 0700,
+		"Versions/B/Updater.app/Contents/Info.plist": 0600, "Versions/B/Resources/Info.plist": 0600,
+	} {
+		verificationWrite(t, filepath.Join(framework, path), "Fixture Sparkle code", mode)
+	}
+	for link, target := range sparkleLinks {
+		if err := os.Symlink(target, filepath.Join(framework, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func newVerificationFixture(t *testing.T) verificationFixture {
@@ -68,11 +94,16 @@ func newVerificationFixture(t *testing.T) verificationFixture {
 		}
 		verificationWrite(t, filepath.Join(app, "Contents/Library/LaunchAgents", filename), string(raw), 0600)
 	}
+	verificationSparkle(t, app)
 	tools := filepath.Join(root, "tools")
 	if err := os.Mkdir(tools, 0700); err != nil {
 		t.Fatal(err)
 	}
 	testTool(t, tools, "codesign", `printf 'codesign|%s\n' "$*" >> "$VERIFY_TEST_EVENTS"
+if [ "$1" = --display ]; then
+  if [ "$3" = "$VERIFY_TEST_BAD_TEAM" ]; then printf 'TeamIdentifier=OTHERTEAM\n' >&2; else printf 'TeamIdentifier=FIXTURETEAM\n' >&2; fi
+  exit 0
+fi
 [ "$1" = --verify ] && [ "$2" = --strict ] && [ "$3" = --deep ] || exit 98
 [ -z "$VERIFY_TEST_BAD_SIGNATURE" ] || [ "$4" != "$VERIFY_TEST_BAD_SIGNATURE" ] || exit 17
 `)
@@ -85,6 +116,7 @@ if [ "$3" = "$VERIFY_TEST_BAD_ARCH" ]; then printf 'arm64\n'; else printf 'x86_6
 	t.Setenv("VERIFY_TEST_EVENTS", events)
 	t.Setenv("VERIFY_TEST_BAD_SIGNATURE", "")
 	t.Setenv("VERIFY_TEST_BAD_ARCH", "")
+	t.Setenv("VERIFY_TEST_BAD_TEAM", "")
 	return verificationFixture{root: root, app: app, source: source, events: events}
 }
 

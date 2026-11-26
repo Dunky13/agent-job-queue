@@ -34,7 +34,7 @@ func TestInstallerAutomaticRepairBacksUpCustomCallbackAndInstalls(t *testing.T) 
 	if !bytes.Equal(original, integrationTestRead(t, backup)) {
 		t.Fatal("automatic migration must preserve the complete original configuration")
 	}
-	if _, err := updateInstalled(f.installer.root, f.installer.app); err != nil {
+	if _, err := installedVersionReport(f.installer.root, f.installer.app); err != nil {
 		t.Fatal("automatic migration did not finish installation", err)
 	}
 }
@@ -89,7 +89,7 @@ func TestInstallerAutomaticLegacyOptionsCannotBypassInstallationOwnership(t *tes
 	m := managedTestFixture(t)
 	m.legacy(t)
 	filename := filepath.Join(m.installer.launch, "io.went.agent-resources.plist")
-	definition, err := updatePlist(filename)
+	definition, err := readBundlePlist(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -611,7 +611,7 @@ func TestInstallerAutomaticSetupStopsForCustomizedLegacyServiceOptions(t *testin
 	m := managedTestFixture(t)
 	m.legacy(t)
 	filename := filepath.Join(m.installer.launch, "io.went.agent-resources.plist")
-	definition, err := updatePlist(filename)
+	definition, err := readBundlePlist(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -633,7 +633,7 @@ func TestInstallerAutomaticSetupReviewsCustomizedServiceBesideMissingDefinition(
 	m := managedTestFixture(t)
 	m.legacy(t)
 	filename := filepath.Join(m.installer.launch, "io.went.agent-resources.plist")
-	definition, err := updatePlist(filename)
+	definition, err := readBundlePlist(filename)
 	if err != nil {
 		t.Fatal(err)
 	}

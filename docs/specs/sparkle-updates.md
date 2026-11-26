@@ -63,11 +63,11 @@ This work ships as stacked pull requests, merged in this order:
   - It is not running in preview mode.
 - The **About and updates** window keeps the version display and gets a **Check for Updates…** button bound to `canCheckForUpdates`. Untracked builds show why updates are unavailable and link to the releases page.
 - An `SPUUpdaterDelegate` refuses checks and installs (`updater(_:mayPerform:)` throws) while the incomplete-installation marker exists. Reuse the existing marker check.
-- Drain before installing. Run the drain in `updater(_:willInstallUpdateOnQuit:immediateInstallationBlock:)` and in `updater(_:shouldPostponeRelaunchForUpdate:untilInvokingBlock:)`:
-  - The app runs the bundled `agent-heavy drain` with the default bounded expiry, then calls the install block.
+- Drain before installing, on the user-initiated relaunch path only (`updater(_:shouldPostponeRelaunchForUpdate:untilInvokingBlock:)`). `updater(_:willInstallUpdateOnQuit:immediateInstallationBlock:)` returns false and never calls its block, so Sparkle installs on a real quit and never restarts the app mid-session (owner decision):
+  - The app runs the bundled `agent-heavy drain --for 4h`, reads back the resulting `queue.drainUntil` from `status --json`, and writes a private marker (0600 in a 0700 directory, never following links) holding that exact `drainUntil` and whether the queue was already paused. Then it calls the install block.
   - If the drain fails, it logs the failure and still proceeds, because the drain only protects callers.
-  - After relaunch, once setup reports the queue up, setup runs `agent-heavy undrain` only when a marker file written by this flow exists. It never removes a drain that an operator set.
-- `applicationShouldTerminate` already stops setup and helpers and then replies. Verify that Sparkle's install-on-quit and relaunch complete through it, and that nothing returns `.terminateCancel` during an update.
+  - After relaunch, once setup reports the queue up, the app parses the marker strictly, consumes it, and runs `agent-heavy undrain` only when the live `drainUntil` still equals the recorded one. If the queue was paused before the flow, it runs `undrain --keep-paused`, which ends only the drain. It never removes a drain that an operator set, extended or replaced, and a marker that lapsed with its drain is dropped without any command.
+- `applicationShouldTerminate` already stops setup and helpers and then replies. Verify that Sparkle's install on a real quit and relaunch complete through it, and that nothing returns `.terminateCancel` during an update.
 
 ### Deletions
 

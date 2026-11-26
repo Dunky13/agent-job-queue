@@ -19,7 +19,7 @@ func missingServiceFixture(t *testing.T) (*installFixture, map[string]string) {
 	outputs := map[string]string{}
 	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
 		p := filepath.Join(f.installer.launch, label+".plist")
-		definition, err := updatePlist(p)
+		definition, err := readBundlePlist(p)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +72,7 @@ func TestInstallerMissingServiceDefinitionsRecovery(t *testing.T) {
 	}
 	for label := range outputs {
 		p := filepath.Join(f.installer.launch, label+".plist")
-		definition, err := updatePlist(p)
+		definition, err := readBundlePlist(p)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -197,7 +197,7 @@ func TestInstallerMissingServiceDefinitionsLoadedEnvironment(t *testing.T) {
 				if err := f.installer.recover(context.Background(), installRestoreServices, nil, ""); err != nil {
 					t.Fatal(err)
 				}
-				value, err := updatePlist(filepath.Join(f.installer.launch, label+".plist"))
+				value, err := readBundlePlist(filepath.Join(f.installer.launch, label+".plist"))
 				if err != nil {
 					t.Fatal(err)
 				}

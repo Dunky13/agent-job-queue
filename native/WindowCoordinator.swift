@@ -24,6 +24,8 @@ typealias PollSleep = @MainActor (Duration) async throws -> Void
 struct QueueAppRoutes {
     let perform: @MainActor (QueueAppAction) -> Void
     let openLearning: @MainActor (String) -> Void
+    /// Opens Sparkle's install dialog for an update a background check found.
+    let installUpdate: @MainActor () -> Void
 }
 
 struct QueueWindowSpec {
@@ -75,6 +77,7 @@ enum QueueWindowKind: CaseIterable {
 @MainActor final class WindowCoordinator {
     let store: QueueStore
     // Built on first use: the update store reads the bundle's build metadata when it is created.
+    // The menu bar builds it at launch; Sparkle's updater starts only in `updateStore.start()`, after setup.
     private(set) lazy var remoteStore = RemoteAccessStore(fixtureMode: store.fixtureMode, command: command, pollSleep: pollSleep)
     private(set) lazy var integrationStore = AgentIntegrationStore(fixtureMode: store.fixtureMode, command: command)
     private(set) lazy var updateStore = QueueUpdateStore(fixtureMode: store.fixtureMode, command: command)
@@ -95,11 +98,17 @@ enum QueueWindowKind: CaseIterable {
 
     var routes: QueueAppRoutes {
         QueueAppRoutes(perform: { [weak self] in self?.perform($0) },
-                       openLearning: { [weak self] in self?.show(.learning, profileID: $0) })
+                       openLearning: { [weak self] in self?.show(.learning, profileID: $0) },
+                       installUpdate: { [weak self] in self?.installUpdate() })
     }
 
     func showMenuBar(statusItem: NSStatusItem?) {
-        menuBarController = QueueMenuBarController(store: store, statusItem: statusItem, app: routes)
+        menuBarController = QueueMenuBarController(store: store, statusItem: statusItem, updates: updateStore, app: routes)
+    }
+
+    func installUpdate() {
+        menuBarController?.closePopover()
+        updateStore.checkForUpdates()
     }
 
     func tearDown() {
@@ -155,7 +164,7 @@ enum QueueWindowKind: CaseIterable {
         // A view's Done button closes its own window.
         let close: () -> Void = { [weak self] in self?.windows[kind]?.close() }
         switch kind {
-        case .queue: return NSHostingView(rootView: QueuePanel(store: store, app: routes, fullWindow: true))
+        case .queue: return NSHostingView(rootView: QueuePanel(store: store, app: routes, fullWindow: true, updates: updateStore))
         case .learning: return NSHostingView(rootView: LearningWindow(store: learningStore, onDone: close))
         case .updates: return NSHostingView(rootView: QueueUpdatesSettings(store: updateStore, onDone: close))
         case .integration: return NSHostingView(rootView: AgentIntegrationSettings(store: integrationStore, onDone: close))

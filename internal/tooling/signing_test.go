@@ -142,6 +142,9 @@ func signingTestApp(t *testing.T, app string) {
 		verificationWrite(t, filepath.Join(app, filepath.FromSlash(path)), "fixture executable", 0700)
 	}
 	verificationWrite(t, filepath.Join(app, "Contents/Info.plist"), signingTestInfoPlist, 0600)
+	for _, path := range []string{"Versions/B/Autoupdate", "Versions/B/Sparkle", "Versions/B/Updater.app/Contents/MacOS/Updater"} {
+		verificationWrite(t, filepath.Join(app, "Contents/Frameworks/Sparkle.framework", filepath.FromSlash(path)), "fixture executable", 0700)
+	}
 	verificationWrite(t, filepath.Join(app, "Contents/Resources/payload/source/build-info.json"), "{}", 0600)
 	for _, name := range []string{"heavy", "resources", "remote"} {
 		filename := "io.went.agent-" + name + ".plist"
@@ -245,6 +248,50 @@ func TestMacOSSigningSignsBundledHelpersBeforeApp(t *testing.T) {
 		t.Fatalf("disk image did not contain the app and the Applications link: %s", record)
 	}
 	assertNotarySubmissionNames(t, record, "1.2.3")
+}
+
+func TestMacOSSigningSignsSparkleInsideOutWithHardenedRuntimeAndNoDeep(t *testing.T) {
+	f := newSigningFixture(t)
+	if output, err := f.run(t, signingProductionEnvironment(), "package", f.app, f.destination, "1.2.3"); err != nil {
+		t.Fatalf("app packaging failed: %v: %s", err, output)
+	}
+	record := f.recorded(t)
+	prefix := "codesign|--force|--sign|Developer ID Application: Fixture (" + signingTestTeam + ")|--timestamp|--options|runtime|"
+	framework := filepath.Join(f.app, "Contents/Frameworks/Sparkle.framework")
+	previous := -1
+	for _, path := range []string{
+		filepath.Join(framework, "Versions/B/Autoupdate"), filepath.Join(framework, "Versions/B/Updater.app"), framework,
+		"--identifier|io.went.agent-queue.agent-heavy|" + filepath.Join(f.app, "Contents/MacOS/agent-heavy"),
+		"--identifier|io.went.agent-queue.agent-remote|" + filepath.Join(f.app, "Contents/MacOS/agent-remote"), f.app,
+	} {
+		index := strings.Index(record, prefix+path+"\n")
+		if index <= previous {
+			t.Fatalf("code was not signed inside out at %s: %s", path, record)
+		}
+		previous = index
+	}
+	for _, line := range strings.Split(record, "\n") {
+		if strings.HasPrefix(line, "codesign|--force") && strings.Contains(line, "--deep") {
+			t.Fatalf("signing used --deep: %s", line)
+		}
+	}
+	for _, path := range []string{filepath.Join(framework, "Versions/B/Autoupdate"), filepath.Join(framework, "Versions/B/Updater.app"), framework} {
+		for _, arch := range []string{"arm64", "x86_64"} {
+			if !strings.Contains(record, "codesign|--display|--verbose=4|--architecture|"+arch+"|"+path+"\n") {
+				t.Fatalf("Sparkle signature was not inspected for %s: %s", arch, path)
+			}
+		}
+	}
+}
+
+func TestMacOSSigningRejectsAppWithoutSparkle(t *testing.T) {
+	f := newSigningFixture(t)
+	if err := os.RemoveAll(filepath.Join(f.app, "Contents/Frameworks")); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := f.run(t, signingProductionEnvironment(), "package", f.app, f.destination, "1.2.3"); err == nil || !strings.Contains(output, "Sparkle.framework") {
+		t.Fatalf("app without Sparkle was packaged: %v: %s", err, output)
+	}
 }
 
 func TestMacOSSigningRejectsPartialAppWithoutPublishing(t *testing.T) {
@@ -375,8 +422,8 @@ func TestMacOSSigningAdhocDoesNotUseProductionTools(t *testing.T) {
 			t.Fatalf("ad hoc build used %s:\n%s", forbidden, record)
 		}
 	}
-	if count := strings.Count(record, "codesign|--force|--sign|-|"); count != 3 {
-		t.Fatalf("expected three explicit ad hoc signatures, got %d:\n%s", count, record)
+	if count := strings.Count(record, "codesign|--force|--sign|-|"); count != 6 {
+		t.Fatalf("expected six explicit ad hoc signatures (three Sparkle, two helpers, the app), got %d:\n%s", count, record)
 	}
 	if _, err := os.Stat(f.destination + ".notarization"); !os.IsNotExist(err) {
 		t.Fatalf("ad hoc build created a notarization directory: %v", err)
