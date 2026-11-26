@@ -20,7 +20,7 @@ const usage = `Usage: agent-heavy <command>
   plugins list|validate|reload [--json]
   pause|resume
   drain [--for DURATION] [--wait] [--cancel-queued] [--cancel-running]
-  undrain [--force]
+  undrain [--force | --keep-paused]
   daemon
   cancel|logs|start|next|last JOB_ID
   priority JOB_ID PRIORITY
@@ -30,7 +30,6 @@ const usage = `Usage: agent-heavy <command>
   profiles list|show|edit|merge|combine|split|reset|regroup
   agents status|install|remove [--runner codex|claude] [--json]
   version [--json]
-  updates check|install
 Commands receive stdin EOF. Supply input as argv or an explicit file.
 `
 
@@ -53,8 +52,8 @@ func Main(args []string) int {
 		args = append([]string{"version"}, args[1:]...)
 	}
 	switch args[0] {
-	case "version", "updates":
-		return UpdatesMain(args)
+	case "version":
+		return VersionMain(args)
 	case "profiles":
 		return LearningMain(args[1:])
 	case "agents":
@@ -99,7 +98,7 @@ func commandHelp(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "daemon", "pause", "resume", "drain", "undrain", "execute-attempt", "status", "cancel", "logs", "cleanup", "execute", "next", "last", "priority", "limit", "start", "scheduling", "scheduler", "profiles", "agents", "version", "updates", "lane", "plugins":
+	case "daemon", "pause", "resume", "drain", "undrain", "execute-attempt", "status", "cancel", "logs", "cleanup", "execute", "next", "last", "priority", "limit", "start", "scheduling", "scheduler", "profiles", "agents", "version", "lane", "plugins":
 		for _, arg := range args[1:] {
 			if arg == "--help" || arg == "-h" {
 				return true

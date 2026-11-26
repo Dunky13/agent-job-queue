@@ -28,7 +28,7 @@ func managedBundleBuild(t *testing.T, i *installer, app, build string) BuildInfo
 	for _, filename := range []string{filepath.Join(app, "Contents/Resources/payload/source/build-info.json"), filepath.Join(app, "Contents/Resources/build-info.json")} {
 		integrationTestWrite(t, filename, mustMetadataJSON(t, identity))
 	}
-	info, err := updatePlist(filepath.Join(app, "Contents/Info.plist"))
+	info, err := readBundlePlist(filepath.Join(app, "Contents/Info.plist"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestManagedLifecycleRejectsUnmarkedLegacyCandidates(t *testing.T) {
 		t.Run(map[bool]string{false: "setup", true: "remove"}[removal], func(t *testing.T) {
 			f := installTestFixture(t)
 			i := f.installer
-			info, err := updatePlist(filepath.Join(i.app, "Contents/Info.plist"))
+			info, err := readBundlePlist(filepath.Join(i.app, "Contents/Info.plist"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -462,7 +462,7 @@ func TestManagedRemovalPreservesPueueImportAndSlotForReinstall(t *testing.T) {
 	m.legacy(t)
 	i := m.installer
 	filename := filepath.Join(i.launch, "io.went.agent-resources.plist")
-	definition, err := updatePlist(filename)
+	definition, err := readBundlePlist(filename)
 	if err != nil {
 		t.Fatal(err)
 	}

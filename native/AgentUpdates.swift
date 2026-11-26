@@ -1,6 +1,10 @@
 import AppKit
+import Combine
 import Foundation
+// Sparkle's delegate protocols are not annotated for Sendable, and it calls them on the main thread, where this code runs.
+@preconcurrency import Sparkle
 import SwiftUI
+@preconcurrency import UserNotifications
 
 struct InstalledQueueVersion: Codable, Equatable, Sendable {
     let version: String?
@@ -31,7 +35,7 @@ struct RunningQueueVersion: Equatable, Sendable {
             defer { try? input.close() }
             let data = try input.read(upToCount: 16_385) ?? Data()
             guard data.count <= 16_384 else { throw ClientError.message("Running app build metadata is too large.") }
-            let metadata = try JSONDecoder().decode(RunningBuildMetadata.self, from: data)
+            let metadata = try StrictJSON.decode(RunningBuildMetadata.self, from: data, allowedKeys: RunningBuildMetadata.keys)
             guard metadata.schemaVersion == 1, metadata.repository == "Dunky13/agent-job-queue",
                   metadata.version == result.version,
                   String(metadata.build ?? 0) == result.bundleBuild,
@@ -46,6 +50,7 @@ struct RunningQueueVersion: Equatable, Sendable {
 }
 
 private struct RunningBuildMetadata: Decodable {
+    static let keys: Set<String> = ["schemaVersion", "repository", "version", "commit", "build"]
     let schemaVersion: Int
     let repository: String
     let version: String
@@ -53,163 +58,403 @@ private struct RunningBuildMetadata: Decodable {
     let build: Int?
 }
 
-struct QueueRelease: Codable, Equatable, Sendable {
-    let version: String
-    let build: Int
-    let commit: String
-    let tag: String
-    let url: String
-    var releaseURL: URL? {
-        guard let components = URLComponents(string: url), components.scheme == "https",
-              components.host == "github.com", components.user == nil, components.password == nil,
-              components.port == nil, components.path.hasPrefix("/Dunky13/agent-job-queue/releases/") else { return nil }
-        return components.url
+/// Decides when Sparkle may act, apart from Sparkle itself.
+enum QueueUpdatePolicy {
+    static let releasesPage = URL(string: "https://github.com/Dunky13/agent-job-queue/releases")!
+
+    /// nil means this running app may check for and install updates. Only published
+    /// builds update: a local, pull-request, test-hook or preview build never does.
+    static func unavailableReason(running: RunningQueueVersion, fixtureMode: Bool, testHooks: Bool) -> String? {
+        if testHooks { return "This is a test build, which never checks for updates." }
+        if fixtureMode { return "Preview mode never checks for updates." }
+        if let error = running.metadataError { return error }
+        if running.publishedBuild == nil { return "This is an untracked build. Only published builds check for updates." }
+        return nil
+    }
+
+    /// An incomplete installation must finish setup before any update starts.
+    static func requireCompleteInstallation(incomplete: Bool) throws {
+        if incomplete {
+            throw NSError(domain: "io.went.agent-queue.updates", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "Agent Queue is finishing an incomplete installation. Updates resume once setup completes."])
+        }
+    }
+
+    static var isTestHookBuild: Bool {
+        #if AGENT_QUEUE_TEST_HOOKS
+        true
+        #else
+        false
+        #endif
     }
 }
 
-enum QueueUpdateComparison: String, Codable, Sendable {
-    case available, current, newer, untracked, unavailable
+/// What the update flow recorded about the drain it started.
+struct QueueUpdateDrainRecord: Codable, Equatable, Sendable {
+    /// The live drain's exact expiry, as the controller reported it.
+    let drainUntil: String
+    /// The queue was already paused before the flow drained, so releasing must not resume it.
+    let wasPaused: Bool
 }
 
-struct QueueUpdateCheck: Codable, Sendable {
-    let installed: InstalledQueueVersion
-    let latest: QueueRelease?
-    let comparison: QueueUpdateComparison
-    let canDownload: Bool
-    let message: String
+/// Decodes JSON that may hold only the listed top-level keys, each once. Codable and
+/// JSONSerialization both drop a repeated key silently, so the keys are read from the text.
+enum StrictJSON {
+    static func decode<T: Decodable>(_ type: T.Type, from data: Data, allowedKeys: Set<String>) throws -> T {
+        guard let keys = topLevelKeys(data), Set(keys).count == keys.count, Set(keys).isSubset(of: allowedKeys) else {
+            throw ClientError.message("JSON has unknown or duplicate keys.")
+        }
+        return try JSONDecoder().decode(type, from: data)
+    }
+
+    private static func topLevelKeys(_ data: Data) -> [String]? {
+        let bytes = [UInt8](data)
+        var keys: [String] = [], depth = 0, index = 0
+        while index < bytes.count {
+            switch bytes[index] {
+            case UInt8(ascii: "{"), UInt8(ascii: "["): depth += 1
+            case UInt8(ascii: "}"), UInt8(ascii: "]"): depth -= 1
+            case UInt8(ascii: "\""):
+                var end = index + 1
+                while end < bytes.count, bytes[end] != UInt8(ascii: "\"") { end += bytes[end] == UInt8(ascii: "\\") ? 2 : 1 }
+                guard end < bytes.count else { return nil }
+                var after = end + 1
+                while after < bytes.count, [0x20, 0x09, 0x0a, 0x0d].contains(bytes[after]) { after += 1 }
+                if depth == 1, after < bytes.count, bytes[after] == UInt8(ascii: ":") {
+                    guard let key = try? JSONDecoder().decode(String.self, from: Data(bytes[index...end])) else { return nil }
+                    keys.append(key)
+                }
+                index = end
+            default: break
+            }
+            index += 1
+        }
+        return depth == 0 ? keys : nil
+    }
 }
 
-struct QueueUpdateDownload: Codable, Sendable {
-    let downloaded: Bool
-    let build: Int
-    let app: String
-    let message: String
+/// Closes queue intake for a bounded time before an update restarts the app, so running
+/// callers survive. The marker file binds a drain to this flow: it holds the drain's exact
+/// expiry, and a drain whose expiry differs (an operator's own, or one they extended) is
+/// never released. The marker is private to the account and lives only as long as the drain.
+struct QueueUpdateDrain: Sendable {
+    private struct Probe: Decodable {
+        struct Queue: Decodable { let drainUntil: String?; let status: String }
+        let queue: Queue
+    }
+
+    let marker: URL
+    let command: @Sendable (QueueClient.Command) async throws -> Data
+    var now: @Sendable () -> Date = { Date() }
+
+    /// The recorded drain while it can still be live. A missing, unreadable, foreign or lapsed marker is none.
+    var record: QueueUpdateDrainRecord? {
+        guard let record = Self.read(marker), let expiry = Self.date(record.drainUntil), expiry > now() else { return nil }
+        return record
+    }
+
+    var hasMarker: Bool { record != nil }
+
+    /// Removes a marker that can no longer be released: lapsed, unreadable or not the account's own.
+    func discardIfStale() { if record == nil { try? FileManager.default.removeItem(at: marker) } }
+
+    /// A failed drain is logged and the update proceeds: the drain only protects callers.
+    func begin() async {
+        do {
+            let before = try await probe()
+            if let live = before.drainUntil {
+                // Our own drain from an earlier call keeps its marker; anything else is not ours.
+                if record?.drainUntil != live { try? FileManager.default.removeItem(at: marker) }
+                return
+            }
+            try? FileManager.default.removeItem(at: marker)
+            _ = try await command(.drain)
+            guard let until = try await probe().drainUntil else { throw ClientError.message("The drain did not take effect.") }
+            try Self.write(QueueUpdateDrainRecord(drainUntil: until, wasPaused: before.status != "running"), to: marker)
+        } catch {
+            NSLog("Agent Queue update drain failed, continuing: %@", error.localizedDescription)
+        }
+    }
+
+    /// One attempt per relaunch: the marker goes either way, and an unreleased drain expires on its own.
+    func release() async {
+        let ours = record
+        try? FileManager.default.removeItem(at: marker)
+        guard let ours else { return }
+        do {
+            guard try await probe().drainUntil == ours.drainUntil else { return }
+            _ = try await command(ours.wasPaused ? .undrainKeepPaused : .undrain)
+        } catch { NSLog("Agent Queue could not release its update drain; it expires on its own: %@", error.localizedDescription) }
+    }
+
+    // Only a queue known to be running is resumed on release; a paused or unknown status stays paused.
+    private func probe() async throws -> (drainUntil: String?, status: String) {
+        let queue = try JSONDecoder().decode(Probe.self, from: try await command(.status)).queue
+        return (queue.drainUntil, queue.status)
+    }
+
+    private static func date(_ text: String) -> Date? {
+        let plain = ISO8601DateFormatter()
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return plain.date(from: text) ?? fractional.date(from: text)
+    }
+
+    /// The marker is the account's own regular file, readable by nobody else, inside the account's own directory.
+    private static func privateDirectory(_ directory: URL, create: Bool) -> Bool {
+        if create { try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
+        var value = stat()
+        return lstat(directory.path, &value) == 0 && value.st_mode & S_IFMT == S_IFDIR && value.st_uid == getuid() && value.st_mode & 0o077 == 0
+    }
+
+    static func write(_ record: QueueUpdateDrainRecord, to marker: URL) throws {
+        guard privateDirectory(marker.deletingLastPathComponent(), create: true) else {
+            throw ClientError.message("The update drain directory is not private to this account.")
+        }
+        unlink(marker.path)
+        let descriptor = open(marker.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard descriptor >= 0 else { throw ClientError.message("Could not create the update drain marker.") }
+        defer { close(descriptor) }
+        let data = try JSONEncoder().encode(record)
+        guard data.withUnsafeBytes({ Darwin.write(descriptor, $0.baseAddress, data.count) }) == data.count else {
+            throw ClientError.message("Could not write the update drain marker.")
+        }
+    }
+
+    static func read(_ marker: URL) -> QueueUpdateDrainRecord? {
+        guard privateDirectory(marker.deletingLastPathComponent(), create: false) else { return nil }
+        let descriptor = open(marker.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+        var value = stat()
+        guard fstat(descriptor, &value) == 0, value.st_mode & S_IFMT == S_IFREG, value.st_uid == getuid(),
+              value.st_mode & 0o077 == 0, value.st_size > 0, value.st_size <= 4096 else { return nil }
+        let data = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false).readData(ofLength: 4096)
+        return try? StrictJSON.decode(QueueUpdateDrainRecord.self, from: data, allowedKeys: ["drainUntil", "wasPaused"])
+    }
+}
+
+@MainActor
+final class QueueUpdaterDelegate: NSObject, SPUUpdaterDelegate {
+    private let drain: QueueUpdateDrain
+    private let installationIncomplete: @MainActor () -> Bool
+
+    init(drain: QueueUpdateDrain, installationIncomplete: @escaping @MainActor () -> Bool) {
+        self.drain = drain
+        self.installationIncomplete = installationIncomplete
+    }
+
+    func updater(_ updater: SPUUpdater, mayPerform updateCheck: SPUUpdateCheck) throws {
+        try QueueUpdatePolicy.requireCompleteInstallation(incomplete: installationIncomplete())
+    }
+
+    func updater(_ updater: SPUUpdater, shouldPostponeRelaunchForUpdate item: SUAppcastItem,
+                 untilInvokingBlock installHandler: @escaping () -> Void) -> Bool {
+        drainThenInstall(installHandler)
+    }
+
+    /// Declining leaves Sparkle to install on a real quit. The block would restart the app mid-session, so it is never called.
+    func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem,
+                 immediateInstallationBlock immediateInstallHandler: @escaping () -> Void) -> Bool {
+        false
+    }
+
+    private func drainThenInstall(_ install: @escaping () -> Void) -> Bool {
+        let drain = drain
+        Task { @MainActor in
+            await drain.begin()
+            install()
+        }
+        return true
+    }
+}
+
+/// Agent Queue is a menu-bar app, so Sparkle would open a scheduled update's window where it can sit unseen behind
+/// other apps. Sparkle shows its window itself only in immediate focus (the app launched recently or the Mac was idle);
+/// otherwise this reports the waiting version, and nil once the user has seen it or the update session ends.
+@MainActor
+final class QueueUpdateAnnouncer: NSObject, @preconcurrency SPUStandardUserDriverDelegate {
+    var changed: @MainActor (String?) -> Void = { _ in }
+
+    var supportsGentleScheduledUpdateReminders: Bool { true }
+
+    func standardUserDriverShouldHandleShowingScheduledUpdate(_ update: SUAppcastItem, andInImmediateFocus immediateFocus: Bool) -> Bool {
+        immediateFocus
+    }
+
+    func standardUserDriverWillHandleShowingUpdate(_ handleShowingUpdate: Bool, forUpdate update: SUAppcastItem, state: SPUUserUpdateState) {
+        if !handleShowingUpdate { changed(update.displayVersionString) }
+    }
+
+    func standardUserDriverDidReceiveUserAttention(forUpdate update: SUAppcastItem) { changed(nil) }
+
+    func standardUserDriverWillFinishUpdateSession() { changed(nil) }
+}
+
+/// Posts the one update notification. Clicking it opens Sparkle's update window.
+@MainActor
+final class QueueUpdateNotifier: NSObject, @preconcurrency UNUserNotificationCenterDelegate {
+    nonisolated static let identifier = "agent-queue-update"
+    private let open: @MainActor () -> Void
+    private var posted = false
+
+    init(open: @escaping @MainActor () -> Void) { self.open = open }
+
+    /// Called at launch of a build that updates, so a click on a notification left from an earlier run still opens
+    /// Sparkle, and a notification for an update that may be gone is removed.
+    func adopt() {
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.removeDeliveredNotifications(withIdentifiers: [Self.identifier])
+    }
+
+    func post(version: String) {
+        UNUserNotificationCenter.current().delegate = self
+        posted = true
+        Task {
+            let granted = (try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert])) ?? false
+            if granted { deliver(version: version) }
+        }
+    }
+
+    // The permission prompt can still be open when the update is withdrawn; post only if it is still wanted.
+    private func deliver(version: String) {
+        guard posted else { return }
+        let center = UNUserNotificationCenter.current()
+        let content = UNMutableNotificationContent()
+        content.title = "Agent Queue \(version) is available"
+        content.body = "Click to install it, or choose Install Update in the menu bar."
+        center.add(UNNotificationRequest(identifier: Self.identifier, content: content, trigger: nil))
+    }
+
+    func withdraw() {
+        guard posted else { return }
+        posted = false
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [Self.identifier])
+        center.removeDeliveredNotifications(withIdentifiers: [Self.identifier])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
+        guard response.notification.request.identifier == Self.identifier else { return }
+        open()
+    }
 }
 
 @MainActor
 final class QueueUpdateStore: ObservableObject {
-    enum Operation { case version, checking, downloading }
     @Published private(set) var installed: InstalledQueueVersion?
-    @Published private(set) var check: QueueUpdateCheck?
-    @Published private(set) var operation: Operation?
+    @Published private(set) var isReadingVersion = false
     @Published private(set) var error: String?
-    @Published private(set) var notice: String?
-    @Published private(set) var updateDownloaded = false
+    @Published private(set) var canCheckForUpdates = false
+    /// A version a scheduled check found while Agent Queue was not in front, until the user turns to it.
+    @Published private(set) var availableUpdate: String?
     let running: RunningQueueVersion
     let fixtureMode: Bool
+    /// Why this build never updates, or nil when it does.
+    let unavailableReason: String?
     private let command: @Sendable (QueueClient.Command) async throws -> Data
+    private let drain: QueueUpdateDrain
+    private let controller: SPUStandardUpdaterController?
+    private let updaterDelegate: QueueUpdaterDelegate?
+    private let announcer: QueueUpdateAnnouncer?
+    private lazy var notifier = QueueUpdateNotifier { [weak self] in self?.checkForUpdates() }
 
     init(fixtureMode: Bool = false, running: RunningQueueVersion = .current(),
+         testHooks: Bool = QueueUpdatePolicy.isTestHookBuild,
+         environment: @escaping @Sendable () -> QueueBootstrapEnvironment = { .current() },
          command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
              try await QueueClient.run($0)
          }) {
         self.fixtureMode = fixtureMode
-        self.running = fixtureMode ? RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100) : running
+        let running = fixtureMode ? RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100) : running
+        self.running = running
         self.command = command
+        let drain = QueueUpdateDrain(marker: environment().updateDrainMarker, command: command)
+        self.drain = drain
+        unavailableReason = QueueUpdatePolicy.unavailableReason(running: running, fixtureMode: fixtureMode, testHooks: testHooks)
+        if unavailableReason == nil {
+            let delegate = QueueUpdaterDelegate(drain: drain, installationIncomplete: { environment().installIncomplete })
+            let announcer = QueueUpdateAnnouncer()
+            let controller = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: delegate, userDriverDelegate: announcer)
+            updaterDelegate = delegate
+            self.announcer = announcer
+            self.controller = controller
+        } else {
+            updaterDelegate = nil
+            announcer = nil
+            controller = nil
+        }
+        announcer?.changed = { [weak self] version in self?.announce(version) }
+        controller?.updater.publisher(for: \.canCheckForUpdates).receive(on: DispatchQueue.main).assign(to: &$canCheckForUpdates)
         #if AGENT_QUEUE_TEST_HOOKS
         if fixtureMode {
-            let preview = InstalledQueueVersion(version: "1.0.0", build: 100, bundleBuild: "100", commit: nil,
+            installed = InstalledQueueVersion(version: "1.0.0", build: 100, bundleBuild: "100", commit: nil,
                 tracked: true, displayVersion: "1.0.0 (build 100)")
-            installed = preview
-            check = QueueUpdateCheck(installed: preview,
-                latest: QueueRelease(version: "1.0.1", build: 101, commit: String(repeating: "a", count: 40),
-                    tag: "build-101", url: "https://github.com/Dunky13/agent-job-queue/releases/tag/build-101"),
-                comparison: .available, canDownload: true, message: "Version 1.0.1 (build 101) is available.")
         }
         #endif
     }
 
-    var isBusy: Bool { operation != nil }
-    var canDownload: Bool {
-        guard !fixtureMode, !isBusy, !updateDownloaded, let check, check.canDownload,
-              check.comparison == .available || check.comparison == .untracked,
-              running.metadataError == nil,
-              let release = check.latest, release.releaseURL != nil else { return false }
-        if let runningBuild = running.publishedBuild, release.build <= runningBuild { return false }
-        if check.installed.tracked {
-            guard let installedBuild = check.installed.build, release.build > installedBuild else { return false }
-        }
-        return true
-    }
-    var isReplacement: Bool { check?.installed.tracked == false || running.publishedBuild == nil }
-    var downloadButtonLabel: String {
-        if updateDownloaded { return "Update downloaded" }
-        return isReplacement ? "Download published build…" : "Download update"
-    }
-    var compatibilityMessage: String? {
-        if let error = running.metadataError { return error }
-        guard let release = check?.latest, check?.canDownload == true else { return nil }
-        guard let runningBuild = running.publishedBuild else {
-            return check?.installed.tracked == false ? nil : "The running app has no published build number. Choose a published release to replace it."
-        }
-        if runningBuild > release.build { return "The running app is newer than the published release. Downgrades are disabled." }
-        if runningBuild == release.build { return "The running app already has this published build." }
-        return nil
-    }
-    var progressLabel: String {
-        switch operation {
-        case .version: "Reading installed version…"
-        case .checking: "Checking for updates…"
-        case .downloading: "Downloading and verifying update…"
-        case nil: ""
-        }
+    /// Sparkle asks for consent to check automatically on its first scheduled run, then checks on its own.
+    var updaterCreated: Bool { controller != nil }
+
+    func start() {
+        guard let controller else { return }
+        notifier.adopt()
+        controller.startUpdater()
     }
 
-    // This runs locally when the window opens. Network access requires the Check button.
+    /// Also resumes an update announced in the background: Sparkle shows it in front.
+    func checkForUpdates() {
+        guard let controller else { return }
+        NSApp.activate()
+        controller.checkForUpdates(nil)
+    }
+
+    func announce(_ version: String?) {
+        availableUpdate = version
+        // Only a build that updates announces anything; others never touch the notification centre.
+        guard controller != nil else { return }
+        if let version { notifier.post(version: version) } else { notifier.withdraw() }
+    }
+
+    /// Called once the relaunched queue is up. Releases only a drain the update flow started.
+    func releaseDrainAfterRelaunch() async {
+        guard !fixtureMode else { return }
+        await drain.release()
+    }
+
+    /// A marker for a drain that can still be live. Launches without helpers and a queue that never comes up leave it
+    /// in place on purpose: the next launch releases it, or it lapses with the drain.
+    var hasPendingDrain: Bool { !fixtureMode && drain.hasMarker }
+
+    func discardStaleDrainMarker() {
+        guard !fixtureMode else { return }
+        drain.discardIfStale()
+    }
+
+    // This runs locally when the window opens. It never contacts the network.
     func refreshInstalled() async {
-        guard !fixtureMode, !isBusy else { return }
-        operation = .version
-        defer { operation = nil }
+        guard !fixtureMode, !isReadingVersion else { return }
+        isReadingVersion = true
+        defer { isReadingVersion = false }
         do {
-            let latestInstalled = try JSONDecoder().decode(InstalledQueueVersion.self,
-                from: try await command(.version))
-            if let check, check.installed != latestInstalled { self.check = nil }
-            installed = latestInstalled
+            installed = try JSONDecoder().decode(InstalledQueueVersion.self, from: try await command(.version))
             error = nil
         } catch { self.error = "Could not read the installed controller version. \(error.localizedDescription)" }
     }
+}
 
-    @discardableResult
-    func checkForUpdates() -> Task<Void, Never>? {
-        guard !fixtureMode, !isBusy else { return nil }
-        operation = .checking
-        error = nil
-        notice = nil
-        check = nil
-        updateDownloaded = false
-        return Task {
-            defer { operation = nil }
-            do {
-                let result = try JSONDecoder().decode(QueueUpdateCheck.self,
-                    from: try await command(.updatesCheck))
-                if let latest = result.latest {
-                    guard latest.build > 0, latest.releaseURL != nil else {
-                        throw ClientError.message("The update check returned an invalid release.")
-                    }
-                }
-                installed = result.installed
-                check = result
-            } catch { self.error = "Could not check for updates. \(error.localizedDescription)" }
-        }
-    }
+/// Shown in the queue panel while an update found in the background waits for the user.
+struct QueueUpdateButton: View {
+    @ObservedObject var store: QueueUpdateStore
+    let install: @MainActor () -> Void
 
-    @discardableResult
-    func downloadUpdate() -> Task<Void, Never>? {
-        guard canDownload, let release = check?.latest else { return nil }
-        operation = .downloading
-        error = nil
-        notice = nil
-        return Task {
-            defer { operation = nil }
-            do {
-                let result = try JSONDecoder().decode(QueueUpdateDownload.self,
-                    from: try await command(.updatesDownload(build: release.build)))
-                guard result.downloaded, result.build == release.build else {
-                    throw ClientError.message("The requested update was not downloaded. Check for updates before retrying.")
-                }
-                updateDownloaded = true
-                notice = result.message
-            } catch { self.error = "Could not download the update. \(error.localizedDescription)" }
+    var body: some View {
+        if let version = store.availableUpdate {
+            Button("Install Update \(version)…", systemImage: "arrow.down.circle", action: install)
+                .buttonStyle(.borderless).foregroundStyle(Color.accentColor)
+                .accessibilityIdentifier("agent-queue-install-update")
         }
     }
 }
@@ -236,53 +481,31 @@ struct QueueUpdatesSettings: View {
                     VStack(alignment: .leading, spacing: 5) {
                         versionRow("Installed controller", value: store.installed?.displayVersion ?? "Not yet read")
                         if let installed = store.installed, !installed.tracked {
-                            Text("This installation has no published build number. Choose a published release to replace it.")
+                            Text("This installation has no published build number.")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     }
-                    if let check = store.check {
+                    if let reason = store.unavailableReason {
                         VStack(alignment: .leading, spacing: 8) {
-                            if let release = check.latest {
-                                versionRow("Latest release", value: "\(release.version) · build \(release.build)")
-                                if let url = release.releaseURL {
-                                    Link("Release notes", destination: url).disabled(store.fixtureMode)
-                                }
-                            }
-                            Label(check.message, systemImage: check.comparison == .available ? "arrow.down.circle" : "info.circle")
-                                .font(.callout).textSelection(.enabled)
+                            Label(reason, systemImage: "info.circle").font(.callout)
+                            Link("Open the releases page", destination: QueueUpdatePolicy.releasesPage).disabled(store.fixtureMode)
                         }
                     } else {
-                        Text("Check for updates to contact GitHub for the latest published release.")
-                            .font(.callout).foregroundStyle(.secondary)
+                        Text("Agent Queue checks for updates automatically once you allow it. An update is verified, installed in place and the app relaunches. Jobs still running keep running, and new queued calls wait for a bounded time first.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
-                    if let message = store.compatibilityMessage {
-                        Label(message, systemImage: store.running.metadataError == nil ? "info.circle" : "exclamationmark.triangle")
-                            .font(.callout).foregroundStyle(store.running.metadataError == nil ? Color.secondary : Color.orange)
-                    }
-                    Text("Updates download a verified copy of the new app into your Downloads folder and show it in Finder. Quit Agent Queue, drag the new copy into Applications and choose Replace. Opening it finishes the update. Jobs still running when you quit keep running, and the queue reopens paused.")
-                        .font(.caption).foregroundStyle(.secondary)
                     if let error = store.error {
                         Label(error, systemImage: "exclamationmark.triangle").font(.callout)
                             .foregroundStyle(.orange).textSelection(.enabled)
                     }
-                    if let notice = store.notice {
-                        Label(notice, systemImage: "checkmark.circle").font(.callout)
-                            .foregroundStyle(.green).textSelection(.enabled)
-                    }
                 }.frame(maxWidth: .infinity, alignment: .leading).padding(22)
             }
             Divider()
-            VStack(alignment: .leading, spacing: 12) {
-                if store.isBusy {
-                    HStack { ProgressView().controlSize(.small); Text(store.progressLabel).font(.caption) }
-                }
-                HStack {
-                    Button("Done", action: onDone)
-                    Spacer()
-                    Button("Check for updates") { store.checkForUpdates() }.disabled(store.fixtureMode || store.isBusy)
-                    Button(store.downloadButtonLabel) { store.downloadUpdate() }
-                        .buttonStyle(.borderedProminent).disabled(!store.canDownload)
-                }
+            HStack {
+                Button("Done", action: onDone)
+                Spacer()
+                Button("Check for Updates…") { store.checkForUpdates() }
+                    .buttonStyle(.borderedProminent).disabled(!store.canCheckForUpdates)
             }.padding(18)
         }.background(Color(nsColor: .windowBackgroundColor))
             .task { await store.refreshInstalled() }

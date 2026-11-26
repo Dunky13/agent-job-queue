@@ -90,7 +90,7 @@ func installBaseFixture(t *testing.T) *installFixture {
 			case "print":
 				label := filepath.Base(args[2])
 				if f.loaded[label] {
-					definition, err := updatePlist(filepath.Join(install.launch, label+".plist"))
+					definition, err := readBundlePlist(filepath.Join(install.launch, label+".plist"))
 					if err != nil {
 						return []byte("unowned service"), nil
 					}
@@ -158,7 +158,7 @@ func installCopyTree(source, destination string) error {
 		if err != nil {
 			return err
 		}
-		raw, err := installReadPayload(source, filename, updateMaxArchive)
+		raw, err := installReadPayload(source, filename, maxArchiveBytes)
 		if err != nil {
 			return err
 		}
@@ -294,7 +294,7 @@ func TestInstallerFreshPythonFreeAndPrivate(t *testing.T) {
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
 	}
-	installed, err := updateInstalled(install.root, install.app)
+	installed, err := installedVersionReport(install.root, install.app)
 	if err != nil || installed["build"] != 123 {
 		t.Fatalf("installed identity %v %v", installed, err)
 	}
@@ -391,7 +391,7 @@ func TestInstallerEnabledRemoteMigratesBeforeCompletionAndRetainsFailureMarker(t
 	if !bytes.Equal(previous, integrationTestRead(t, filepath.Join(install.root, "build-info.json"))) {
 		t.Fatal("failed migration advanced completed identity")
 	}
-	if _, err := updateInstalled(install.root, install.app); err == nil || !strings.Contains(err.Error(), "incomplete") {
+	if _, err := installedVersionReport(install.root, install.app); err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("failed migration lost retry marker: %v", err)
 	}
 	failMigration = false
@@ -401,7 +401,7 @@ func TestInstallerEnabledRemoteMigratesBeforeCompletionAndRetainsFailureMarker(t
 	if migrations != 2 {
 		t.Fatalf("migration was not retried: %d", migrations)
 	}
-	installed, err := updateInstalled(install.root, install.app)
+	installed, err := installedVersionReport(install.root, install.app)
 	if err != nil || installed["build"] != 124 {
 		t.Fatalf("migration retry did not complete: %v %v", installed, err)
 	}
@@ -485,7 +485,7 @@ func TestInstallerDisabledRemoteReconcilesStaleOwnedServicesBeforeCompletion(t *
 			if err := f.run(t); err == nil || !strings.Contains(err.Error(), "Managed phone access migration is incomplete") {
 				t.Fatalf("stale service was reported retired: %v", err)
 			}
-			if _, err := updateInstalled(install.root, install.app); err == nil || !strings.Contains(err.Error(), "incomplete") {
+			if _, err := installedVersionReport(install.root, install.app); err == nil || !strings.Contains(err.Error(), "incomplete") {
 				t.Fatalf("failed stale cleanup lost retry marker: %v", err)
 			}
 			failCleanup = false
@@ -642,7 +642,7 @@ func TestInstallerStandardCleanupCallbackSpellings(t *testing.T) {
 				if err := f.run(t); err != nil {
 					t.Fatalf("standard callback %q rejected: %v", callback, err)
 				}
-				if _, err := updateInstalled(install.root, install.app); err != nil {
+				if _, err := installedVersionReport(install.root, install.app); err != nil {
 					t.Fatalf("standard callback migration incomplete: %v", err)
 				}
 			})
@@ -823,7 +823,7 @@ func TestInstallerLegacyExplicitProgramMigratesQueueAndController(t *testing.T) 
 	install := f.installer
 	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
 		filename := filepath.Join(install.launch, label+".plist")
-		definition, err := updatePlist(filename)
+		definition, err := readBundlePlist(filename)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -858,7 +858,7 @@ func TestInstallerLegacyMismatchedProgramRejectsBeforeShutdown(t *testing.T) {
 			source := filepath.Join(install.root, "agent_heavy.py")
 			original := integrationTestRead(t, source)
 			filename := filepath.Join(install.launch, label+".plist")
-			definition, err := updatePlist(filename)
+			definition, err := readBundlePlist(filename)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -900,7 +900,7 @@ func TestInstallerReservedServiceEnvironmentMismatchRejectsBeforeMutation(t *tes
 						installOlderEmbedded(t, install)
 					}
 					filename := filepath.Join(install.launch, label+".plist")
-					definition, err := updatePlist(filename)
+					definition, err := readBundlePlist(filename)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -957,7 +957,7 @@ func TestInstallerConfiguredServiceSlotRemainsAuthoritative(t *testing.T) {
 			expected := Object{"HOME": install.home, "AGENT_HEAVY_STATE": install.state, "AGENT_HEAVY_CONFIG": filepath.Join(install.config, "pueue.yml"), "AGENT_HEAVY_LEGACY_SLOT": slot}
 			for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources"} {
 				filename := filepath.Join(install.launch, label+".plist")
-				definition, err := updatePlist(filename)
+				definition, err := readBundlePlist(filename)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1001,7 +1001,7 @@ func TestInstallerConflictingServiceSlotsRejectBeforeShutdown(t *testing.T) {
 	f := installTestFixture(t)
 	f.legacy(t)
 	filename := filepath.Join(f.installer.launch, "io.went.agent-resources.plist")
-	definition, err := updatePlist(filename)
+	definition, err := readBundlePlist(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1612,7 +1612,7 @@ func TestInstallMainLegacyPhoneAccessRecoveryDiagnostic(t *testing.T) {
 	if err := installCopyTree(bundle, i.app); err != nil {
 		t.Fatal(err)
 	}
-	info, err := updatePlist(filepath.Join(i.app, "Contents/Info.plist"))
+	info, err := readBundlePlist(filepath.Join(i.app, "Contents/Info.plist"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1948,14 +1948,14 @@ func TestInstallerFailureLeavesIncompleteTransactionAndRetryRecovers(t *testing.
 	if !bytes.Equal(integrationTestRead(t, filepath.Join(install.root, "build-info.json")), previous) {
 		t.Fatal("failed upgrade advanced marker")
 	}
-	if _, err := updateInstalled(install.root, install.app); err == nil || !strings.Contains(err.Error(), "incomplete") {
+	if _, err := installedVersionReport(install.root, install.app); err == nil || !strings.Contains(err.Error(), "incomplete") {
 		t.Fatalf("failed upgrade reported complete: %v", err)
 	}
 	m.nativeFailure = ""
 	if err := f.run(t); err != nil {
 		t.Fatal(err)
 	}
-	installed, err := updateInstalled(install.root, install.app)
+	installed, err := installedVersionReport(install.root, install.app)
 	if err != nil || installed["build"] != 124 {
 		t.Fatalf("retry %v %v", installed, err)
 	}

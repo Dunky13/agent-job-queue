@@ -241,6 +241,23 @@ func TestUndrainResumesBeforeItRemovesTheDrain(t *testing.T) {
 	}
 }
 
+func TestUndrainKeepPausedRemovesOnlyTheDrain(t *testing.T) {
+	g := testGate(t)
+	mustWrite(t, drainPath(g), Object{"until": time.Now().UTC().Add(time.Hour).Format(time.RFC3339)})
+	g.queueControl = func(operation string, payload Object) (Object, error) {
+		if operation != "snapshot" {
+			t.Errorf("--keep-paused must not send %s", operation)
+		}
+		return Object{"groups": Object{"default": Object{"status": "Paused", "parallel_tasks": 1}}}, nil
+	}
+	if code, err := UndrainMain(g, []string{"--keep-paused"}); code != 0 || err != nil || drainHolds(g) {
+		t.Fatalf("undrain --keep-paused: %d %v", code, err)
+	}
+	if code, err := UndrainMain(g, []string{"--keep-paused", "--force"}); code != 125 || err == nil {
+		t.Fatalf("combined flags: %d %v", code, err)
+	}
+}
+
 func TestRealDaemonDrainHoldsRunUntilUndrain(t *testing.T) {
 	f := daemonAcceptance(t)
 	f.cli("drain", "--for", "1h").wait(t, 0)

@@ -5,6 +5,8 @@ temporary=$(mktemp -d)
 trap 'rm -rf "$temporary"' EXIT
 # Every suite below links this one build of the app's code.
 export AGENT_QUEUE_TEST_LIBRARY="$temporary/library"
+# Every suite also links the pinned Sparkle framework.
+export SPARKLE_DIR=${SPARKLE_DIR:-$(bash "$root/packaging/sparkle/fetch.sh")}
 bash "$root/native/build-library.sh" "$AGENT_QUEUE_TEST_LIBRARY" "$(uname -m)" test
 zsh "$root/native/tests/run-refresh-tests.sh"
 bash "$root/native/tests/run-bootstrap-tests.sh"

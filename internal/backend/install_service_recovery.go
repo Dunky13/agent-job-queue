@@ -195,7 +195,7 @@ func (install *installer) missingServiceDefinitions(ctx context.Context) ([]inst
 			return nil, err
 		}
 		filename := filepath.Join(install.launch, label+".plist")
-		exists, err := updateExists(filename)
+		exists, err := pathExists(filename)
 		if err != nil {
 			return nil, err
 		}
@@ -203,7 +203,7 @@ func (install *installer) missingServiceDefinitions(ctx context.Context) ([]inst
 			continue
 		}
 		if exists {
-			definition, err := updatePlist(filename)
+			definition, err := readBundlePlist(filename)
 			if err != nil {
 				return nil, err
 			}
@@ -249,7 +249,7 @@ func (install *installer) restoreServiceDefinitions(ctx context.Context) (result
 	// The caller already owns install.lock and scheduling.lock. Serialize remote
 	// settings too when that subsystem exists; never create a directory in preflight.
 	remote := filepath.Join(install.state, "remote")
-	if exists, err := updateExists(remote); err != nil {
+	if exists, err := pathExists(remote); err != nil {
 		return err
 	} else if exists {
 		if err := installInspectDirectory(remote); err != nil {

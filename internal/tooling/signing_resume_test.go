@@ -268,7 +268,7 @@ func TestMacOSResumeRESTPreservesSubmissionCustodyAcrossFailures(t *testing.T) {
 				t.Fatal("REST failure or retry changed immutable signed bytes")
 			}
 			events := f.recorded(t)
-			if strings.Contains(events, "xcrun|notarytool|") || strings.Count(events, "rest-create|") > 1 || strings.Count(events, "codesign|--force|") != 3 {
+			if strings.Contains(events, "xcrun|notarytool|") || strings.Count(events, "rest-create|") > 1 || strings.Count(events, "codesign|--force|") != 6 {
 				t.Fatalf("REST path repeated signing/create or used native notarization: %s", events)
 			}
 		})
@@ -339,7 +339,7 @@ func TestMacOSResumeRESTFinishesAllStagesWithBoundReceipts(t *testing.T) {
 			t.Fatalf("expected two %s events: %s", event, events)
 		}
 	}
-	if strings.Contains(events, "xcrun|notarytool|") || strings.Count(events, "codesign|--force|") != 4 || !strings.Contains(events, "spctl|--assess|") {
+	if strings.Contains(events, "xcrun|notarytool|") || strings.Count(events, "codesign|--force|") != 7 || !strings.Contains(events, "spctl|--assess|") {
 		t.Fatalf("REST completion skipped policy or repeated signing: %s", events)
 	}
 }
@@ -720,7 +720,7 @@ func TestMacOSResumeRetainsExactArtifactsAndIDsAcrossAttempts(t *testing.T) {
 	f.command(t, []string{"GITHUB_RUN_ATTEMPT=3", "APPLE_SIGNING_IDENTITY=", "NOTARY_KEYCHAIN_PROFILE="}, "export", f.state, f.destination, "0.1.0")
 	record := f.recorded(t)
 	assertNotarySubmissionNames(t, record, "0.1.0")
-	if strings.Count(record, "xcrun|notarytool|submit|") != 2 || strings.Count(record, "codesign|--force|") != 4 {
+	if strings.Count(record, "xcrun|notarytool|submit|") != 2 || strings.Count(record, "codesign|--force|") != 7 {
 		t.Fatalf("retry signed or submitted again:\n%s", record)
 	}
 	after, err := os.ReadFile(filepath.Join(f.state, "archives/app.zip"))
@@ -987,7 +987,7 @@ func TestMacOSResumeReusesSignedBytesAndSubmissionAcrossDistributionRuns(t *test
 		t.Fatal("new distribution execution changed original signed bytes")
 	}
 	calls := f.recorded(t)
-	if strings.Count(calls, "xcrun|notarytool|submit|") != 1 || strings.Count(calls, "codesign|--force|") != 3 {
+	if strings.Count(calls, "xcrun|notarytool|submit|") != 1 || strings.Count(calls, "codesign|--force|") != 6 {
 		t.Fatalf("cross-run recovery signed or uploaded again: %s", calls)
 	}
 	f.mutate(t, "metadata.json", func(v map[string]any) {

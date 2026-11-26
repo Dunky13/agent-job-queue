@@ -26,7 +26,7 @@ func managedTestFixture(t *testing.T) *managedFixture {
 	t.Helper()
 	f := installBaseFixture(t)
 	app := f.installer.app
-	info, err := updatePlist(filepath.Join(app, "Contents/Info.plist"))
+	info, err := readBundlePlist(filepath.Join(app, "Contents/Info.plist"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,7 @@ func TestManagedFreshInstallUsesOnlyBundleHelpers(t *testing.T) {
 	if err != nil || metadata == nil || metadata.App != i.app {
 		t.Fatalf("metadata %v: %v", metadata, err)
 	}
-	app, err := updateRegisteredApp()
+	app, err := registeredAppPath()
 	if err != nil || app != i.app {
 		t.Fatalf("updater location %q: %v", app, err)
 	}
@@ -358,7 +358,7 @@ func TestManagedInvalidNativeJSONAndInstallationMetadata(t *testing.T) {
 			case "metadata":
 				integrationTestWrite(t, filepath.Join(i.root, "installation.json"), []byte(`{"schemaVersion":99,"app":"/unknown","serviceManagement":true}`))
 			case "marker":
-				info, err := updatePlist(filepath.Join(i.app, "Contents/Info.plist"))
+				info, err := readBundlePlist(filepath.Join(i.app, "Contents/Info.plist"))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -449,11 +449,11 @@ func TestManagedCustomFinderLocationIsReadBackByUpdater(t *testing.T) {
 	if err := m.run(t); err != nil {
 		t.Fatal(err)
 	}
-	app, err := updateRegisteredApp()
+	app, err := registeredAppPath()
 	if err != nil || app != i.app {
 		t.Fatal("updater lost explicit app location", app, err)
 	}
-	version, err := updateInstalled(i.root, "")
+	version, err := installedVersionReport(i.root, "")
 	if err != nil || version["build"] != 123 {
 		t.Fatal(version, err)
 	}
@@ -464,7 +464,7 @@ func TestManagedPueuePythonMigrationPreservesImportAndRetiresRuntime(t *testing.
 	m.legacy(t)
 	i := m.installer
 	filename := filepath.Join(i.launch, "io.went.agent-resources.plist")
-	definition, err := updatePlist(filename)
+	definition, err := readBundlePlist(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +499,7 @@ func TestManagedExplicitPhoneRecoveryStillRequiresDrainedQueue(t *testing.T) {
 	m.legacy(t)
 	i := m.installer
 	i.disablePhoneAccess = true
-	definition, err := updatePlist(filepath.Join(i.launch, "io.went.agent-resources.plist"))
+	definition, err := readBundlePlist(filepath.Join(i.launch, "io.went.agent-resources.plist"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +534,7 @@ func TestManagedRejectsEmbeddedExecutableCopiesAndWrongStaticArguments(t *testin
 				integrationTestWrite(t, filepath.Join(app, "Contents/Resources/payload/source/bin/agent-heavy"), []byte("duplicate"))
 			case "arguments":
 				filename := filepath.Join(app, "Contents/Library/LaunchAgents/io.went.agent-heavy.plist")
-				value, err := updatePlist(filename)
+				value, err := readBundlePlist(filename)
 				if err != nil {
 					t.Fatal(err)
 				}

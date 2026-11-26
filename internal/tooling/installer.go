@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,7 +25,7 @@ func VerifyApp(app string) error {
 	if app == "" {
 		return errors.New("App path is required")
 	}
-	if err := verifyPayloadTree(app); err != nil {
+	if err := verifyPayloadTree(app, filepath.Join(app, sparkleFramework)); err != nil {
 		return err
 	}
 	managed, err := managedApp(app)
@@ -36,6 +37,12 @@ func VerifyApp(app string) error {
 	}
 	raw, err := verifySourceLayout(filepath.Join(app, "Contents/Resources/payload/source"), app)
 	if err != nil {
+		return err
+	}
+	if err := verifySparkle(app); err != nil {
+		return err
+	}
+	if err := verifyNoLooseCode(app); err != nil {
 		return err
 	}
 	if err := verifyNativeBundle(app, "AgentQueue", "io.went.agent-queue", raw); err != nil {
@@ -69,7 +76,7 @@ func verifySourceLayout(source, app string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	for _, required := range []string{"licenses/Go-LICENSE", "LICENSE", "README.md", "THIRD-PARTY-NOTICES.md", "VERSION"} {
+	for _, required := range []string{"licenses/Go-LICENSE", "licenses/Sparkle-LICENSE", "LICENSE", "README.md", "THIRD-PARTY-NOTICES.md", "VERSION"} {
 		if err := requiredPayloadFile(filepath.Join(source, required), false); err != nil {
 			return nil, err
 		}
@@ -181,6 +188,9 @@ func verifyNativeBundle(bundle, executable, identifier string, raw []byte) error
 	if info["LSMinimumSystemVersion"] != "15.0" || info["CFBundleIdentifier"] != identifier || info["CFBundleExecutable"] != executable || info["CFBundleShortVersionString"] != identity.Version || info["CFBundleVersion"] != build {
 		return fmt.Errorf("Native bundle metadata differs from the payload: %s", executable)
 	}
+	if err := verifySparkleConfiguration(info, identity.Build != nil); err != nil {
+		return err
+	}
 	metadata, err := os.ReadFile(filepath.Join(bundle, "Contents/Resources/build-info.json"))
 	if err != nil {
 		return err
@@ -202,7 +212,8 @@ func requiredPayloadFile(path string, executable bool) error {
 	return nil
 }
 
-func verifyPayloadTree(root string) error {
+// Paths in skip are verified separately, by code that owns their layout.
+func verifyPayloadTree(root string, skip ...string) error {
 	info, err := os.Lstat(root)
 	if err != nil {
 		return err
@@ -214,7 +225,13 @@ func verifyPayloadTree(root string) error {
 		if err != nil {
 			return err
 		}
+		if slices.Contains(skip, path) {
+			return filepath.SkipDir
+		}
 		name := entry.Name()
+		if strings.HasSuffix(name, ".framework") || strings.HasSuffix(name, ".xpc") || name == "XPCServices" {
+			return fmt.Errorf("Unexpected framework or XPC service in payload: %s", path)
+		}
 		if entry.Type()&os.ModeSymlink != 0 || !entry.IsDir() && !entry.Type().IsRegular() {
 			return fmt.Errorf("Symlink or special file in payload: %s", path)
 		}

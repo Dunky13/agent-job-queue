@@ -1,6 +1,6 @@
 # Automatic installation and upgrade recovery
 
-Opening `Agent Queue.app` from `/Applications` or `~/Applications` runs setup automatically, whether the app arrived from the DMG, the ZIP, or an update download (nothing runs at install or upgrade). The app includes the queue, resource controller and HTTPS runtime; installed users need no development toolchain or separately installed Python, Pueue or Caddy executable.
+Opening `Agent Queue.app` from `/Applications` or `~/Applications` runs setup automatically, whether the app arrived from the DMG, the ZIP or a Sparkle update (nothing runs at install or upgrade). The app includes the queue, resource controller and HTTPS runtime; installed users need no development toolchain or separately installed Python, Pueue or Caddy executable.
 
 Setup runs from inside the app bundle (`agent-heavy install --app-bundle`), writes the CLI wrappers to `~/.local/bin`, migrates state, registers only the app's login item with Service Management and copies no executables out of the bundle. It also unregisters any queue, resource or phone-access launchd registrations left by older versions, including crash-looping ones that hold no process and ones still awaiting approval. It no longer registers those services or waits for daemon readiness: the menu bar app starts them afterwards (see below). A launch that finds a completed, current installation only reads installation state and checks that no registration from an older version remains; it never repeats installation or recovery. Every normal launch presents the menu bar immediately with only "Starting…", then finishes incomplete installation in the background. Setup wording and **Retry** appear only after an actual failure. It never opens a setup wizard, progress window or installation confirmation, including during upgrades, waits, failures and approval. The same status item is retained throughout and becomes the normal queue menu when setup completes.
 
@@ -25,7 +25,7 @@ Quitting the app stops its daemon without stopping independent jobs, so a normal
 - A queued job's caller ends the same way after the same budget. The job stays queued.
 - If jobs were running, the next daemon comes up paused under the unclean-restart rule above, and queued jobs run after `agent-heavy resume`. Without a drain they have no caller attached; during a drain their callers stay attached (see below).
 
-To keep callers attached, close intake first. The upgrade flow is:
+Sparkle updates do this automatically: the app runs `agent-heavy drain` before it installs and relaunches, and `agent-heavy undrain` after the queue is up, only for a drain it started itself (see [updates](updates.md)). For a manual drag upgrade, close intake first. The manual flow is:
 
 1. `agent-heavy drain` (optionally `--wait` to let the queue empty, or `--cancel-queued` and `--cancel-running` when you cannot wait).
 2. Quit Agent Queue, drag the new version over the old one and choose **Replace**, then open it.

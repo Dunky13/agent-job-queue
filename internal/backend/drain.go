@@ -379,7 +379,7 @@ func waitDrained(g *Gate) (int, error) {
 	}
 }
 
-const undrainUsage = "Usage: agent-heavy undrain [--force]"
+const undrainUsage = "Usage: agent-heavy undrain [--force | --keep-paused]"
 
 // UndrainMain reopens intake. With an active drain it resumes the queue first
 // and removes the drain only afterwards, so waiting callers are never released
@@ -387,7 +387,8 @@ const undrainUsage = "Usage: agent-heavy undrain [--force]"
 // nothing: a pause after an unclean restart needs explicit operator recovery.
 func UndrainMain(g *Gate, args []string) (int, error) {
 	force := len(args) == 1 && args[0] == "--force"
-	if len(args) > 1 || len(args) == 1 && !force {
+	keepPaused := len(args) == 1 && args[0] == "--keep-paused"
+	if len(args) > 1 || len(args) == 1 && !force && !keepPaused {
 		return 125, errors.New(undrainUsage)
 	}
 	until, draining, readErr := drainUntil(g)
@@ -419,14 +420,19 @@ func UndrainMain(g *Gate, args []string) (int, error) {
 		return 125, err
 	}
 	wasPaused := obj(obj(snapshot["groups"])["default"])["status"] == "Paused"
-	if _, err = g.QueueControl("resume", nil); err != nil {
-		return 125, fmt.Errorf("%w; the drain stays in place", err)
+	// --keep-paused ends only the drain, for a caller that must not end an operator's pause.
+	if !keepPaused {
+		if _, err = g.QueueControl("resume", nil); err != nil {
+			return 125, fmt.Errorf("%w; the drain stays in place", err)
+		}
 	}
 	if err = os.Remove(drainPath(g)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return 125, err
 	}
 	fmt.Fprintln(os.Stderr, "agent-heavy: drain removed; new run calls are accepted")
-	if wasPaused {
+	if wasPaused && keepPaused {
+		fmt.Fprintln(os.Stderr, "agent-heavy: the queue was paused and stays paused")
+	} else if wasPaused {
 		fmt.Fprintln(os.Stderr, "agent-heavy: the queue was paused and is resumed; this also ends a pause set with agent-heavy pause")
 	}
 	return 0, nil

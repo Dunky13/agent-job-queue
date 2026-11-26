@@ -287,7 +287,7 @@ func (install *installer) validateLoadedServices(ctx context.Context) error {
 		if !loaded {
 			continue
 		}
-		definition, err := updatePlist(filepath.Join(install.launch, label+".plist"))
+		definition, err := readBundlePlist(filepath.Join(install.launch, label+".plist"))
 		if err != nil {
 			return err
 		}
@@ -306,7 +306,7 @@ func (install *installer) legacyInstallation(node *yaml.Node) bool {
 	if install.embeddedDefinition() {
 		return false
 	}
-	if exists, _ := updateExists(filepath.Join(install.root, "agent_heavy.py")); exists {
+	if exists, _ := pathExists(filepath.Join(install.root, "agent_heavy.py")); exists {
 		return true
 	}
 	for _, name := range []string{"state.json", "state.json.gz"} {
@@ -319,7 +319,7 @@ func (install *installer) legacyInstallation(node *yaml.Node) bool {
 			}
 		}
 	}
-	if definition, err := updatePlist(filepath.Join(install.launch, "io.went.agent-heavy.plist")); err == nil {
+	if definition, err := readBundlePlist(filepath.Join(install.launch, "io.went.agent-heavy.plist")); err == nil {
 		if arguments, err := stringsFrom(definition["ProgramArguments"]); err == nil && len(arguments) > 0 && filepath.Base(arguments[0]) == "pueued" {
 			return true
 		}
@@ -434,10 +434,10 @@ func (install *installer) preflightLegacy(ctx context.Context, report installPre
 	}
 	var node *yaml.Node
 	configPath := filepath.Join(install.config, "pueue.yml")
-	if exists, err := updateExists(configPath); err != nil {
+	if exists, err := pathExists(configPath); err != nil {
 		report.add("configuration-invalid", "Review queue configuration", err.Error(), configPath, "reveal")
 	} else if exists {
-		raw, readErr := updateReadOwned(configPath, 4*1024*1024)
+		raw, readErr := readOwnedFile(configPath, 4*1024*1024)
 		if readErr != nil {
 			err = readErr
 		} else {
@@ -556,7 +556,7 @@ func (install *installer) preflightLegacy(ctx context.Context, report installPre
 		} else if legacy && (enabled || loaded) {
 			report.add("legacy-phone-access", "Phone access must be disabled", "Credentials, configuration and trusted certificates will be preserved. You can enable phone access in settings after setup. Disabling is allowed only after jobs and cleanup have finished.", "", "disable-phone-access")
 		} else if !legacy && enabled {
-			if exists, _ := updateExists(filepath.Join(install.state, "remote/error.json")); exists {
+			if exists, _ := pathExists(filepath.Join(install.state, "remote/error.json")); exists {
 				report.add("remote-migration", "Phone access needs attention", "Review phone service diagnostics, or disable phone access and finish upgrading. Credentials and trusted certificates will be preserved. Disabling is allowed only after jobs and cleanup have finished.", filepath.Join(install.state, "remote/error.json"), "reveal", "disable-phone-access")
 			}
 		}
@@ -622,7 +622,7 @@ func (install *installer) preflightLegacyProcesses(ctx context.Context, report *
 		} else if !servicesSafe {
 			continue
 		}
-		definition, err := updatePlist(filepath.Join(install.launch, label+".plist"))
+		definition, err := readBundlePlist(filepath.Join(install.launch, label+".plist"))
 		if err != nil {
 			continue
 		}
@@ -737,7 +737,7 @@ func (install *installer) preflightCleanupJobs(report *installPreflightReport, c
 }
 
 func (install *installer) matchQueueService(output []byte) error {
-	definition, err := updatePlist(filepath.Join(install.launch, "io.went.agent-heavy.plist"))
+	definition, err := readBundlePlist(filepath.Join(install.launch, "io.went.agent-heavy.plist"))
 	if err != nil {
 		return err
 	}
@@ -814,7 +814,7 @@ func installValidateRecoveryFiles(g *Gate, id int) error {
 		}
 	}
 	paths := []string{g.ReceiptPath(id), filepath.Join(g.Cancelled, strconv.Itoa(id)+".json"), filepath.Join(g.Slot, "agent-heavy.json"), filepath.Join(g.Slot, "agent-heavy-lease.json")}
-	if raw, err := updateReadOwned(g.ReceiptPath(id), 32*1024*1024); err == nil {
+	if raw, err := readOwnedFile(g.ReceiptPath(id), 32*1024*1024); err == nil {
 		receipt, err := decodeObject(raw)
 		if err != nil {
 			return err
@@ -826,7 +826,7 @@ func installValidateRecoveryFiles(g *Gate, id int) error {
 		return err
 	}
 	for _, path := range paths {
-		if _, err := updateReadOwned(path, 32*1024*1024); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if _, err := readOwnedFile(path, 32*1024*1024); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -917,7 +917,7 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 	}
 	configPath := filepath.Join(install.config, "pueue.yml")
 	var node *yaml.Node
-	if exists, _ := updateExists(configPath); exists {
+	if exists, _ := pathExists(configPath); exists {
 		node, err = installConfig(configPath)
 		if err != nil {
 			return err
@@ -1009,7 +1009,7 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 		if node == nil {
 			return errors.New("Missing configuration cannot be replaced with guessed defaults")
 		}
-		raw, err := updateReadOwned(configPath, 4*1024*1024)
+		raw, err := readOwnedFile(configPath, 4*1024*1024)
 		if err != nil {
 			return err
 		}
@@ -1045,7 +1045,7 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 			return errors.New("The callback cannot be repaired without reviewing the configuration structure")
 		}
 		backup := filepath.Join(install.config, "pueue.before-upgrade-"+revision+".yml")
-		if existing, err := updateReadOwned(backup, 4*1024*1024); err == nil {
+		if existing, err := readOwnedFile(backup, 4*1024*1024); err == nil {
 			if !bytes.Equal(existing, raw) {
 				return errors.New("The retained configuration backup has changed")
 			}
@@ -1065,7 +1065,7 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 				return fmt.Errorf("Original configuration backup could not be created exclusively: %w", err)
 			}
 		}
-		current, err := updateReadOwned(configPath, 4*1024*1024)
+		current, err := readOwnedFile(configPath, 4*1024*1024)
 		if err != nil {
 			return err
 		}

@@ -241,12 +241,12 @@ func (install *installer) retainManagedRuntime(ctx context.Context, attempts []r
 			}
 		}
 	}
-	previous, err := updateExists(install.managedPreviousPath())
+	previous, err := pathExists(install.managedPreviousPath())
 	if err != nil {
 		return err
 	}
 	target := install.runtimeGenerationPath(identity)
-	present, err := updateExists(target)
+	present, err := pathExists(target)
 	if err != nil {
 		return err
 	}
@@ -384,7 +384,7 @@ func (install *installer) cleanupManagedRuntimes(ctx context.Context) error {
 		if publication != nil && publication.Backup != nil && publication.Backup.equal(record.Runtime) {
 			continue // This generation is still the pending publication's backup.
 		}
-		present, err := updateExists(record.Path)
+		present, err := pathExists(record.Path)
 		if err != nil {
 			return err
 		}

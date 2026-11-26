@@ -162,7 +162,7 @@ func TestInstallerPreflightReviewsStateBesideAnInvalidBundle(t *testing.T) {
 			f.legacy(t)
 			integrationTestWrite(t, filepath.Join(i.config, "remote.json"), []byte(`{"enabled":true}`))
 			if kind == "unmarked" {
-				info, err := updatePlist(filepath.Join(i.app, "Contents/Info.plist"))
+				info, err := readBundlePlist(filepath.Join(i.app, "Contents/Info.plist"))
 				if err != nil {
 					t.Fatal(err)
 				}

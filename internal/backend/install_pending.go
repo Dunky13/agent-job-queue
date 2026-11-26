@@ -44,7 +44,7 @@ func (install *installer) managedPendingSuperseded(identity, pending BuildInfo) 
 		return false, nil
 	}
 	for _, retained := range []string{install.managedPreviousPath(), install.managedReceiptPath()} {
-		if exists, err := updateExists(retained); err != nil || exists {
+		if exists, err := pathExists(retained); err != nil || exists {
 			return false, err
 		}
 	}
