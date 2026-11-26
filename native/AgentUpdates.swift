@@ -63,10 +63,9 @@ enum QueueUpdatePolicy {
     static let releasesPage = URL(string: "https://github.com/Dunky13/agent-job-queue/releases")!
 
     /// nil means this running app may check for and install updates. Only published
-    /// builds update: a local, pull-request, test-hook or preview build never does.
-    static func unavailableReason(running: RunningQueueVersion, fixtureMode: Bool, testHooks: Bool) -> String? {
+    /// builds update: a local, pull-request or test-hook build never does.
+    static func unavailableReason(running: RunningQueueVersion, testHooks: Bool) -> String? {
         if testHooks { return "This is a test build, which never checks for updates." }
-        if fixtureMode { return "Preview mode never checks for updates." }
         if let error = running.metadataError { return error }
         if running.publishedBuild == nil { return "This is an untracked build. Only published builds check for updates." }
         return nil
@@ -350,7 +349,6 @@ final class QueueUpdateStore: ObservableObject {
     /// A version a scheduled check found while Agent Queue was not in front, until the user turns to it.
     @Published private(set) var availableUpdate: String?
     let running: RunningQueueVersion
-    let fixtureMode: Bool
     /// Why this build never updates, or nil when it does.
     let unavailableReason: String?
     private let command: @Sendable (QueueClient.Command) async throws -> Data
@@ -360,19 +358,15 @@ final class QueueUpdateStore: ObservableObject {
     private let announcer: QueueUpdateAnnouncer?
     private lazy var notifier = QueueUpdateNotifier { [weak self] in self?.checkForUpdates() }
 
-    init(fixtureMode: Bool = false, running: RunningQueueVersion = .current(),
+    init(running: RunningQueueVersion,
          testHooks: Bool = QueueUpdatePolicy.isTestHookBuild,
-         environment: @escaping @Sendable () -> QueueBootstrapEnvironment = { .current() },
-         command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
-             try await QueueClient.run($0)
-         }) {
-        self.fixtureMode = fixtureMode
-        let running = fixtureMode ? RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100) : running
+         environment: @escaping @Sendable () -> QueueBootstrapEnvironment,
+         command: @escaping @Sendable (QueueClient.Command) async throws -> Data) {
         self.running = running
         self.command = command
         let drain = QueueUpdateDrain(marker: environment().updateDrainMarker, command: command)
         self.drain = drain
-        unavailableReason = QueueUpdatePolicy.unavailableReason(running: running, fixtureMode: fixtureMode, testHooks: testHooks)
+        unavailableReason = QueueUpdatePolicy.unavailableReason(running: running, testHooks: testHooks)
         if unavailableReason == nil {
             let delegate = QueueUpdaterDelegate(drain: drain, installationIncomplete: { environment().installIncomplete })
             let announcer = QueueUpdateAnnouncer()
@@ -387,12 +381,6 @@ final class QueueUpdateStore: ObservableObject {
         }
         announcer?.changed = { [weak self] version in self?.announce(version) }
         controller?.updater.publisher(for: \.canCheckForUpdates).receive(on: DispatchQueue.main).assign(to: &$canCheckForUpdates)
-        #if AGENT_QUEUE_TEST_HOOKS
-        if fixtureMode {
-            installed = InstalledQueueVersion(version: "1.0.0", build: 100, bundleBuild: "100", commit: nil,
-                tracked: true, displayVersion: "1.0.0 (build 100)")
-        }
-        #endif
     }
 
     /// Sparkle asks for consent to check automatically on its first scheduled run, then checks on its own.
@@ -420,22 +408,20 @@ final class QueueUpdateStore: ObservableObject {
 
     /// Called once the relaunched queue is up. Releases only a drain the update flow started.
     func releaseDrainAfterRelaunch() async {
-        guard !fixtureMode else { return }
         await drain.release()
     }
 
     /// A marker for a drain that can still be live. Launches without helpers and a queue that never comes up leave it
     /// in place on purpose: the next launch releases it, or it lapses with the drain.
-    var hasPendingDrain: Bool { !fixtureMode && drain.hasMarker }
+    var hasPendingDrain: Bool { drain.hasMarker }
 
     func discardStaleDrainMarker() {
-        guard !fixtureMode else { return }
         drain.discardIfStale()
     }
 
     // This runs locally when the window opens. It never contacts the network.
     func refreshInstalled() async {
-        guard !fixtureMode, !isReadingVersion else { return }
+        guard !isReadingVersion else { return }
         isReadingVersion = true
         defer { isReadingVersion = false }
         do {
@@ -461,6 +447,7 @@ struct QueueUpdateButton: View {
 
 struct QueueUpdatesSettings: View {
     @ObservedObject var store: QueueUpdateStore
+    let desktop: QueueDesktop
     var onDone: () -> Void
 
     var body: some View {
@@ -472,7 +459,6 @@ struct QueueUpdatesSettings: View {
                     Text("About and updates").font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if store.fixtureMode { Text("PREVIEW").font(.caption2).foregroundStyle(.secondary) }
             }.padding(22)
             Divider()
             ScrollView {
@@ -488,7 +474,8 @@ struct QueueUpdatesSettings: View {
                     if let reason = store.unavailableReason {
                         VStack(alignment: .leading, spacing: 8) {
                             Label(reason, systemImage: "info.circle").font(.callout)
-                            Link("Open the releases page", destination: QueueUpdatePolicy.releasesPage).disabled(store.fixtureMode)
+                            Link("Open the releases page", destination: QueueUpdatePolicy.releasesPage)
+                                .environment(\.openURL, OpenURLAction { desktop(.open($0)); return .handled })
                         }
                     } else {
                         Text("Agent Queue checks for updates automatically once you allow it. An update is verified, installed in place and the app relaunches. Jobs still running keep running, and new queued calls wait for a bounded time first.")

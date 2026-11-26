@@ -37,8 +37,8 @@ private struct ResetInput: Decodable { let revision: Int; let confirm: Bool }
 
 private func testDetail(id: String = sourceID, revision: Int = 7, label: String = "Web tests",
                         memory: Int64? = 2_147_483_648, cpu: Double? = nil,
-                        prediction: ResourcePrediction? = LearningStore.previewDetail().prediction) -> LearningDetail {
-    let preview = LearningStore.previewDetail()
+                        prediction: ResourcePrediction? = QueueFixture.previewDetail().prediction) -> LearningDetail {
+    let preview = QueueFixture.previewDetail()
     let members = [LearningMember(family: familyID, label: "Web tests", project: "Demo", executable: "npm"),
         LearningMember(family: String(repeating: "2", count: 64), label: "Related tests", project: "Demo", executable: "npm")]
     return LearningDetail(revision: revision,
@@ -170,8 +170,8 @@ struct LearningTests {
         }
         try check(!opaque.hasAlpha && background.alphaComponent == 1 && background.greenComponent > 0.9,
             "Native snapshot rendering includes the window background and emits an opaque PNG")
-        try check(LearningStore.previewDetail().prediction?.source == "family" &&
-            LearningStore.previewDetail().prediction?.confidence == "low" && LearningStore.previewDetail().prediction?.samples == 0,
+        try check(QueueFixture.previewDetail().prediction?.source == "family" &&
+            QueueFixture.previewDetail().prediction?.confidence == "low" && QueueFixture.previewDetail().prediction?.samples == 0,
             "Learning preview uses a conservative group envelope without invented exact-variant confidence")
         let unusual = testDetail(memory: 1_125_899_906_842_623, cpu: 0.123456789012345)
         let unusualData = try JSONEncoder().encode(unusual)
@@ -576,24 +576,48 @@ struct LearningTests {
         try check(store.detail?.profile.id == sourceID && store.error == nil,
             "Reload recovers a failed detail read without inventing a cached profile")
 
-        let beforePreview = await fixture.calls
-        let preview = LearningStore(fixtureMode: true, command: { try await fixture.load($0.arguments, $0.input) })
+        let recorder = QueueFixture(arguments: [])
+        let preview = recorder.coordinator().learningStore
+        let sample = QueueFixture.previewDetail()
         await preview.loadPage()?.value
-        await preview.select(sourceID)?.value
+        if let project = preview.hierarchy?.projects.first { preview.openProject(project) }
+        await preview.openOperation("tests")?.value
+        try check(preview.selectedID == sample.profile.id && preview.detail?.profile.label == "Web test suite" && preview.error == nil,
+            "Fixture drill-down reads the sample project, operation and group")
+        await preview.inspectMember(sample.members[0].family)?.value
+        try check(preview.memberDetail?.members.map(\.family) == [sample.members[0].family] && preview.memberError == nil,
+            "Fixture member inspection satisfies the live response checks")
+        await preview.loadMembers()?.value
+        try check(preview.detail?.memberPage?.offset == 0 && preview.memberError == nil,
+            "Fixture member paging satisfies the live response checks")
+        let readsBeforeReload = recorder.reads.count
+        await preview.reloadSelection()?.value
+        let reloaded = preview.selectedID.map { QueueClient.Command.profilesShow($0) }
+        try check(reloaded != nil && recorder.reads.count > readsBeforeReload && recorder.reads.last == reloaded
+            && preview.error == nil, "Fixture reload reads the selected profile from the fixture")
         preview.draftLabel = "Attempted fixture edit"
-        try check(preview.save() == nil && preview.merge(into: targetID) == nil && preview.split(family: familyID) == nil &&
-            preview.reset() == nil && preview.reloadSelection() == nil,
-            "Fixture controls are inert for every read and mutation path")
-        let afterPreview = await fixture.calls
-        try check(beforePreview.count == afterPreview.count && preview.detail?.profile.label == "Web test suite" &&
-            preview.controllerMessage?.contains("has applied") == true,
+        await preview.save()?.value
+        try check(preview.error == nil && preview.notice != nil, "Fixture save completes")
+        await preview.reset()?.value
+        try check(preview.error == nil && preview.notice != nil, "Fixture reset completes")
+        try check(preview.split(family: sample.members[0].family) == nil, "A single-member sample group cannot be split")
+        await preview.merge(into: targetID)?.value
+        try check(preview.error == nil && preview.selectedID == targetID, "Fixture merge answers as its destination")
+        preview.toggleMergeItem(LearningMergeItem(identity: sample.profile.id, label: "Web test suite", isGroup: true,
+            sourceGroup: sample.profile.id, revision: sample.revision))
+        await preview.combine(into: targetID)?.value
+        try check(preview.error == nil && preview.mergeSelection.isEmpty, "Fixture combine completes")
+        try check(recorder.changes.map { Array($0.arguments.prefix(3)) } == [["profiles", "edit", sample.profile.id],
+            ["profiles", "reset", sample.profile.id], ["profiles", "merge", sample.profile.id], ["profiles", "combine", targetID]],
+            "Fixture controls run every mutation path and end at the recorder")
+        try check(preview.controllerMessage?.contains("has applied") == true,
             "Snapshot uses artificial profiles and never invokes the installed queue")
         let unavailable = testDetail(prediction: nil)
         let decoded = try JSONDecoder().decode(LearningDetail.self, from: JSONEncoder().encode(unavailable))
         try check(decoded.prediction == nil && decoded.predictionMachine == nil && decoded.runs.first?.id.count == 64,
             "Unavailable prediction and opaque run identities decode without fabricating telemetry")
         let learning = JobLearningReference(id: sourceID, label: "Web tests", reason: "Member job family shares this profile")
-        guard let prediction = LearningStore.previewDetail().prediction else { throw ClientError.message("Missing artificial prediction") }
+        guard let prediction = QueueFixture.previewDetail().prediction else { throw ClientError.message("Missing artificial prediction") }
         let jobResources = JobResources(prediction: prediction, observed: nil, decision: nil, learning: learning)
         let decodedResources = try JSONDecoder().decode(JobResources.self, from: JSONEncoder().encode(jobResources))
         try check(decodedResources.learning == learning, "Job resources retain the profile lookup reason for native detail links")

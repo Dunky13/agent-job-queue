@@ -129,14 +129,22 @@ private actor CommandLog {
     func record(_ command: QueueClient.Command) { commands.append(command) }
 }
 
+/// The fixture's backend with only its controller replaced.
+@MainActor
+private func backend(command: @escaping @Sendable (QueueClient.Command) async throws -> Data) -> QueueBackend {
+    var backend = QueueFixture(arguments: []).backend
+    backend.command = command
+    return backend
+}
+
 @main
 struct RefreshTests {
     /// Queue polling: every 2 s while any surface is visible, otherwise every fifth tick.
     @MainActor private static func checkQueueCadence(_ data: Data, _ check: (Bool, String) throws -> Void) async throws {
         let clock = ManualPollClock()
         let fixture = StatusFixture(data)
-        let coordinator = WindowCoordinator(command: { _ in try await fixture.load() }, pollSleep: clock.pollSleep,
-                                            arguments: [])
+        let coordinator = WindowCoordinator(backend: backend { _ in try await fixture.load() },
+                                            pollSleep: clock.pollSleep)
         let store = coordinator.store
         let window = FakeSurface()
         let popover = FakeSurface()
@@ -189,8 +197,8 @@ struct RefreshTests {
         let log = CommandLog()
         let status = try JSONEncoder().encode(RemoteStatus(enabled: false, configured: false, running: false,
             url: "https://192.0.2.10:8743/", port: 8743, username: "agent", certificatePath: "", error: nil))
-        let coordinator = WindowCoordinator(command: { await log.record($0); return status }, pollSleep: clock.pollSleep,
-                                            arguments: [])
+        let coordinator = WindowCoordinator(backend: backend { await log.record($0); return status },
+                                            pollSleep: clock.pollSleep)
         let store = coordinator.remoteStore
         let window = FakeSurface()
         window.isVisible = true
@@ -230,8 +238,10 @@ struct RefreshTests {
     /// Every store the coordinator builds, and the merge-target picker, sends its commands through the injected adapter.
     @MainActor private static func checkCoordinatorAdapters(_ check: (Bool, String) throws -> Void) async throws {
         let log = CommandLog()
-        let coordinator = WindowCoordinator(command: { await log.record($0); throw ClientError.message("Recorded") },
-                                            arguments: [])
+        let coordinator = WindowCoordinator(backend: backend {
+            await log.record($0)
+            throw ClientError.message("Recorded")
+        })
         var count = 0
         func sent(_ name: String) async throws {
             let commands = await log.commands
@@ -252,6 +262,85 @@ struct RefreshTests {
         try await sent("the merge-target picker store")
     }
 
+    /// One read through every store of a coordinator, one change through each store that makes them, plus both routes out of the app.
+    @MainActor private static func drive(_ coordinator: WindowCoordinator) async throws {
+        await coordinator.store.refresh()
+        await coordinator.store.dispatch(.resume)?.value
+        let remote = coordinator.remoteStore
+        await remote.refresh()
+        if remote.configure(password: "fixture-only-password", enable: false) {
+            for await busy in remote.$isBusy.values where !busy { break }
+        }
+        let integration = coordinator.integrationStore
+        await integration.refresh()
+        integration.select("codex", enabled: true)
+        await integration.save()?.value
+        let updates = coordinator.updateStore
+        await updates.refreshInstalled()
+        let learning = coordinator.learningStore
+        await learning.loadPage()?.value
+        if let project = learning.hierarchy?.projects.first { learning.openProject(project) }
+        await learning.openOperation("tests")?.value
+        learning.draftLabel = "Renamed sample"
+        await learning.save()?.value
+        await learning.targetPickerStore().loadPage()?.value
+        _ = try await coordinator.routes.logTail("/example/state/logs/1.log")
+        coordinator.routes.desktop(.copy("fixture address"))
+    }
+
+    /// What a drive should have left in a fixture and did not.
+    @MainActor private static func missing(from fixture: QueueFixture) -> [String] {
+        let id = QueueFixture.previewDetail().profile.id
+        let reads: [QueueClient.Command] = [.status, .remoteStatus, .agentsStatus, .version,
+            .profilesHierarchy(limit: 100), .profilesShow(id),
+            .profilesList(offset: 0, limit: 50, query: "", project: "Sample project", operation: "tests"),
+            .profilesList(offset: 0, limit: 50, query: "")]
+        var result = reads.filter { !fixture.reads.contains($0) }.map { $0.arguments.joined(separator: " ") }
+        let changes = [["resume"], ["configure"], ["agents", "install", "--runner", "codex", "--json"],
+            ["profiles", "edit", id, "--json"]]
+        if fixture.changes.map(\.arguments) != changes { result.append("exactly the expected changes") }
+        if fixture.logPaths != ["/example/state/logs/1.log"] { result.append("log tail") }
+        if fixture.desktopRequests != [.copy("fixture address")] { result.append("desktop request") }
+        return result
+    }
+
+    /// A fixture coordinator reaches its fixture and nothing else. The runner points the home
+    /// directory at a tripwire, so the live controller path is observable and harmless.
+    @MainActor private static func checkFixtureIsolation(_ check: (Bool, String) throws -> Void) async throws {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        // Fail before any live call unless the redirect really holds.
+        guard let expected = ProcessInfo.processInfo.environment["AGENT_QUEUE_TRIPWIRE_HOME"],
+              home.standardizedFileURL.path == URL(fileURLWithPath: expected).standardizedFileURL.path else {
+            throw ClientError.message("Run native/tests/run-refresh-tests.sh, which supplies a tripwire home directory.")
+        }
+        let binaries = home.appendingPathComponent(".local/bin", isDirectory: true)
+        let stray = home.appendingPathComponent("stray-controller")
+        try FileManager.default.createDirectory(at: binaries, withIntermediateDirectories: true)
+        for controller in [QueueClient.Controller.heavy, .remote] {
+            let tripwire = binaries.appendingPathComponent(controller.rawValue)
+            try Data("#!/bin/sh\necho \"$0 $*\" >> \"$HOME/stray-controller\"\necho '{}'\n".utf8).write(to: tripwire)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: tripwire.path)
+        }
+        _ = try await QueueClient.run(.status)
+        try check(FileManager.default.fileExists(atPath: stray.path),
+                  "Negative control: a live controller call trips the tripwire")
+        try FileManager.default.removeItem(at: stray)
+
+        let queue = home.appendingPathComponent("queue.json")
+        try JSONEncoder().encode(QueueSnapshot(updatedAt: "isolation",
+            queue: QueueSummary(status: "paused", limit: 1, running: 0, waiting: 0, legacyOccupied: false), jobs: []))
+            .write(to: queue)
+        let fixture = QueueFixture(arguments: ["--fixture", queue.path])
+        try await drive(fixture.coordinator())
+        let missed = missing(from: fixture)
+        try check(missed.isEmpty, "Every store of a fixture coordinator uses its fixture (missing: \(missed))")
+        try check(!FileManager.default.fileExists(atPath: stray.path), "A driven fixture coordinator starts no controller")
+        let bystander = QueueFixture(arguments: ["--fixture", queue.path])
+        try await drive(QueueFixture(arguments: ["--fixture", queue.path]).coordinator())
+        try check(missing(from: bystander).count == 11 && bystander.reads.isEmpty && bystander.changes.isEmpty,
+                  "Negative control: the isolation check reports every store that bypasses a fixture")
+    }
+
     @MainActor static func main() async throws {
         func snapshot(_ stamp: String, limit: Int = 1) throws -> Data {
             try JSONEncoder().encode(QueueSnapshot(updatedAt: stamp,
@@ -262,7 +351,8 @@ struct RefreshTests {
             if !value { throw ClientError.message(name) }
         }
         let fixture = StatusFixture(try snapshot("2026-10-18T10:00:00Z"))
-        let store = QueueStore(statusLoader: { try await fixture.load() })
+        let store = QueueStore(statusLoader: { try await fixture.load() },
+            command: { _ in throw ClientError.message("A refresh check sent a command") })
         await store.refresh()
         var publishes = 0
         let subscription = store.objectWillChange.sink { publishes += 1 }
@@ -418,7 +508,8 @@ struct RefreshTests {
         }
         let large = QueueSnapshot(updatedAt: "large", queue: telemetry.queue, jobs: jobs)
         let largeData = try JSONEncoder().encode(large)
-        let largeStore = QueueStore(statusLoader: { largeData })
+        let largeStore = QueueStore(statusLoader: { largeData },
+            command: { _ in throw ClientError.message("A refresh check sent a command") })
         await largeStore.refresh()
         let expectedWaiting = jobs.filter(\.isWaiting).sorted {
             ($0.queuePosition ?? Int.max, $0.id) < ($1.queuePosition ?? Int.max, $1.id)
@@ -432,5 +523,6 @@ struct RefreshTests {
         try await checkQueueCadence(try snapshot("cadence"), check)
         try await checkRemoteCadence(check)
         try await checkCoordinatorAdapters(check)
+        try await checkFixtureIsolation(check)
     }
 }

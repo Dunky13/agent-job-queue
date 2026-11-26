@@ -43,11 +43,12 @@ struct QueueBootstrapEnvironment: Sendable {
         }
         #if AGENT_QUEUE_TEST_HOOKS
         let fixtureIndices = arguments.indices.filter { arguments[$0] == "--fixture" }
-        if !fixtureIndices.isEmpty || arguments.contains(where: { $0.hasPrefix("--fixture=") }) {
+        // Any other spelling would pick the fixture backend while the guards above read the launch as live.
+        let otherFixtureOptions = arguments.contains { $0.hasPrefix("--fixture") && $0 != "--fixture" }
+        if !fixtureIndices.isEmpty || otherFixtureOptions {
             guard fixtureIndices.count == 1, let index = fixtureIndices.first,
                   arguments.indices.contains(index + 1), !arguments[index + 1].isEmpty,
-                  !arguments[index + 1].hasPrefix("-"),
-                  !arguments.contains(where: { $0.hasPrefix("--fixture=") }) else {
+                  !arguments[index + 1].hasPrefix("-"), !otherFixtureOptions else {
                 throw ClientError.message("--fixture requires a JSONFILE argument. No backend changes have been made.")
             }
         }
@@ -208,9 +209,9 @@ struct QueueBootstrapEnvironment: Sendable {
         return packaging?.serviceManagement == true
     }
 
-    /// Nil for fixtures, private test fixtures, setup-disabled and unmanaged bundles, so they stay inert.
-    @MainActor func makeSupervisor(fixtureMode: Bool) -> QueueHelperSupervisor? {
-        guard !fixtureMode, supervisesHelpers else { return nil }
+    /// Nil for `--fixture`, private test fixtures, setup-disabled and unmanaged bundles, so they stay inert.
+    @MainActor func makeSupervisor() -> QueueHelperSupervisor? {
+        guard supervisesHelpers else { return nil }
         return QueueHelperSupervisor(app: app, stateDirectory: home.appendingPathComponent(".local/state/agent-heavy", isDirectory: true),
                                      settingsDirectory: home.appendingPathComponent(".config/agent-heavy", isDirectory: true))
     }

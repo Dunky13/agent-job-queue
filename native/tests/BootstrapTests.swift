@@ -49,13 +49,19 @@ struct BootstrapTests {
         }
 
         // Only a real managed launch supervises helpers; fixtures and unmanaged bundles stay inert.
-        for scenario in ["managed", "fixture-flag", "setup-disabled", "unmanaged", "fixture-mode"] {
+        let fixtureArguments = ["fixture-flag": ["--fixture", "queue.json"], "fixture-bare": ["--fixture"]]
+        for scenario in ["managed", "fixture-flag", "setup-disabled", "unmanaged", "fixture-bare"] {
             let supervised = try BootstrapFixture(parent: temporary, setupMode: scenario != "setup-disabled", managed: scenario != "unmanaged",
-                arguments: scenario == "fixture-flag" ? ["--fixture", "queue.json"] : [])
-            let helpers = supervised.environment.makeSupervisor(fixtureMode: scenario == "fixture-mode")
-            try check((helpers != nil) == (scenario == "managed") && supervised.environment.supervisesHelpers == (scenario != "unmanaged" && scenario != "fixture-flag" && scenario != "setup-disabled"),
+                arguments: fixtureArguments[scenario] ?? [])
+            let helpers = supervised.environment.makeSupervisor()
+            try check((helpers != nil) == (scenario == "managed") && supervised.environment.supervisesHelpers == (scenario == "managed"),
                 scenario == "managed" ? "A real managed launch creates a helper supervisor"
                     : "No helper supervisor is created for \(scenario) launches")
+            if let arguments = fixtureArguments[scenario] {
+                let requests = try supervised.environment.serviceStatusRequests()
+                try check(QueueFixture.launch(arguments: arguments) != nil && requests.isEmpty,
+                    "A \(scenario) launch gets the stand-in backend and asks no service for status")
+            }
         }
 
         // Runtime launch never performs installation. Only the installer stage
@@ -448,6 +454,11 @@ struct BootstrapTests {
         try check(try inert.inspect() == .legacy, "Fixture arguments are inert even for a damaged packaged app")
         inert.arguments = ["--fixture"]
         try check(rejects(inert, containing: "requires a JSONFILE"), "Malformed fixture selection fails closed before real queue startup")
+        for spelling in [["--fixtures", "private-fixture.json"], ["--fixture", "private-fixture.json", "--fixture-file", "x"]] {
+            inert.arguments = spelling
+            try check(rejects(inert, containing: "requires a JSONFILE"),
+                "\(spelling.joined(separator: " ")) cannot select the fixture backend while the launch reads as live")
+        }
         try check(["--fixture", "--fixture=x", "--snapshot", "--snapshot-menu", "--verify-detail-navigation"].allSatisfy(QueueBootstrapEnvironment.isTestOption)
             && !["--setup", "--open-window", "fixture.json"].contains(where: QueueBootstrapEnvironment.isTestOption),
             "The shipped build refuses exactly the options whose hooks it leaves out")

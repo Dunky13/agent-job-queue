@@ -186,12 +186,18 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         return startup
     }
 
+    /// The app that finished starting is the stand-in one, and nothing has asked it to change anything.
+    private func runsFixture(_ coordinator: WindowCoordinator?) -> Bool {
+        guard let launched = QueueFixture.launched else { return false }
+        return coordinator === launched.coordinator && launched.fixture.changes.isEmpty
+    }
+
     private func checkReady(_ delegate: AppDelegate, startup: QueueStartupMenuBarController, item: NSStatusItem) async throws {
         guard let coordinator = delegate.coordinator, let controller = coordinator.menuBarController else {
             throw ClientError.message("Ready menu missing")
         }
         try check(controller.statusItem === item && startup.isTornDown && delegate.startupMenuBarController == nil &&
-            delegate.setupWindow == nil && coordinator.windows.isEmpty && coordinator.store.fixtureMode &&
+            delegate.setupWindow == nil && coordinator.windows.isEmpty && runsFixture(coordinator) &&
             delegate.supervisor == nil && coordinator.remoteStore.supervisor == nil &&
             delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "Readiness transfers the exact status item once, keeps default launch menu-bar-only and starts no helpers for fixtures")
@@ -365,7 +371,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let mutations = await executor.mutations
         try check(mutations == 2 && requests.contains(where: { $0.arguments.suffix(2) == ["--recover", "restore-service-definitions"] }) &&
             requests.contains(where: { $0.arguments.suffix(2) == ["--recover", "disable-phone-access"] }) &&
-            delegate.setupWindow == nil && delegate.coordinator?.store.fixtureMode == true,
+            delegate.setupWindow == nil && runsFixture(delegate.coordinator),
             "Explicit preflight recovery refreshes requirements, verifies installation, and continues simulated queue startup")
         guard let queue = delegate.coordinator?.windows[.queue] else { throw ClientError.message("Preflight recovery did not open its simulated queue") }
         try snapshot(queue, name: "04-normal-fixture-startup")
@@ -453,7 +459,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let installs = await executor.installations
         try check(installs == 1 && !requests.contains { $0.arguments.contains("--recover") } &&
             requests.filter { $0.arguments.suffix(2) == ["--repair-and-continue", "--keep-custom-callback"] }.count == 1 &&
-            delegate.setupWindow == nil && delegate.coordinator?.store.fixtureMode == true,
+            delegate.setupWindow == nil && runsFixture(delegate.coordinator),
             "One accepted dialog runs the controller's repair once and verifies normal startup without further intervention")
         guard let queue = delegate.coordinator?.windows[.queue] else { throw ClientError.message("Approved repair did not start the simulated queue") }
         try snapshot(queue, name: "03-approved-startup")

@@ -16,9 +16,11 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     private var childSelections = 0
     private var outsideClicks = 0
     private var footerMenuOpenCount = 0
+    private var footerMenuEndCount = 0
     private var footerMenu: NSMenu?
     private let applicationMenuDelegate = AppDelegate()
-    private let coordinator = WindowCoordinator()
+    private let fixture = QueueFixture(arguments: CommandLine.arguments)
+    private lazy var coordinator = fixture.coordinator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let watchdog = Timer(timeInterval: 60, target: self, selector: #selector(timedOut(_:)), userInfo: nil, repeats: false)
@@ -78,6 +80,11 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         RunLoop.main.add(timer, forMode: .common)
     }
 
+    @objc private func footerMenuEndedTracking(_ notification: Notification) {
+        guard let menu = notification.object as? NSMenu, menu !== controller?.menu else { return }
+        footerMenuEndCount += 1
+    }
+
     @objc private func closeFooterMenu(_ timer: Timer) {
         footerMenu?.cancelTracking()
         footerMenu = nil
@@ -124,7 +131,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
 
     private func verify() async throws {
         let store = coordinator.store
-        guard store.fixtureMode, store.snapshot != nil else {
+        guard fixture.loadError == nil, store.snapshot != nil else {
             throw ClientError.message("Menu-bar verification requires --fixture JSONFILE containing simulated jobs.")
         }
         let routes = coordinator.routes
@@ -133,7 +140,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
             // The Quit item's real selector is exercised with an inert endpoint.
             // Every window action still uses the production coordinator handler.
             if action != .quit { routes.perform(action) }
-        }, openLearning: routes.openLearning, installUpdate: routes.installUpdate))
+        }, openLearning: routes.openLearning, logTail: routes.logTail, desktop: routes.desktop,
+            installUpdate: routes.installUpdate))
         self.controller = controller
         coordinator.menuBarController = controller
         NSApp.mainMenu = applicationMenuDelegate.makeMainMenu()
@@ -260,15 +268,20 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try check([QueueWindowKind.learning, .updates, .integration, .remote].allSatisfy { coordinator.windows[$0]?.isVisible == true },
                   "nativeSettingsSelectorsReachProductionWindowHandlers")
         try check(actions.suffix(5) == QueueAppAction.settings + [.quit], "allSettingsAndInertQuitDispatchExactlyOnce")
-        try check(coordinator.remoteStore.fixtureMode && coordinator.integrationStore.fixtureMode
-            && coordinator.updateStore.fixtureMode && coordinator.learningStore.fixtureMode,
+        // Each opened window loads through its own store; every one of those reads must arrive at the fixture.
+        for read: QueueClient.Command in [.remoteStatus, .agentsStatus, .version, .profilesHierarchy(limit: 100)] {
+            await fixture.waitForRead(read)
+        }
+        try check(fixture.changes.isEmpty && fixture.desktopRequests.isEmpty,
                   "allOpenedSettingsRemainFixtureIsolated")
         try await verifyWindows()
         try await verifyApplicationMenus()
         try await verifyUpdateItem()
         let original = store.snapshot
+        fixture.snapshot = nil
         store.error = "Simulated unavailable queue"
         try check(controller.statusItem.button?.title == "!", "errorBadgeUpdatesOnRealStatusButton")
+        fixture.snapshot = original
         store.error = nil
         let presentation = QueueStatusPresentation(snapshot: original, error: nil)
         try check(controller.statusItem.button?.title == presentation.title
@@ -285,10 +298,13 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     /// Pins each window's chrome and that a closed window is the one that comes back.
     /// A background update adds a hidden-until-announced item that opens Sparkle's dialog through the install route.
     private func verifyUpdateItem() async throws {
-        let updates = QueueUpdateStore(fixtureMode: true)
+        let backend = fixture.backend
+        let updates = QueueUpdateStore(running: backend.runningVersion(), environment: backend.environment,
+            command: backend.command)
         let routes = coordinator.routes
         let controller = QueueMenuBarController(store: coordinator.store, updates: updates, app: QueueAppRoutes(
-            perform: routes.perform, openLearning: routes.openLearning, installUpdate: { [weak self] in self?.installs += 1 }))
+            perform: routes.perform, openLearning: routes.openLearning, logTail: routes.logTail, desktop: routes.desktop,
+            installUpdate: { [weak self] in self?.installs += 1 }))
         defer { controller.tearDown() }
         guard let index = controller.menu.items.firstIndex(where: { $0.tag == -1 }),
               controller.menu.items.indices.contains(index + 1) else {
@@ -359,8 +375,11 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     private func verifySettingsFirstClick(_ controller: QueueMenuBarController) async throws {
         NotificationCenter.default.addObserver(self, selector: #selector(footerMenuBeganTracking(_:)),
             name: NSMenu.didBeginTrackingNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(footerMenuEndedTracking(_:)),
+            name: NSMenu.didEndTrackingNotification, object: nil)
         defer {
             NotificationCenter.default.removeObserver(self, name: NSMenu.didBeginTrackingNotification, object: nil)
+            NotificationCenter.default.removeObserver(self, name: NSMenu.didEndTrackingNotification, object: nil)
             controller.closePopover()
         }
         // Each hit target runs in a fresh fixture process. A previous system
@@ -373,15 +392,31 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
             throw ClientError.message("Settings first-click verification requires the real popover")
         }
         window.resignKey()
-        try check(!NSApp.isActive && !window.isKeyWindow && controller.popover.isShown,
-                  "settingsFixtureStartsWithInactivePopover")
+        // The popover reports shown before its window is on screen; a click posted earlier reaches the app below.
+        try await waitUntil { window.isVisible && window.occlusionState.contains(.visible) }
+        try check(!NSApp.isActive && !window.isKeyWindow && controller.popover.isShown
+                  && window.isVisible && window.occlusionState.contains(.visible), "settingsFixtureStartsWithInactivePopover")
         let offset = CommandLine.arguments.contains("--settings-chevron") ? 25.0 : 40.0
         let point = NSPoint(x: view.bounds.maxX - offset,
                             y: view.isFlipped ? view.bounds.maxY - 22 : view.bounds.minY + 22)
+        // Records where the posted click landed, so an intermittent failure names its cause.
+        var landed: [String] = []
+        let monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            landed.append(event.window === window ? "popover at \(event.locationInWindow)" : "another window")
+            return event
+        }
+        defer { if let monitor { NSEvent.removeMonitor(monitor) } }
         try postSystemClick(in: window, at: view.convert(point, to: nil))
-        try await settle(0.3)
+        // The system delivers the posted click asynchronously, later on a busy or freshly built host.
+        try await waitUntil { footerMenuOpenCount > 0 }
+        if footerMenuOpenCount != 1 {
+            FileHandle.standardError.write(Data("Settings click aimed at \(point) reached: \(landed.isEmpty ? "nothing in this app" : landed.joined(separator: ", ")); menus opened \(footerMenuOpenCount); app active \(NSApp.isActive)\n".utf8))
+        }
         try check(footerMenuOpenCount == 1 && controller.popover.isShown,
                   "firstSettingsClickOpensMenuInInactivePopover")
+        // The queue ignores outside clicks while a menu tracks, so the next check needs this menu closed.
+        try await waitUntil { footerMenuEndCount == footerMenuOpenCount }
+        try check(footerMenuEndCount == footerMenuOpenCount, "firstSettingsMenuEndsTracking")
     }
 
     private func postSystemClick(in window: NSWindow, at point: NSPoint) throws {
@@ -425,7 +460,9 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         }
         controller.activate(.accessible)
         try await settle()
-        try check(controller.popover.isShown, "externalClickStartsWithShownPopover")
+        let popoverOnScreen = { controller.popover.contentViewController?.view.window.map { $0.isVisible && $0.occlusionState.contains(.visible) } ?? false }
+        try await waitUntil(popoverOnScreen)
+        try check(controller.popover.isShown && popoverOnScreen(), "externalClickStartsWithShownPopover")
         // Click only the owned helper. Its nonactivating panel does not send
         // an application-deactivation notification to the queue fixture.
         guard let screen = NSScreen.screens.first else { throw ClientError.message("No fixture screen") }
@@ -437,7 +474,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
             }
             event.post(tap: .cghidEventTap)
         }
-        try await settle(0.3)
+        // The helper and the queue's global monitor receive the posted click asynchronously.
+        try await waitUntil { FileManager.default.fileExists(atPath: clicked.path) && !controller.popover.isShown && !controller.isMonitoringEvents }
         try check(FileManager.default.fileExists(atPath: clicked.path), "externalClickReachesOwnedHelper")
         try check(!controller.popover.isShown && !controller.isMonitoringEvents,
                   "externalClickDismissesPopoverWithoutApplicationDeactivation")
@@ -487,11 +525,18 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await settle()
         try check(controller.popover.isShown, "anotherAppTakingFocusKeepsPopoverOpen")
         let shownTitle = controller.statusItem.button?.title
-        coordinator.store.error = "Simulated unavailable queue"
+        // Fail the queue through a real read: a refresh already in flight reads again once it ends,
+        // so no healthy answer can land after the error and clear it.
+        let healthy = fixture.snapshot
+        fixture.snapshot = nil
+        await coordinator.store.refresh()
+        try await waitUntil { coordinator.store.error != nil }
+        try check(coordinator.store.error != nil, "statusFixtureFailsThroughRead")
         try check(shownTitle != "!" && controller.statusItem.button?.title == shownTitle, "statusTitleHoldsWidthWhilePopoverShown")
         controller.closePopover()
         try await settle()
         try check(controller.statusItem.button?.title == "!", "heldStatusTitleAppliesOnClose")
+        fixture.snapshot = healthy
         coordinator.store.error = nil
         try check(controller.statusItem.button?.title == shownTitle, "closedStatusTitleUpdatesImmediately")
         // The queue window opened earlier may still be on screen; the dismissed popover must not count.

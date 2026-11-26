@@ -14,7 +14,7 @@ The macOS menu-bar app shows what is running, what is waiting, and which project
 | --- | --- |
 | [![Mac queue showing running and waiting jobs, project labels, and the parallel job limit](docs/screenshots/mac-queue.png)](docs/screenshots/mac-queue.png) | [![Phone dashboard showing the queue and controls to start or reorder jobs](docs/screenshots/phone-queue.png)](docs/screenshots/phone-queue.png) |
 
-Screenshots use sample jobs. The Mac image uses the app's safe preview mode.
+Screenshots use sample jobs. The Mac images come from a test build whose stand-in backend runs no queue command.
 
 <details>
 <summary>Start a waiting job in parallel</summary>
@@ -73,7 +73,7 @@ Users who installed the installer cask must use the second route: the old cask l
 
 ## Version and updates
 
-Choose **About and updates** from the queue's gear menu to see the running app and installed controller versions. **Check for Updates…** asks Sparkle to find, verify and install a published build in place; Sparkle asks once whether to check automatically. Before the relaunch the app drains the queue and releases only its own drain afterwards. Untracked, test-hook and preview builds never check. `agent-heavy version` reports the installed version. Details are in [Installed version and updates](docs/updates.md).
+Choose **About and updates** from the queue's gear menu to see the running app and installed controller versions. **Check for Updates…** asks Sparkle to find, verify and install a published build in place; Sparkle asks once whether to check automatically. Before the relaunch the app drains the queue and releases only its own drain afterwards. Untracked and test-hook builds never check. `agent-heavy version` reports the installed version. Details are in [Installed version and updates](docs/updates.md).
 
 ## Connect your coding agents
 

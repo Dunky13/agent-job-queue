@@ -12,7 +12,7 @@ When you choose to relaunch for an update, the app first closes queue intake wit
 
 The app records the drain it started in a private marker file, `~/.local/state/agent-heavy/update-drain.json` (mode 0600 in a 0700 directory, created without following links and read back only if it is a regular file owned by you). The marker holds the drain's exact expiry and whether the queue was already paused. After the relaunch, once setup reports the queue up, the app reads the marker strictly (unknown or duplicate keys, other owners and loose permissions all make it void), consumes it, and runs `agent-heavy undrain` only if the live drain still has the recorded expiry. A drain you set, extended or replaced yourself has a different expiry and is never released, and a marker whose drain has lapsed is removed without running anything. If the queue was paused before the update, or its status could not be read as running, the app runs `agent-heavy undrain --keep-paused`, which ends only the drain and never resumes your pause. Otherwise `undrain` also resumes the queue, which ends the pause a restarted queue starts with.
 
-The marker is consumed when the relaunched queue is up, whether or not the release succeeds. It is left in place on purpose when the queue never comes up within a minute of launch and when the app runs without helpers (preview and fixture launches): a later launch releases it if the drain is still live, and removes it otherwise. See [upgrade recovery](upgrade-recovery.md) for the drain itself.
+The marker is consumed when the relaunched queue is up, whether or not the release succeeds. It is left in place on purpose when the queue never comes up within a minute of launch and when the app runs without helpers (fixture, setup-disabled and unmanaged launches): a later launch releases it if the drain is still live, and removes it otherwise. See [upgrade recovery](upgrade-recovery.md) for the drain itself.
 
 The CLI reports only the installed version:
 
@@ -21,15 +21,14 @@ agent-heavy version
 agent-heavy version --json
 ```
 
-There is no `agent-heavy updates` command. Preview mode never checks or installs.
+There is no `agent-heavy updates` command. A test build launched with `--fixture` is a test-hook build, so it never checks or installs.
 
 ### When updates are unavailable
 
 The updater exists only in a published build. These builds never check or install:
 
 - Untracked builds (local and pull-request builds, or a build whose release metadata cannot be verified).
-- Test-hook builds.
-- Preview mode.
+- Test-hook builds, including any launched with `--fixture`.
 
 The window says which applies and links to the releases page. A tracked build also refuses checks and installs while the incomplete-installation marker (`install-in-progress.json`) exists. Open Agent Queue from Applications to finish setup first.
 
@@ -77,6 +76,6 @@ Agent Queue is no longer distributed through Homebrew. An app installed earlier 
 
 ## Validation contract
 
-Native tests cover the tracked, untracked, test-hook and preview decision for creating the updater, the refusal while the incomplete-installation marker exists, the drain running before the install block on the relaunch path, the install-on-quit offer being declined without a drain, the failed-drain continuation, and the rule that `undrain` runs only for a marker whose recorded expiry still matches the live drain (operator drains, extended drains and prior pauses included). Go tests cover the installed-version command and `queue-tool verify-app` for the Sparkle layout, signatures, architectures, `Info.plist` keys and licenses. Signing tests pin the inside-out order, hardened runtime and the absence of `--deep`. Real Developer ID signing, notarization and an actual update from one build to the next cannot run in these tests; tests never write to the operator's Applications or live queue. Operating-system approval and endpoint-protection policy remain independent requirements.
+Native tests cover the tracked, untracked and test-hook decision for creating the updater, the refusal while the incomplete-installation marker exists, the drain running before the install block on the relaunch path, the install-on-quit offer being declined without a drain, the failed-drain continuation, and the rule that `undrain` runs only for a marker whose recorded expiry still matches the live drain (operator drains, extended drains and prior pauses included). Go tests cover the installed-version command and `queue-tool verify-app` for the Sparkle layout, signatures, architectures, `Info.plist` keys and licenses. Signing tests pin the inside-out order, hardened runtime and the absence of `--deep`. Real Developer ID signing, notarization and an actual update from one build to the next cannot run in these tests; tests never write to the operator's Applications or live queue. Operating-system approval and endpoint-protection policy remain independent requirements.
 
 Sparkle behavior is documented in [Sparkle's documentation](https://sparkle-project.org/documentation/). Bundle display reads Apple's [infoDictionary](https://developer.apple.com/documentation/foundation/bundle/infodictionary).

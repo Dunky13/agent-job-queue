@@ -84,16 +84,14 @@ struct UpdateTests {
         let tracked = RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100)
         let untracked = RunningQueueVersion(version: "1.0.0", bundleBuild: "0")
         let broken = RunningQueueVersion(version: "1.0.0", bundleBuild: "100", metadataError: "Running metadata is invalid")
-        try check(QueueUpdatePolicy.unavailableReason(running: tracked, fixtureMode: false, testHooks: false) == nil,
-            "A tracked, non-test, non-preview build may update")
-        try check(QueueUpdatePolicy.unavailableReason(running: untracked, fixtureMode: false, testHooks: false) != nil,
+        try check(QueueUpdatePolicy.unavailableReason(running: tracked, testHooks: false) == nil,
+            "A tracked, non-test build may update")
+        try check(QueueUpdatePolicy.unavailableReason(running: untracked, testHooks: false) != nil,
             "An untracked build never updates")
-        try check(QueueUpdatePolicy.unavailableReason(running: broken, fixtureMode: false, testHooks: false) == "Running metadata is invalid",
+        try check(QueueUpdatePolicy.unavailableReason(running: broken, testHooks: false) == "Running metadata is invalid",
             "Unverifiable build metadata never updates and says why")
-        try check(QueueUpdatePolicy.unavailableReason(running: tracked, fixtureMode: false, testHooks: true) != nil,
+        try check(QueueUpdatePolicy.unavailableReason(running: tracked, testHooks: true) != nil,
             "A test-hook build never updates")
-        try check(QueueUpdatePolicy.unavailableReason(running: tracked, fixtureMode: true, testHooks: false) != nil,
-            "Preview mode never updates")
         try check(QueueUpdatePolicy.isTestHookBuild, "The test library carries the test-hook flag that disables updates")
         let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("queue-update-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
@@ -102,9 +100,8 @@ struct UpdateTests {
             resources: scratch.appendingPathComponent("Resources"), home: scratch)
         let drainFixture = DrainFixture()
         let command: @Sendable (QueueClient.Command) async throws -> Data = { try await drainFixture.load($0.arguments) }
-        for (name, running, preview, hooks) in [("untracked", untracked, false, false), ("preview", tracked, true, false),
-                                                ("test-hook", tracked, false, true)] {
-            let store = QueueUpdateStore(fixtureMode: preview, running: running, testHooks: hooks,
+        for (name, running, hooks) in [("untracked", untracked, false), ("test-hook", tracked, true)] {
+            let store = QueueUpdateStore(running: running, testHooks: hooks,
                 environment: { environment }, command: command)
             store.start()
             store.checkForUpdates()
@@ -145,7 +142,7 @@ struct UpdateTests {
         announcer.standardUserDriverDidReceiveUserAttention(forUpdate: .empty())
         announcer.standardUserDriverWillFinishUpdateSession()
         try check(announced == [nil, nil], "Attention or the end of the session clears the announcement")
-        let announcing = QueueUpdateStore(fixtureMode: true, environment: { environment }, command: command)
+        let announcing = QueueUpdateStore(running: tracked, environment: { environment }, command: command)
         announcing.announce("2.0.0")
         try check(announcing.availableUpdate == "2.0.0", "An announced update is offered in the menu and panel")
         announcing.announce(nil)
@@ -313,11 +310,20 @@ struct UpdateTests {
         await model.refreshInstalled()
         try check(await drainFixture.calls == [["version", "--json"]] && model.installed?.build == 100,
             "Refreshing reads only the installed version")
-        let preview = QueueUpdateStore(fixtureMode: true, environment: { environment }, command: command)
-        await preview.refreshInstalled()
-        await preview.releaseDrainAfterRelaunch()
-        try check(await drainFixture.calls == [["version", "--json"]] && !preview.hasPendingDrain,
-            "Preview mode performs no controller effects")
+        // A fixture launch builds its update store from the fixture: test hooks rule out Sparkle, and reads end there.
+        let recorder = QueueFixture(arguments: [])
+        let fixtureUpdates = recorder.coordinator().updateStore
+        await fixtureUpdates.refreshInstalled()
+        try check(!fixtureUpdates.updaterCreated && fixtureUpdates.unavailableReason != nil
+            && recorder.reads == [.version] && recorder.changes.isEmpty && fixtureUpdates.installed != nil,
+            "A fixture update store creates no updater and reads only from the fixture")
+        let fixtureHome = recorder.home
+        await fixtureUpdates.releaseDrainAfterRelaunch()
+        fixtureUpdates.discardStaleDrainMarker()
+        try check(!fixtureUpdates.hasPendingDrain && recorder.reads == [.version] && recorder.changes.isEmpty
+            && fixtureHome != FileManager.default.homeDirectoryForCurrentUser
+            && !FileManager.default.fileExists(atPath: fixtureHome.path),
+            "A fixture update store finds no drain and sends no drain command, outside the user's home")
         for service in QueueServiceManagement.Service.allCases {
             try check(QueueClient.Command.serviceStatus(service).timeout == 5,
                 "Exact native status for \(service.rawValue) has a five-second read budget")

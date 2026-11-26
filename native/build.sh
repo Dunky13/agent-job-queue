@@ -26,7 +26,7 @@ xcrun lipo -create "${binaries[@]}" -output "$output"
 # Nothing strips this binary, so its symbols show whether test hooks reached it.
 symbols=$(xcrun nm -arch all "$output")
 grep -q AgentQueueCore <<<"$symbols" || { echo "Could not read app symbols from $output" >&2; exit 1; }
-if grep -E 'runSnapshotHooks|FixtureDispatchRecorder|NativeSnapshotRenderer|NavigationVerification' <<<"$symbols" >&2; then
+if grep -E 'runSnapshotHooks|QueueFixture|RecordedQueueAction|NativeSnapshotRenderer|NavigationVerification' <<<"$symbols" >&2; then
   echo "Test hooks reached the shipped app binary." >&2
   exit 1
 fi
