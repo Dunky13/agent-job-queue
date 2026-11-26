@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Queue: a macOS menu-bar queue for heavy agent commands</title>
+<meta name="description" content="Run many coding agents while sharing a limited number of heavy local job slots. Builds and test suites wait their turn from the macOS menu bar.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Agent Queue">
+<meta property="og:description" content="Agents think in parallel. Builds, test suites and type checks take turns on your Mac.">
+<meta property="og:url" content="https://dunky13.github.io/agent-job-queue/">
+<meta property="og:image" content="https://dunky13.github.io/agent-job-queue/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Agent Queue menu-bar window listing one running job and two waiting jobs">
+<meta name="twitter:card" content="summary_large_image">
+<script type="module" src="download.js"></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="img/icon.png" width="112" height="112" alt="">Agent Queue</a>
+    <nav aria-label="Primary">
+      <ul>
+        <li class="extra"><a href="#how">How it works</a></li>
+        <li class="extra"><a href="#features">Features</a></li>
+        <li class="extra"><a href="#cli">Command line</a></li>
+        <li><a href="#download">Download</a></li>
+        <li><a href="https://github.com/Dunky13/agent-job-queue">GitHub</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+  <div class="wrap hero">
+    <div class="hero-copy">
+      <h1>Agents think in parallel. Builds take turns.</h1>
+      <p class="lede">Agent Queue is a macOS menu-bar queue for heavy agent commands. Agents read, reason and edit concurrently while builds, test suites and type checks share a limited number of job slots.</p>
+      <div class="dl">
+        <a class="button" href="https://github.com/Dunky13/agent-job-queue/releases" data-download>Download for macOS</a>
+        <p class="fine" data-download-note>macOS 15 or later, Apple Silicon and Intel.</p>
+      </div>
+    </div>
+    <img class="shot" src="img/mac-queue.webp" width="615" height="800" alt="Agent Queue menu-bar window: one running job, two queued jobs with project and branch labels, and a parallel jobs limit of 1">
+  </div>
+
+  <section id="how" aria-labelledby="how-h">
+    <div class="wrap">
+      <h2 id="how-h">How it works</h2>
+      <ol class="steps">
+        <li>
+          <h3>Wrap the heavy command</h3>
+          <p>Your agent, or you, runs the command through <code>agent-heavy run</code>. It keeps its working directory, arguments and environment.</p>
+        </li>
+        <li>
+          <h3>Wait for a slot</h3>
+          <p>The menu-bar app shows what is running, what is waiting, and which project and branch each job belongs to. You choose how many jobs run in parallel.</p>
+        </li>
+        <li>
+          <h3>Get the result</h3>
+          <p>Output streams back to the caller, which returns the command's own exit status. Several repositories, worktrees, terminals and agents share one queue.</p>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section id="features" aria-labelledby="features-h">
+    <div class="wrap">
+      <h2 id="features-h">Built for a busy laptop</h2>
+
+      <article class="feature">
+        <div class="copy">
+          <h3>Adaptive scheduling</h3>
+          <p>The queue measures the machine and each job, and can delay a job when its predicted demand does not fit current headroom. Fixed scheduling is the default, Learn only records predictions, and Adaptive turns on resource-based admission.</p>
+          <p>Changing mode never stops a running job.</p>
+        </div>
+        <img class="shot mid" src="img/adaptive-native.webp" width="492" height="640" alt="Agent Queue with the Adaptive scheduling mode selected, showing estimated memory and CPU for each job and a queued job waiting for memory headroom" loading="lazy" decoding="async">
+      </article>
+
+      <article class="feature flip wide">
+        <div class="copy">
+          <h3>It learns your recurring jobs</h3>
+          <p>For recurring jobs the queue learns conservative CPU and memory envelopes. Open <strong>Learned workloads</strong> to inspect measured peaks and run counts, and set minimums that correct future estimates.</p>
+        </div>
+        <img class="shot" src="img/mac-learning.webp" width="1200" height="936" alt="Learned workloads window for a web test suite, with measured history, a group estimate and fields for minimum RAM and CPU" loading="lazy" decoding="async">
+      </article>
+
+      <article class="feature">
+        <div class="copy">
+          <h3>A private dashboard for your phone</h3>
+          <p>An optional private web dashboard works from a phone over home Wi-Fi or a VPN. See the queue, start or reorder waiting jobs, and cancel what you no longer need.</p>
+        </div>
+        <img class="shot tall" src="img/phone-queue.webp" width="360" height="780" alt="Phone dashboard listing a running job and queued jobs with Start now, Move to end, Cancel and Details buttons" loading="lazy" decoding="async">
+      </article>
+
+      <article class="feature flip">
+        <div class="copy">
+          <h3>Works with your coding agents</h3>
+          <p>Add queue instructions for Codex and Claude Code from <strong>Agent integration</strong>, or run <code>agent-heavy agents install</code>. It is optional, and the instructions guide agents; they do not intercept commands.</p>
+          <p>Plugins can also add lanes, named queues with their own concurrency and priority.</p>
+        </div>
+        <img class="shot mid" src="img/agent-integration.webp" width="533" height="640" alt="Agent integration setup offering Codex and Claude Code with no runners selected" loading="lazy" decoding="async">
+      </article>
+    </div>
+  </section>
+
+  <section id="cli" class="cli" aria-labelledby="cli-h">
+    <div class="wrap">
+      <h2 id="cli-h">Command line</h2>
+      <div class="copy">
+        <p>Queue resource-intensive parallel work. Small serial compilations, focused tests and editing can run directly.</p>
+      </div>
+      <pre role="region" tabindex="0" aria-label="Example agent-heavy commands"><code>agent-heavy run --label "Build and unit tests" -- npm run build
+agent-heavy -- npm run typecheck
+agent-heavy -- go test -p 2 ./...</code></pre>
+    </div>
+  </section>
+
+  <section id="download" class="get" aria-labelledby="download-h">
+    <div class="wrap">
+      <h2 id="download-h">Get Agent Queue</h2>
+      <dl class="facts">
+        <dt>Requires</dt><dd>macOS 15 or later</dd>
+        <dt>Runs on</dt><dd>Apple Silicon and Intel</dd>
+        <dt>Install</dt><dd>Open the DMG and drag Agent Queue to Applications</dd>
+        <dt>Signing</dt><dd>Developer ID signed and notarized</dd>
+        <dt>License</dt><dd><a href="https://github.com/Dunky13/agent-job-queue/blob/main/LICENSE">MIT</a></dd>
+      </dl>
+      <p class="fine">The download button opens the latest DMG when this site can identify it, and the releases page otherwise. All builds are on the <a href="https://github.com/Dunky13/agent-job-queue/releases">releases page</a>.</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Agent Queue, MIT licensed.</p>
+    <nav aria-label="Project links">
+      <ul>
+        <li><a href="https://github.com/Dunky13/agent-job-queue">Source on GitHub</a></li>
+        <li><a href="https://github.com/Dunky13/agent-job-queue/tree/main/docs">Documentation</a></li>
+        <li><a href="https://github.com/Dunky13/agent-job-queue/releases">Releases</a></li>
+        <li><a href="https://github.com/Dunky13/agent-job-queue/blob/main/LICENSE">License</a></li>
+      </ul>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

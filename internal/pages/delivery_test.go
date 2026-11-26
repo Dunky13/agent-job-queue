@@ -733,3 +733,16 @@ func TestLiveRedirectsStayOnHTTPS(t *testing.T) {
 		t.Fatal("third redirect accepted")
 	}
 }
+
+func TestRepositorySiteAssembles(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out")
+	generated := map[string][]byte{"appcast.xml": []byte("<rss/>"), "latest.json": []byte("{}")}
+	if err := assembleSite(filepath.Join("..", "..", "site"), out, generated); err != nil {
+		t.Fatalf("the homepage in site/ would fail delivery: %v", err)
+	}
+	for _, name := range []string{"index.html", "404.html", "appcast.xml", "latest.json"} {
+		if _, err := os.Stat(filepath.Join(out, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
