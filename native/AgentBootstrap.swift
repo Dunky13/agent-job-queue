@@ -199,9 +199,9 @@ struct QueueBootstrapEnvironment: Sendable {
         return packaging?.serviceManagement == true
     }
 
-    /// Nil for fixtures, private test fixtures, setup-disabled and unmanaged bundles, so they stay inert.
-    @MainActor func makeSupervisor(fixtureMode: Bool) -> QueueHelperSupervisor? {
-        guard !fixtureMode, supervisesHelpers else { return nil }
+    /// Nil for `--fixture`, private test fixtures, setup-disabled and unmanaged bundles, so they stay inert.
+    @MainActor func makeSupervisor() -> QueueHelperSupervisor? {
+        guard supervisesHelpers else { return nil }
         return QueueHelperSupervisor(app: app, stateDirectory: home.appendingPathComponent(".local/state/agent-heavy", isDirectory: true),
                                      settingsDirectory: home.appendingPathComponent(".config/agent-heavy", isDirectory: true))
     }

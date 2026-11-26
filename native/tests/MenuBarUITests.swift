@@ -17,7 +17,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     private var footerMenuOpenCount = 0
     private var footerMenu: NSMenu?
     private let applicationMenuDelegate = AppDelegate()
-    private let coordinator = WindowCoordinator()
+    private let fixture = QueueFixture(arguments: CommandLine.arguments)
+    private lazy var coordinator = fixture.coordinator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let watchdog = Timer(timeInterval: 60, target: self, selector: #selector(timedOut(_:)), userInfo: nil, repeats: false)
@@ -123,7 +124,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
 
     private func verify() async throws {
         let store = coordinator.store
-        guard store.fixtureMode, store.snapshot != nil else {
+        guard fixture.loadError == nil, store.snapshot != nil else {
             throw ClientError.message("Menu-bar verification requires --fixture JSONFILE containing simulated jobs.")
         }
         let routes = coordinator.routes
@@ -132,7 +133,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
             // The Quit item's real selector is exercised with an inert endpoint.
             // Every window action still uses the production coordinator handler.
             if action != .quit { routes.perform(action) }
-        }, openLearning: routes.openLearning))
+        }, openLearning: routes.openLearning, logTail: routes.logTail, desktop: routes.desktop))
         self.controller = controller
         coordinator.menuBarController = controller
         NSApp.mainMenu = applicationMenuDelegate.makeMainMenu()
@@ -259,14 +260,19 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try check([QueueWindowKind.learning, .updates, .integration, .remote].allSatisfy { coordinator.windows[$0]?.isVisible == true },
                   "nativeSettingsSelectorsReachProductionWindowHandlers")
         try check(actions.suffix(5) == QueueAppAction.settings + [.quit], "allSettingsAndInertQuitDispatchExactlyOnce")
-        try check(coordinator.remoteStore.fixtureMode && coordinator.integrationStore.fixtureMode
-            && coordinator.updateStore.fixtureMode && coordinator.learningStore.fixtureMode,
+        // Each opened window loads through its own store; every one of those reads must arrive at the fixture.
+        for read: QueueClient.Command in [.remoteStatus, .agentsStatus, .version, .profilesHierarchy(limit: 100)] {
+            await fixture.waitForRead(read)
+        }
+        try check(fixture.changes.isEmpty && fixture.desktopRequests.isEmpty,
                   "allOpenedSettingsRemainFixtureIsolated")
         try await verifyWindows()
         try await verifyApplicationMenus()
         let original = store.snapshot
+        fixture.snapshot = nil
         store.error = "Simulated unavailable queue"
         try check(controller.statusItem.button?.title == "!", "errorBadgeUpdatesOnRealStatusButton")
+        fixture.snapshot = original
         store.error = nil
         let presentation = QueueStatusPresentation(snapshot: original, error: nil)
         try check(controller.statusItem.button?.title == presentation.title
@@ -462,11 +468,15 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await settle()
         try check(controller.popover.isShown, "anotherAppTakingFocusKeepsPopoverOpen")
         let shownTitle = controller.statusItem.button?.title
+        // A refresh landing during these checks must not report the queue as healthy again.
+        let healthy = fixture.snapshot
+        fixture.snapshot = nil
         coordinator.store.error = "Simulated unavailable queue"
         try check(shownTitle != "!" && controller.statusItem.button?.title == shownTitle, "statusTitleHoldsWidthWhilePopoverShown")
         controller.closePopover()
         try await settle()
         try check(controller.statusItem.button?.title == "!", "heldStatusTitleAppliesOnClose")
+        fixture.snapshot = healthy
         coordinator.store.error = nil
         try check(controller.statusItem.button?.title == shownTitle, "closedStatusTitleUpdatesImmediately")
         // The queue window opened earlier may still be on screen; the dismissed popover must not count.

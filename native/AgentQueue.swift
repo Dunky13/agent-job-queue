@@ -658,50 +658,25 @@ final class QueueStore: ObservableObject {
     private var refreshInFlight = false
     private var refreshRequested = false
     private var mutationRevision = 0
-    let fixtureMode: Bool
-    #if AGENT_QUEUE_TEST_HOOKS
-    private(set) var fixtureRecorder: FixtureDispatchRecorder?
-    #endif
-
-    init(statusLoader: @escaping @Sendable () async throws -> Data = {
-        try await QueueClient.run(.status)
-    }, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = { try await QueueClient.run($0) },
+    init(statusLoader: @escaping @Sendable () async throws -> Data,
+         command: @escaping @Sendable (QueueClient.Command) async throws -> Data,
          snapshotPreparer: @escaping @Sendable (Data, QueueSnapshot?) async throws -> PreparedQueueSnapshot? = {
              try await PreparedQueueSnapshot.decode($0, comparedTo: $1)
-         }, arguments: [String] = CommandLine.arguments,
+         },
          pollSleep: @escaping PollSleep = { try await Task.sleep(for: $0, clock: .continuous) }) {
         self.pollSleep = pollSleep
         self.statusLoader = statusLoader
         self.command = command
         self.snapshotPreparer = snapshotPreparer
-        #if AGENT_QUEUE_TEST_HOOKS
-        let args = arguments
-        if let index = args.firstIndex(of: "--fixture"), args.indices.contains(index + 1) {
-            fixtureMode = true
-            if args.contains("--verify-confirmation-navigation") { fixtureRecorder = FixtureDispatchRecorder() }
-            do {
-                let data = try Data(contentsOf: URL(fileURLWithPath: args[index + 1]))
-                snapshot = try JSONDecoder().decode(QueueSnapshot.self, from: data)
-                lastRefreshed = Date()
-            } catch { self.error = "Fixture could not be loaded: \(error.localizedDescription)" }
-        } else { fixtureMode = false }
-        #else
-        fixtureMode = false
-        #endif
     }
 
     var running: [QueueJob] { prepared?.running ?? [] }
     var waiting: [QueueJob] { prepared?.waiting ?? [] }
     var recent: [QueueJob] { prepared?.recent ?? [] }
     var isPaused: Bool { QueueAction.resume.isAllowed(in: snapshot) }
-    var actionsDisabled: Bool {
-        #if AGENT_QUEUE_TEST_HOOKS
-        if fixtureMode && fixtureRecorder == nil { return true }
-        #endif
-        return isRefreshing || isMutating || error != nil
-    }
+    var actionsDisabled: Bool { isRefreshing || isMutating || error != nil }
     func start() {
-        guard !fixtureMode, pollTask == nil else { return }
+        guard pollTask == nil else { return }
         pollTask = Task { [weak self, pollSleep] in
             await self?.refresh()
             var ticks = 0
@@ -719,7 +694,7 @@ final class QueueStore: ObservableObject {
     func appear() -> Task<Void, Never> { Task { await refresh() } }
 
     func refresh(manual: Bool = false) async {
-        guard !fixtureMode, !isMutating else { return }
+        guard !isMutating else { return }
         guard !refreshInFlight else { refreshRequested = true; return }
         refreshInFlight = true
         let revision = mutationRevision
@@ -755,8 +730,6 @@ final class QueueStore: ObservableObject {
     @discardableResult
     func dispatch(_ action: QueueAction) -> Task<Void, Never>? {
         guard !actionsDisabled, action.isAllowed(in: snapshot) else { return nil }
-        // Only job actions reach a fixture recorder; queue-level changes stay refused in fixtures.
-        guard action.job != nil || !fixtureMode else { return nil }
         // Reserve before scheduling asynchronous I/O so polling and other windows
         // cannot silently consume the user's confirmed action between these steps.
         isMutating = true
@@ -767,15 +740,6 @@ final class QueueStore: ObservableObject {
     }
 
     private func complete(_ action: QueueAction) async {
-        #if AGENT_QUEUE_TEST_HOOKS
-        if fixtureMode {
-            // Fixture actions can only reach this recorder, never the live CLI.
-            if let job = action.job { fixtureRecorder?.record(action: action.name, jobID: job.id) }
-            isResuming = false
-            isMutating = false
-            return
-        }
-        #endif
         do {
             _ = try await command(action.command)
             notice = action.notice
@@ -815,25 +779,14 @@ final class RemoteAccessStore: ObservableObject {
     var surfaces = QueueSurfaces()
     private var pollTask: Task<Void, Never>?
     private let pollSleep: PollSleep
-    let fixtureMode: Bool
-    /// Runs `agent-remote serve` as a child of the app. Nil for fixtures and unmanaged launches.
+    /// Runs `agent-remote serve` as a child of the app. Nil for unmanaged launches.
     var supervisor: QueueHelperSupervisor?
     private let command: @Sendable (QueueClient.Command) async throws -> Data
 
-    init(fixtureMode: Bool, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = { try await QueueClient.run($0) },
+    init(command: @escaping @Sendable (QueueClient.Command) async throws -> Data,
          pollSleep: @escaping PollSleep = { try await Task.sleep(for: $0, clock: .continuous) }) {
         self.pollSleep = pollSleep
-        self.fixtureMode = fixtureMode
         self.command = command
-        #if AGENT_QUEUE_TEST_HOOKS
-        if fixtureMode {
-            let stopFailure = CommandLine.arguments.contains("--snapshot-remote-stop-failure")
-                || CommandLine.arguments.contains("--verify-remote-stop-state")
-            status = RemoteStatus(enabled: false, configured: stopFailure, running: false,
-                url: "https://192.0.2.10:8743/", port: 8743, username: "agent", certificatePath: "",
-                error: stopFailure ? "Remote stop incomplete" : nil)
-        }
-        #endif
     }
 
     var effectiveError: String? { status?.error ?? error }
@@ -850,7 +803,7 @@ final class RemoteAccessStore: ObservableObject {
     /// Polls while a surface is visible. Returns the new loop, or nil when none was started.
     @discardableResult
     func startPolling() -> Task<Void, Never>? {
-        guard !fixtureMode, pollTask == nil else { return nil }
+        guard pollTask == nil else { return nil }
         pollTask = Task { [weak self, pollSleep] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -863,7 +816,7 @@ final class RemoteAccessStore: ObservableObject {
     }
 
     func refresh() async {
-        guard !fixtureMode, !isBusy, !isRefreshing else { return }
+        guard !isBusy, !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
         do {
@@ -874,7 +827,7 @@ final class RemoteAccessStore: ObservableObject {
     }
 
     func setEnabled(_ enabled: Bool) {
-        guard !fixtureMode, !isBusy, !isRefreshing, let status,
+        guard !isBusy, !isRefreshing, let status,
               !enabled || status.configured else { return }
         isBusy = true
         notice = nil
@@ -908,7 +861,7 @@ final class RemoteAccessStore: ObservableObject {
 
     @discardableResult
     func configure(password: String, enable: Bool) -> Bool {
-        guard !fixtureMode, !isBusy, !isRefreshing, Self.acceptsPassword(password) else { return false }
+        guard !isBusy, !isRefreshing, Self.acceptsPassword(password) else { return false }
         isBusy = true
         error = nil
         notice = nil
@@ -1403,7 +1356,8 @@ struct QueuePanel: View {
                     .background(Color(nsColor: .windowBackgroundColor))
             } else if let job = navigation.selected {
                 let currentJob = store.snapshot?.jobs.first(where: { $0.id == job.id }) ?? job
-                JobDetail(job: currentJob, fixtureMode: store.fixtureMode, openLearning: app.openLearning, onClose: navigation.back)
+                JobDetail(job: currentJob, logTail: app.logTail, desktop: app.desktop,
+                          openLearning: app.openLearning, onClose: navigation.back)
                     .background(Color(nsColor: .windowBackgroundColor))
             }
         }
@@ -1434,12 +1388,11 @@ struct QueuePanel: View {
             HStack {
                 Label("Agent Queue", systemImage: QueueBrand.symbolName).font(.system(size: 15, weight: .semibold))
                 Spacer()
-                if store.fixtureMode { Text("PREVIEW").font(.caption2.weight(.semibold)).foregroundStyle(.secondary) }
                 Button { Task { await store.refresh(manual: true) } } label: {
                     Image(systemName: "arrow.clockwise").frame(width: 20, height: 20)
                 }.buttonStyle(.borderless).help("Refresh queue (Command-R)")
                     .accessibilityLabel("Refresh queue").keyboardShortcut("r")
-                    .disabled(store.isRefreshing || store.isMutating || store.fixtureMode)
+                    .disabled(store.isRefreshing || store.isMutating)
             }
             HStack(spacing: 14) {
                 Label("\(store.snapshot?.queue.running ?? 0) running", systemImage: "play.fill").foregroundStyle(.green)
@@ -1462,7 +1415,7 @@ struct QueuePanel: View {
                 Spacer(minLength: 0)
             }
             .pickerStyle(.menu).font(.caption)
-            .disabled(store.fixtureMode || store.actionsDisabled || store.snapshot == nil)
+            .disabled(store.actionsDisabled || store.snapshot == nil)
             if let scheduler = store.snapshot?.scheduler {
                 hostLine(scheduler)
             } else {
@@ -1684,11 +1637,12 @@ struct QueuePanel: View {
 
 struct RemoteAccessSettings: View {
     @ObservedObject var store: RemoteAccessStore
+    let desktop: QueueDesktop
     @State private var password = ""
     @State private var copied = false
 
     private var canSave: Bool {
-        !store.fixtureMode && !store.isBusy && !store.isRefreshing && RemoteAccessStore.acceptsPassword(password)
+        !store.isBusy && !store.isRefreshing && RemoteAccessStore.acceptsPassword(password)
     }
     private var remoteURL: URL? {
         guard let value = store.status?.url, let url = URL(string: value), url.scheme == "https", url.host != nil else { return nil }
@@ -1701,10 +1655,9 @@ struct RemoteAccessSettings: View {
                 HStack {
                     Label("Remote access", systemImage: "network").font(.title2.weight(.semibold))
                     Spacer()
-                    if store.fixtureMode { Text("PREVIEW").font(.caption2.weight(.semibold)).foregroundStyle(.secondary) }
                     Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless).help("Refresh remote access status").accessibilityLabel("Refresh remote access status")
-                        .disabled(store.fixtureMode || store.isBusy || store.isRefreshing)
+                        .disabled(store.isBusy || store.isRefreshing)
                 }
                 Text("Open the queue from your phone over your home network or existing VPN.")
                     .font(.callout).foregroundStyle(.secondary)
@@ -1715,7 +1668,7 @@ struct RemoteAccessSettings: View {
                     Toggle("Remote access", isOn: Binding(
                         get: { store.status?.enabled ?? false },
                         set: { store.setEnabled($0) }))
-                        .disabled(store.fixtureMode || store.isBusy || store.isRefreshing
+                        .disabled(store.isBusy || store.isRefreshing
                             || (store.status?.configured != true && store.status?.enabled != true))
                     HStack(spacing: 7) {
                         Circle().fill(statusColor).frame(width: 7, height: 7)
@@ -1734,7 +1687,7 @@ struct RemoteAccessSettings: View {
                 Section("Phone sign-in") {
                     LabeledContent("Username", value: store.status?.username ?? "agent")
                     SecureField("New password", text: $password).textContentType(.newPassword)
-                        .disabled(store.fixtureMode || store.isBusy)
+                        .disabled(store.isBusy)
                     Text("Use at least 4 characters. No special characters required.")
                         .font(.caption).foregroundStyle(.secondary)
                     HStack {
@@ -1752,12 +1705,11 @@ struct RemoteAccessSettings: View {
                         Text(remoteURL.absoluteString).font(.system(.callout, design: .monospaced)).textSelection(.enabled)
                         HStack {
                             Button(copied ? "Copied" : "Copy address", systemImage: "doc.on.doc") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(remoteURL.absoluteString, forType: .string)
+                                desktop(.copy(remoteURL.absoluteString))
                                 copied = true
-                            }.disabled(store.fixtureMode)
-                            Button("Open", systemImage: "arrow.up.forward.square") { NSWorkspace.shared.open(remoteURL) }
-                                .disabled(store.fixtureMode || store.status?.running != true)
+                            }
+                            Button("Open", systemImage: "arrow.up.forward.square") { desktop(.open(remoteURL)) }
+                                .disabled(store.status?.running != true)
                         }
                     } else { Text("The phone address appears after setup.").font(.caption).foregroundStyle(.secondary) }
                     VStack(alignment: .leading, spacing: 14) {
@@ -1766,9 +1718,9 @@ struct RemoteAccessSettings: View {
                             HStack {
                                 ShareLink(item: URL(fileURLWithPath: path)) { Label("Share certificate", systemImage: "square.and.arrow.up") }
                                 Button("Show in Finder", systemImage: "folder") {
-                                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                                    desktop(.reveal(URL(fileURLWithPath: path)))
                                 }
-                            }.disabled(store.fixtureMode)
+                            }
                         }
                         instruction(2, "Install it as a CA certificate", "Go to Settings > Security & privacy > More security settings > Encryption & credentials > Install a certificate > CA certificate. Select root.crt and confirm your PIN. Labels vary by device; search Settings for CA certificate. Choose CA certificate for HTTPS.")
                         instruction(3, "Open the address and sign in", "Open the address above in Chrome or your browser. Sign in as agent with your saved password.")
@@ -1873,7 +1825,8 @@ func parseDate(_ value: String) -> Date? {
 
 struct JobDetail: View {
     let job: QueueJob
-    let fixtureMode: Bool
+    let logTail: QueueLogTail
+    let desktop: QueueDesktop
     let openLearning: @MainActor (String) -> Void
     let onClose: () -> Void
     @State private var output = "Loading output…"
@@ -1926,10 +1879,10 @@ struct JobDetail: View {
                 Text("Output").font(.headline)
                 Text("Latest 64 KB").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("Refresh", systemImage: "arrow.clockwise") { Task { await loadLog() } }.disabled(loading || fixtureMode)
+                Button("Refresh", systemImage: "arrow.clockwise") { Task { await loadLog() } }.disabled(loading)
                 Button("Open log", systemImage: "arrow.up.forward.square") {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: job.logPath))
-                }.disabled(fixtureMode || job.logPath.isEmpty)
+                    desktop(.open(URL(fileURLWithPath: job.logPath)))
+                }.disabled(job.logPath.isEmpty)
             }
             ScrollView([.horizontal, .vertical]) {
                 Text(output).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
@@ -1949,11 +1902,10 @@ struct JobDetail: View {
     }
     private func formatted(_ value: String) -> String { parseDate(value)?.formatted(date: .abbreviated, time: .standard) ?? value }
     private func loadLog() async {
-        guard !fixtureMode else { output = "Log access is disabled in preview mode."; return }
         guard !job.logPath.isEmpty else { output = "This job has no output log."; return }
         loading = true
         defer { loading = false }
-        do { output = try await QueueClient.logTail(job.logPath) }
+        do { output = try await logTail(job.logPath) }
         catch { output = "Cannot read output: \(error.localizedDescription)" }
     }
 }
@@ -1972,14 +1924,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var bootstrapEnvironment: QueueBootstrapEnvironment?
     private var bootstrapExecutor: QueueBootstrapModel.Executor = QueueBootstrapModel.runInstaller
     private var replyToTermination: @MainActor () -> Void = { NSApp.reply(toApplicationShouldTerminate: true) }
-    private var makeSupervisor: @MainActor (QueueBootstrapEnvironment, Bool) -> QueueHelperSupervisor? = {
-        $0.makeSupervisor(fixtureMode: $1)
+    private var makeSupervisor: @MainActor (QueueBootstrapEnvironment) -> QueueHelperSupervisor? = {
+        $0.makeSupervisor()
     }
 
     override init() { super.init() }
 
     // The separate graphical fixture supplies a private bundle/home and an inert
-    // executor. Normal launch still follows the production path with --fixture.
+    // executor. Normal launch still follows the production path.
     // Fixtures never supervise helpers unless a test injects a fake supervisor.
     init(environment: QueueBootstrapEnvironment,
          terminationReply: @escaping @MainActor () -> Void = { NSApp.reply(toApplicationShouldTerminate: true) },
@@ -1988,7 +1940,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bootstrapEnvironment = environment
         bootstrapExecutor = executor
         replyToTermination = terminationReply
-        makeSupervisor = { _, _ in supervisor }
+        makeSupervisor = { _ in supervisor }
         super.init()
     }
 
@@ -2041,10 +1993,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = makeMainMenu()
         let statusItem = startupMenuBarController?.transferStatusItem()
         startupMenuBarController = nil
-        let coordinator = WindowCoordinator()
+        let environment = bootstrapEnvironment ?? .current()
+        #if AGENT_QUEUE_TEST_HOOKS
+        // `--fixture` in either argument list selects the stand-in backend, never the live one.
+        let coordinator = QueueFixture.launch(arguments: environment.arguments + CommandLine.arguments)
+            ?? WindowCoordinator(backend: .live)
+        #else
+        let coordinator = WindowCoordinator(backend: .live)
+        #endif
         self.coordinator = coordinator
         coordinator.showMenuBar(statusItem: statusItem)
-        if let helpers = makeSupervisor(bootstrapEnvironment ?? .current(), coordinator.store.fixtureMode) {
+        if let helpers = makeSupervisor(environment) {
             startHelpers(helpers, for: coordinator)
         } else { coordinator.store.start() }
         #if AGENT_QUEUE_TEST_HOOKS

@@ -61,34 +61,39 @@ struct BehaviorTests {
         try checkMenuBarBehavior(check)
         try checkLaneStatusDecoding(check)
         try checkQueueRowSummaries(check)
-        let store = QueueStore()
-        guard store.fixtureMode, let recorder = store.fixtureRecorder,
-              let queued = store.waiting.first, let original = store.snapshot else {
-            throw ClientError.message("Native behavior tests require a recorded fixture.")
+        let fixture = QueueFixture(arguments: CommandLine.arguments)
+        let coordinator = fixture.coordinator()
+        let store = coordinator.store
+        guard fixture.loadError == nil, let queued = store.waiting.first, let original = store.snapshot else {
+            throw ClientError.message("Native behavior tests require --fixture JSONFILE with a waiting job.")
         }
         let navigation = QueueNavigation()
-        store.snapshot = QueueSnapshot(updatedAt: original.updatedAt,
+        let paused = QueueSnapshot(updatedAt: original.updatedAt,
             queue: QueueSummary(status: "paused", limit: original.queue.limit, running: 0,
                                 waiting: original.queue.waiting, legacyOccupied: false), jobs: original.jobs)
-        let beforeResume = recorder.actions.count
-        try check(store.dispatch(.resume) == nil && recorder.actions.count == beforeResume,
-                  "Read-only fixtures cannot dispatch Resume even with an action recorder")
+        fixture.snapshot = paused
+        store.snapshot = paused
+        await store.dispatch(.resume)?.value
+        try check(fixture.changes == [.resume] && store.notice == "Queue resumed." && store.error == nil && !store.isMutating,
+                  "Fixture Resume runs the live pipeline and ends at the recorder")
+        fixture.snapshot = original
         store.snapshot = original
         navigation.show(queued)
         navigation.back()
         try check(navigation.selected == nil, "Done returns to queue navigation")
         for kind in [QueueConfirmationKind.start, .cancel] {
-            let before = recorder.actions.count
+            let before = fixture.changes.count
             navigation.request(kind, job: queued)
-            try check(recorder.actions.count == before, "Opening confirmation sends no action")
+            try check(fixture.changes.count == before, "Opening confirmation sends no action")
             navigation.decline()
-            try check(recorder.actions.count == before && navigation.confirmation == nil, "Declining confirmation sends no action")
+            try check(fixture.changes.count == before && navigation.confirmation == nil, "Declining confirmation sends no action")
             navigation.request(kind, job: queued)
             let task = navigation.confirm(in: store)
             try check(task != nil && store.isMutating, "Confirm reserves action before I/O")
             try check(navigation.confirm(in: store) == nil, "Duplicate confirmation is rejected")
             await task?.value
-            try check(recorder.actions.count == before + 1, "Confirmed action dispatches exactly once")
+            try check(Array(fixture.changes.dropFirst(before)) == [kind.action(for: queued).command],
+                      "Confirmed action dispatches exactly once")
         }
         navigation.request(.start, job: queued)
         store.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [])
@@ -179,9 +184,8 @@ struct BehaviorTests {
             try check(kind.action(for: movable).confirmation == kind && kind.action(for: movable).name == kind.rawValue,
                       "\(kind.rawValue) confirmation builds the matching action")
         }
-        // Any command reaching this store fails and sets its error; it ignores the CLI fixture.
-        let rejecting = QueueStore(statusLoader: { Data() }, command: { _ in throw ClientError.message("A command was sent") },
-                                   arguments: [])
+        // Any command reaching this store fails and sets its error.
+        let rejecting = QueueStore(statusLoader: { Data() }, command: { _ in throw ClientError.message("A command was sent") })
         rejecting.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [running])
         try check(rejecting.dispatch(.next(running)) == nil && !rejecting.isMutating, "The store rejects a disallowed action")
         await rejecting.dispatch(.cancel(running))?.value
@@ -204,11 +208,17 @@ struct BehaviorTests {
         for (value, expected) in passwords {
             try check(RemoteAccessStore.acceptsPassword(value) == expected, "Remote password boundary")
         }
-        let remote = RemoteAccessStore(fixtureMode: true)
-        try check(remote.fixtureMode && !remote.configure(password: "word", enable: true), "Fixture cannot change actual remote credentials")
+        let remote = coordinator.remoteStore
+        await remote.refresh()
+        let beforeCredentials = fixture.changes.count
+        let configuring = remote.configure(password: "word", enable: false)
+        for await busy in remote.$isBusy.values where !busy { break }
+        try check(configuring && fixture.changes.dropFirst(beforeCredentials).map(\.controller) == [.remote]
+                  && fixture.changes.last?.arguments == ["configure"],
+                  "Fixture records remote credential changes instead of applying them")
 
         let remoteFixture = RemoteFixture()
-        let liveRemote = RemoteAccessStore(fixtureMode: false, command: { try await remoteFixture.load($0) })
+        let liveRemote = RemoteAccessStore(command: { try await remoteFixture.load($0) })
         func settleRemote() async throws {
             let deadline = ProcessInfo.processInfo.systemUptime + 3
             while liveRemote.isBusy {
@@ -268,12 +278,32 @@ struct BehaviorTests {
         await integration.save()?.value
         try check(integration.error != nil && integration.notice == nil && !integration.isBusy, "Partial failure is explained without a success notice")
         try check(integration.snapshot?.runners.first?.configured == true && integration.snapshot?.runners.last?.configured == false, "Partial failure reconciles actual per-runner state")
-        let preview = AgentIntegrationStore(fixtureMode: true, command: { _ in
-            throw ClientError.message("Preview must not dispatch")
-        })
-        preview.select("codex", enabled: true)
+        let preview = coordinator.integrationStore
         await preview.refresh()
-        try check(preview.save() == nil && preview.error == nil, "Preview never dispatches instruction changes")
+        preview.select("codex", enabled: true)
+        let beforeInstructions = fixture.changes.count
+        await preview.save()?.value
+        try check(Array(fixture.changes.dropFirst(beforeInstructions)) == [.agents("install", runner: "codex")]
+                  && preview.error == nil, "Preview instruction changes end at the recorder")
+
+        // A launch that names a fixture never falls back to the live backend.
+        for arguments in [["app", "--fixture", "/nonexistent/queue.json"], ["app", "--fixture"], ["app", "--fixture=queue.json"]] {
+            guard let broken = QueueFixture.launch(arguments: arguments), let launched = QueueFixture.launched,
+                  launched.coordinator === broken else {
+                throw ClientError.message("A fixture launch must build a fixture coordinator: \(arguments)")
+            }
+            await broken.store.refresh()
+            try check(broken.store.error?.contains("Fixture could not be loaded") == true && broken.store.actionsDisabled
+                      && broken.store.dispatch(.limit(2)) == nil && launched.fixture.changes.isEmpty,
+                      "An unloadable fixture stays inert and says why: \(arguments.dropFirst().joined(separator: " "))")
+        }
+        try check(QueueFixture.launch(arguments: ["app", "--setup"]) == nil, "A launch without a fixture gets no stand-in backend")
+        do {
+            _ = try fixture.respond(.setup(["install", "--payload", "/example/payload"]))
+            try check(false, "The fixture refuses commands it has no answer for")
+        } catch {
+            try check(error.localizedDescription.contains("no answer"), "The fixture refuses commands it has no answer for")
+        }
     }
 
     @MainActor private static func checkMenuBarBehavior(_ check: (Bool, String) throws -> Void) throws {

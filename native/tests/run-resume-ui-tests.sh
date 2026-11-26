@@ -16,7 +16,7 @@ build_before_fixture() {
   local source=$1
   local queue_source="$source/AgentQueue.swift"
   # Supply the same injected-provider argument seam to the historical store.
-  # This changes no baseline view code and keeps fixture badges/controls equal.
+  # This changes no baseline view code, and the injected store renders live controls.
   awk '
     /^final class QueueStore:/ { store=1 }
     store && /^    init\(statusLoader:/ { initializer=1 }
@@ -30,11 +30,12 @@ build_before_fixture() {
     { print }
   ' "$queue_source" > "$temporary/before-injected.swift"
   # The historical store injects argv where the current one injects a typed command,
-  # keeps its controllers in AppRuntime with no injected routes, and compiles into
-  # one module with the test rather than linking a library.
-  sed -e 's/\(backend\.command(.0\)\.arguments)/\1)/' -e '/^@testable import AgentQueueCore$/d' \
-    -e '/let coordinator = WindowCoordinator()/d' -e 's/coordinator\(\.[a-zA-Z]*Store\.\)/AppRuntime\1/g' \
-    -e 's/coordinator\.store\./AppRuntime.store./' -e 's/app: coordinator\.routes, //' \
+  # keeps its controllers in AppRuntime with a fixture flag and no injected routes,
+  # and compiles into one module with the test rather than linking a library.
+  sed -e 's/\(backend\.command(.0\)\.arguments) })/\1) }, arguments: [])/' -e '/^@testable import AgentQueueCore$/d' \
+    -e '/let fixture = QueueFixture(/d' -e '/let coordinator = fixture\.coordinator()/d' \
+    -e 's/fixture\.changes\.isEmpty/AppRuntime.store.fixtureMode \&\& AppRuntime.remoteStore.fixtureMode/' \
+    -e 's/app: coordinator\.routes, //' \
     -e 's/refreshesOnAppear:/tracksVisibility:/' \
     "$root/native/tests/ResumeUITests.swift" > "$temporary/before-ResumeUITests.swift"
   sed '/^@main$/d' "$temporary/before-injected.swift" > "$temporary/before-AgentQueue.swift"

@@ -94,7 +94,8 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
             from: Data(contentsOf: URL(fileURLWithPath: try option("--input"))))
         guard let queued = original.jobs.first(where: \.isWaiting) else { throw ClientError.message("Waiting fixture job missing") }
         let captureOnly = CommandLine.arguments.contains("--capture-only")
-        let coordinator = WindowCoordinator()
+        let fixture = QueueFixture(arguments: CommandLine.arguments)
+        let coordinator = fixture.coordinator()
         for fullWindow in [false, true] {
             let name = fullWindow ? "window-waiting" : "menu-empty"
             let jobs = fullWindow ? [queued] : []
@@ -102,11 +103,9 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
                 queue: QueueSummary(status: "paused", limit: 3, running: 0, waiting: jobs.count, legacyOccupied: false),
                 jobs: jobs, scheduler: original.scheduler)
             let backend = ResumeUIBackend(snapshot)
-            // Only this store opts out of CLI fixtures, with both providers injected.
-            // The coordinator's stores retain --fixture and cannot reach live controllers.
-            let store = QueueStore(statusLoader: { try await backend.load() }, command: { try await backend.command($0.arguments) }, arguments: [])
-            try check(coordinator.store.fixtureMode && coordinator.remoteStore.fixtureMode,
-                      "\(name): app controllers remain inert")
+            // Only this store drives the resumable backend. The coordinator's stores belong to the
+            // fixture, so they cannot reach live controllers and must receive no change.
+            let store = QueueStore(statusLoader: { try await backend.load() }, command: { try await backend.command($0.arguments) })
             await store.refresh()
             let size = NSSize(width: fullWindow ? 800 : 500, height: fullWindow ? 700 : 650)
             let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
@@ -143,6 +142,7 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
                 try check(list.bounds.height < pausedHeight, "\(name): paused control disappears after resume")
                 try capture(view, to: output.appendingPathComponent("resumed-\(name).png"))
             }
+            try check(fixture.changes.isEmpty, "\(name): app controllers remain inert")
             window.orderOut(nil)
             window.close()
         }

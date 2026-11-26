@@ -14,7 +14,7 @@ The macOS menu-bar app shows what is running, what is waiting, and which project
 | --- | --- |
 | [![Mac queue showing running and waiting jobs, project labels, and the parallel job limit](docs/screenshots/mac-queue.png)](docs/screenshots/mac-queue.png) | [![Phone dashboard showing the queue and controls to start or reorder jobs](docs/screenshots/phone-queue.png)](docs/screenshots/phone-queue.png) |
 
-Screenshots use sample jobs. The Mac image uses the app's safe preview mode.
+Screenshots use sample jobs. The Mac images come from a test build whose stand-in backend runs no queue command.
 
 <details>
 <summary>Start a waiting job in parallel</summary>

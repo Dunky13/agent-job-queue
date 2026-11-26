@@ -49,13 +49,19 @@ struct BootstrapTests {
         }
 
         // Only a real managed launch supervises helpers; fixtures and unmanaged bundles stay inert.
-        for scenario in ["managed", "fixture-flag", "setup-disabled", "unmanaged", "fixture-mode"] {
+        let fixtureArguments = ["fixture-flag": ["--fixture", "queue.json"], "fixture-bare": ["--fixture"]]
+        for scenario in ["managed", "fixture-flag", "setup-disabled", "unmanaged", "fixture-bare"] {
             let supervised = try BootstrapFixture(parent: temporary, setupMode: scenario != "setup-disabled", managed: scenario != "unmanaged",
-                arguments: scenario == "fixture-flag" ? ["--fixture", "queue.json"] : [])
-            let helpers = supervised.environment.makeSupervisor(fixtureMode: scenario == "fixture-mode")
-            try check((helpers != nil) == (scenario == "managed") && supervised.environment.supervisesHelpers == (scenario != "unmanaged" && scenario != "fixture-flag" && scenario != "setup-disabled"),
+                arguments: fixtureArguments[scenario] ?? [])
+            let helpers = supervised.environment.makeSupervisor()
+            try check((helpers != nil) == (scenario == "managed") && supervised.environment.supervisesHelpers == (scenario == "managed"),
                 scenario == "managed" ? "A real managed launch creates a helper supervisor"
                     : "No helper supervisor is created for \(scenario) launches")
+            if let arguments = fixtureArguments[scenario] {
+                let requests = try supervised.environment.serviceStatusRequests()
+                try check(QueueFixture.launch(arguments: arguments) != nil && requests.isEmpty,
+                    "A \(scenario) launch gets the stand-in backend and asks no service for status")
+            }
         }
 
         // Runtime launch never performs installation. Only the installer stage

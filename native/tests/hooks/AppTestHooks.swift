@@ -4,23 +4,15 @@ import AppKit
 import SwiftUI
 import Foundation
 
-@MainActor
-final class FixtureDispatchRecorder {
-    private(set) var actions: [RecordedQueueAction] = []
-    func record(action: String, jobID: Int) { actions.append(RecordedQueueAction(action: action, jobID: jobID)) }
-}
-
-struct RecordedQueueAction: Codable, Equatable {
-    let action: String
-    let jobID: Int
-}
-
 extension AppDelegate {
     /// True when `--snapshot` takes over this launch; it terminates the app when done.
     func runSnapshotHooks(_ coordinator: WindowCoordinator) -> Bool {
         let arguments = CommandLine.arguments
         guard let index = arguments.firstIndex(of: "--snapshot"), arguments.indices.contains(index + 1) else { return false }
-        guard coordinator.store.fixtureMode else { diagnostic("--snapshot requires --fixture JSONFILE"); exit(EXIT_FAILURE) }
+        guard let launched = QueueFixture.launched, launched.coordinator === coordinator else {
+            diagnostic("--snapshot requires --fixture JSONFILE"); exit(EXIT_FAILURE)
+        }
+        let fixture = launched.fixture
         coordinator.show(.queue)
         let navigation = QueueNavigation()
         let verifyIndex = arguments.firstIndex(of: "--verify-detail-navigation")
@@ -54,42 +46,10 @@ extension AppDelegate {
             }
             navigation.show(job)
         }
-        if let window = coordinator.windows[.queue] {
-            let menuSize = arguments.contains("--snapshot-menu")
-            window.contentView = NSHostingView(rootView: QueuePanel(store: coordinator.store, app: coordinator.routes,
-                fullWindow: !menuSize, navigation: navigation))
-            if menuSize {
-                window.minSize = NSSize(width: 500, height: 650)
-                window.setContentSize(NSSize(width: 500, height: 650))
-                window.center()
-            }
-            if arguments.contains("--snapshot-remote-settings") {
-                window.contentView = NSHostingView(rootView: RemoteAccessSettings(store: coordinator.remoteStore))
-                window.minSize = QueueWindowKind.remote.spec.minSize ?? .zero
-                window.setContentSize(QueueWindowKind.remote.spec.size)
-                window.center()
-            }
-            if arguments.contains("--snapshot-agent-integration") {
-                window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: coordinator.integrationStore) {})
-                window.minSize = QueueWindowKind.integration.spec.minSize ?? .zero
-                window.setContentSize(QueueWindowKind.integration.spec.size)
-                window.center()
-            }
-            if arguments.contains("--snapshot-learning") {
-                if arguments.contains("--snapshot-learning-projects") { coordinator.learningStore.showFixtureLevel(.projects) }
-                window.contentView = NSHostingView(rootView: LearningWindow(store: coordinator.learningStore) {})
-                window.minSize = QueueWindowKind.learning.spec.minSize ?? .zero
-                window.setContentSize(QueueWindowKind.learning.spec.size)
-                window.center()
-            }
-            if arguments.contains("--snapshot-updates") {
-                window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: coordinator.updateStore) {})
-                window.minSize = QueueWindowKind.updates.spec.minSize ?? .zero
-                window.setContentSize(QueueWindowKind.updates.spec.size)
-                window.center()
-            }
-        }
         Task { @MainActor in
+            do { try await self.loadSnapshotData(coordinator, arguments: arguments) }
+            catch { self.diagnostic("Snapshot failed: \(error.localizedDescription)"); exit(EXIT_FAILURE) }
+            self.showSnapshotContent(coordinator, navigation: navigation, arguments: arguments)
             try? await Task.sleep(for: .milliseconds(500))
             guard let window = coordinator.windows[.queue], let view = window.contentView else {
                 self.diagnostic("Could not create snapshot view."); exit(EXIT_FAILURE)
@@ -111,14 +71,14 @@ extension AppDelegate {
                     guard report.passed else { throw ClientError.message("Remote stop-state regression failed; inspect the verification report.") }
                 }
                 if let passwordVerificationPath {
-                    let report = self.verifyPasswordValidation(coordinator.remoteStore)
+                    let report = await self.verifyPasswordValidation(fixture, coordinator.remoteStore)
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                     try encoder.encode(report).write(to: URL(fileURLWithPath: passwordVerificationPath))
                     guard report.passed else { throw ClientError.message("Password validation regression failed; inspect the verification report.") }
                 }
                 if let confirmationVerificationPath {
-                    let report = try await self.verifyConfirmations(navigation: navigation,
+                    let report = try await self.verifyConfirmations(navigation: navigation, fixture: fixture,
                         store: coordinator.store, window: window, view: view)
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -151,7 +111,67 @@ extension AppDelegate {
         return true
     }
 
-    private func verifyPasswordValidation(_ remote: RemoteAccessStore) -> PasswordValidationVerification {
+    /// Loads what the requested view shows through its store, before the view exists to load it itself.
+    private func loadSnapshotData(_ coordinator: WindowCoordinator, arguments: [String]) async throws {
+        if arguments.contains("--snapshot-remote-settings") { await coordinator.remoteStore.refresh() }
+        if arguments.contains("--snapshot-agent-integration") { await coordinator.integrationStore.refresh() }
+        if arguments.contains("--snapshot-learning") {
+            let learning = coordinator.learningStore
+            await learning.loadPage()?.value
+            if !arguments.contains("--snapshot-learning-projects") {
+                guard let project = learning.hierarchy?.projects.first else {
+                    throw ClientError.message("The fixture has no learned project.")
+                }
+                learning.openProject(project)
+                await learning.openOperation("tests")?.value
+            }
+        }
+        if arguments.contains("--snapshot-updates") {
+            await coordinator.updateStore.refreshInstalled()
+            await coordinator.updateStore.checkForUpdates()?.value
+        }
+    }
+
+    private func showSnapshotContent(_ coordinator: WindowCoordinator, navigation: QueueNavigation, arguments: [String]) {
+        if let window = coordinator.windows[.queue] {
+            let menuSize = arguments.contains("--snapshot-menu")
+            window.contentView = NSHostingView(rootView: QueuePanel(store: coordinator.store, app: coordinator.routes,
+                fullWindow: !menuSize, navigation: navigation))
+            if menuSize {
+                window.minSize = NSSize(width: 500, height: 650)
+                window.setContentSize(NSSize(width: 500, height: 650))
+                window.center()
+            }
+            if arguments.contains("--snapshot-remote-settings") {
+                window.contentView = NSHostingView(rootView: RemoteAccessSettings(store: coordinator.remoteStore,
+                    desktop: coordinator.routes.desktop))
+                window.minSize = QueueWindowKind.remote.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.remote.spec.size)
+                window.center()
+            }
+            if arguments.contains("--snapshot-agent-integration") {
+                window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: coordinator.integrationStore) {})
+                window.minSize = QueueWindowKind.integration.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.integration.spec.size)
+                window.center()
+            }
+            if arguments.contains("--snapshot-learning") {
+                window.contentView = NSHostingView(rootView: LearningWindow(store: coordinator.learningStore) {})
+                window.minSize = QueueWindowKind.learning.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.learning.spec.size)
+                window.center()
+            }
+            if arguments.contains("--snapshot-updates") {
+                window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: coordinator.updateStore,
+                    desktop: coordinator.routes.desktop) {})
+                window.minSize = QueueWindowKind.updates.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.updates.spec.size)
+                window.center()
+            }
+        }
+    }
+
+    private func verifyPasswordValidation(_ fixture: QueueFixture, _ remote: RemoteAccessStore) async -> PasswordValidationVerification {
         let candidates: [(String, String, Bool)] = [
             ("Empty rejected", "", false),
             ("ASCII below minimum", String(repeating: "a", count: 3), false),
@@ -175,17 +195,23 @@ extension AppDelegate {
         let cases = candidates.map { name, value, expected in
             PasswordValidationCase(name: name, expected: expected, accepted: RemoteAccessStore.acceptsPassword(value))
         }
-        let enabledBefore = remote.status?.enabled
-        let fixtureConfigurationRejected = !remote.configure(password: "fixture-only-password", enable: true)
+        await remote.refresh()
+        let before = fixture.changes.count
+        let invalidRejected = !remote.configure(password: "abc", enable: true)
         remote.setEnabled(true)
+        let rejectionsSentNothing = invalidRejected && !remote.isBusy && fixture.changes.count == before
+        let accepted = remote.configure(password: "fixture-only-password", enable: true)
+        for await busy in remote.$isBusy.values where !busy { break }
+        let sent = fixture.changes.dropFirst(before)
         return PasswordValidationVerification(cases: cases,
-            fixtureConfigurationRejected: fixtureConfigurationRejected,
-            fixtureEnableRejected: remote.status?.enabled == enabledBefore && !remote.isBusy)
+            rejectionsSentNothing: rejectionsSentNothing,
+            acceptedPasswordReachedTheFixture: accepted && sent.map(\.controller) == [.remote, .remote]
+                && sent.map(\.arguments) == [["configure"], ["enable"]])
     }
 
-    private func verifyConfirmations(navigation: QueueNavigation, store: QueueStore,
+    private func verifyConfirmations(navigation: QueueNavigation, fixture: QueueFixture, store: QueueStore,
                                      window: NSWindow, view: NSView) async throws -> ConfirmationVerification {
-        guard store.fixtureMode, let recorder = store.fixtureRecorder, let original = store.snapshot,
+        guard let original = store.snapshot,
               let queued = original.jobs.first(where: { QueueAction.next($0).isAllowed(in: original) && QueueAction.cancel($0).isAllowed(in: original) }) else {
             throw ClientError.message("Confirmation verification requires a fixture with an eligible waiting job.")
         }
@@ -193,8 +219,13 @@ extension AppDelegate {
             project: "Fixture", branch: "", directory: "", executable: "", priority: 0, queuePosition: nil,
             submittedAt: nil, startedAt: nil, finishedAt: nil, exitCode: nil, logPath: "",
             canReorder: false, canCancel: true, phase: "Paused")
-        store.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: original.jobs + [paused])
-        defer { navigation.decline(); store.snapshot = original; store.isMutating = false }
+        // The store refreshes from the fixture after each change, so both must hold the same queue.
+        func replaceQueue(_ snapshot: QueueSnapshot) {
+            fixture.snapshot = snapshot
+            store.snapshot = snapshot
+        }
+        replaceQueue(QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: original.jobs + [paused]))
+        defer { navigation.decline(); replaceQueue(original); store.isMutating = false }
 
         func sameSurface() -> Bool {
             window.isVisible && window.contentView === view && window.attachedSheet == nil
@@ -203,15 +234,15 @@ extension AppDelegate {
         var cases: [(QueueConfirmationKind, QueueJob)] = [(.start, queued), (.cancel, queued), (.cancel, paused)]
         if let running = original.jobs.first(where: { $0.isRunning && QueueAction.cancel($0).isAllowed(in: original) }) { cases.append((.cancel, running)) }
         for (kind, job) in cases {
-            let before = recorder.actions.count
+            let before = fixture.changes.count
             navigation.request(kind, job: job)
             try await Task.sleep(for: .milliseconds(60))
             var surfaceStayedVisible = sameSurface()
-            let openingDidNotDispatch = recorder.actions.count == before
+            let openingDidNotDispatch = fixture.changes.count == before
             navigation.decline()
             try await Task.sleep(for: .milliseconds(60))
             surfaceStayedVisible = surfaceStayedVisible && sameSurface()
-            let declineDidNotDispatch = recorder.actions.count == before && navigation.confirmation == nil
+            let declineDidNotDispatch = fixture.changes.count == before && navigation.confirmation == nil
 
             navigation.request(kind, job: job)
             try await Task.sleep(for: .milliseconds(60))
@@ -227,8 +258,7 @@ extension AppDelegate {
             store.isRefreshing = false
             try await Task.sleep(for: .milliseconds(60))
             surfaceStayedVisible = surfaceStayedVisible && sameSurface()
-            let expected = [RecordedQueueAction(action: kind.rawValue, jobID: job.id)]
-            let exactlyOneExpectedAction = Array(recorder.actions.dropFirst(before)) == expected
+            let exactlyOneExpectedAction = Array(fixture.changes.dropFirst(before)) == [kind.action(for: job).command]
 
             navigation.request(kind, job: job)
             store.isMutating = true
@@ -244,27 +274,30 @@ extension AppDelegate {
                 surfaceStayedVisible: surfaceStayedVisible))
         }
 
-        let beforeStale = recorder.actions.count
+        let beforeStale = fixture.changes.count
         navigation.request(.start, job: queued)
         // The same ID has become paused while the confirmation panel was open.
         let transitioned = QueueJob(id: queued.id, state: "paused", title: queued.title, project: queued.project,
             branch: queued.branch, directory: queued.directory, executable: queued.executable, priority: queued.priority,
             queuePosition: nil, submittedAt: queued.submittedAt, startedAt: queued.startedAt,
             finishedAt: nil, exitCode: nil, logPath: queued.logPath, canReorder: false, canCancel: true, phase: "Paused")
-        store.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue,
-            jobs: original.jobs.map { $0.id == queued.id ? transitioned : $0 })
+        replaceQueue(QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue,
+            jobs: original.jobs.map { $0.id == queued.id ? transitioned : $0 }))
         let staleJobExplained = navigation.unavailability(in: store) != nil
-        let staleJobRejected = navigation.confirm(in: store) == nil && recorder.actions.count == beforeStale
+        let staleJobRejected = navigation.confirm(in: store) == nil && fixture.changes.count == beforeStale
         navigation.decline()
-        // Fixtures refuse queue-level changes before any recorder or command.
-        let fixtureLimitDidNotDispatch = store.dispatch(.limit(original.queue.limit % 8 + 1)) == nil && !store.isMutating
-            && recorder.actions.count == beforeStale
+        // A queue-level change runs the same pipeline and ends at the fixture, once.
+        let limit = original.queue.limit % 8 + 1
+        let limitDispatch = store.dispatch(.limit(limit))
+        await limitDispatch?.value
+        let limitReachedOnlyTheFixture = limitDispatch != nil && !store.isMutating
+            && Array(fixture.changes.dropFirst(beforeStale)) == [.limit(limit)]
         let restoredSurface = sameSurface()
-        store.snapshot = original
+        replaceQueue(original)
         try await Task.sleep(for: .milliseconds(80))
         return ConfirmationVerification(cases: results, staleJobExplained: staleJobExplained,
-            staleJobRejected: staleJobRejected, fixtureLimitDidNotDispatch: fixtureLimitDidNotDispatch,
-            finalSurfaceStayedVisible: restoredSurface, recordedActions: recorder.actions)
+            staleJobRejected: staleJobRejected, limitReachedOnlyTheFixture: limitReachedOnlyTheFixture,
+            finalSurfaceStayedVisible: restoredSurface, recordedActions: fixture.actions)
     }
 
     private func writeSnapshot(_ view: NSView, to path: String) throws {
@@ -335,11 +368,11 @@ struct PasswordValidationCase: Encodable {
 
 struct PasswordValidationVerification: Encodable {
     let cases: [PasswordValidationCase]
-    let fixtureConfigurationRejected: Bool
-    let fixtureEnableRejected: Bool
+    let rejectionsSentNothing: Bool
+    let acceptedPasswordReachedTheFixture: Bool
     var passed: Bool {
         !cases.isEmpty && cases.allSatisfy { $0.expected == $0.accepted }
-            && fixtureConfigurationRejected && fixtureEnableRejected
+            && rejectionsSentNothing && acceptedPasswordReachedTheFixture
     }
 }
 
@@ -367,11 +400,11 @@ struct ConfirmationVerification: Encodable {
     let cases: [ConfirmationCaseVerification]
     let staleJobExplained: Bool
     let staleJobRejected: Bool
-    let fixtureLimitDidNotDispatch: Bool
+    let limitReachedOnlyTheFixture: Bool
     let finalSurfaceStayedVisible: Bool
     let recordedActions: [RecordedQueueAction]
     var passed: Bool {
         !cases.isEmpty && cases.allSatisfy(\.passed) && staleJobExplained && staleJobRejected
-            && fixtureLimitDidNotDispatch && finalSurfaceStayedVisible
+            && limitReachedOnlyTheFixture && finalSurfaceStayedVisible
     }
 }

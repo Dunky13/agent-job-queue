@@ -96,32 +96,17 @@ final class QueueUpdateStore: ObservableObject {
     @Published private(set) var notice: String?
     @Published private(set) var updateDownloaded = false
     let running: RunningQueueVersion
-    let fixtureMode: Bool
     private let command: @Sendable (QueueClient.Command) async throws -> Data
 
-    init(fixtureMode: Bool = false, running: RunningQueueVersion = .current(),
-         command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
-             try await QueueClient.run($0)
-         }) {
-        self.fixtureMode = fixtureMode
-        self.running = fixtureMode ? RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100) : running
+    init(running: RunningQueueVersion = .current(),
+         command: @escaping @Sendable (QueueClient.Command) async throws -> Data) {
+        self.running = running
         self.command = command
-        #if AGENT_QUEUE_TEST_HOOKS
-        if fixtureMode {
-            let preview = InstalledQueueVersion(version: "1.0.0", build: 100, bundleBuild: "100", commit: nil,
-                tracked: true, displayVersion: "1.0.0 (build 100)")
-            installed = preview
-            check = QueueUpdateCheck(installed: preview,
-                latest: QueueRelease(version: "1.0.1", build: 101, commit: String(repeating: "a", count: 40),
-                    tag: "build-101", url: "https://github.com/Dunky13/agent-job-queue/releases/tag/build-101"),
-                comparison: .available, canDownload: true, message: "Version 1.0.1 (build 101) is available.")
-        }
-        #endif
     }
 
     var isBusy: Bool { operation != nil }
     var canDownload: Bool {
-        guard !fixtureMode, !isBusy, !updateDownloaded, let check, check.canDownload,
+        guard !isBusy, !updateDownloaded, let check, check.canDownload,
               check.comparison == .available || check.comparison == .untracked,
               running.metadataError == nil,
               let release = check.latest, release.releaseURL != nil else { return false }
@@ -157,7 +142,7 @@ final class QueueUpdateStore: ObservableObject {
 
     // This runs locally when the window opens. Network access requires the Check button.
     func refreshInstalled() async {
-        guard !fixtureMode, !isBusy else { return }
+        guard !isBusy else { return }
         operation = .version
         defer { operation = nil }
         do {
@@ -171,7 +156,7 @@ final class QueueUpdateStore: ObservableObject {
 
     @discardableResult
     func checkForUpdates() -> Task<Void, Never>? {
-        guard !fixtureMode, !isBusy else { return nil }
+        guard !isBusy else { return nil }
         operation = .checking
         error = nil
         notice = nil
@@ -216,6 +201,7 @@ final class QueueUpdateStore: ObservableObject {
 
 struct QueueUpdatesSettings: View {
     @ObservedObject var store: QueueUpdateStore
+    let desktop: QueueDesktop
     var onDone: () -> Void
 
     var body: some View {
@@ -227,7 +213,6 @@ struct QueueUpdatesSettings: View {
                     Text("About and updates").font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if store.fixtureMode { Text("PREVIEW").font(.caption2).foregroundStyle(.secondary) }
             }.padding(22)
             Divider()
             ScrollView {
@@ -245,7 +230,8 @@ struct QueueUpdatesSettings: View {
                             if let release = check.latest {
                                 versionRow("Latest release", value: "\(release.version) · build \(release.build)")
                                 if let url = release.releaseURL {
-                                    Link("Release notes", destination: url).disabled(store.fixtureMode)
+                                    Link("Release notes", destination: url)
+                                        .environment(\.openURL, OpenURLAction { desktop(.open($0)); return .handled })
                                 }
                             }
                             Label(check.message, systemImage: check.comparison == .available ? "arrow.down.circle" : "info.circle")
@@ -279,7 +265,7 @@ struct QueueUpdatesSettings: View {
                 HStack {
                     Button("Done", action: onDone)
                     Spacer()
-                    Button("Check for updates") { store.checkForUpdates() }.disabled(store.fixtureMode || store.isBusy)
+                    Button("Check for updates") { store.checkForUpdates() }.disabled(store.isBusy)
                     Button(store.downloadButtonLabel) { store.downloadUpdate() }
                         .buttonStyle(.borderedProminent).disabled(!store.canDownload)
                 }

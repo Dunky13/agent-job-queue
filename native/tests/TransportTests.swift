@@ -634,7 +634,7 @@ struct TransportTests {
             exit(3)
         case "detail":
             if marker.lastPathComponent == "latest" {
-                var detail = LearningStore.previewDetail()
+                var detail = QueueFixture.previewDetail()
                 let profile = detail.profile
                 detail = LearningDetail(revision: detail.revision,
                     profile: LearningProfile(id: "latest", label: profile.label, memberCount: profile.memberCount,

@@ -243,7 +243,6 @@ final class LearningStore: ObservableObject {
     @Published var draftMemory = ""
     @Published var draftCPU = ""
     @Published var memoryUnit = LearningMemoryUnit.gib
-    let fixtureMode: Bool
     let pageSize = 50
     private var selectionGeneration = 0
     private var selectionTask: Task<Void, Never>?
@@ -252,32 +251,13 @@ final class LearningStore: ObservableObject {
     private let command: @Sendable (QueueClient.Command) async throws -> Data
 
     /// `flat` is for the merge-target picker, which lists every group and never drills down.
-    init(fixtureMode: Bool = false, flat: Bool = false, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
-        try await QueueClient.run($0)
-    }) {
-        self.fixtureMode = fixtureMode
+    init(flat: Bool = false, command: @escaping @Sendable (QueueClient.Command) async throws -> Data) {
         self.command = command
         level = flat ? .groups : .projects
-        #if AGENT_QUEUE_TEST_HOOKS
-        if fixtureMode {
-            let preview = Self.previewDetail()
-            catalog = LearningCatalog(revision: preview.revision, profiles: [preview.profile], total: 1, offset: 0, limit: 50,
-                controllerAppliedRevision: preview.revision, controllerStatus: "applied")
-            selectedID = preview.profile.id
-            detail = preview
-            restoreDraft(preview)
-            if !flat {
-                hierarchy = Self.previewHierarchy()
-                level = .groups
-                scope = LearningScope(project: "Sample project", collapsed: false)
-                operation = "tests"
-            }
-        }
-        #endif
     }
 
     /// The merge-target picker lists every group through its own store, over the same adapter.
-    func targetPickerStore() -> LearningStore { LearningStore(fixtureMode: fixtureMode, flat: true, command: command) }
+    func targetPickerStore() -> LearningStore { LearningStore(flat: true, command: command) }
 
     var displayLevel: LearningLevel { searchActive ? .groups : level }
     var projectRow: LearningProjectRow? {
@@ -295,23 +275,12 @@ final class LearningStore: ObservableObject {
         return (displayLevel == .groups ? trail + [operation.map(learningOperationName) ?? "All operations"] : trail).joined(separator: " / ")
     }
 
-    var canSave: Bool { !fixtureMode && !isLoading && !isMutating && !isMemberPageLoading && detail != nil }
+    var canSave: Bool { !isLoading && !isMutating && !isMemberPageLoading && detail != nil }
     var hasPrevious: Bool { (catalog?.offset ?? 0) > 0 && (catalog?.total ?? 0) > 0 }
     var hasNext: Bool {
         guard let catalog else { return false }
         return catalog.offset + catalog.profiles.count < catalog.total
     }
-    #if AGENT_QUEUE_TEST_HOOKS
-    func showFixtureLevel(_ level: LearningLevel) {
-        guard fixtureMode else { return }
-        self.level = level
-        if level == .projects {
-            scope = nil
-            operation = nil
-            clearSelection()
-        }
-    }
-    #endif
 
     var pageLabel: String {
         guard let catalog, catalog.total > 0, !catalog.profiles.isEmpty else { return "No learned workloads" }
@@ -342,7 +311,7 @@ final class LearningStore: ObservableObject {
     }
 
     private func load(query requestedQuery: String, offset: Int, preserveSelection: Bool) -> Task<Void, Never>? {
-        guard !fixtureMode, !isLoading, !isMutating else { return nil }
+        guard !isLoading, !isMutating else { return nil }
         isLoading = true
         error = nil
         let searching = !requestedQuery.isEmpty
@@ -409,7 +378,7 @@ final class LearningStore: ObservableObject {
 
     /// Drilling down reads nothing: the overview already holds every operation of its project.
     func openProject(_ row: LearningProjectRow) {
-        guard !fixtureMode, !isLoading, !isMutating else { return }
+        guard !isLoading, !isMutating else { return }
         scope = LearningScope(project: row.project, collapsed: row.collapsed)
         operation = nil
         level = .operations
@@ -421,7 +390,7 @@ final class LearningStore: ObservableObject {
 
     @discardableResult
     func openOperation(_ operation: String?) -> Task<Void, Never>? {
-        guard !fixtureMode, !isLoading, !isMutating, scope != nil else { return nil }
+        guard !isLoading, !isMutating, scope != nil else { return nil }
         self.operation = operation
         level = .groups
         catalog = nil
@@ -432,7 +401,7 @@ final class LearningStore: ObservableObject {
     /// Going up reloads, so the counts reflect any merge or edit made below.
     @discardableResult
     func show(_ target: LearningLevel) -> Task<Void, Never>? {
-        guard !fixtureMode, !isLoading, !isMutating, target != .groups else { return nil }
+        guard !isLoading, !isMutating, target != .groups else { return nil }
         level = target
         operation = nil
         if target == .projects { scope = nil }
@@ -453,7 +422,6 @@ final class LearningStore: ObservableObject {
 
     @discardableResult
     func select(_ id: String) -> Task<Void, Never>? {
-        guard !fixtureMode else { return nil }
         closeMember()
         ungroupedFrom = nil
         memberQuery = ""
@@ -508,17 +476,10 @@ final class LearningStore: ObservableObject {
     @discardableResult
     func inspectMember(_ family: String) -> Task<Void, Never>? {
         guard !isMutating, !isLoading, !isDetailLoading, !isMemberPageLoading, let detail,
-              let member = detail.members.first(where: { $0.family == family }) else { return nil }
+              detail.members.contains(where: { $0.family == family }) else { return nil }
         let previous = memberTask
         closeMember()
         inspectedFamily = family
-        if fixtureMode {
-            memberDetail = LearningDetail(revision: detail.revision, profile: detail.profile, members: [member],
-                variants: detail.variants.filter { $0.family == family }, runs: detail.runs.filter { $0.family == family },
-                prediction: detail.prediction, predictionMachine: detail.predictionMachine, truncated: detail.truncated,
-                inspectedFamily: family)
-            return nil
-        }
         let sourceID = detail.profile.id
         let revision = detail.revision
         let generation = memberGeneration
@@ -551,7 +512,7 @@ final class LearningStore: ObservableObject {
 
     @discardableResult
     func loadMembers(offset: Int = 0) -> Task<Void, Never>? {
-        guard !fixtureMode, !isMutating, !isLoading, !isDetailLoading, !isMemberPageLoading, let detail else { return nil }
+        guard !isMutating, !isLoading, !isDetailLoading, !isMemberPageLoading, let detail else { return nil }
         let query = memberQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard query.count <= 120, !query.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
             memberError = "Search with up to 120 printable characters."
@@ -589,7 +550,7 @@ final class LearningStore: ObservableObject {
     }
 
     var canMergeSelection: Bool {
-        !fixtureMode && !isLoading && !isDetailLoading && !isMutating && !isMemberPageLoading && !mergeSelection.isEmpty
+        !isLoading && !isDetailLoading && !isMutating && !isMemberPageLoading && !mergeSelection.isEmpty
     }
     var hasUnsavedCorrections: Bool {
         guard let detail else { return false }
@@ -597,7 +558,7 @@ final class LearningStore: ObservableObject {
         return edit.label != detail.profile.label || edit.memoryFloorBytes != detail.profile.memoryFloorBytes || edit.cpuFloorCores != detail.profile.cpuFloorCores
     }
     func toggleMergeItem(_ item: LearningMergeItem) {
-        guard !fixtureMode, !isLoading, !isMutating else { return }
+        guard !isLoading, !isMutating else { return }
         if let index = mergeSelection.firstIndex(where: { $0.id == item.id }) { mergeSelection.remove(at: index); return }
         guard mergeSelection.count < 32 else { error = "Select at most 32 groups or workloads per merge."; return }
         guard mergeSelection.first?.revision == nil || mergeSelection.first?.revision == item.revision else {
@@ -703,7 +664,7 @@ final class LearningStore: ObservableObject {
     }
 
     private func mutate(_ operation: String, payload: Data, success: String, changesSelection: Bool = false, expectedTarget: String? = nil, returnGroup: LearningGroupReference? = nil, requestID: String? = nil) -> Task<Void, Never>? {
-        guard !fixtureMode, !isMutating, let sourceID = requestID ?? selectedID else { return nil }
+        guard !isMutating, let sourceID = requestID ?? selectedID else { return nil }
         let originalSelection = selectedID
         let sourceGeneration = selectionGeneration
         closeMember()
@@ -781,42 +742,6 @@ final class LearningStore: ObservableObject {
         return value.formatted(.number.grouping(.never).precision(.fractionLength(0...12)))
     }
 
-    #if AGENT_QUEUE_TEST_HOOKS
-    nonisolated static func previewHierarchy() -> LearningHierarchy {
-        func operations(_ rows: [(String, Int, Int, Int)]) -> [LearningOperationRow] {
-            rows.map { LearningOperationRow(operation: $0.0, workloadCount: $0.1, groupCount: $0.2, runCount: $0.3) }
-        }
-        return LearningHierarchy(revision: 4, projects: [
-            LearningProjectRow(project: "Sample project", collapsed: false, workloadCount: 9, groupCount: 3, runCount: 44,
-                operations: operations([("tests", 1, 1, 20), ("build", 6, 1, 16), ("lint", 2, 1, 8)])),
-            LearningProjectRow(project: "Sample service", collapsed: false, workloadCount: 5, groupCount: 2, runCount: 30,
-                operations: operations([("tests", 4, 1, 22), ("race-tests", 1, 1, 8)])),
-            LearningProjectRow(project: "Other projects", collapsed: true, projectCount: 3, workloadCount: 3, groupCount: 3, runCount: 9,
-                operations: operations([("build", 2, 2, 6), ("other", 1, 1, 3)])),
-        ], total: 2, limit: 100, controllerAppliedRevision: 4, controllerStatus: "applied")
-    }
-    nonisolated static func previewDetail() -> LearningDetail {
-        let family = String(repeating: "b", count: 64)
-        let variant = String(repeating: "c", count: 64)
-        let profile = LearningProfile(id: String(repeating: "a", count: 64), label: "Web test suite", memberCount: 1,
-            variantCount: 3, successCount: 18, incompleteCount: 2, peakMemoryBytes: 1_342_177_280,
-            peakCpuCores: 1.6, lastRunAt: 1_790_000_000, memoryFloorBytes: 2_147_483_648, cpuFloorCores: nil)
-        return LearningDetail(revision: 4, profile: profile,
-            members: [LearningMember(family: family, label: "Web tests", project: "Sample project", executable: "npm",
-                measurements: LearningMeasurements(variantCount: 3, successCount: 18, incompleteCount: 2,
-                    peakMemoryBytes: 1_342_177_280, peakCpuCores: 1.6, lastRunAt: 1_790_000_000))],
-            variants: [LearningVariant(id: variant, family: family, successCount: 18, incompleteCount: 2,
-                lastRunAt: 1_790_000_000, peakMemoryBytes: 1_342_177_280, peakCpuCores: 1.6)],
-            runs: [LearningRun(id: String(repeating: "d", count: 64), family: family, variant: variant, machine: "preview-machine", sampledAt: 1_790_000_000,
-                memoryBytes: 1_342_177_280, cpuCores: 1.6, cpuSeconds: 42, durationSeconds: 30, success: true),
-                LearningRun(id: String(repeating: "e", count: 64), family: family, variant: variant, machine: "preview-machine", sampledAt: 1_789_999_000,
-                    memoryBytes: 1_073_741_824, cpuCores: 1.2, cpuSeconds: 20, durationSeconds: 24, success: false)],
-            prediction: ResourcePrediction(memoryBytes: 2_147_483_648, cpuCores: 2.4, durationSeconds: 45,
-                samples: 0, confidence: "low", source: "family"), predictionMachine: "preview-machine",
-            truncated: LearningTruncation(members: false, variants: false, runs: false),
-            controllerAppliedRevision: 4, controllerStatus: "applied")
-    }
-    #endif
 }
 
 private enum LearningConfirmation: Identifiable {
@@ -863,7 +788,6 @@ struct LearningWindow: View {
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
-                if store.fixtureMode { Text("PREVIEW").font(.caption).foregroundStyle(.secondary) }
                 Button("Done", action: onDone).keyboardShortcut(.defaultAction)
             }.padding(20)
             Divider()
@@ -875,7 +799,7 @@ struct LearningWindow: View {
                 HStack(alignment: .top) {
                     Label(error, systemImage: "exclamationmark.triangle").textSelection(.enabled)
                     Spacer()
-                    Button("Reload selected") { store.reloadSelection() }.disabled(store.isMutating || store.fixtureMode)
+                    Button("Reload selected") { store.reloadSelection() }.disabled(store.isMutating)
                         .help("Reload the current workload and discard its unsaved edits")
                 }.font(.callout).padding(12).background(Color.orange.opacity(0.1))
                 Divider()
@@ -973,13 +897,13 @@ struct LearningWindow: View {
                     .onSubmit { store.loadPage() }
                 Button("Search", systemImage: "magnifyingglass") { store.loadPage() }
                     .labelStyle(.iconOnly).help("Search every project by workload, project or safe job description")
-            }.disabled(store.fixtureMode || store.isLoading || store.isMutating)
+            }.disabled(store.isLoading || store.isMutating)
             if store.searchActive {
                 Text("Search results across every project").font(.caption).foregroundStyle(.secondary)
             } else if store.level != .projects {
                 HStack(alignment: .firstTextBaseline) {
                     Button("Back", systemImage: "chevron.left") { store.goBack() }
-                        .disabled(store.fixtureMode || store.isLoading || store.isMutating)
+                        .disabled(store.isLoading || store.isMutating)
                     breadcrumbTrail
                 }
             }
@@ -1004,11 +928,11 @@ struct LearningWindow: View {
                     Button("Next", systemImage: "chevron.right") {
                         store.reloadPage(offset: (store.catalog?.offset ?? 0) + store.pageSize)
                     }.labelStyle(.iconOnly).disabled(!store.hasNext)
-                }.disabled(store.fixtureMode || store.isLoading || store.isMutating)
+                }.disabled(store.isLoading || store.isMutating)
             }
             Button("Refresh list", systemImage: "arrow.clockwise") {
                 store.reloadPage(preserveSelection: true)
-            }.disabled(store.fixtureMode || store.isLoading || store.isMutating)
+            }.disabled(store.isLoading || store.isMutating)
         }.padding(16)
     }
 
@@ -1019,16 +943,16 @@ struct LearningWindow: View {
                 Text(counts)
                 if let note { Text(note) }
             }.font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding(10).contentShape(Rectangle())
-        }.buttonStyle(.plain).disabled(store.fixtureMode || store.isLoading || store.isMutating)
+        }.buttonStyle(.plain).disabled(store.isLoading || store.isMutating)
     }
 
     private var backToProjects: some View {
-        Button("Back to all projects") { store.show(.projects) }.disabled(store.fixtureMode || store.isLoading || store.isMutating)
+        Button("Back to all projects") { store.show(.projects) }.disabled(store.isLoading || store.isMutating)
     }
 
     /// Earlier parts of the location go to their level; the last part is where the operator is.
     private var breadcrumbTrail: some View {
-        let blocked = store.fixtureMode || store.isLoading || store.isMutating
+        let blocked = store.isLoading || store.isMutating
         return HStack(spacing: 4) {
             Button("All projects") { store.show(.projects) }.buttonStyle(.link).disabled(blocked)
             if let scope = store.scope {
@@ -1093,7 +1017,7 @@ struct LearningWindow: View {
                         .contentShape(Rectangle())
                         .background(store.selectedID == profile.id ? Color.accentColor.opacity(0.13) : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 7))
-                }.buttonStyle(.plain).disabled(store.fixtureMode)
+                }.buttonStyle(.plain)
             }
         }
         if let catalog = store.catalog, catalog.profiles.isEmpty, !store.searchActive, store.scope != nil, !store.isLoading {
@@ -1132,7 +1056,7 @@ struct LearningWindow: View {
                     .disabled(!store.canSave)
                 Spacer()
                 Button("Reload selected", systemImage: "arrow.clockwise") { store.reloadSelection() }
-                    .disabled(store.fixtureMode || store.isMutating)
+                    .disabled(store.isMutating)
                     .help("Discard unsaved edits and read the current workload")
             }
         }.frame(maxWidth: .infinity, alignment: .leading)
@@ -1197,7 +1121,7 @@ struct LearningWindow: View {
                 Button("Save corrections") { store.save() }.disabled(!store.canSave)
                 if store.isMutating { ProgressView().controlSize(.small); Text("Applying correction…").font(.caption) }
             }
-        }.disabled(store.fixtureMode || store.isMutating)
+        }.disabled(store.isMutating)
     }
 
     private func membershipSection(_ detail: LearningDetail) -> some View {
@@ -1218,7 +1142,7 @@ struct LearningWindow: View {
                 TextField("Find a member in this group", text: $store.memberQuery).textFieldStyle(.roundedBorder)
                     .onSubmit { store.loadMembers() }
                 Button("Search members") { store.loadMembers() }
-            }.disabled(store.fixtureMode || store.isMutating || store.isMemberPageLoading)
+            }.disabled(store.isMutating || store.isMemberPageLoading)
             if let error = store.memberError, store.inspectedFamily == nil {
                 Text(error).font(.caption).foregroundStyle(.orange)
             }
@@ -1238,7 +1162,7 @@ struct LearningWindow: View {
                         .font(.caption).foregroundStyle(.secondary)
                     Button("Next members") { store.loadMembers(offset: page.offset + page.limit) }
                         .disabled(page.offset + detail.members.count >= page.total)
-                }.disabled(store.fixtureMode || store.isMutating || store.isMemberPageLoading)
+                }.disabled(store.isMutating || store.isMemberPageLoading)
             } else if detail.truncated.members {
                 Text("Update the app to search and page through every group member.").font(.caption).foregroundStyle(.secondary)
             }
@@ -1252,7 +1176,7 @@ struct LearningWindow: View {
             .toggleStyle(.checkbox).labelsHidden()
             .accessibilityLabel("Select \(item.isGroup ? "group" : "workload"): \(item.label)")
             .help("Select for merging. Workloads include all their run history and future matching runs.")
-            .disabled(store.fixtureMode || store.isLoading || store.isMutating)
+            .disabled(store.isLoading || store.isMutating)
     }
 
     private func memberRow(_ member: LearningMember, group: LearningDetail) -> some View {
@@ -1334,7 +1258,7 @@ struct LearningWindow: View {
                             .font(.caption).foregroundStyle(.secondary)
                         Button("Select this run’s workload") {
                             store.toggleMergeItem(LearningMergeItem(identity: run.family, label: memberLabel(run.family, in: detail), isGroup: false, sourceGroup: detail.profile.id, revision: detail.revision))
-                        }.disabled(store.fixtureMode || store.isMutating || store.isLoading)
+                        }.disabled(store.isMutating || store.isLoading)
                         Text("Variant \(run.variant.prefix(12))… · machine \(run.machine.prefix(12))…")
                             .font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
                     }
@@ -1383,7 +1307,7 @@ private struct LearningTargetPicker: View {
             HStack {
                 TextField("Search target workloads", text: $store.query).textFieldStyle(.roundedBorder).onSubmit { store.loadPage() }
                 Button("Search") { store.loadPage() }
-            }.disabled(store.isLoading || store.fixtureMode)
+            }.disabled(store.isLoading)
             if let error = store.error { Text(error).font(.caption).foregroundStyle(.orange) }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 8) {
@@ -1394,7 +1318,7 @@ private struct LearningTargetPicker: View {
                                 Text("\(profile.memberCount) families · \(profile.successCount) successful observations").font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Button("Choose") { onChoose(profile.id, profile.label) }.disabled(store.fixtureMode)
+                            Button("Choose") { onChoose(profile.id, profile.label) }
                         }.padding(8)
                     }
                 }

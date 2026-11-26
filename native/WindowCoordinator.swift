@@ -20,10 +20,41 @@ extension NSWindow: QueueSurface {}
 /// The wait between two polls. The app sleeps on the continuous clock; tests advance their own.
 typealias PollSleep = @MainActor (Duration) async throws -> Void
 
+/// Something a window asks of the rest of the Mac.
+enum QueueDesktopRequest: Equatable { case open(URL), reveal(URL), copy(String) }
+
+typealias QueueDesktop = @MainActor (QueueDesktopRequest) -> Void
+typealias QueueLogTail = @Sendable (String) async throws -> String
+
+/// Everything the windows reach outside the app. A replacement supplies every member,
+/// so none of it can stay live by omission.
+struct QueueBackend {
+    var command: @Sendable (QueueClient.Command) async throws -> Data
+    var logTail: QueueLogTail
+    var desktop: QueueDesktop
+    var runningVersion: RunningQueueVersion
+
+    /// The installed controllers and this Mac.
+    @MainActor static var live: QueueBackend {
+        QueueBackend(command: { try await QueueClient.run($0) }, logTail: { try await QueueClient.logTail($0) },
+            desktop: { request in
+                switch request {
+                case .open(let url): NSWorkspace.shared.open(url)
+                case .reveal(let url): NSWorkspace.shared.activateFileViewerSelecting([url])
+                case .copy(let text):
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                }
+            }, runningVersion: .current())
+    }
+}
+
 /// The app-level requests a view may make.
 struct QueueAppRoutes {
     let perform: @MainActor (QueueAppAction) -> Void
     let openLearning: @MainActor (String) -> Void
+    let logTail: QueueLogTail
+    let desktop: QueueDesktop
 }
 
 struct QueueWindowSpec {
@@ -75,27 +106,28 @@ enum QueueWindowKind: CaseIterable {
 @MainActor final class WindowCoordinator {
     let store: QueueStore
     // Built on first use: the update store reads the bundle's build metadata when it is created.
-    private(set) lazy var remoteStore = RemoteAccessStore(fixtureMode: store.fixtureMode, command: command, pollSleep: pollSleep)
-    private(set) lazy var integrationStore = AgentIntegrationStore(fixtureMode: store.fixtureMode, command: command)
-    private(set) lazy var updateStore = QueueUpdateStore(fixtureMode: store.fixtureMode, command: command)
-    private(set) lazy var learningStore = LearningStore(fixtureMode: store.fixtureMode, command: command)
+    private(set) lazy var remoteStore = RemoteAccessStore(command: backend.command, pollSleep: pollSleep)
+    private(set) lazy var integrationStore = AgentIntegrationStore(command: backend.command)
+    private(set) lazy var updateStore = QueueUpdateStore(running: backend.runningVersion, command: backend.command)
+    private(set) lazy var learningStore = LearningStore(command: backend.command)
     private(set) var windows: [QueueWindowKind: NSWindow] = [:]
     var menuBarController: QueueMenuBarController?
-    private let command: @Sendable (QueueClient.Command) async throws -> Data
+    private let backend: QueueBackend
     private let pollSleep: PollSleep
 
-    init(command: @escaping @Sendable (QueueClient.Command) async throws -> Data = { try await QueueClient.run($0) },
-         pollSleep: @escaping PollSleep = { try await Task.sleep(for: $0, clock: .continuous) },
-         arguments: [String] = CommandLine.arguments) {
-        self.command = command
+    /// `backend` has no default: only the app's launch names the live one.
+    init(backend: QueueBackend,
+         pollSleep: @escaping PollSleep = { try await Task.sleep(for: $0, clock: .continuous) }) {
+        self.backend = backend
         self.pollSleep = pollSleep
-        store = QueueStore(statusLoader: { try await command(.status) }, command: command,
-                           arguments: arguments, pollSleep: pollSleep)
+        let command = backend.command
+        store = QueueStore(statusLoader: { try await command(.status) }, command: command, pollSleep: pollSleep)
     }
 
     var routes: QueueAppRoutes {
         QueueAppRoutes(perform: { [weak self] in self?.perform($0) },
-                       openLearning: { [weak self] in self?.show(.learning, profileID: $0) })
+                       openLearning: { [weak self] in self?.show(.learning, profileID: $0) },
+                       logTail: backend.logTail, desktop: backend.desktop)
     }
 
     func showMenuBar(statusItem: NSStatusItem?) {
@@ -157,9 +189,9 @@ enum QueueWindowKind: CaseIterable {
         switch kind {
         case .queue: return NSHostingView(rootView: QueuePanel(store: store, app: routes, fullWindow: true))
         case .learning: return NSHostingView(rootView: LearningWindow(store: learningStore, onDone: close))
-        case .updates: return NSHostingView(rootView: QueueUpdatesSettings(store: updateStore, onDone: close))
+        case .updates: return NSHostingView(rootView: QueueUpdatesSettings(store: updateStore, desktop: backend.desktop, onDone: close))
         case .integration: return NSHostingView(rootView: AgentIntegrationSettings(store: integrationStore, onDone: close))
-        case .remote: return NSHostingView(rootView: RemoteAccessSettings(store: remoteStore))
+        case .remote: return NSHostingView(rootView: RemoteAccessSettings(store: remoteStore, desktop: backend.desktop))
         }
     }
 }

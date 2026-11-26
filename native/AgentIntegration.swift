@@ -22,28 +22,16 @@ final class AgentIntegrationStore: ObservableObject {
     @Published private(set) var error: String?
     @Published private(set) var notice: String?
     @Published private(set) var selected: Set<String> = []
-    let fixtureMode: Bool
     private let command: @Sendable (QueueClient.Command) async throws -> Data
 
-    init(fixtureMode: Bool = false, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = {
-        try await QueueClient.run($0)
-    }) {
-        self.fixtureMode = fixtureMode
+    init(command: @escaping @Sendable (QueueClient.Command) async throws -> Data) {
         self.command = command
-        #if AGENT_QUEUE_TEST_HOOKS
-        if fixtureMode {
-            snapshot = AgentIntegrationSnapshot(runners: [
-                AgentRunnerConfiguration(id: "codex", name: "Codex", path: "~/.codex/AGENTS.md", configured: false, error: nil),
-                AgentRunnerConfiguration(id: "claude", name: "Claude Code", path: "~/.claude/CLAUDE.md", configured: false, error: nil)
-            ], instruction: "Run heavy builds and broad tests through agent-heavy -- <command>.\nKeep lightweight checks outside the queue.")
-        }
-        #endif
     }
 
     var hasChanges: Bool {
         snapshot?.runners.contains { $0.error == nil && $0.configured != selected.contains($0.id) } ?? false
     }
-    var canSave: Bool { !fixtureMode && !isBusy && hasChanges }
+    var canSave: Bool { !isBusy && hasChanges }
 
     func select(_ id: String, enabled: Bool) {
         guard !isBusy, snapshot?.runners.contains(where: { $0.id == id && $0.error == nil }) == true else { return }
@@ -51,7 +39,7 @@ final class AgentIntegrationStore: ObservableObject {
     }
 
     func refresh() async {
-        guard !fixtureMode, !isBusy else { return }
+        guard !isBusy else { return }
         isBusy = true
         defer { isBusy = false }
         do {
@@ -108,11 +96,10 @@ struct AgentIntegrationSettings: View {
                 HStack {
                     Label("Agent integration", systemImage: "terminal").font(.title2.weight(.semibold))
                     Spacer()
-                    if store.fixtureMode { Text("PREVIEW").font(.caption2).foregroundStyle(.secondary) }
                     Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless).help("Refresh agent integration status")
                         .accessibilityLabel("Refresh agent integration status")
-                        .disabled(store.fixtureMode || store.isBusy)
+                        .disabled(store.isBusy)
                 }
                 Text("Help your coding agents share the heavy-command queue.")
                     .font(.callout).foregroundStyle(.secondary)
