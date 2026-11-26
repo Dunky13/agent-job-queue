@@ -99,15 +99,6 @@ final class QueueFixture {
             return try read(command, integration)
         case (.heavy, "agents") where arguments.count == 5 && ["install", "remove"].contains(arguments[1]):
             return try change(command, integration)
-        case (.heavy, "updates") where command == .updatesCheck:
-            return try read(command, QueueUpdateCheck(installed: installed,
-                latest: QueueRelease(version: "1.0.1", build: 101, commit: String(repeating: "a", count: 40),
-                    tag: "build-101", url: "https://github.com/Dunky13/agent-job-queue/releases/tag/build-101"),
-                comparison: .available, canDownload: true, message: "Version 1.0.1 (build 101) is available."))
-        case (.heavy, "updates") where arguments.count == 5 && arguments[1] == "download":
-            guard let build = Int(arguments[3]) else { break }
-            return try change(command, QueueUpdateDownload(downloaded: true, build: build,
-                app: "/example/Downloads/Agent Queue.app", message: "Sample download. Nothing was saved."))
         case (.heavy, "profiles") where arguments.count >= 4:
             return try profiles(command)
         default: break

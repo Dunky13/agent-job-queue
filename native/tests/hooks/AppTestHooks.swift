@@ -128,7 +128,6 @@ extension AppDelegate {
         }
         if arguments.contains("--snapshot-updates") {
             await coordinator.updateStore.refreshInstalled()
-            await coordinator.updateStore.checkForUpdates()?.value
         }
     }
 

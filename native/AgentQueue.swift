@@ -253,7 +253,7 @@ enum QueueClient {
             case stopWhileWaiting
         }
         /// Output bounds and the wording of deadline and failure errors.
-        enum Reporting: Sendable { case queue, updates, setup }
+        enum Reporting: Sendable { case queue, setup }
 
         var controller = Controller.heavy
         var arguments: [String]
@@ -499,8 +499,6 @@ extension QueueClient.Command {
         switch reporting {
         case .setup:
             .message("Setup did not finish within \(Int(timeout)) seconds. Quit and reopen Agent Queue, or retry setup.\n" + String(decoding: partial.suffix(8_000), as: UTF8.self))
-        case .updates:
-            .message("The update operation did not finish within \(Int(timeout)) seconds. Check your Downloads folder, then check for updates before retrying.")
         case .queue:
             .message("The queue did not respond within \(Int(timeout)) seconds. Jobs continue independently. Refresh to check whether the change was applied.")
         }
@@ -551,12 +549,10 @@ extension QueueClient.Command {
         .init(arguments: ["profiles", operation, id, "--json"], input: payload, decodesStructuredErrors: true)
     }
 
-    // A verified update includes a bounded download and signature checks. The
-    // backend has a 120-second aggregate deadline; normal queue I/O is unchanged.
-    static let updatesCheck = Self(arguments: ["updates", "check", "--json"], timeout: 130, reporting: .updates)
-    static func updatesDownload(build: Int) -> Self {
-        .init(arguments: ["updates", "download", "--build", String(build), "--json"], timeout: 130, reporting: .updates)
-    }
+    // The Sparkle flow closes queue intake for a fixed 4 hours before it restarts the app, and releases only that drain.
+    static let drain = Self(arguments: ["drain", "--for", "4h"])
+    static let undrain = Self(arguments: ["undrain"])
+    static let undrainKeepPaused = Self(arguments: ["undrain", "--keep-paused"])
 
     // Phone lifecycle owns up to 120 seconds for native stop/start and
     // readiness. Its caller must allow startup and result delivery too.
@@ -1078,10 +1074,14 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate, QueueSurface {
     /// True from `popoverWillShow` until the popover is closed, ahead of its close animation.
     private(set) var isVisible = false
     private let app: QueueAppRoutes
+    private let updates: QueueUpdateStore?
+    private var updateObservation: AnyCancellable?
+    let installUpdate = NSMenuItem(title: "", action: #selector(installAvailableUpdate), keyEquivalent: "")
 
-    init(store: QueueStore, statusItem: NSStatusItem? = nil, app: QueueAppRoutes) {
+    init(store: QueueStore, statusItem: NSStatusItem? = nil, updates: QueueUpdateStore? = nil, app: QueueAppRoutes) {
         self.statusItem = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.store = store
+        self.updates = updates
         self.app = app
         super.init()
         store.surfaces.add(self)
@@ -1090,7 +1090,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate, QueueSurface {
         popover.behavior = .applicationDefined
         popover.delegate = self
         popover.contentSize = NSSize(width: 500, height: 650)
-        popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, app: app, refreshesOnAppear: false))
+        popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, app: app, refreshesOnAppear: false, updates: updates))
         if let button = self.statusItem.button {
             button.image = NSImage(systemSymbolName: QueueBrand.symbolName, accessibilityDescription: nil)
             button.image?.isTemplate = true
@@ -1126,6 +1126,22 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate, QueueSurface {
 
     private func buildMenu() {
         menu.autoenablesItems = false
+        if let updates {
+            installUpdate.target = self
+            // A tag no QueueAppAction uses, so lookups by action tag never find it.
+            installUpdate.tag = -1
+            installUpdate.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: nil)
+            let separator = NSMenuItem.separator()
+            installUpdate.isHidden = true
+            separator.isHidden = true
+            menu.addItem(installUpdate)
+            menu.addItem(separator)
+            updateObservation = updates.$availableUpdate.receive(on: DispatchQueue.main).sink { [weak self] version in
+                self?.installUpdate.title = version.map { "Install Update \($0)…" } ?? ""
+                self?.installUpdate.isHidden = version == nil
+                separator.isHidden = version == nil
+            }
+        }
         for action in QueueAppAction.allCases {
             if action == .learnedWorkloads { menu.addItem(.separator()) }
             if action == .quit {
@@ -1194,6 +1210,8 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate, QueueSurface {
         if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
         if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor); self.globalMouseMonitor = nil }
     }
+
+    @objc private func installAvailableUpdate() { app.installUpdate() }
 
     @objc private func selectMenuAction(_ sender: NSMenuItem) {
         guard let action = QueueAppAction(rawValue: sender.tag) else { return }
@@ -1302,17 +1320,19 @@ struct QueuePanel: View {
     let app: QueueAppRoutes
     var fullWindow = false
     var refreshesOnAppear = true
+    var updates: QueueUpdateStore?
     @StateObject private var navigation: QueueNavigation
     // The requested value shows until the queue reports it, so a menu never snaps back mid-change.
     @State private var pendingLimit: Int?
     @State private var pendingMode: SchedulingMode?
 
     init(store: QueueStore, app: QueueAppRoutes, fullWindow: Bool = false, refreshesOnAppear: Bool = true,
-         navigation: QueueNavigation = QueueNavigation()) {
+         navigation: QueueNavigation = QueueNavigation(), updates: QueueUpdateStore? = nil) {
         self.store = store
         self.app = app
         self.fullWindow = fullWindow
         self.refreshesOnAppear = refreshesOnAppear
+        self.updates = updates
         _navigation = StateObject(wrappedValue: navigation)
     }
 
@@ -1615,6 +1635,7 @@ struct QueuePanel: View {
                 else { Text("Connecting…") }
             }
             Spacer(minLength: 8)
+            if let updates { QueueUpdateButton(store: updates, install: app.installUpdate) }
             if !fullWindow { Button(QueueAppAction.openWindow.title, systemImage: QueueAppAction.openWindow.symbol) { app.perform(.openWindow) }.buttonStyle(.borderless) }
             Menu {
                 ForEach(QueueAppAction.settings) { action in
@@ -2004,9 +2025,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let helpers = makeSupervisor(environment)
         self.coordinator = coordinator
         coordinator.showMenuBar(statusItem: statusItem)
+        // Without helpers (fixture launches) there is no queue to release a drain on, so a marker stays for a later launch.
         if let helpers {
             startHelpers(helpers, for: coordinator)
         } else { coordinator.store.start() }
+        // Setup is complete here. The store creates no updater for untracked or test-hook builds.
+        coordinator.updateStore.start()
         #if AGENT_QUEUE_TEST_HOOKS
         if runSnapshotHooks(coordinator) { return }
         #endif
@@ -2021,10 +2045,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         helpers.startAll()
         helperStartup = Task { @MainActor in
             // Let the daemon come up first so the menu does not flash "Queue unavailable".
-            _ = await helpers.waitUntilQueueReachable(timeout: .seconds(5))
+            let reachable = await helpers.waitUntilQueueReachable(timeout: .seconds(5))
             guard !Task.isCancelled else { return }
             coordinator.store.start()
             if CommandLine.arguments.contains("--open-window") { coordinator.show(.queue) }
+            // A relaunch after an update ends the drain that update started, once the queue is up.
+            guard coordinator.updateStore.hasPendingDrain else { coordinator.updateStore.discardStaleDrainMarker(); return }
+            // A queue that stays unreachable leaves the marker for the next launch (or it lapses with the drain).
+            if !reachable { guard await helpers.waitUntilQueueReachable(timeout: .seconds(60)), !Task.isCancelled else { return } }
+            await coordinator.updateStore.releaseDrainAfterRelaunch()
         }
     }
 

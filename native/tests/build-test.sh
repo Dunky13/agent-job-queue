@@ -11,6 +11,8 @@ if [[ -z "$library" ]]; then
   trap 'rm -rf -- "$library"' EXIT
   bash "$root/native/build-library.sh" "$library" "$(uname -m)" test
 fi
+# The library imports Sparkle, so every test binary links it and finds it at its pinned location.
+sparkle=${SPARKLE_DIR:-$(bash "$root/packaging/sparkle/fetch.sh")}
 xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library -Onone -target "$(uname -m)-apple-macos15.0" \
-  -framework SwiftUI -framework AppKit -framework ServiceManagement \
+  -framework SwiftUI -framework AppKit -framework ServiceManagement -F "$sparkle" -framework Sparkle -Xlinker -rpath -Xlinker "$sparkle" \
   -I "$library" -Xlinker -force_load -Xlinker "$library/libAgentQueueCore.a" "$@" -o "$output"

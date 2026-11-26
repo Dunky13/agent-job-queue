@@ -33,7 +33,7 @@ go test -p 2 ./internal/tooling ./internal/pages
 bash scripts/build-go.sh
 npm run test:web
 npm run test:browser
-bash scripts/test-native.sh
+bash scripts/test-native.sh   # fetches and checksum-verifies Sparkle into build/sparkle on first use
 scripts/build-app.sh
 scripts/test-installer.sh "dist/Agent-Queue-$(cat VERSION)-universal.zip"
 bash scripts/test-dmg.sh "dist/Agent-Queue-$(cat VERSION)-universal.dmg"

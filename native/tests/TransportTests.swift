@@ -281,10 +281,6 @@ struct TransportTests {
             Command(controller: .heavy, arguments: ["profiles"] + arguments + ["--json"], input: input, timeout: 25,
                     cancellation: cancellation, reporting: .queue, decodesStructuredErrors: true)
         }
-        func updates(_ arguments: [String]) -> Command {
-            Command(controller: .heavy, arguments: arguments, input: nil, timeout: 130, cancellation: .retain,
-                    reporting: .updates, decodesStructuredErrors: false)
-        }
         func remote(_ arguments: [String], input: Data? = nil, timeout: TimeInterval = 125,
                     cancellation: Command.Cancellation = .retain) -> Command {
             Command(controller: .remote, arguments: arguments, input: input, timeout: timeout, cancellation: cancellation,
@@ -300,6 +296,9 @@ struct TransportTests {
             ("limit", .limit(3), queue(["limit", "3"])),
             ("scheduling", .scheduling(.adaptive), queue(["scheduling", SchedulingMode.adaptive.rawValue])),
             ("version", .version, queue(["version", "--json"])),
+            ("update drain", .drain, queue(["drain", "--for", "4h"])),
+            ("update undrain", .undrain, queue(["undrain"])),
+            ("update undrain keep paused", .undrainKeepPaused, queue(["undrain", "--keep-paused"])),
             ("agents status", .agentsStatus, queue(["agents", "status", "--json"])),
             ("agents install", .agents("install", runner: "codex"), queue(["agents", "install", "--runner", "codex", "--json"])),
             ("agents remove", .agents("remove", runner: "claude"), queue(["agents", "remove", "--runner", "claude", "--json"])),
@@ -314,8 +313,6 @@ struct TransportTests {
             ("profiles show family", .profilesShow("id", family: "f"), profiles(["show", "id", "--family", "f"], cancellation: .discard)),
             ("profiles show members", .profilesShow("id", membersQuery: "q", membersOffset: 2),
              profiles(["show", "id", "--members-query", "q", "--members-offset", "2"], cancellation: .discard)),
-            ("updates check", .updatesCheck, updates(["updates", "check", "--json"])),
-            ("updates download", .updatesDownload(build: 7), updates(["updates", "download", "--build", "7", "--json"])),
             ("remote status", .remoteStatus, remote(["status", "--json"], timeout: 8, cancellation: .discard)),
             ("remote enable", .remoteEnabled(true), remote(["enable"])),
             ("remote disable", .remoteEnabled(false), remote(["disable"])),
@@ -409,7 +406,6 @@ struct TransportTests {
             } catch {
                 let wording = switch row.command.reporting {
                 case .queue: "The queue did not respond within"
-                case .updates: "The update operation did not finish within"
                 case .setup: "Setup did not finish within"
                 }
                 try check(error.localizedDescription.hasPrefix(wording) && reapedAfterShortDeadline(deadlineMarker),

@@ -4,6 +4,8 @@ set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 # shellcheck source=scripts/macos-signing.sh
 source "$root/scripts/macos-signing.sh"
+# shellcheck source=packaging/sparkle/public-key.sh
+source "$root/packaging/sparkle/public-key.sh"
 # Reject partial production configuration before starting any compilation.
 macos_signing_configure
 version=${VERSION:-$(cat "$root/VERSION")}
@@ -17,6 +19,9 @@ bundle_build=$(cd "$root" && go run -p 2 ./cmd/queue-build-info --version "$vers
 app="$work/Agent Queue.app"
 source_dir="$app/Contents/Resources/payload/source"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$app/Contents/Library/LaunchAgents" "$source_dir"
+SPARKLE_DIR=$(bash "$root/packaging/sparkle/fetch.sh")
+export SPARKLE_DIR
+sparkle_key_plist=$(sparkle_public_key_plist "$root/packaging/sparkle/public-ed-key.txt") || exit 1
 ARCHS='arm64 x86_64' "$root/native/build.sh" "$app/Contents/MacOS/AgentQueue"
 for architecture in arm64 x86_64; do
   goarch=$architecture
@@ -37,6 +42,14 @@ cp "$root/native/Resources/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
 cp "$work/build-info.json" "$app/Contents/Resources/build-info.json"
 cp "$work/build-info.json" "$source_dir/build-info.json"
 (cd "$root" && go run -p 2 ./cmd/queue-tool licenses --output "$source_dir/licenses")
+cp "$SPARKLE_DIR/LICENSE" "$source_dir/licenses/Sparkle-LICENSE"
+# Sparkle is not sandboxed here, so its XPC services, headers and modules are not needed. Remove the
+# links to them too, and sign what remains inside out later.
+mkdir -p "$app/Contents/Frameworks"
+ditto "$SPARKLE_DIR/Sparkle.framework" "$app/Contents/Frameworks/Sparkle.framework"
+for trimmed in XPCServices PrivateHeaders Headers Modules; do
+  rm -rf "$app/Contents/Frameworks/Sparkle.framework/Versions/B/$trimmed" "$app/Contents/Frameworks/Sparkle.framework/$trimmed"
+done
 for document in README.md LICENSE THIRD-PARTY-NOTICES.md; do
   [[ ! -f "$root/$document" ]] || cp "$root/$document" "$source_dir/$document"
 done
@@ -57,9 +70,12 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
-<key>NSDownloadsFolderUsageDescription</key><string>Agent Queue saves verified updates to your Downloads folder.</string>
 <key>AgentQueueEmbeddedPayload</key><true/>
 <key>AgentQueueServiceManagement</key><true/>
+<key>SUFeedURL</key><string>https://dunky13.github.io/agent-job-queue/appcast.xml</string>
+<key>SURequireSignedFeed</key><true/>
+<key>SUVerifyUpdateBeforeExtraction</key><true/>
+$sparkle_key_plist
 </dict></plist>
 PLIST
 cp "$root"/native/LaunchAgents/*.plist "$app/Contents/Library/LaunchAgents/"

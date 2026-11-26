@@ -272,7 +272,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 		p.live = live
 		return nil
 	}
-	exists, err := updateExists(filepath.Join(install.state, "queue.sqlite3"))
+	exists, err := pathExists(filepath.Join(install.state, "queue.sqlite3"))
 	if err != nil {
 		return err
 	}
@@ -396,7 +396,7 @@ func (install *installer) managedOfflineDrainHolding(ctx context.Context, p *man
 	}
 	defer os.RemoveAll(temporary)
 	for _, suffix := range []string{"", "-journal", "-wal", "-shm"} {
-		raw, err := appservices.ReadFile(install.home, path+suffix, updateMaxArchive, false)
+		raw, err := appservices.ReadFile(install.home, path+suffix, maxArchiveBytes, false)
 		if errors.Is(err, os.ErrNotExist) && suffix != "" {
 			continue
 		}
@@ -467,7 +467,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	if err := install.managedPublicationAccess(); err != nil {
 		return nil, err
 	}
-	if exists, err := updateExists(filepath.Join(install.config, "pueue.yml")); err != nil {
+	if exists, err := pathExists(filepath.Join(install.config, "pueue.yml")); err != nil {
 		return nil, err
 	} else if exists {
 		p.node, err = installConfig(filepath.Join(install.config, "pueue.yml"))
@@ -493,10 +493,10 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	}
 	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-queue"} {
 		filename := filepath.Join(install.launch, label+".plist")
-		if exists, err := updateExists(filename); err != nil {
+		if exists, err := pathExists(filename); err != nil {
 			return nil, err
 		} else if exists {
-			definition, err := updatePlist(filename)
+			definition, err := readBundlePlist(filename)
 			if err != nil {
 				return nil, err
 			}
@@ -545,7 +545,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 				return nil, err
 			}
 			if p.previous == nil {
-				if exists, err := updateExists(filepath.Join(install.root, "install-in-progress.json")); err != nil || !exists {
+				if exists, err := pathExists(filepath.Join(install.root, "install-in-progress.json")); err != nil || !exists {
 					return nil, errors.New("Loaded managed service has no installation custody metadata")
 				}
 			}
@@ -582,7 +582,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 		}
 	}
 	if p.previous != nil {
-		p.python, err = updateExists(filepath.Join(install.root, "agent_heavy.py"))
+		p.python, err = pathExists(filepath.Join(install.root, "agent_heavy.py"))
 	} else {
 		p.python, err = install.pythonMigration(ctx, p.node)
 	}
@@ -604,7 +604,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 	if err != nil {
 		return nil, err
 	}
-	legacyRemote, err := updateExists(filepath.Join(install.launch, "io.went.agent-remote.plist"))
+	legacyRemote, err := pathExists(filepath.Join(install.launch, "io.went.agent-remote.plist"))
 	if err != nil {
 		return nil, err
 	}
@@ -614,7 +614,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 		}
 	}
 	if legacyRemote {
-		definition, err := updatePlist(filepath.Join(install.launch, "io.went.agent-remote.plist"))
+		definition, err := readBundlePlist(filepath.Join(install.launch, "io.went.agent-remote.plist"))
 		if err != nil {
 			return nil, err
 		}
@@ -637,7 +637,7 @@ func (install *installer) planManaged(ctx context.Context) (*managedPlan, error)
 		}
 	}
 	for _, name := range []string{"agent-heavy", "agent-remote"} {
-		if _, err := appservices.ReadFile(install.home, filepath.Join(install.root, "bin", name), updateMaxArchive, false); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if _, err := appservices.ReadFile(install.home, filepath.Join(install.root, "bin", name), maxArchiveBytes, false); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}
 	}
@@ -661,10 +661,10 @@ func (install *installer) managedStaleInstallation(ctx context.Context, previous
 	if install.unregisterServices || previous == nil || previous.App == install.app {
 		return false, nil
 	}
-	if exists, err := updateExists(previous.App); err != nil || exists {
+	if exists, err := pathExists(previous.App); err != nil || exists {
 		return false, err
 	}
-	if retained, err := updateExists(filepath.Join(filepath.Dir(previous.App), ".Agent Queue.previous.app")); err != nil || retained {
+	if retained, err := pathExists(filepath.Join(filepath.Dir(previous.App), ".Agent Queue.previous.app")); err != nil || retained {
 		return false, err
 	}
 	for _, label := range []string{"io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-remote"} {
@@ -794,7 +794,7 @@ func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan)
 		if err := install.validatePhoneAccessRecovery(ctx); err != nil {
 			return err
 		}
-		current, err := updatePlist(filepath.Join(install.launch, "io.went.agent-remote.plist"))
+		current, err := readBundlePlist(filepath.Join(install.launch, "io.went.agent-remote.plist"))
 		if err != nil {
 			return err
 		}
@@ -818,7 +818,7 @@ func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan)
 			if p.legacy[label] == nil || !p.loaded[label] {
 				continue
 			}
-			current, err := updatePlist(filepath.Join(install.launch, label+".plist"))
+			current, err := readBundlePlist(filepath.Join(install.launch, label+".plist"))
 			if err != nil {
 				return err
 			}
@@ -843,7 +843,7 @@ func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan)
 	}
 	if p.legacy["io.went.agent-queue"] != nil && p.loaded["io.went.agent-queue"] {
 		if p.orphanedMenu {
-			if exists, err := updateExists(filepath.Join(install.launch, "io.went.agent-queue.plist")); err != nil {
+			if exists, err := pathExists(filepath.Join(install.launch, "io.went.agent-queue.plist")); err != nil {
 				return err
 			} else if exists {
 				return errors.New("Menu definition reappeared before shutdown; review its ownership")
@@ -869,7 +869,7 @@ func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan)
 		}
 		// Re-read before removing: never unlink a definition replaced by another operator.
 		filename := filepath.Join(install.launch, label+".plist")
-		current, err := updatePlist(filename)
+		current, err := readBundlePlist(filename)
 		if p.orphanedMenu && label == "io.went.agent-queue" && errors.Is(err, os.ErrNotExist) {
 			continue
 		}
@@ -920,10 +920,18 @@ func managedBundleDigest(app string) ([32]byte, error) {
 		if entry.IsDir() {
 			return nil
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			target, err := installBundleLink(app, path)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(hash, "link:%d:%s", len(target), target)
+			return nil
+		}
 		if !entry.Type().IsRegular() {
 			return errors.New("Unsafe bundle entry")
 		}
-		raw, err := installReadPayload(app, path, updateMaxArchive)
+		raw, err := installReadPayload(app, path, maxArchiveBytes)
 		if err != nil {
 			return err
 		}
@@ -951,7 +959,7 @@ func (install *installer) managedPublicationAccess() error {
 	if err := install.managedBackupAccess(); err != nil {
 		return err
 	}
-	if exists, err := updateExists(install.managedPreviousPath()); err != nil {
+	if exists, err := pathExists(install.managedPreviousPath()); err != nil {
 		return err
 	} else if exists {
 		if err := unix.Faccessat(int(publication.Fd()), ".", unix.W_OK|unix.X_OK, 0); err != nil {
@@ -1037,7 +1045,7 @@ func (install *installer) managedWrappers() (map[string][]byte, error) {
 }
 
 func (install *installer) managedRemoveFile(filename string, expected []byte) error {
-	raw, err := appservices.ReadFile(install.home, filename, updateMaxArchive, false)
+	raw, err := appservices.ReadFile(install.home, filename, maxArchiveBytes, false)
 	if err != nil {
 		return err
 	}
@@ -1077,7 +1085,7 @@ func (install *installer) managedRemovalIdentity() (BuildInfo, error) {
 }
 
 func (install *installer) managedStopMenu(ctx context.Context) error {
-	exists, err := updateExists(install.app)
+	exists, err := pathExists(install.app)
 	if err != nil || !exists {
 		return err
 	}
@@ -1183,7 +1191,7 @@ func (install *installer) removeManaged(ctx context.Context) error {
 	// agent-heavy run and lane acquire wait for it, so they add no work after the
 	// check below.
 	for _, directory := range []string{install.root, install.state, filepath.Join(install.state, "remote")} {
-		exists, err := updateExists(directory)
+		exists, err := pathExists(directory)
 		if err != nil {
 			return err
 		}
@@ -1399,7 +1407,7 @@ func (install *installer) quiesceManaged(ctx context.Context, p *managedPlan) er
 	if err := install.stopManagedLegacy(ctx, p); err != nil {
 		return err
 	}
-	if exists, err := updateExists(QueueDatabasePath(install.state)); err != nil {
+	if exists, err := pathExists(QueueDatabasePath(install.state)); err != nil {
 		return err
 	} else if exists {
 		if p.live != nil {
@@ -1675,7 +1683,7 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	// controller has adopted the bundle. Unknown private files remain untouched.
 	for _, name := range []string{"agent-heavy", "agent-remote"} {
 		filename := filepath.Join(install.root, "bin", name)
-		if _, err := appservices.ReadFile(install.home, filename, updateMaxArchive, false); errors.Is(err, os.ErrNotExist) {
+		if _, err := appservices.ReadFile(install.home, filename, maxArchiveBytes, false); errors.Is(err, os.ErrNotExist) {
 			continue
 		} else if err != nil {
 			return err

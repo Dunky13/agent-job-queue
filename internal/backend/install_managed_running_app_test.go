@@ -570,7 +570,7 @@ func TestManagedRemovalRefusedQuitLeavesARunningAppComplete(t *testing.T) {
 		t.Fatal("a refused quit reported success")
 	}
 	a.requireUntouched(t)
-	if err := updateCompleted(i.root); err != nil {
+	if err := requireCompleteInstallation(i.root); err != nil {
 		t.Fatal("a refused quit made the running app look incomplete", err)
 	}
 	refuse = false

@@ -191,7 +191,7 @@ func TestManagedRemovalOfSupervisedApp(t *testing.T) {
 	for _, filename := range []string{"Contents/Resources/build-info.json", "Contents/Resources/payload/source/build-info.json"} {
 		integrationTestWrite(t, filepath.Join(i.app, filename), mustMetadataJSON(t, untracked))
 	}
-	info, err := updatePlist(filepath.Join(i.app, "Contents/Info.plist"))
+	info, err := readBundlePlist(filepath.Join(i.app, "Contents/Info.plist"))
 	if err != nil {
 		t.Fatal(err)
 	}

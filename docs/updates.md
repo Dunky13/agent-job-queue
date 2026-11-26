@@ -1,64 +1,81 @@
 # Installed version and updates
 
+Agent Queue updates itself with [Sparkle](https://sparkle-project.org). Sparkle downloads a new build, verifies it, installs it in place and relaunches the app. See [ADR 0001](adr/0001-sparkle-updates-in-place.md) for the decision and [the spec](specs/sparkle-updates.md) for the design.
+
 ## Operator flow
 
-Open the queue's gear menu and choose **About and updates**. The window shows the running app's bundle version immediately and reads the installed controller version locally. Opening the window does not contact the network. Choose **Check for updates** to query the public project releases. Choose **Download update** for an available update.
+Open the queue's gear menu and choose **About and updates**. The window shows the running app's bundle version immediately and reads the installed controller version locally. Opening the window does not contact the network.
 
-The updater downloads and verifies the new `Agent Queue.app`, copies it to a new folder named `~/Downloads/Agent Queue <version> (build <N>)`, and reveals it in Finder. It never installs the app itself. Before you finish, optionally run `agent-heavy drain`: new `agent-heavy run` calls then wait instead of failing, and callers of running or queued jobs survive the restart. Run `agent-heavy undrain` once the new app is open and its queue is up; it refuses while the daemon is away, and `--force` drops the drain anyway (see [upgrade recovery](upgrade-recovery.md)). To finish:
+The first time Sparkle is due to check, it asks once whether Agent Queue may check for updates automatically. After you agree it checks on its own schedule. Sparkle opens its own window for an update found by a scheduled check only when Agent Queue was just launched or the Mac was idle, so the window cannot open unseen behind other apps. Instead **Install Update…** appears in the queue panel and the menu-bar menu, and a notification announces the version; macOS asks once for permission to show it. Clicking either opens Sparkle's install dialog. **Check for Updates…** in the window asks Sparkle to check now and shows Sparkle's own dialogs for the release notes, the download and the install. The button is disabled while Sparkle is busy or may not act.
 
-1. Quit Agent Queue.
-2. Drag the new `Agent Queue.app` into Applications and choose **Replace**.
-3. Open it from Applications. Setup runs automatically, detects the newer build, retires any queue, resource or phone-access registrations left by older versions and lets the app start its own queue processes; only the app's login item stays registered. Quitting the old app stopped its queue processes but not running jobs. Those jobs keep running and their outcomes are recorded without replay, but without a drain attached callers retry for about two minutes and then exit with status 125 (or report the job's own exit status when the queue store shows it finished), and queued jobs run later with no caller attached. Setup waits only for a queue daemon that is still running, as one from an older version can be. Settings, history and credentials are preserved.
+When you choose to relaunch for an update, the app first closes queue intake with the bundled `agent-heavy drain --for 4h`. New `agent-heavy run` calls then wait instead of failing, and callers of running or queued jobs survive the restart. An update that Sparkle installs when you quit the app does not drain and never restarts the app mid-session: the app declines Sparkle's immediate-install offer, so the update installs at the next real quit. If the drain cannot be set, the app logs the failure and installs anyway, because the drain only protects callers.
 
-An existing folder in Downloads is never overwritten or deleted. If the folder name is taken, the updater uses a numbered suffix such as `Agent Queue 1.2.0 (build 42) 2`.
+The app records the drain it started in a private marker file, `~/.local/state/agent-heavy/update-drain.json` (mode 0600 in a 0700 directory, created without following links and read back only if it is a regular file owned by you). The marker holds the drain's exact expiry and whether the queue was already paused. After the relaunch, once setup reports the queue up, the app reads the marker strictly (unknown or duplicate keys, other owners and loose permissions all make it void), consumes it, and runs `agent-heavy undrain` only if the live drain still has the recorded expiry. A drain you set, extended or replaced yourself has a different expiry and is never released, and a marker whose drain has lapsed is removed without running anything. If the queue was paused before the update, or its status could not be read as running, the app runs `agent-heavy undrain --keep-paused`, which ends only the drain and never resumes your pause. Otherwise `undrain` also resumes the queue, which ends the pause a restarted queue starts with.
 
-An installation without a published build identity is explicitly marked untracked. Its version string is displayed as recorded, including legacy bundle versions. **Download published build** offers an explicit replacement with a published build rather than claiming that unknown build histories are comparable. Known newer published installations cannot be downgraded: the updater refuses to download an older or equal tracked build, and opening an older copy later is rejected by setup.
+The marker is consumed when the relaunched queue is up, whether or not the release succeeds. It is left in place on purpose when the queue never comes up within a minute of launch and when the app runs without helpers (fixture launches): a later launch releases it if the drain is still live, and removes it otherwise. See [upgrade recovery](upgrade-recovery.md) for the drain itself.
 
-The CLI supports the same flow:
+The CLI reports only the installed version:
 
 ```sh
 agent-heavy version
 agent-heavy version --json
-agent-heavy updates check
-agent-heavy updates check --json
-agent-heavy updates download --build 42
-agent-heavy updates download --build 42 --json
 ```
 
-Replace 42 with the published build returned by the check. The JSON result is:
+There is no `agent-heavy updates` command. A test build launched with `--fixture` is a test-hook build, so it never checks or installs.
 
-```json
-{"downloaded": true, "build": 42, "app": "~/Downloads/Agent Queue 1.2.0 (build 42)/Agent Queue.app", "message": "Quit Agent Queue, then drag the new copy into Applications and choose Replace. Opening it finishes the update automatically."}
-```
+### When updates are unavailable
 
-If availability changes, check again and select the current build. If Finder cannot reveal the copy, the download still succeeds and the message names its path. Checks do not require GitHub authentication, change queue state, or download executable assets. Network failures and rate limits remain errors. A test build launched with `--fixture` answers checks with sample data, records a download request without saving anything, and records links instead of opening them.
+The updater exists only in a published build. These builds never check or install:
+
+- Untracked builds (local and pull-request builds, or a build whose release metadata cannot be verified).
+- Test-hook builds, including any launched with `--fixture`.
+
+The window says which applies and links to the releases page. A tracked build also refuses checks and installs while the incomplete-installation marker (`install-in-progress.json`) exists. Open Agent Queue from Applications to finish setup first.
+
+Installations older than the first Sparkle build cannot update in place. They need one last manual download from the release page.
 
 ## Version identity
 
-Each release ZIP, `Agent-Queue-<version>-universal.zip`, contains only `Agent Queue.app` at its top level. The release manifest `agent-job-queue.json` contains repository, semantic version, monotonically increasing CI build number, full source commit, immutable tag, asset name and SHA-256. Version comparison uses the build number so consecutive source builds with the same semantic version are discoverable.
+Each release ZIP, `Agent-Queue-<version>-universal.zip`, contains only `Agent Queue.app` at its top level. The release manifest `agent-job-queue.json` contains repository, semantic version, monotonically increasing CI build number, full source commit, immutable tag, asset name and SHA-256. The Sparkle feed `appcast.xml` carries the build number as `sparkle:version` and the semantic version as `sparkle:shortVersionString`, so consecutive source builds with the same semantic version are comparable.
 
-Packaging embeds matching build-info.json records in the app's `Contents/Resources` and in its runtime payload (`Contents/Resources/payload/source`) before signing. Published main-branch CI receives its build number and commit from the CI environment. Local and pull-request packages remain untracked. For an intentionally tracked test package, supply BUILD_NUMBER and SOURCE_COMMIT together; this does not publish it. A checkout name or current branch alone does not establish a published build.
+Packaging embeds matching build-info.json records in the app's `Contents/Resources` and in its runtime payload (`Contents/Resources/payload/source`) before signing. Published main-branch CI receives its build number and commit from the CI environment. Local and pull-request packages remain untracked. For an intentionally tracked test package, supply BUILD_NUMBER and SOURCE_COMMIT together; this does not publish it, and it requires `packaging/sparkle/public-ed-key.txt`. A checkout name or current branch alone does not establish a published build.
 
-Setup validates source and app metadata before replacing support files. Under the existing installation lock, it rejects older tracked builds and conflicting equal-build identities across completed, app and pending-installation identities. Identical tracked builds can be reinstalled. A durable incomplete-installation marker precedes the first support-file replacement and remains after failure or interruption. It is cleared only after service registration is verified (for the app, only its login item remains registered and older queue, resource and phone-access registrations are retired), remote adoption and the completed identity commit succeed. While the marker is present, version checks and update downloads fail; open Agent Queue from Applications to finish setup. Setup never starts a live handover: before replacing a running daemon it waits for that daemon's jobs. Uncertain attempts, process ownership or changed custody fail closed. Runtime refuses to certify an incomplete installation and otherwise compares the completed marker, bundled identity and bundle version.
+Setup validates source and app metadata before replacing support files. Under the existing installation lock, it rejects older tracked builds and conflicting equal-build identities across completed, app and pending-installation identities. Identical tracked builds can be reinstalled. A durable incomplete-installation marker precedes the first support-file replacement and remains after failure or interruption. It is cleared only after service registration is verified (for the app, only its login item remains registered and older queue, resource and phone-access registrations are retired), remote adoption and the completed identity commit succeed. While the marker is present, version checks fail and Sparkle refuses checks and installs; open Agent Queue from Applications to finish setup. Setup never starts a live handover: before replacing a running daemon it waits for that daemon's jobs. Uncertain attempts, process ownership or changed custody fail closed. Runtime refuses to certify an incomplete installation and otherwise compares the completed marker, bundled identity and bundle version.
 
 Managed publication records exact candidate and backup custody in private installation state. A changed candidate, newer target, substituted backup or retained backup without an owned receipt blocks publication or recovery and preserves the evidence. Do not delete these records to force an update. Setup also refuses executable locations with group- or world-writable ancestors before service changes; the default target is the account's Applications folder.
 
 Setup never starts a live handover. Finishing one an older release left behind preserves queued work, pause state, the parallel limit and each original caller's outcome and exit status without replaying attempts. During the swap, new mutations can be briefly rejected before acceptance. Complete previous signed bundles needed by outstanding callers or workers remain visible under `~/Applications/Agent Queue Runtimes`, bound to exact filesystem and attempt custody. Only a later setup operation reclaims a generation after verifying terminal attempts and dead original callers and owned workers; the runtime never deletes executable code.
 
-## Download boundary
+## Trust
 
-The checker uses the fixed public project repository and selects the highest numbered published build with the expected manifest, including published prerelease builds. It uses the release list because GitHub's latest-release shortcut excludes prereleases. Pagination searches at most 1,000 releases within the operation deadline; reaching the search bound reports an incomplete search instead of claiming that a build is current. The manifest must match the release tag and full commit. Asset URLs must belong to that exact project release.
+An update is trusted through these layers:
 
-Downloads require HTTPS with redirects restricted to known GitHub release hosts. Metadata, archive size, extraction size, entry count and operation time are bounded. An absolute CLI deadline interrupts DNS, connection setup, headers and trickling bodies; a socket idle timeout alone cannot bound those operations. The updater verifies the archive SHA-256 against the manifest and GitHub's asset digest when available. It rejects traversal, symlinks, special files, case or Unicode path collisions and any top-level entry other than `Agent Queue.app` (and `__MACOSX`). It extracts into private staging, then checks both embedded build identity records, the bundle identifier `io.went.agent-queue`, the bundle version and build, and the code signature against the published release. Only then does it copy the app with `ditto` into a newly created Downloads folder, verify the copy's identity and signature again, mark the app with the same quarantine attribute a browser download carries (the HTTP client sets none, so Gatekeeper would otherwise never assess it), and reveal it. A failed copy or quarantine step removes only the folder the updater just created. If macOS denies writing to Downloads, the updater reports that Agent Queue needs access under **System Settings > Privacy & Security > Files and Folders**.
+1. Sparkle's EdDSA signature on the archive, verified before extraction (`SUVerifyUpdateBeforeExtraction`).
+2. Sparkle's EdDSA signature on the feed itself (`SURequireSignedFeed`).
+3. Sparkle's check that the new app is code-signed by the same Developer ID team.
+4. Apple notarization, with a stapled ticket on the app and the DMG.
+5. Setup's build-identity, downgrade and incomplete-installation checks when the relaunched app runs setup. Setup rejects an older tracked build.
 
-One download runs at a time. Private staging is removed after every attempt, and leftovers from an interrupted attempt or from the earlier installer flow are cleaned up on the next one. The installed version is rechecked before the copy is made.
+The app carries these `Info.plist` keys:
 
-The public GitHub release is the distribution trust boundary. New main releases produced by the notarized pipeline use Developer ID signatures and Apple notarization, with a stapled ticket on the app and the DMG. Historical releases and local development packages can remain ad hoc signed. The updater checks signature integrity and release identity; those checks alone do not establish Apple notarization or Gatekeeper acceptance. It does not disable Gatekeeper, remove quarantine from the delivered copy (it adds it), or add a background installation service. Copying and replacing the app in Applications is left to the user, so the updater never writes code into Applications. Older archives without embedded build metadata or in the earlier installer layout remain available through their release pages; the updater refuses to present them as verified new-format downloads. Builds that predate this flow cannot update in place and need one manual download from the release page.
+| Key | Value |
+| --- | --- |
+| `SUFeedURL` | `https://dunky13.github.io/agent-job-queue/appcast.xml` |
+| `SUPublicEDKey` | The public key in `packaging/sparkle/public-ed-key.txt`. Required for a tracked build, optional for an untracked one. |
+| `SURequireSignedFeed` | true |
+| `SUVerifyUpdateBeforeExtraction` | true |
+| `SUEnableAutomaticChecks` | Unset, so Sparkle asks for consent once. |
 
-Agent Queue is no longer distributed through Homebrew. See [Pages delivery](pages-delivery.md).
+The EdDSA private key is a CI secret. Losing it strands every installation on its current build until a manual download.
+
+The app is not sandboxed, so the bundled `Sparkle.framework` omits its XPC services, headers and modules. It contains `Autoupdate` and `Updater.app`, signed inside out with the hardened runtime, and the app is notarized with them. `queue-tool verify-app` allows exactly that one nested app and framework layout, requires universal Mach-O files signed by the app's team, and rejects any other nested app or framework and any XPC service. Sparkle's license is shipped as `source/licenses/Sparkle-LICENSE`.
+
+This work qualifies Sparkle's installer mechanism on an employer-managed Mac that previously quarantined Agent Queue, not Agent Queue's own binaries. The open acceptance gate is a Sparkle update of Agent Queue from build N to N+1 on that Mac. See [the investigation](handoffs/sentinelone-detection-investigation.md).
+
+Agent Queue is no longer distributed through Homebrew. An app installed earlier through the Homebrew tap updates itself through Sparkle like any other installation. Never run `brew uninstall` on it, which deletes the app; `brew untap dunky13/agent-job-queue` is optional. See [Pages delivery](pages-delivery.md).
 
 ## Validation contract
 
-Tests use artificial releases, an injected Downloads folder and inert native commands. They cover truthful offline versions, release selection, same-version build updates, unknown history, downgrade refusal, changed availability, private staging cleanup, network failures, malicious archives, digest, metadata and signature failures, the never-overwrite rule for Downloads, explicit download, duplicate actions and preview isolation. Native checks retain ARM and Intel coverage. Operating-system approval and endpoint-protection policy remain independent requirements. Public metadata can be checked read-only; tests never write to the operator's Downloads, Applications or live queue.
+Native tests cover the tracked, untracked and test-hook decision for creating the updater, the refusal while the incomplete-installation marker exists, the drain running before the install block on the relaunch path, the install-on-quit offer being declined without a drain, the failed-drain continuation, and the rule that `undrain` runs only for a marker whose recorded expiry still matches the live drain (operator drains, extended drains and prior pauses included). Go tests cover the installed-version command and `queue-tool verify-app` for the Sparkle layout, signatures, architectures, `Info.plist` keys and licenses. Signing tests pin the inside-out order, hardened runtime and the absence of `--deep`. Real Developer ID signing, notarization and an actual update from one build to the next cannot run in these tests; tests never write to the operator's Applications or live queue. Operating-system approval and endpoint-protection policy remain independent requirements.
 
-API behavior is documented in [GitHub REST releases](https://docs.github.com/en/rest/releases/releases), including public access, prerelease flags and release assets. Bundle display reads Apple's [infoDictionary](https://developer.apple.com/documentation/foundation/bundle/infodictionary).
+Sparkle behavior is documented in [Sparkle's documentation](https://sparkle-project.org/documentation/). Bundle display reads Apple's [infoDictionary](https://developer.apple.com/documentation/foundation/bundle/infodictionary).

@@ -10,7 +10,7 @@ Use Developer ID Application for the app bundle, its two bundled Go executables
 (`agent-heavy` and `agent-remote` in `Contents/MacOS`), and the DMG. Sign universal executables after combining their architecture slices. Each
 executable receives Hardened Runtime, a secure timestamp, and a stable code
 identifier. Verify both architecture slices against Apple's certificate chain
-and the configured team. Sign components explicitly from the inside out; use
+and the configured team. Sign components explicitly from the inside out (Sparkle's `Autoupdate`, `Updater.app` and framework first, then the helpers, then the app); use
 `--deep` for verification only. These choices follow Apple's
 [distribution signing instructions](https://developer.apple.com/documentation/xcode/creating-distribution-signed-code-for-the-mac/).
 

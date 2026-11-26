@@ -6,6 +6,8 @@ source_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 output=${1:?Usage: native/build-library.sh OUTPUT_DIRECTORY ARCHITECTURE release|test}
 architecture=${2:?Usage: native/build-library.sh OUTPUT_DIRECTORY ARCHITECTURE release|test}
 sources=("$source_dir"/*.swift)
+# Sparkle.framework comes from the pinned, checksum-verified download; callers may export SPARKLE_DIR.
+sparkle=${SPARKLE_DIR:-$(bash "$source_dir/../packaging/sparkle/fetch.sh")}
 case "${3:-}" in
   release) flags=(-O) ;;
   test)
@@ -15,7 +17,7 @@ case "${3:-}" in
   *) echo "Usage: native/build-library.sh OUTPUT_DIRECTORY ARCHITECTURE release|test" >&2; exit 2 ;;
 esac
 mkdir -p -- "$output"
-xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library "${flags[@]}" \
+xcrun swiftc -warnings-as-errors -swift-version 6 -parse-as-library "${flags[@]}" -F "$sparkle" \
   -target "$architecture-apple-macos15.0" -module-name AgentQueueCore \
   -emit-module -emit-module-path "$output/AgentQueueCore.swiftmodule" \
   -emit-library -static -o "$output/libAgentQueueCore.a" "${sources[@]}"

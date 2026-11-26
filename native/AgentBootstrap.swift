@@ -20,8 +20,17 @@ struct QueueBootstrapEnvironment: Sendable {
              home: FileManager.default.homeDirectoryForCurrentUser, arguments: CommandLine.arguments)
     }
 
+    /// Setup's marker for an installation that has not completed.
+    static let incompleteInstallationMarker = "install-in-progress.json"
     var root: URL { home.appendingPathComponent(".local/share/agent-heavy") }
     var source: URL { resources.appendingPathComponent("payload/source") }
+    /// Setup writes this marker while it installs and removes it when the installation is complete.
+    var installIncomplete: Bool {
+        var value = stat()
+        return lstat(root.appendingPathComponent(Self.incompleteInstallationMarker).path, &value) == 0
+    }
+    /// Present only while a drain started by the update flow is waiting for the relaunched queue.
+    var updateDrainMarker: URL { home.appendingPathComponent(".local/state/agent-heavy/update-drain.json") }
     var allowsInstallation: Bool { setupAllowed && !arguments.contains("--fixture") }
 
     static func isTestOption(_ argument: String) -> Bool {
@@ -123,7 +132,7 @@ struct QueueBootstrapEnvironment: Sendable {
                           home.appendingPathComponent(".local/state/agent-heavy"), home.appendingPathComponent(".config/agent-heavy")] {
             try QueueBootstrapFiles.validateDirectory(directory, scope: .init(root: directory))
         }
-        for name in ["build-info.json", "install-in-progress.json", "installation.json"] + (managed ? [] : ["bin/agent-heavy", "bin/agent-remote"]) {
+        for name in ["build-info.json", Self.incompleteInstallationMarker, "installation.json"] + (managed ? [] : ["bin/agent-heavy", "bin/agent-remote"]) {
             try QueueBootstrapFiles.validateFile(root.appendingPathComponent(name), scope: privateScope)
         }
         for name in ["agent-heavy", "agent-remote"] {
@@ -132,7 +141,7 @@ struct QueueBootstrapEnvironment: Sendable {
         for label in ["io.went.agent-heavy", "io.went.agent-resources", "io.went.agent-queue"] {
             try QueueBootstrapFiles.validateFile(launch.appendingPathComponent("\(label).plist"), scope: launchScope)
         }
-        if Self.exists(root.appendingPathComponent("install-in-progress.json")) {
+        if Self.exists(root.appendingPathComponent(Self.incompleteInstallationMarker)) {
             return .install(request, "Finishing an incomplete installation…")
         }
         guard let installed = try? Self.readIdentity(root.appendingPathComponent("build-info.json"), scope: privateScope), installed == identity else {

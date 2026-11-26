@@ -215,7 +215,7 @@ macos_verify_code() {
 macos_sign_code() {
   local path=$1 identifier=${2:-} operation=${3:-code}
   case "$operation" in
-    code|app-agent-heavy|app-agent-remote|app) ;;
+    code|app-sparkle-autoupdate|app-sparkle-updater|app-sparkle-framework|app-agent-heavy|app-agent-remote|app) ;;
     *) macos_signing_error 'Unknown signing operation.'; return 1 ;;
   esac
   local arguments=(--force --sign -)
@@ -385,8 +385,8 @@ macos_verify_app_code() {
   local app=$1 name
   macos_app_payload_mode "$app" || return
   [[ $MACOS_APP_MANAGED == 1 ]] || { macos_signing_error 'The app must own its background services.'; return 1; }
-  for name in agent-heavy agent-remote; do
-    macos_verify_code "$MACOS_APP_HELPERS/$name" || return
+  for name in "${MACOS_SPARKLE_CODE[@]}" "$MACOS_APP_HELPERS/agent-heavy" "$MACOS_APP_HELPERS/agent-remote"; do
+    macos_verify_code "$name" || return
   done
   macos_verify_code "$app" || return
   codesign --verify --strict --deep "$app"
@@ -398,6 +398,7 @@ macos_app_payload_mode() {
   local app=$1 payload="$1/Contents/Resources/payload" name marker service helper command definition
   MACOS_APP_EMBEDDED=0
   MACOS_APP_MANAGED=0
+  MACOS_SPARKLE_CODE=()
   MACOS_APP_HELPERS="$payload/source/bin"
   if marker=$(plutil -type AgentQueueServiceManagement "$app/Contents/Info.plist" 2>/dev/null); then
     [[ $marker == bool && $(plutil -extract AgentQueueServiceManagement raw -o - "$app/Contents/Info.plist") == true ]] || { macos_signing_error 'Invalid service management packaging marker.'; return 1; }
@@ -451,6 +452,14 @@ macos_app_payload_mode() {
       count=$((count + 1))
     done
     [[ $count == 3 ]] || { macos_signing_error 'Unexpected managed app LaunchAgent.'; return 1; }
+    # Sparkle ships inside the app. Its code is listed in the order it must be signed, inside out.
+    local sparkle="$app/Contents/Frameworks/Sparkle.framework"
+    [[ -d $sparkle && ! -L $sparkle && -d $sparkle/Versions/B && ! -L $sparkle/Versions/B &&
+      -f $sparkle/Versions/B/Autoupdate && ! -L $sparkle/Versions/B/Autoupdate && -x $sparkle/Versions/B/Autoupdate &&
+      -d $sparkle/Versions/B/Updater.app && ! -L $sparkle/Versions/B/Updater.app ]] || {
+      macos_signing_error 'The managed app must contain Sparkle.framework with Autoupdate and Updater.app.'; return 1;
+    }
+    MACOS_SPARKLE_CODE=("$sparkle/Versions/B/Autoupdate" "$sparkle/Versions/B/Updater.app" "$sparkle")
   fi
   MACOS_APP_EMBEDDED=1
 }
@@ -459,6 +468,15 @@ macos_sign_app_helpers() {
   local app=$1 name
   macos_app_payload_mode "$app" || return
   [[ $MACOS_APP_EMBEDDED == 1 ]] || return 0
+  # Inside out and without --deep: Autoupdate, Updater.app, the framework, then the helpers. The caller signs the app last.
+  local sparkle="$app/Contents/Frameworks/Sparkle.framework"
+  # Exactly these three, named one by one: anything else the layout check let through is an error, not a fallback.
+  [[ ${#MACOS_SPARKLE_CODE[@]} == 3 && ${MACOS_SPARKLE_CODE[0]} == "$sparkle/Versions/B/Autoupdate" &&
+    ${MACOS_SPARKLE_CODE[1]} == "$sparkle/Versions/B/Updater.app" && ${MACOS_SPARKLE_CODE[2]} == "$sparkle" ]] || {
+    echo "Unexpected Sparkle code in $app: ${MACOS_SPARKLE_CODE[*]}" >&2; return 1; }
+  macos_sign_code "$sparkle/Versions/B/Autoupdate" '' app-sparkle-autoupdate || return
+  macos_sign_code "$sparkle/Versions/B/Updater.app" '' app-sparkle-updater || return
+  macos_sign_code "$sparkle" '' app-sparkle-framework || return
   for name in agent-heavy agent-remote; do
     macos_sign_code "$MACOS_APP_HELPERS/$name" "io.went.agent-queue.$name" "app-$name" || return
   done

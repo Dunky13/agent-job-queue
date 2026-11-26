@@ -262,7 +262,7 @@ struct RefreshTests {
         try await sent("the merge-target picker store")
     }
 
-    /// One read and one change through every store of a coordinator, plus both routes out of the app.
+    /// One read through every store of a coordinator, one change through each store that makes them, plus both routes out of the app.
     @MainActor private static func drive(_ coordinator: WindowCoordinator) async throws {
         await coordinator.store.refresh()
         await coordinator.store.dispatch(.resume)?.value
@@ -277,8 +277,6 @@ struct RefreshTests {
         await integration.save()?.value
         let updates = coordinator.updateStore
         await updates.refreshInstalled()
-        await updates.checkForUpdates()?.value
-        await updates.downloadUpdate()?.value
         let learning = coordinator.learningStore
         await learning.loadPage()?.value
         if let project = learning.hierarchy?.projects.first { learning.openProject(project) }
@@ -293,14 +291,14 @@ struct RefreshTests {
     /// What a drive should have left in a fixture and did not.
     @MainActor private static func missing(from fixture: QueueFixture) -> [String] {
         let id = QueueFixture.previewDetail().profile.id
-        let reads: [QueueClient.Command] = [.status, .remoteStatus, .agentsStatus, .version, .updatesCheck,
+        let reads: [QueueClient.Command] = [.status, .remoteStatus, .agentsStatus, .version,
             .profilesHierarchy(limit: 100), .profilesShow(id),
             .profilesList(offset: 0, limit: 50, query: "", project: "Sample project", operation: "tests"),
             .profilesList(offset: 0, limit: 50, query: "")]
         var result = reads.filter { !fixture.reads.contains($0) }.map { $0.arguments.joined(separator: " ") }
         let changes = [["resume"], ["configure"], ["agents", "install", "--runner", "codex", "--json"],
-            ["updates", "download", "--build", "101", "--json"], ["profiles", "edit", id, "--json"]]
-        if fixture.changes.map(\.arguments) != changes { result.append("exactly one change from each store") }
+            ["profiles", "edit", id, "--json"]]
+        if fixture.changes.map(\.arguments) != changes { result.append("exactly the expected changes") }
         if fixture.logPaths != ["/example/state/logs/1.log"] { result.append("log tail") }
         if fixture.desktopRequests != [.copy("fixture address")] { result.append("desktop request") }
         return result
@@ -339,7 +337,7 @@ struct RefreshTests {
         try check(!FileManager.default.fileExists(atPath: stray.path), "A driven fixture coordinator starts no controller")
         let bystander = QueueFixture(arguments: ["--fixture", queue.path])
         try await drive(QueueFixture(arguments: ["--fixture", queue.path]).coordinator())
-        try check(missing(from: bystander).count == 12 && bystander.reads.isEmpty && bystander.changes.isEmpty,
+        try check(missing(from: bystander).count == 11 && bystander.reads.isEmpty && bystander.changes.isEmpty,
                   "Negative control: the isolation check reports every store that bypasses a fixture")
     }
 

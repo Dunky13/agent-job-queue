@@ -52,7 +52,7 @@ func (install *installer) liveControl(ctx context.Context, operation string, pay
 }
 
 func (install *installer) liveTargetDigest() (string, error) {
-	raw, err := install.readPayload(filepath.Join(install.app, "Contents/MacOS/agent-heavy"), updateMaxArchive)
+	raw, err := install.readPayload(filepath.Join(install.app, "Contents/MacOS/agent-heavy"), maxArchiveBytes)
 	if err != nil {
 		return "", err
 	}
@@ -102,7 +102,7 @@ func liveAttempts(value Object) ([]runtimeGenerationAttempt, error) {
 }
 
 func (install *installer) readLiveJournal() (*managedLiveUpgrade, []byte, error) {
-	raw, err := updateReadOwned(install.liveJournalPath(), 4*1024*1024)
+	raw, err := readOwnedFile(install.liveJournalPath(), 4*1024*1024)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil, nil
 	}

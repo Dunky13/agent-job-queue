@@ -9,6 +9,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     private var results: [String: Bool] = [:]
     private var skippedChecks: [String: String] = [:]
     private var actions: [QueueAppAction] = []
+    private var installs = 0
     private var menuOpenCount = 0
     private var menuSelection: QueueAppAction?
     private var trackedMenu: NSMenu?
@@ -139,7 +140,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
             // The Quit item's real selector is exercised with an inert endpoint.
             // Every window action still uses the production coordinator handler.
             if action != .quit { routes.perform(action) }
-        }, openLearning: routes.openLearning, logTail: routes.logTail, desktop: routes.desktop))
+        }, openLearning: routes.openLearning, logTail: routes.logTail, desktop: routes.desktop,
+            installUpdate: routes.installUpdate))
         self.controller = controller
         coordinator.menuBarController = controller
         NSApp.mainMenu = applicationMenuDelegate.makeMainMenu()
@@ -274,6 +276,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
                   "allOpenedSettingsRemainFixtureIsolated")
         try await verifyWindows()
         try await verifyApplicationMenus()
+        try await verifyUpdateItem()
         let original = store.snapshot
         fixture.snapshot = nil
         store.error = "Simulated unavailable queue"
@@ -293,6 +296,31 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     }
 
     /// Pins each window's chrome and that a closed window is the one that comes back.
+    /// A background update adds a hidden-until-announced item that opens Sparkle's dialog through the install route.
+    private func verifyUpdateItem() async throws {
+        let backend = fixture.backend
+        let updates = QueueUpdateStore(running: backend.runningVersion(), command: backend.command)
+        let routes = coordinator.routes
+        let controller = QueueMenuBarController(store: coordinator.store, updates: updates, app: QueueAppRoutes(
+            perform: routes.perform, openLearning: routes.openLearning, logTail: routes.logTail, desktop: routes.desktop,
+            installUpdate: { [weak self] in self?.installs += 1 }))
+        defer { controller.tearDown() }
+        guard let index = controller.menu.items.firstIndex(where: { $0.tag == -1 }),
+              controller.menu.items.indices.contains(index + 1) else {
+            throw ClientError.message("The menu has no install update item.")
+        }
+        let item = controller.menu.items[index], separator = controller.menu.items[index + 1]
+        try check(item.isHidden && separator.isSeparatorItem && separator.isHidden, "installUpdateItemHiddenWithoutAnUpdate")
+        updates.announce("2.0.0")
+        try await settle()
+        try check(!item.isHidden && !separator.isHidden && item.title == "Install Update 2.0.0…", "announcedUpdateShowsInstallItem")
+        controller.menu.performActionForItem(at: index)
+        try check(installs == 1, "installUpdateItemUsesTheInstallRoute")
+        updates.announce(nil)
+        try await settle()
+        try check(item.isHidden && separator.isHidden, "clearedUpdateHidesInstallItem")
+    }
+
     private func verifyWindows() async throws {
         let resizable: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
         let expected: [(QueueWindowKind, QueueAppAction, String, NSSize, NSSize)] = [
