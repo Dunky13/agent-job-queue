@@ -346,12 +346,12 @@ func TestManagedHistoricalCaskRemovedMenuDefinition(t *testing.T) {
 			case "extra-argument":
 				extra = "--args\n"
 			}
-			original := i.command
-			i.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if m.loaded["io.went.agent-queue"] && slices.Equal(args, []string{"launchctl", "print", i.domain() + "/io.went.agent-queue"}) {
+			original := m.services.print
+			m.services.print = func(label string) ([]byte, error) {
+				if label == "io.went.agent-queue" && m.loaded[label] {
 					return []byte("program = " + program + "\narguments = {\n/usr/bin/open\n-a\n" + app + "\n" + extra + "}\n"), nil
 				}
-				return original(ctx, args)
+				return original(label)
 			}
 			before := installTreeWitness(t, i.home)
 			err := m.run(t)

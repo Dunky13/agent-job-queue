@@ -271,7 +271,7 @@ func installInspectDirectory(directory string) error {
 }
 
 func (install *installer) inspectService(ctx context.Context, label string) ([]byte, bool, error) {
-	output, err := install.run(ctx, "launchctl", "print", install.domain()+"/"+label)
+	output, err := install.loginServices().Print(ctx, label)
 	if errors.Is(err, errInstallServiceNotLoaded) {
 		return nil, false, nil
 	}
@@ -947,8 +947,7 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 		} else if !ready {
 			return errors.New("The installed backend is not executable; setup retires it instead of starting its service")
 		}
-		_, err = install.run(ctx, "launchctl", "bootstrap", install.domain(), filepath.Join(install.launch, "io.went.agent-heavy.plist"))
-		return err
+		return install.loginServices().Bootstrap(ctx, filepath.Join(install.launch, "io.went.agent-heavy.plist"))
 	case "cancel-job", "cleanup-job":
 		if node == nil {
 			return errors.New("Legacy job recovery requires its dedicated configuration")

@@ -30,6 +30,10 @@ _Avoid_: Command, button, operation
 
 ## Upgrades and setup
 
+**Service**:
+A background program the installer registers with the user's login session, such as the queue, the resource sampler or phone access. It is either loaded or not loaded.
+_Avoid_: Daemon (for every service), agent (unqualified)
+
 **Drain**:
 An operator-declared window, started with `agent-heavy drain`, during which new runs wait so a restart cannot strand their callers.
 _Avoid_: Pause, freeze

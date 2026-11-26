@@ -382,12 +382,16 @@ func TestManagedRemovalFinalCheckRefusalsSayToRetry(t *testing.T) {
 			}
 			i := m.installer
 			managedRemovalTarget(i)
-			original := i.command
 			reads, loaded := 0, false
-			i.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if loaded && slices.Equal(args, []string{"launchctl", "print", i.domain() + "/io.went.agent-heavy"}) {
+			print := m.services.print
+			m.services.print = func(label string) ([]byte, error) {
+				if loaded && label == "io.went.agent-heavy" {
 					return []byte("state = running\n"), nil
 				}
+				return print(label)
+			}
+			original := i.command
+			i.command = func(ctx context.Context, args []string) ([]byte, error) {
 				if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" {
 					if args[3] == "login" && m.statuses["login"] == "notRegistered" {
 						reads++

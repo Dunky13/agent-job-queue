@@ -92,7 +92,7 @@ func runPackagedSetup(ctx context.Context, fixture *installFixture, execute func
 		for _, args := range fixture.calls[calls:] {
 			if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" ||
 				len(args) > 1 && args[1] == "--prepare-app-replacement" ||
-				len(args) > 1 && args[0] == "launchctl" && args[1] != "print" {
+				len(args) > 1 && args[0] == "service" && args[1] != "print" {
 				return attempt, fmt.Errorf("busy setup accepted a service mutation; no retry: %w", err)
 			}
 		}

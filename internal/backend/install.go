@@ -45,6 +45,7 @@ type installer struct {
 	automaticSetup                               bool
 	keepCustomCallback                           bool
 	command                                      func(context.Context, []string) ([]byte, error)
+	services                                     installServices
 	notice                                       func(string)
 }
 
@@ -277,12 +278,8 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 		if bounded.Err() != nil {
 			return nil, fmt.Errorf("Installer command %s timed out", filepath.Base(args[0]))
 		}
-		var exited *exec.ExitError
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && strings.HasPrefix(args[2], install.domain()+"/") && errors.As(err, &exited) &&
-			installServiceAbsent(output.Bytes(), exited.ExitCode(), strings.TrimPrefix(args[2], install.domain()+"/")) {
-			return nil, errInstallServiceNotLoaded
-		}
-		return nil, fmt.Errorf("Installer command %s failed: %w", filepath.Base(args[0]), err)
+		// Adapters read the output to classify a failure.
+		return output.Bytes(), fmt.Errorf("Installer command %s failed: %w", filepath.Base(args[0]), err)
 	}
 	return output.Bytes(), nil
 }
@@ -291,9 +288,8 @@ func installServiceAbsent(output []byte, exitCode int, label string) bool {
 	return appservices.LaunchServiceAbsent(output, exitCode, label)
 }
 
-func (install *installer) domain() string { return fmt.Sprintf("gui/%d", os.Getuid()) }
 func (install *installer) loaded(ctx context.Context, label string) bool {
-	_, err := install.run(ctx, "launchctl", "print", install.domain()+"/"+label)
+	_, err := install.loginServices().Print(ctx, label)
 	return err == nil
 }
 
@@ -1403,7 +1399,7 @@ func (install *installer) validatePhoneAccessRecovery(ctx context.Context) error
 	if err != nil {
 		return err
 	}
-	output, queryErr := install.run(ctx, "launchctl", "print", install.domain()+"/"+label)
+	output, queryErr := install.loginServices().Print(ctx, label)
 	if queryErr != nil && !errors.Is(queryErr, errInstallServiceNotLoaded) {
 		return fmt.Errorf("Cannot inspect phone access service ownership: %w", queryErr)
 	}
@@ -1498,7 +1494,7 @@ func (install *installer) stopLegacy(ctx context.Context, node *yaml.Node) error
 			if err != nil || len(expected) == 0 {
 				return errors.New("Cannot establish legacy service process ownership")
 			}
-			loaded, err := install.run(ctx, "launchctl", "print", install.domain()+"/"+label)
+			loaded, err := install.loginServices().Print(ctx, label)
 			if err != nil {
 				return err
 			}
@@ -1514,7 +1510,7 @@ func (install *installer) stopLegacy(ctx context.Context, node *yaml.Node) error
 					return err
 				}
 			}
-			if _, err := install.run(ctx, "launchctl", "bootout", install.domain()+"/"+label); err != nil {
+			if err := install.loginServices().Bootout(ctx, label); err != nil {
 				return err
 			}
 			if label == "io.went.agent-heavy" {

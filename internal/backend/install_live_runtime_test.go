@@ -691,21 +691,22 @@ func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string
 	})
 	pendingBuild := i.app
 	services := map[string]string{"queue": pendingBuild, "resources": pendingBuild, "remote": pendingBuild}
+	print := m.services.print
+	m.services.print = func(label string) ([]byte, error) {
+		service := map[string]string{"io.went.agent-heavy": "queue", "io.went.agent-resources": "resources", "io.went.agent-remote": "remote"}[label]
+		if service != "" && m.loaded[label] && m.statuses[service] == "enabled" {
+			helper, command := "agent-heavy", "daemon"
+			if service == "resources" {
+				command = "scheduler"
+			} else if service == "remote" {
+				helper, command = "agent-remote", "serve"
+			}
+			return []byte("program = " + filepath.Join(services[service], "Contents/MacOS", helper) + "\narguments = {\n" + helper + "\n" + command + "\n}\n"), nil
+		}
+		return print(label)
+	}
 	original := i.command
 	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" {
-			label := filepath.Base(args[2])
-			service := map[string]string{"io.went.agent-heavy": "queue", "io.went.agent-resources": "resources", "io.went.agent-remote": "remote"}[label]
-			if service != "" && m.loaded[label] && m.statuses[service] == "enabled" {
-				helper, command := "agent-heavy", "daemon"
-				if service == "resources" {
-					command = "scheduler"
-				} else if service == "remote" {
-					helper, command = "agent-remote", "serve"
-				}
-				return []byte("program = " + filepath.Join(services[service], "Contents/MacOS", helper) + "\narguments = {\n" + helper + "\n" + command + "\n}\n"), nil
-			}
-		}
 		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" {
 			services[args[3]] = filepath.Dir(filepath.Dir(filepath.Dir(args[0])))
 		}

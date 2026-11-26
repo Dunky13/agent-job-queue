@@ -93,7 +93,7 @@ func TestInstallerAppBundlePreservesApplicationAndLaunchesSuppliedPath(t *testin
 	}
 	install.app = app
 	if runtime.GOOS == "darwin" {
-		// Exercise production branches too; all launchctl calls remain simulated.
+		// Exercise production branches too; all service calls remain simulated.
 		install.testing = false
 	}
 	integrationTestWrite(t, filepath.Join(install.home, "Applications/.Agent Queue.installing.app/keep"), []byte("unrelated recovery artifact"))
@@ -168,7 +168,7 @@ func TestInstallerAppBundleUpgradePreservesActiveGoJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, args := range f.calls {
-		if args[0] == "launchctl" && (args[1] == "bootout" || (args[1] == "kickstart" && strings.HasSuffix(args[len(args)-1], "/io.went.agent-heavy"))) {
+		if args[0] == "service" && (args[1] == "bootout" || (args[1] == "kickstart" && strings.HasSuffix(args[len(args)-1], "/io.went.agent-heavy"))) {
 			t.Fatalf("self-install interrupted the Go daemon: %v", args)
 		}
 	}

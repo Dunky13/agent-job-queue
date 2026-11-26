@@ -28,6 +28,7 @@ type installFixture struct {
 	tasks     Object
 	groups    Object
 	loaded    map[string]bool
+	services  *memoryServices
 	calls     [][]string
 	fail      string
 	// seededPending marks a pending marker the fixture wrote itself, not setup.
@@ -39,7 +40,8 @@ func installTestFixture(t *testing.T) *installFixture {
 	return managedTestFixture(t).installFixture
 }
 
-// installBaseFixture puts a marked bundle where the user dropped it and mocks launchctl.
+// installBaseFixture puts a marked bundle where the user dropped it, with its
+// services and commands in memory.
 func installBaseFixture(t *testing.T) *installFixture {
 	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
@@ -79,43 +81,43 @@ func installBaseFixture(t *testing.T) *installFixture {
 	integrationTestWrite(t, filepath.Join(support, "build-info.json"), mustMetadataJSON(t, info))
 	integrationTestWrite(t, filepath.Join(support, "VERSION"), []byte("0.1.0\n"))
 	f := &installFixture{installer: install, tasks: Object{}, groups: Object{"default": Object{"parallel_tasks": 1, "status": "Running"}}, loaded: map[string]bool{}}
+	record := func(call []string) error {
+		f.calls = append(f.calls, call)
+		if f.fail != "" && strings.Contains(strings.Join(call, " "), f.fail) {
+			return errors.New("simulated installer failure")
+		}
+		return nil
+	}
+	f.services = newMemoryServices(&f.loaded, record)
+	f.services.output = func(label string) []byte {
+		definition, err := readBundlePlist(filepath.Join(install.launch, label+".plist"))
+		if err != nil {
+			return []byte("unowned service")
+		}
+		arguments, err := stringsFrom(definition["ProgramArguments"])
+		if err != nil || len(arguments) == 0 {
+			t.Fatal("invalid fixture service")
+		}
+		program := arguments[0]
+		if explicit, present := definition["Program"]; present {
+			program = text(explicit)
+		}
+		return []byte("program = " + program + "\narguments = {\n" + strings.Join(arguments, "\n") + "\n}\n")
+	}
+	f.services.bootout = func(label string) {
+		if label == "io.went.agent-heavy" {
+			integrationTestWrite(t, filepath.Join(install.state, "pueue/state.json"), mustMetadataJSON(t, f.snapshot()))
+		}
+	}
+	install.services = f.services
 	install.command = func(_ context.Context, args []string) ([]byte, error) {
-		f.calls = append(f.calls, append([]string{}, args...))
-		joined := strings.Join(args, " ")
-		if f.fail != "" && strings.Contains(joined, f.fail) {
-			return nil, errors.New("simulated installer failure")
-		}
 		if args[0] == "launchctl" {
-			switch args[1] {
-			case "print":
-				label := filepath.Base(args[2])
-				if f.loaded[label] {
-					definition, err := readBundlePlist(filepath.Join(install.launch, label+".plist"))
-					if err != nil {
-						return []byte("unowned service"), nil
-					}
-					arguments, err := stringsFrom(definition["ProgramArguments"])
-					if err != nil || len(arguments) == 0 {
-						t.Fatal("invalid fixture service")
-					}
-					program := arguments[0]
-					if explicit, present := definition["Program"]; present {
-						program = text(explicit)
-					}
-					return []byte("program = " + program + "\narguments = {\n" + strings.Join(arguments, "\n") + "\n}\n"), nil
-				}
-				return nil, errInstallServiceNotLoaded
-			case "bootstrap":
-				label := strings.TrimSuffix(filepath.Base(args[3]), ".plist")
-				f.loaded[label] = true
-			case "bootout":
-				if filepath.Base(args[2]) == "io.went.agent-heavy" {
-					integrationTestWrite(t, filepath.Join(install.state, "pueue/state.json"), mustMetadataJSON(t, f.snapshot()))
-				}
-				delete(f.loaded, filepath.Base(args[2]))
-			}
+			t.Errorf("launchctl bypassed the service port: %v", args)
 		}
-		if args[0] == "pueue" && strings.Contains(joined, "status --json") {
+		if err := record(append([]string{}, args...)); err != nil {
+			return nil, err
+		}
+		if args[0] == "pueue" && strings.Contains(strings.Join(args, " "), "status --json") {
 			if !f.loaded["io.went.agent-heavy"] {
 				return nil, errors.New("fixture daemon is not running")
 			}
@@ -406,7 +408,7 @@ func TestInstallerEnabledRemoteMigratesBeforeCompletionAndRetainsFailureMarker(t
 		t.Fatalf("migration retry did not complete: %v %v", installed, err)
 	}
 	for _, args := range f.calls {
-		if len(args) > 1 && args[0] == "launchctl" && args[1] == "bootout" {
+		if len(args) > 1 && args[0] == "service" && args[1] == "bootout" {
 			t.Fatalf("Go migration stopped queue work: %v", args)
 		}
 	}
@@ -554,7 +556,7 @@ func TestInstallerUpgradePreservesPrivateDataAndExistingDaemon(t *testing.T) {
 		}
 	}
 	for _, args := range f.calls {
-		if len(args) > 1 && args[0] == "launchctl" && (args[1] == "bootout" || (args[1] == "kickstart" && strings.HasSuffix(args[len(args)-1], "/io.went.agent-heavy"))) {
+		if len(args) > 1 && args[0] == "service" && (args[1] == "bootout" || (args[1] == "kickstart" && strings.HasSuffix(args[len(args)-1], "/io.went.agent-heavy"))) {
 			t.Fatalf("upgrade stopped working queue: %v", args)
 		}
 	}
@@ -808,7 +810,7 @@ func TestInstallerLegacyDrainedMigrationRemovesRuntimeAndUpdatesOwnedHooks(t *te
 	}
 	var stopped []string
 	for _, args := range f.calls {
-		if len(args) > 1 && args[0] == "launchctl" && args[1] == "bootout" {
+		if len(args) > 1 && args[0] == "service" && args[1] == "bootout" {
 			stopped = append(stopped, filepath.Base(args[2]))
 		}
 	}
@@ -874,7 +876,7 @@ func TestInstallerLegacyMismatchedProgramRejectsBeforeShutdown(t *testing.T) {
 				t.Fatal("Program preflight changed existing source or service")
 			}
 			for _, args := range f.calls {
-				if len(args) > 1 && args[0] == "launchctl" && (args[1] == "bootout" || args[1] == "bootstrap" || args[1] == "kickstart") {
+				if len(args) > 1 && args[0] == "service" && (args[1] == "bootout" || args[1] == "bootstrap" || args[1] == "kickstart") {
 					t.Fatal("Program preflight modified a running service")
 				}
 			}
@@ -930,7 +932,7 @@ func TestInstallerReservedServiceEnvironmentMismatchRejectsBeforeMutation(t *tes
 						t.Fatal("environment preflight changed source, service, or import marker")
 					}
 					for _, args := range f.calls {
-						if len(args) > 1 && args[0] == "launchctl" && (args[1] == "bootout" || args[1] == "bootstrap" || args[1] == "kickstart") {
+						if len(args) > 1 && args[0] == "service" && (args[1] == "bootout" || args[1] == "bootstrap" || args[1] == "kickstart") {
 							t.Fatal("environment preflight changed a running service")
 						}
 					}
@@ -1013,7 +1015,7 @@ func TestInstallerConflictingServiceSlotsRejectBeforeShutdown(t *testing.T) {
 		t.Fatalf("conflicting service slots accepted: %v", err)
 	}
 	for _, args := range f.calls {
-		if len(args) > 1 && args[0] == "launchctl" && args[1] == "bootout" {
+		if len(args) > 1 && args[0] == "service" && args[1] == "bootout" {
 			t.Fatal("conflicting service slots stopped a legacy service")
 		}
 	}
@@ -1170,7 +1172,7 @@ func TestInstallerMalformedLegacyGroupSettingsRejectBeforeShutdown(t *testing.T)
 					t.Fatal("malformed settings changed legacy source/configuration")
 				}
 				for _, args := range f.calls {
-					if len(args) > 1 && args[0] == "launchctl" && args[1] == "bootout" {
+					if len(args) > 1 && args[0] == "service" && args[1] == "bootout" {
 						t.Fatal("malformed settings stopped an existing service")
 					}
 				}
@@ -1203,12 +1205,12 @@ func TestInstallerAbsentLegacyStatePublishesExplicitFreshDefaults(t *testing.T) 
 func TestInstallerLegacyLoadedOwnershipMismatchRefusesShutdown(t *testing.T) {
 	f := installTestFixture(t)
 	f.externalGoQueue(t)
-	command := f.installer.command
-	f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && strings.HasSuffix(args[2], "/io.went.agent-heavy") {
+	print := f.services.print
+	f.services.print = func(label string) ([]byte, error) {
+		if label == "io.went.agent-heavy" {
 			return []byte("program = /different/daemon\narguments = {\n/different/daemon\n}\n"), nil
 		}
-		return command(ctx, args)
+		return print(label)
 	}
 	if err := f.run(t); err == nil || !strings.Contains(err.Error(), "differs") {
 		t.Fatalf("unowned loaded daemon accepted: %v", err)
@@ -1261,12 +1263,12 @@ func TestInstallerOwnershipParsesRealPrivateLaunchctlService(t *testing.T) {
 func TestInstallerLegacyStateRecheckedAfterDaemonStops(t *testing.T) {
 	f := installTestFixture(t)
 	f.externalGoQueue(t)
-	command := f.installer.command
-	f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "bootout" && strings.HasSuffix(args[2], "/io.went.agent-heavy") {
+	bootout := f.services.bootout
+	f.services.bootout = func(label string) {
+		if label == "io.went.agent-heavy" {
 			f.tasks = Object{"42": Object{"status": Object{"Queued": Object{}}}}
 		}
-		return command(ctx, args)
+		bootout(label)
 	}
 	if err := f.run(t); err == nil || !strings.Contains(err.Error(), "drained") {
 		t.Fatalf("newly persisted waiting task accepted: %v", err)
@@ -1312,7 +1314,7 @@ func TestInstallerLegacyDoneJobsRequireCompletedCleanup(t *testing.T) {
 				t.Fatal("cleanup preflight changed existing source or ownership records")
 			}
 			for _, args := range f.calls {
-				if len(args) > 1 && args[0] == "launchctl" && args[1] == "bootout" {
+				if len(args) > 1 && args[0] == "service" && args[1] == "bootout" {
 					t.Fatal("unfinished cleanup preflight stopped a legacy service")
 				}
 			}
@@ -1329,12 +1331,12 @@ func TestInstallerLegacyLateReceiptPreventsPublication(t *testing.T) {
 	install := f.installer
 	old := []byte("retained old Go executable")
 	integrationTestWrite(t, filepath.Join(install.root, "bin/agent-heavy"), old)
-	command := install.command
-	install.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "bootout" && strings.HasSuffix(args[2], "/io.went.agent-heavy") {
+	bootout := f.services.bootout
+	f.services.bootout = func(label string) {
+		if label == "io.went.agent-heavy" {
 			integrationTestWrite(t, filepath.Join(install.state, "receipts/42.json"), []byte(`{"task_id":42,"token":"late"}`))
 		}
-		return command(ctx, args)
+		bootout(label)
 	}
 	if err := f.run(t); !errors.Is(err, errInstallPendingCleanup) {
 		t.Fatalf("late receipt was accepted: %v", err)
@@ -1557,16 +1559,21 @@ func TestInstallerPhoneAccessRecoveryRejectsUnownedServices(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			command := install.command
-			install.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote") || (args[0] == "launchctl" && args[1] == "bootout") {
-					t.Fatalf("unowned service permitted a shutdown command: %v", args)
-				}
-				if kind == "loaded-mismatch" && args[0] == "launchctl" && args[1] == "print" && filepath.Base(args[2]) == "io.went.agent-remote" {
+			f.services.bootout = func(label string) { t.Fatalf("unowned service permitted a shutdown: bootout %s", label) }
+			print := f.services.print
+			f.services.print = func(label string) ([]byte, error) {
+				if kind == "loaded-mismatch" && label == "io.went.agent-remote" {
 					return []byte("program = /usr/bin/unrelated\narguments = {\n/usr/bin/unrelated\nserve\n}\n"), nil
 				}
-				if kind == "query-failed" && args[0] == "launchctl" && args[1] == "print" && filepath.Base(args[2]) == "io.went.agent-remote" {
+				if kind == "query-failed" && label == "io.went.agent-remote" {
 					return nil, errors.New("fixture service inspection failed")
+				}
+				return print(label)
+			}
+			command := install.command
+			install.command = func(ctx context.Context, args []string) ([]byte, error) {
+				if args[0] == filepath.Join(install.app, "Contents/MacOS/agent-remote") {
+					t.Fatalf("unowned service permitted a shutdown command: %v", args)
 				}
 				return command(ctx, args)
 			}
@@ -2280,7 +2287,7 @@ func TestInstallerPackagedAppBundle(t *testing.T) {
 		return errors.Is(err, os.ErrNotExist)
 	})
 	for _, args := range f.calls {
-		if len(args) > 1 && args[0] == "launchctl" && args[1] == "bootout" {
+		if len(args) > 1 && args[0] == "service" && args[1] == "bootout" {
 			t.Fatal("Go upgrade restarted its daemon")
 		}
 	}
