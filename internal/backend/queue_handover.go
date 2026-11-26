@@ -279,7 +279,9 @@ func readQueueHandoverReceipt(g *Gate) (*queueHandoverReceipt, error) {
 		return nil, err
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || !fileOwned(info, true) || stat.Nlink != 1 {
+	// No links means the daemon renamed a newer receipt over this one after it was
+	// opened. The old file is complete and is what a slightly earlier read returned.
+	if !ok || !fileOwned(info, true) || stat.Nlink > 1 {
 		return nil, errors.New("Unsafe queue handover receipt")
 	}
 	raw, err := io.ReadAll(io.LimitReader(file, 32*1024*1024+1))

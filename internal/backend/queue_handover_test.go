@@ -94,6 +94,39 @@ func TestRealDaemonLiveHandoverRetainsWorkerCallerAndQueuedJobs(t *testing.T) {
 	f.waitJobs(2)
 	value := prepareQueueHandover(t, f, handoverTarget(t))
 	commitQueueHandover(t, f, value)
+	// The queued job has no worker, so the test writes its log. Output a caller
+	// prints from after the daemon exited proves it has finished every read of the
+	// custody receipt that it started before that point.
+	queuedFollows := func(text string) {
+		t.Helper()
+		log, err := os.OpenFile(f.gate.LogPath(1), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err == nil {
+			_, err = log.WriteString(text + "\n")
+			err = errors.Join(err, log.Close())
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixtureUntil(t, 8*time.Second, func() bool { return strings.Contains(queued.out.String(), text) })
+	}
+	// Two command/output barriers force the original caller through at least
+	// one failed socket read while the old worker continues, without a sleep.
+	activeFollows := func(file, text string) {
+		t.Helper()
+		if err := os.WriteFile(file, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		fixtureUntil(t, 8*time.Second, func() bool {
+			raw, err := os.ReadFile(output)
+			return err == nil && strings.Contains(string(raw), text)
+		})
+	}
+	activeFollows(one, "outage-one")
+	queuedFollows("queued-outage-one")
+	// Released custody survives arbitrary operating-system approval delays;
+	// only a still-prepared handover has an expiring dispatch-freeze lease.
+	// No product code edits a released receipt, so the test backdates it only
+	// after both callers are past any earlier view they would compare it with.
 	retained, err := readQueueHandoverReceipt(f.gate)
 	if err != nil {
 		t.Fatal(err)
@@ -102,19 +135,8 @@ func TestRealDaemonLiveHandoverRetainsWorkerCallerAndQueuedJobs(t *testing.T) {
 	if err := writeQueueHandoverReceipt(f.gate, retained); err != nil {
 		t.Fatal(err)
 	}
-	// Released custody survives arbitrary operating-system approval delays;
-	// only a still-prepared handover has an expiring dispatch-freeze lease.
-	// Two command/output barriers force the original caller through at least
-	// one failed socket read while the old worker continues, without a sleep.
-	for _, step := range []struct{ file, text string }{{one, "outage-one"}, {two, "outage-two"}} {
-		if err := os.WriteFile(step.file, nil, 0600); err != nil {
-			t.Fatal(err)
-		}
-		fixtureUntil(t, 8*time.Second, func() bool {
-			raw, err := os.ReadFile(output)
-			return err == nil && strings.Contains(string(raw), step.text)
-		})
-	}
+	activeFollows(two, "outage-two")
+	queuedFollows("queued-outage-two")
 	if _, err := os.Stat(filepath.Join(f.root, "queued-ran")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("queued work ran without a daemon", err)
 	}
@@ -450,6 +472,35 @@ func releasedQueueFixture(t *testing.T) (*Gate, *queueStore, *queueHandoverRecei
 		t.Fatal(err)
 	}
 	return g, store, receipt
+}
+
+// The daemon replaces the receipt by rename while followers read it. A reader
+// that opened the previous receipt holds a complete file with no links left.
+func TestQueueHandoverReceiptReadSurvivesAtomicReplacement(t *testing.T) {
+	g, _, receipt := releasedQueueFixture(t)
+	written := make(chan error, 1)
+	go func() {
+		var err error
+		for i := 0; i < 300 && err == nil; i++ {
+			err = writeQueueHandoverReceipt(g, receipt)
+		}
+		written <- err
+	}()
+	for {
+		select {
+		case err := <-written:
+			if err != nil {
+				t.Fatal("receipt replacement failed", err)
+			}
+			return
+		default:
+		}
+		if _, err := readQueueHandoverReceipt(g); err != nil {
+			t.Error("reader refused a receipt that was being replaced", err)
+			<-written
+			return
+		}
+	}
 }
 
 func TestQueueHandoverFollowerObservesReleaseBeforeDaemonExit(t *testing.T) {
