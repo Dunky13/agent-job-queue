@@ -276,6 +276,9 @@ final class LearningStore: ObservableObject {
         #endif
     }
 
+    /// The merge-target picker lists every group through its own store, over the same adapter.
+    func targetPickerStore() -> LearningStore { LearningStore(fixtureMode: fixtureMode, flat: true, command: command) }
+
     var displayLevel: LearningLevel { searchActive ? .groups : level }
     var projectRow: LearningProjectRow? {
         guard let scope else { return nil }
@@ -915,7 +918,7 @@ struct LearningWindow: View {
                 self.pendingConfirmation = nil
             }
         }) {
-            LearningTargetPicker(sourceID: pickingSelection ? "" : store.selectedID ?? "", fixtureMode: store.fixtureMode) { id, label in
+            LearningTargetPicker(sourceID: pickingSelection ? "" : store.selectedID ?? "", parent: store) { id, label in
                 pendingConfirmation = pickingSelection ? .combine(id: id, label: label, items: store.mergeSelection) : .merge(id: id, label: label)
                 choosingTarget = false
             } onCancel: { choosingTarget = false }
@@ -1366,11 +1369,11 @@ private struct LearningTargetPicker: View {
     let onCancel: () -> Void
     @StateObject private var store: LearningStore
 
-    init(sourceID: String, fixtureMode: Bool, onChoose: @escaping (String, String) -> Void, onCancel: @escaping () -> Void) {
+    init(sourceID: String, parent: LearningStore, onChoose: @escaping (String, String) -> Void, onCancel: @escaping () -> Void) {
         self.sourceID = sourceID
         self.onChoose = onChoose
         self.onCancel = onCancel
-        _store = StateObject(wrappedValue: LearningStore(fixtureMode: fixtureMode, flat: true))
+        _store = StateObject(wrappedValue: parent.targetPickerStore())
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {

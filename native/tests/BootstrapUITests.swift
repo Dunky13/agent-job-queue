@@ -130,7 +130,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let item = startup.statusItem
         try await waitUntil { await executor.isHeld && delegate.bootstrap?.output.contains("Preparing") == true }
         guard let model = delegate.bootstrap else { throw ClientError.message("Production startup did not start") }
-        try check(model.phase == .installing && delegate.setupWindow == nil && AppRuntime.menuBarController == nil && AppRuntime.queueWindow == nil,
+        try check(model.phase == .installing && delegate.setupWindow == nil && delegate.coordinator == nil,
             "Fresh launch prepares behind the menu without starting an unverified queue")
         try check(!delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false) && delegate.setupWindow == nil,
             "Reopen during preparation stays in the menu bar")
@@ -142,7 +142,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let expectedFailure = phoneAccessBlocker ? model.canDisablePhoneAccess && model.message.contains("Phone access") :
             !model.canDisablePhoneAccess && model.output.contains("Fixture service could not start")
         try check(delegate.setupWindow == nil && expectedFailure &&
-            !model.output.contains("AGENT_QUEUE_SETUP_RECOVERY") && AppRuntime.menuBarController == nil &&
+            !model.output.contains("AGENT_QUEUE_SETUP_RECOVERY") && delegate.coordinator == nil &&
             delegate.applicationShouldTerminate(NSApp) == .terminateNow && startup.menu.items.contains { $0.title == "Retry" && !$0.isHidden },
             "Failure stays in the menu with its diagnostic, Retry and Quit")
         try check(startup.menu.items[0].title == model.message && !startup.menu.items[1].isHidden,
@@ -178,7 +178,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
     private func checkStartup(_ delegate: AppDelegate) throws -> QueueStartupMenuBarController {
         guard let startup = delegate.startupMenuBarController else { throw ClientError.message("Immediate startup menu missing") }
         try check(startup.statusItem.isVisible && startup.statusItem.button != nil && startup.statusItem.menu === startup.menu &&
-            AppRuntime.menuBarController == nil && AppRuntime.queueWindow == nil && delegate.setupWindow == nil,
+            delegate.coordinator == nil && delegate.setupWindow == nil,
             "Ordinary launch presents its menu bar immediately, before background preparation")
         try check(startup.menu.items.contains { $0.title == "Quit Agent Queue" } &&
             !startup.menu.items.contains { $0.title == QueueAppAction.openWindow.title },
@@ -187,10 +187,12 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func checkReady(_ delegate: AppDelegate, startup: QueueStartupMenuBarController, item: NSStatusItem) async throws {
-        guard let controller = AppRuntime.menuBarController else { throw ClientError.message("Ready menu missing") }
+        guard let coordinator = delegate.coordinator, let controller = coordinator.menuBarController else {
+            throw ClientError.message("Ready menu missing")
+        }
         try check(controller.statusItem === item && startup.isTornDown && delegate.startupMenuBarController == nil &&
-            delegate.setupWindow == nil && AppRuntime.queueWindow == nil && AppRuntime.store.fixtureMode &&
-            delegate.supervisor == nil && AppRuntime.remoteStore.supervisor == nil &&
+            delegate.setupWindow == nil && coordinator.windows.isEmpty && coordinator.store.fixtureMode &&
+            delegate.supervisor == nil && coordinator.remoteStore.supervisor == nil &&
             delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "Readiness transfers the exact status item once, keeps default launch menu-bar-only and starts no helpers for fixtures")
         try check(delegate.bootstrap?.start() == nil, "Completed startup cannot create another controller")
@@ -247,7 +249,8 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
         startup.tearDown()
         controller.tearDown()
-        try check(AppRuntime.menuBarController == nil && delegate.startupMenuBarController == nil && !controller.popover.isShown,
+        try check(delegate.coordinator === coordinator && coordinator.menuBarController == nil &&
+            delegate.startupMenuBarController == nil && !controller.popover.isShown,
             "Repeated teardown leaves no startup or normal menu controller")
     }
 
@@ -313,10 +316,12 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             throw ClientError.message("Preflight did not present its production setup window")
         }
         let initialInstalls = await executor.installations
-        try check(setup.isVisible && model.issues.count == 3 && initialInstalls == 0 && AppRuntime.menuBarController == nil,
+        try check(setup.isVisible && model.issues.count == 3 && initialInstalls == 0 && delegate.coordinator == nil,
             "Production preflight displays multiple independent blockers before installation")
         try check(delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "A blocked preflight permits quit without initializing the queue")
+        try check(setup.title == "Set up Agent Queue" && setup.styleMask == [.titled, .miniaturizable] &&
+            setup.identifier == nil && !setup.isReleasedWhenClosed, "The setup window keeps its title and style")
         try snapshot(setup, name: "01-preflight-summary")
 
         await model.start()?.value
@@ -355,14 +360,14 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         await executor.update(.init(schemaVersion: 1, issues: [phoneIssue]))
         await model.start()?.value
         await model.perform(actionID: "disable-phone-access", issueID: phoneIssue.id)?.value
-        try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
+        try await waitUntil { model.phase == .complete && delegate.coordinator?.windows[.queue]?.isVisible == true }
         let requests = await executor.requests
         let mutations = await executor.mutations
         try check(mutations == 2 && requests.contains(where: { $0.arguments.suffix(2) == ["--recover", "restore-service-definitions"] }) &&
             requests.contains(where: { $0.arguments.suffix(2) == ["--recover", "disable-phone-access"] }) &&
-            delegate.setupWindow == nil && AppRuntime.store.fixtureMode,
+            delegate.setupWindow == nil && delegate.coordinator?.store.fixtureMode == true,
             "Explicit preflight recovery refreshes requirements, verifies installation, and continues simulated queue startup")
-        guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Preflight recovery did not open its simulated queue") }
+        guard let queue = delegate.coordinator?.windows[.queue] else { throw ClientError.message("Preflight recovery did not open its simulated queue") }
         try snapshot(queue, name: "04-normal-fixture-startup")
     }
 
@@ -379,7 +384,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         try await waitUntil { await executor.isHeld && delegate.bootstrap?.output.contains("Opening it at login is waiting for approval") == true }
         guard let model = delegate.bootstrap else { throw ClientError.message("Startup missing") }
         try check(delegate.setupWindow == nil && model.phase == .installing && !model.canStopWaiting && !model.output.contains("AGENT_QUEUE_SETUP_STATE") &&
-            AppRuntime.menuBarController == nil && !startup.menu.items.contains { $0.title.contains("Login Items") },
+            delegate.coordinator == nil && !startup.menu.items.contains { $0.title.contains("Login Items") },
             "A pending login item approval is a passive note: no Settings prompt, wait or setup window")
         try check(!delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false) && delegate.setupWindow == nil,
             "Reopen during setup stays in the menu")
@@ -443,14 +448,14 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             "One approval waits for the controller before changing anything")
         try snapshot(setup, name: "02-approved-waiting")
         await executor.holdRepairWaiting(false)
-        try await waitUntil { model.phase == .complete && AppRuntime.queueWindow?.isVisible == true }
+        try await waitUntil { model.phase == .complete && delegate.coordinator?.windows[.queue]?.isVisible == true }
         let requests = await executor.requests
         let installs = await executor.installations
         try check(installs == 1 && !requests.contains { $0.arguments.contains("--recover") } &&
             requests.filter { $0.arguments.suffix(2) == ["--repair-and-continue", "--keep-custom-callback"] }.count == 1 &&
-            delegate.setupWindow == nil && AppRuntime.store.fixtureMode,
+            delegate.setupWindow == nil && delegate.coordinator?.store.fixtureMode == true,
             "One accepted dialog runs the controller's repair once and verifies normal startup without further intervention")
-        guard let queue = AppRuntime.queueWindow else { throw ClientError.message("Approved repair did not start the simulated queue") }
+        guard let queue = delegate.coordinator?.windows[.queue] else { throw ClientError.message("Approved repair did not start the simulated queue") }
         try snapshot(queue, name: "03-approved-startup")
     }
 
@@ -470,7 +475,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let startup = try checkStartup(delegate)
         try await waitUntil { delegate.bootstrap?.phase == .waiting }
         guard let model = delegate.bootstrap else { throw ClientError.message("Automatic wait did not start") }
-        try check(model.canStopWaiting && delegate.setupWindow == nil && AppRuntime.menuBarController == nil,
+        try check(model.canStopWaiting && delegate.setupWindow == nil && delegate.coordinator == nil,
             "Automatic drain waits stay in the menu without starting an unready runtime")
         try await checkNeutralStartup(startup, "Waiting for existing jobs names its reason neutrally and offers Stop waiting, with no window", waiting: true)
         try snapshotStartup(startup, name: "01-waiting")
@@ -491,7 +496,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             "Quit during an automatic wait defers termination without opening a window")
         try await waitUntil { terminationAcknowledged }
         await stopping?.value
-        try check(!model.isRunning && model.phase == .failed && delegate.setupWindow == nil && AppRuntime.menuBarController == nil,
+        try check(!model.isRunning && model.phase == .failed && delegate.setupWindow == nil && delegate.coordinator == nil,
             "Stopped wait preserves the independent queue and shows no setup window")
         try snapshotStartup(startup, name: "02-stopped")
     }
@@ -517,7 +522,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         await executor.release()
         try await waitUntil { replies == 1 && !model.isRunning }
         let completed = await executor.completed
-        try check(completed && (try fixture.environment.inspect()) == .ready && AppRuntime.menuBarController == nil &&
+        try check(completed && (try fixture.environment.inspect()) == .ready && delegate.coordinator == nil &&
             delegate.setupWindow == nil && replies == 1,
             "Termination waits for the original accepted response and never drops or retries the mutation")
     }
@@ -538,7 +543,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         _ = try checkStartup(delegate)
         try await waitUntil { delegate.bootstrap?.phase == .complete }
         try await waitUntil { Set(fake.launched) == [.queue, .resources, .remote] }
-        try check(delegate.supervisor === helpers && AppRuntime.remoteStore.supervisor === helpers && fake.launched.count == 3,
+        try check(delegate.supervisor === helpers && delegate.coordinator?.remoteStore.supervisor === helpers && fake.launched.count == 3,
             "A completed managed launch starts the queue, resources and phone helpers without consulting any status")
         try check(delegate.applicationShouldTerminate(NSApp) == .terminateLater && replies == 0,
             "Quit with supervised children defers termination")
@@ -553,7 +558,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
             "Termination replies only after every child stopped, without SIGKILL or restarts")
         delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
         try check(fake.signals(.queue) == [SIGTERM] && fake.signals(.resources) == [SIGTERM] && fake.signals(.remote) == [SIGTERM]
-            && AppRuntime.menuBarController == nil,
+            && delegate.coordinator != nil && delegate.coordinator?.menuBarController == nil,
             "The final exit hook adds no signals once the children are gone")
         production = nil
     }
@@ -572,7 +577,7 @@ final class BootstrapUIFixtureDelegate: NSObject, NSApplicationDelegate {
         let startup = try checkStartup(delegate)
         try await waitUntil { delegate.bootstrap?.phase == .reviewing && startup.menu.items.contains { $0.title == "Download Agent Queue…" && !$0.isHidden } }
         let installations = await executor.installations
-        try check(installations == 0 && delegate.setupWindow == nil && AppRuntime.menuBarController == nil &&
+        try check(installations == 0 && delegate.setupWindow == nil && delegate.coordinator == nil &&
             delegate.bootstrap?.issues == [issue] && !delegate.applicationShouldHandleReopen(NSApp, hasVisibleWindows: false) &&
             delegate.applicationShouldTerminate(NSApp) == .terminateNow,
             "Unknown platform requirements remain visible, block installation, and permit reopen and quit without a setup window")

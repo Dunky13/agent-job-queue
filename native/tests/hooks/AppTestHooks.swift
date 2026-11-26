@@ -17,11 +17,11 @@ struct RecordedQueueAction: Codable, Equatable {
 
 extension AppDelegate {
     /// True when `--snapshot` takes over this launch; it terminates the app when done.
-    func runSnapshotHooks() -> Bool {
+    func runSnapshotHooks(_ coordinator: WindowCoordinator) -> Bool {
         let arguments = CommandLine.arguments
         guard let index = arguments.firstIndex(of: "--snapshot"), arguments.indices.contains(index + 1) else { return false }
-        guard AppRuntime.store.fixtureMode else { diagnostic("--snapshot requires --fixture JSONFILE"); exit(EXIT_FAILURE) }
-        AppRuntime.showWindow()
+        guard coordinator.store.fixtureMode else { diagnostic("--snapshot requires --fixture JSONFILE"); exit(EXIT_FAILURE) }
+        coordinator.show(.queue)
         let navigation = QueueNavigation()
         let verifyIndex = arguments.firstIndex(of: "--verify-detail-navigation")
         let verificationPath = verifyIndex.flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
@@ -36,68 +36,69 @@ extension AppDelegate {
             arguments.indices.contains($0 + 1) ? QueueConfirmationKind(rawValue: arguments[$0 + 1]) : nil
         }
         if let kind = requestedConfirmation ?? (confirmationVerificationPath == nil ? nil : .start) {
-            guard let job = AppRuntime.store.snapshot?.jobs.first(where: {
-                kind.action(for: $0).isAllowed(in: AppRuntime.store.snapshot)
+            guard let job = coordinator.store.snapshot?.jobs.first(where: {
+                kind.action(for: $0).isAllowed(in: coordinator.store.snapshot)
             }) else {
                 diagnostic("Confirmation snapshot requires an eligible job in the fixture."); exit(EXIT_FAILURE)
             }
             navigation.request(kind, job: job)
         } else if let detailIndex = arguments.firstIndex(of: "--snapshot-detail"), arguments.indices.contains(detailIndex + 1) {
             guard let jobID = Int(arguments[detailIndex + 1]),
-                  let job = AppRuntime.store.snapshot?.jobs.first(where: { $0.id == jobID }) else {
+                  let job = coordinator.store.snapshot?.jobs.first(where: { $0.id == jobID }) else {
                 diagnostic("--snapshot-detail requires a job ID present in the fixture."); exit(EXIT_FAILURE)
             }
             navigation.show(job)
         } else if verificationPath != nil {
-            guard let job = AppRuntime.store.snapshot?.jobs.first else {
+            guard let job = coordinator.store.snapshot?.jobs.first else {
                 diagnostic("Navigation verification requires a fixture containing a job."); exit(EXIT_FAILURE)
             }
             navigation.show(job)
         }
-        if let window = AppRuntime.queueWindow {
+        if let window = coordinator.windows[.queue] {
             let menuSize = arguments.contains("--snapshot-menu")
-            window.contentView = NSHostingView(rootView: QueuePanel(store: AppRuntime.store, fullWindow: !menuSize, navigation: navigation))
+            window.contentView = NSHostingView(rootView: QueuePanel(store: coordinator.store, app: coordinator.routes,
+                fullWindow: !menuSize, navigation: navigation))
             if menuSize {
                 window.minSize = NSSize(width: 500, height: 650)
                 window.setContentSize(NSSize(width: 500, height: 650))
                 window.center()
             }
             if arguments.contains("--snapshot-remote-settings") {
-                window.contentView = NSHostingView(rootView: RemoteAccessSettings(store: AppRuntime.remoteStore))
-                window.minSize = NSSize(width: 500, height: 570)
-                window.setContentSize(NSSize(width: 580, height: 780))
+                window.contentView = NSHostingView(rootView: RemoteAccessSettings(store: coordinator.remoteStore))
+                window.minSize = QueueWindowKind.remote.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.remote.spec.size)
                 window.center()
             }
             if arguments.contains("--snapshot-agent-integration") {
-                window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: AppRuntime.integrationStore) {})
-                window.minSize = NSSize(width: 520, height: 540)
-                window.setContentSize(NSSize(width: 600, height: 720))
+                window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: coordinator.integrationStore) {})
+                window.minSize = QueueWindowKind.integration.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.integration.spec.size)
                 window.center()
             }
             if arguments.contains("--snapshot-learning") {
-                if arguments.contains("--snapshot-learning-projects") { AppRuntime.learningStore.showFixtureLevel(.projects) }
-                window.contentView = NSHostingView(rootView: LearningWindow(store: AppRuntime.learningStore) {})
-                window.minSize = NSSize(width: 800, height: 550)
-                window.setContentSize(NSSize(width: 1000, height: 780))
+                if arguments.contains("--snapshot-learning-projects") { coordinator.learningStore.showFixtureLevel(.projects) }
+                window.contentView = NSHostingView(rootView: LearningWindow(store: coordinator.learningStore) {})
+                window.minSize = QueueWindowKind.learning.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.learning.spec.size)
                 window.center()
             }
             if arguments.contains("--snapshot-updates") {
-                window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: AppRuntime.updateStore) {})
-                window.minSize = NSSize(width: 590, height: 500)
-                window.setContentSize(NSSize(width: 620, height: 620))
+                window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: coordinator.updateStore) {})
+                window.minSize = QueueWindowKind.updates.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.updates.spec.size)
                 window.center()
             }
         }
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(500))
-            guard let window = AppRuntime.queueWindow, let view = window.contentView else {
+            guard let window = coordinator.windows[.queue], let view = window.contentView else {
                 self.diagnostic("Could not create snapshot view."); exit(EXIT_FAILURE)
             }
             do {
                 let snapshotPath = arguments[index + 1]
                 try self.writeSnapshot(view, to: snapshotPath)
                 if let remoteStopVerificationPath {
-                    let remote = AppRuntime.remoteStore
+                    let remote = coordinator.remoteStore
                     remote.error = nil
                     await remote.refresh()
                     let report = RemoteStopStateVerification(label: remote.statusLabel,
@@ -110,7 +111,7 @@ extension AppDelegate {
                     guard report.passed else { throw ClientError.message("Remote stop-state regression failed; inspect the verification report.") }
                 }
                 if let passwordVerificationPath {
-                    let report = self.verifyPasswordValidation()
+                    let report = self.verifyPasswordValidation(coordinator.remoteStore)
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                     try encoder.encode(report).write(to: URL(fileURLWithPath: passwordVerificationPath))
@@ -118,7 +119,7 @@ extension AppDelegate {
                 }
                 if let confirmationVerificationPath {
                     let report = try await self.verifyConfirmations(navigation: navigation,
-                        store: AppRuntime.store, window: window, view: view)
+                        store: coordinator.store, window: window, view: view)
                     let encoder = JSONEncoder()
                     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                     try encoder.encode(report).write(to: URL(fileURLWithPath: confirmationVerificationPath))
@@ -150,7 +151,7 @@ extension AppDelegate {
         return true
     }
 
-    private func verifyPasswordValidation() -> PasswordValidationVerification {
+    private func verifyPasswordValidation(_ remote: RemoteAccessStore) -> PasswordValidationVerification {
         let candidates: [(String, String, Bool)] = [
             ("Empty rejected", "", false),
             ("ASCII below minimum", String(repeating: "a", count: 3), false),
@@ -174,7 +175,6 @@ extension AppDelegate {
         let cases = candidates.map { name, value, expected in
             PasswordValidationCase(name: name, expected: expected, accepted: RemoteAccessStore.acceptsPassword(value))
         }
-        let remote = AppRuntime.remoteStore
         let enabledBefore = remote.status?.enabled
         let fixtureConfigurationRejected = !remote.configure(password: "fixture-only-password", enable: true)
         remote.setEnabled(true)

@@ -30,8 +30,12 @@ build_before_fixture() {
     { print }
   ' "$queue_source" > "$temporary/before-injected.swift"
   # The historical store injects argv where the current one injects a typed command,
-  # and it compiles into one module with the test rather than linking a library.
+  # keeps its controllers in AppRuntime with no injected routes, and compiles into
+  # one module with the test rather than linking a library.
   sed -e 's/\(backend\.command(.0\)\.arguments)/\1)/' -e '/^@testable import AgentQueueCore$/d' \
+    -e '/let coordinator = WindowCoordinator()/d' -e 's/coordinator\(\.[a-zA-Z]*Store\.\)/AppRuntime\1/g' \
+    -e 's/coordinator\.store\./AppRuntime.store./' -e 's/app: coordinator\.routes, //' \
+    -e 's/refreshesOnAppear:/tracksVisibility:/' \
     "$root/native/tests/ResumeUITests.swift" > "$temporary/before-ResumeUITests.swift"
   sed '/^@main$/d' "$temporary/before-injected.swift" > "$temporary/before-AgentQueue.swift"
   local sources=("$source/QueueBrand.swift" "$temporary/before-AgentQueue.swift"

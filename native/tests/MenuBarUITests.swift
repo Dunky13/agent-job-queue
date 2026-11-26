@@ -17,6 +17,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     private var footerMenuOpenCount = 0
     private var footerMenu: NSMenu?
     private let applicationMenuDelegate = AppDelegate()
+    private let coordinator = WindowCoordinator()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let watchdog = Timer(timeInterval: 60, target: self, selector: #selector(timedOut(_:)), userInfo: nil, repeats: false)
@@ -91,6 +92,12 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await Task.sleep(for: .seconds(interval))
     }
 
+    /// Waits for an asynchronous window change such as the miniaturize animation, up to 5 s.
+    private func waitUntil(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition() && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+    }
+
     private func click(count: Int = 1, secondary: Bool = false,
                        modifiers: NSEvent.ModifierFlags = []) throws {
         guard let button = controller?.statusItem.button, let window = button.window else {
@@ -115,22 +122,24 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     }
 
     private func verify() async throws {
-        guard AppRuntime.store.fixtureMode, AppRuntime.store.snapshot != nil else {
+        let store = coordinator.store
+        guard store.fixtureMode, store.snapshot != nil else {
             throw ClientError.message("Menu-bar verification requires --fixture JSONFILE containing simulated jobs.")
         }
-        let controller = QueueMenuBarController(store: AppRuntime.store) { [weak self] action in
+        let routes = coordinator.routes
+        let controller = QueueMenuBarController(store: store, app: QueueAppRoutes(perform: { [weak self] action in
             self?.actions.append(action)
             // The Quit item's real selector is exercised with an inert endpoint.
-            // Every window action still uses the production AppRuntime handler.
-            if action != .quit { AppRuntime.perform(action) }
-        }
+            // Every window action still uses the production coordinator handler.
+            if action != .quit { routes.perform(action) }
+        }, openLearning: routes.openLearning))
         self.controller = controller
-        AppRuntime.menuBarController = controller
+        coordinator.menuBarController = controller
         NSApp.mainMenu = applicationMenuDelegate.makeMainMenu()
         controller.popover.animates = false
         controller.menu.delegate = self
         try await settle()
-        try check(AppRuntime.store.visibleSurfaces == 0 && !controller.isMonitoringEvents,
+        try check(store.surfaces.visibleCount == 0 && !controller.isVisible && !controller.isMonitoringEvents,
                   "hiddenPopoverStartsWithoutVisibleQueueSurfaceOrInputMonitor")
         try await verifySystemInteractions(controller)
         if CommandLine.arguments.contains("--interaction-regressions") { return }
@@ -139,38 +148,47 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await settle(0.03)
         try check(controller.popover.isShown, "singleClickShowsRealPopoverImmediately")
         try await settle()
-        try check(AppRuntime.store.visibleSurfaces == 1 && controller.isMonitoringEvents,
+        try check(store.surfaces.visibleCount == 1 && controller.isVisible && controller.isMonitoringEvents,
                   "shownPopoverRegistersOneVisibleQueueSurfaceAndInputMonitor")
         try click()
         try await settle(interval)
         try check(!controller.popover.isShown, "singleClickClosesRealPopover")
-        try check(AppRuntime.store.visibleSurfaces == 0 && !controller.isMonitoringEvents,
+        try check(store.surfaces.visibleCount == 0 && !controller.isVisible && !controller.isMonitoringEvents,
                   "closedPopoverReleasesVisibleQueueSurfaceAndInputMonitor")
 
         try click()
         try await settle(0.03)
         try click(count: 2)
         try await settle(interval)
-        try check(AppRuntime.queueWindow?.isVisible == true && !controller.popover.isShown
+        try check(coordinator.windows[.queue]?.isVisible == true && !controller.popover.isShown
             && actions == [.openWindow],
                   "doubleClickOpensMainWindowWithoutStalePopover")
-        let queueWindow = AppRuntime.queueWindow
+        let queueWindow = coordinator.windows[.queue]
+        try check(store.surfaces.visibleCount == 1 && !controller.isVisible, "openQueueWindowIsTheOnlyVisibleQueueSurface")
+        controller.activate(.accessible)
+        try await settle()
+        try check(store.surfaces.visibleCount == 2, "popoverAndQueueWindowBothCountWhileShown")
+        controller.closePopover()
         queueWindow?.close()
+        try check(store.surfaces.visibleCount == 0, "closedQueueWindowLeavesNoVisibleQueueSurface")
+        try await settle()
         try click()
         try await settle(0.03)
         try click(count: 2)
         try await settle(interval)
-        try check(AppRuntime.queueWindow === queueWindow && queueWindow?.isVisible == true,
+        try check(coordinator.windows[.queue] === queueWindow && queueWindow?.isVisible == true,
                   "doubleClickReopensClosedSingletonWindow")
         queueWindow?.miniaturize(nil)
-        try await settle(0.3)
+        try await waitUntil { queueWindow?.isMiniaturized == true }
         try check(queueWindow?.isMiniaturized == true, "mainWindowCanBeMiniaturized")
+        try check(store.surfaces.visibleCount == 0, "miniaturizedQueueWindowLeavesNoVisibleQueueSurface")
         if let item = controller.menu.items.first(where: { $0.action != nil && $0.tag == QueueAppAction.openWindow.rawValue }) {
             controller.menu.performActionForItem(at: controller.menu.index(of: item))
         }
-        try await settle(0.3)
-        try check(AppRuntime.queueWindow === queueWindow && queueWindow?.isVisible == true && queueWindow?.isMiniaturized == false,
+        try await waitUntil { queueWindow?.isVisible == true && queueWindow?.isMiniaturized == false }
+        try check(coordinator.windows[.queue] === queueWindow && queueWindow?.isVisible == true && queueWindow?.isMiniaturized == false,
                   "openWindowRestoresMiniaturizedSingleton")
+        try check(store.surfaces.visibleCount == 1, "restoredQueueWindowCountsAsVisibleQueueSurface")
 
         // Deliver a non-mouse event before performClick to exercise the real
         // button target/action through the keyboard/accessibility branch.
@@ -196,7 +214,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await settle(0.03)
         try click(count: 2)
         try await settle(interval)
-        try check(AppRuntime.queueWindow === queueWindow && !controller.popover.isShown,
+        try check(coordinator.windows[.queue] === queueWindow && !controller.popover.isShown,
                   "doubleClickAlsoWorksWhenPopoverWasAlreadyOpen")
 
         try click()
@@ -204,7 +222,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         menuSelection = .openWindow
         try click(secondary: true)
         try await settle(interval)
-        try check(menuOpenCount == 1 && AppRuntime.queueWindow === queueWindow && queueWindow?.isVisible == true
+        try check(menuOpenCount == 1 && coordinator.windows[.queue] === queueWindow && queueWindow?.isVisible == true
             && !controller.popover.isShown,
                   "secondaryClickNativeMenuOpensExistingWindow")
         try click()
@@ -238,18 +256,18 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
             controller.menu.performActionForItem(at: controller.menu.index(of: item))
             try await settle()
         }
-        try check(AppRuntime.learningWindow?.isVisible == true && AppRuntime.updatesWindow?.isVisible == true
-            && AppRuntime.integrationWindow?.isVisible == true && AppRuntime.remoteWindow?.isVisible == true,
+        try check([QueueWindowKind.learning, .updates, .integration, .remote].allSatisfy { coordinator.windows[$0]?.isVisible == true },
                   "nativeSettingsSelectorsReachProductionWindowHandlers")
         try check(actions.suffix(5) == QueueAppAction.settings + [.quit], "allSettingsAndInertQuitDispatchExactlyOnce")
-        try check(AppRuntime.remoteStore.fixtureMode && AppRuntime.integrationStore.fixtureMode
-            && AppRuntime.updateStore.fixtureMode && AppRuntime.learningStore.fixtureMode,
+        try check(coordinator.remoteStore.fixtureMode && coordinator.integrationStore.fixtureMode
+            && coordinator.updateStore.fixtureMode && coordinator.learningStore.fixtureMode,
                   "allOpenedSettingsRemainFixtureIsolated")
+        try await verifyWindows()
         try await verifyApplicationMenus()
-        let original = AppRuntime.store.snapshot
-        AppRuntime.store.error = "Simulated unavailable queue"
+        let original = store.snapshot
+        store.error = "Simulated unavailable queue"
         try check(controller.statusItem.button?.title == "!", "errorBadgeUpdatesOnRealStatusButton")
-        AppRuntime.store.error = nil
+        store.error = nil
         let presentation = QueueStatusPresentation(snapshot: original, error: nil)
         try check(controller.statusItem.button?.title == presentation.title
             && controller.statusItem.button?.accessibilityLabel() == presentation.accessibilityLabel,
@@ -259,7 +277,40 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await settle(interval)
         try check(!controller.popover.isShown && !controller.isMonitoringEvents,
                   "teardownClosesPopoverAndRemovesEventMonitor")
-        AppRuntime.menuBarController = nil
+        coordinator.menuBarController = nil
+    }
+
+    /// Pins each window's chrome and that a closed window is the one that comes back.
+    private func verifyWindows() async throws {
+        let resizable: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+        let expected: [(QueueWindowKind, QueueAppAction, String, NSSize, NSSize)] = [
+            (.queue, .openWindow, "Agent Queue", NSSize(width: 700, height: 760), NSSize(width: 490, height: 480)),
+            (.learning, .learnedWorkloads, "Learned Workloads", NSSize(width: 1000, height: 780), NSSize(width: 800, height: 550)),
+            (.updates, .updates, "About Agent Queue", NSSize(width: 620, height: 620), NSSize(width: 590, height: 500)),
+            (.integration, .integration, "Agent Integration", NSSize(width: 600, height: 720), NSSize(width: 520, height: 540)),
+            (.remote, .remoteAccess, "Remote Access", NSSize(width: 580, height: 780), NSSize(width: 500, height: 570))]
+        try check(expected.map(\.0) == QueueWindowKind.allCases, "everyWindowKindIsCovered")
+        for (kind, action, title, size, minimum) in expected {
+            guard let window = coordinator.windows[kind] else { throw ClientError.message("Missing \(title) window") }
+            try check(window.title == title, "\(title) window keeps its title")
+            try check(window.styleMask == resizable, "\(title) window keeps its style")
+            try check(window.identifier == nil, "\(title) window has no identifier")
+            try check(!window.isReleasedWhenClosed, "\(title) window survives closing")
+            try check(window.contentRect(forFrameRect: window.frame).size == size, "\(title) window opens at its content size")
+            // SwiftUI replaces the live minSize with one derived from its content, so check the factory with plain content.
+            try check(kind.spec.makeWindow(content: NSView()).minSize == minimum, "\(title) window applies its minimum size")
+            window.close()
+            try await settle()
+            coordinator.perform(action)
+            try await settle()
+            try check(coordinator.windows[kind] === window && window.isVisible, "\(title) window is reused after closing")
+        }
+        let remote = coordinator.windows[.remote]
+        try check(coordinator.remoteStore.surfaces.visibleCount == 1, "openRemoteWindowIsAVisibleRemoteSurface")
+        remote?.miniaturize(nil)
+        try await waitUntil { remote?.isMiniaturized == true }
+        try check(coordinator.remoteStore.surfaces.visibleCount == 0, "miniaturizedRemoteWindowLeavesNoVisibleRemoteSurface")
+        remote?.close()
     }
 
     private func verifySystemInteractions(_ controller: QueueMenuBarController) async throws {
@@ -411,14 +462,17 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await settle()
         try check(controller.popover.isShown, "anotherAppTakingFocusKeepsPopoverOpen")
         let shownTitle = controller.statusItem.button?.title
-        AppRuntime.store.error = "Simulated unavailable queue"
+        coordinator.store.error = "Simulated unavailable queue"
         try check(shownTitle != "!" && controller.statusItem.button?.title == shownTitle, "statusTitleHoldsWidthWhilePopoverShown")
         controller.closePopover()
         try await settle()
         try check(controller.statusItem.button?.title == "!", "heldStatusTitleAppliesOnClose")
-        AppRuntime.store.error = nil
+        coordinator.store.error = nil
         try check(controller.statusItem.button?.title == shownTitle, "closedStatusTitleUpdatesImmediately")
-        try check(AppRuntime.store.visibleSurfaces == 0, "repeatedPopoverDismissalsLeaveNoVisibleQueueSurface")
+        // The queue window opened earlier may still be on screen; the dismissed popover must not count.
+        let openWindows = coordinator.windows[.queue]?.isVisible == true ? 1 : 0
+        try check(!controller.isVisible && coordinator.store.surfaces.visibleCount == openWindows,
+                  "repeatedPopoverDismissalsLeaveNoVisibleQueueSurface")
     }
 
     private func verifyApplicationMenus() async throws {
