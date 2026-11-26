@@ -31,7 +31,7 @@ Replace 42 with the published build returned by the check. The JSON result is:
 {"downloaded": true, "build": 42, "app": "~/Downloads/Agent Queue 1.2.0 (build 42)/Agent Queue.app", "message": "Quit Agent Queue, then drag the new copy into Applications and choose Replace. Opening it finishes the update automatically."}
 ```
 
-If availability changes, check again and select the current build. If Finder cannot reveal the copy, the download still succeeds and the message names its path. Checks do not require GitHub authentication, change queue state, or download executable assets. Network failures and rate limits remain errors. A test build launched with `--fixture` answers checks and downloads with sample data and only records what it would open or reveal.
+If availability changes, check again and select the current build. If Finder cannot reveal the copy, the download still succeeds and the message names its path. Checks do not require GitHub authentication, change queue state, or download executable assets. Network failures and rate limits remain errors. A test build launched with `--fixture` answers checks with sample data, records a download request without saving anything, and records links instead of opening them.
 
 ## Version identity
 

@@ -454,6 +454,11 @@ struct BootstrapTests {
         try check(try inert.inspect() == .legacy, "Fixture arguments are inert even for a damaged packaged app")
         inert.arguments = ["--fixture"]
         try check(rejects(inert, containing: "requires a JSONFILE"), "Malformed fixture selection fails closed before real queue startup")
+        for spelling in [["--fixtures", "private-fixture.json"], ["--fixture", "private-fixture.json", "--fixture-file", "x"]] {
+            inert.arguments = spelling
+            try check(rejects(inert, containing: "requires a JSONFILE"),
+                "\(spelling.joined(separator: " ")) cannot select the fixture backend while the launch reads as live")
+        }
         try check(["--fixture", "--fixture=x", "--snapshot", "--snapshot-menu", "--verify-detail-navigation"].allSatisfy(QueueBootstrapEnvironment.isTestOption)
             && !["--setup", "--open-window", "fixture.json"].contains(where: QueueBootstrapEnvironment.isTestOption),
             "The shipped build refuses exactly the options whose hooks it leaves out")

@@ -55,7 +55,7 @@ final class QueueFixture {
     var backend: QueueBackend {
         QueueBackend(command: { try await self.respond($0) }, logTail: { await self.logTail($0) },
             desktop: { self.desktopRequests.append($0) },
-            runningVersion: RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100))
+            runningVersion: { RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100) })
     }
 
     /// Each store loads once and never polls on a timer, so nothing changes under a check.

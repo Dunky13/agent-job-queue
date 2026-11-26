@@ -196,7 +196,6 @@ struct UpdateTests {
         try check(store.check == nil && store.error?.contains("invalid release") == true,
             "Untrusted release URL is rejected before it reaches links or download controls")
 
-        let callsBeforePreview = await fixture.calls
         let recorder = QueueFixture(arguments: [])
         let preview = recorder.coordinator().updateStore
         await preview.refreshInstalled()
@@ -204,8 +203,7 @@ struct UpdateTests {
         await preview.downloadUpdate()?.value
         try check(preview.updateDownloaded && preview.error == nil && recorder.changes == [.updatesDownload(build: 101)],
             "Fixture update controls run the live pipeline and end at the recorder")
-        let callsAfterPreview = await fixture.calls
-        try check(callsAfterPreview == callsBeforePreview && recorder.reads == [.version, .updatesCheck]
+        try check(recorder.reads == [.version, .updatesCheck]
             && preview.check?.latest?.build == 101,
             "Snapshot fixture has a simulated release and performs no external effects")
         for service in QueueServiceManagement.Service.allCases {

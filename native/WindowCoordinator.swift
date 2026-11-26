@@ -32,7 +32,7 @@ struct QueueBackend {
     var command: @Sendable (QueueClient.Command) async throws -> Data
     var logTail: QueueLogTail
     var desktop: QueueDesktop
-    var runningVersion: RunningQueueVersion
+    var runningVersion: @MainActor () -> RunningQueueVersion
 
     /// The installed controllers and this Mac.
     @MainActor static var live: QueueBackend {
@@ -45,7 +45,7 @@ struct QueueBackend {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
                 }
-            }, runningVersion: .current())
+            }, runningVersion: { .current() })
     }
 }
 
@@ -108,7 +108,7 @@ enum QueueWindowKind: CaseIterable {
     // Built on first use: the update store reads the bundle's build metadata when it is created.
     private(set) lazy var remoteStore = RemoteAccessStore(command: backend.command, pollSleep: pollSleep)
     private(set) lazy var integrationStore = AgentIntegrationStore(command: backend.command)
-    private(set) lazy var updateStore = QueueUpdateStore(running: backend.runningVersion, command: backend.command)
+    private(set) lazy var updateStore = QueueUpdateStore(running: backend.runningVersion(), command: backend.command)
     private(set) lazy var learningStore = LearningStore(command: backend.command)
     private(set) var windows: [QueueWindowKind: NSWindow] = [:]
     var menuBarController: QueueMenuBarController?

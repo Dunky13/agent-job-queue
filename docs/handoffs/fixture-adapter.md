@@ -19,7 +19,7 @@ A test build launched with `--fixture` cannot reach the installed queue, its lau
 | --- | --- |
 | Controller commands, log reads, update checks, desktop requests, running version | `QueueBackend`, replaced as a whole by the fixture |
 | A command the fixture does not know | It throws; nothing is passed on |
-| Helper processes | `makeSupervisor()` returns nil because `supervisesHelpers` requires `allowsInstallation`, which is false with `--fixture` |
+| Helper processes | A test build never builds the supervisor for a fixture launch. Independently, `makeSupervisor()` returns nil because `supervisesHelpers` requires `allowsInstallation`, which is false with `--fixture` |
 | Setup and installation | `inspect()` answers `.legacy`, `serviceStatusRequests()` is empty and `allowsInstallation` is false |
 | Snapshot or verification hooks against a live app | They require the coordinator that the fixture built |
 | Test options on the shipped app | `validateDiagnostics()` refuses them |
@@ -30,7 +30,7 @@ Bootstrap guards:
 | --- | --- |
 | `allowsInstallation` is false with `--fixture` | Kept |
 | `isTestOption` and the release build's refusal | Kept |
-| Test build validation of `--fixture` and `--snapshot` values | Kept |
+| Test build validation of `--fixture` and `--snapshot` values | Kept, and tightened: any other argument starting with `--fixture`, or a repeated `--fixture`, is refused, so no spelling can select the fixture backend while the guards read the launch as live |
 | `inspect()` returns `.legacy` for `--fixture` | Kept |
 | `serviceStatusRequests()` is empty for `--fixture` | Kept |
 | `makeSupervisor(fixtureMode:)` | Parameter removed. The flag came from the same command line that `--fixture` is read from, so `supervisesHelpers` already refuses those launches |
@@ -46,7 +46,7 @@ SUITE_EVIDENCE
 Implementation checks, run directly on the working tree before the commit (arm64):
 
 - Release and test library flavours compile with warnings as errors. Hook symbols: 0 in the release library.
-- `native/tests/run-refresh-tests.sh` 50 PASS, `run-bootstrap-tests.sh` 257, `run-service-management-tests.sh` 239, `run-supervisor-tests.sh` 119, `BehaviorTests` 126, `UpdateTests` 34, `LearningTests` 85, `TransportTests` 234; no failures.
+- `native/tests/run-refresh-tests.sh` 50 PASS, `run-bootstrap-tests.sh` 259, `run-service-management-tests.sh` 239, `run-supervisor-tests.sh` 119, `BehaviorTests` 126, `UpdateTests` 34, `LearningTests` 86, `TransportTests` 234; no failures.
 - `MenuBarUITests`, `BootstrapUITests` and `ResumeUITests` compile but were not run. The resume runner's historical build at `2295abe1` compiles but was not run.
 - `go run -p 2 ./cmd/queue-tool check-source`, ShellCheck on the changed Bash scripts, `git diff --check`.
 
@@ -56,6 +56,17 @@ What the new checks cover:
 - Checks that asserted a disabled or inert preview now assert that the live pipeline ran and ended at the recorder, with the exact commands.
 - `BootstrapTests` replaces the `fixture-mode` supervisor scenario with a bare `--fixture` argument, and checks that both fixture launches get the stand-in backend and request no service status.
 - The UI suites check that the launched coordinator is the fixture's and received no change. `MenuBarUITests` waits for each settings window's read to reach the fixture.
+
+## Review dispositions
+
+Independent Standards and Spec reviews (Opus) found no live regression and no new route from a fixture launch to the real controllers. Fixed:
+
+- A `--fixture` spelling the guards did not recognise could select the fixture backend while the launch read as live. Test builds now refuse such spellings, and `finishLaunching` skips the helper supervisor for any fixture launch.
+- The update store read the running version when the coordinator was built. It is now a `QueueBackend` member read on first use, as before, and the store requires it.
+- The menu-bar status check could race a refresh already in flight. It now fails the queue through a real fixture read and waits for the error.
+- Vacuous count conditions in `UpdateTests` and `LearningTests` were removed; `LearningTests` now checks that a reload reads the selected profile from the fixture. `ResumeUITests` refreshes through the fixture before checking that it recorded no change.
+- `firstSettingsClickOpensMenuInInactivePopover` failed on the first run after a build on this branch and on main's predecessor PR. The posted click arrives asynchronously, and the check waited a fixed 0.3 s; it now waits for the menu to open, up to 5 s.
+- Docs said the fixture only records what it would open or reveal; an update download is also recorded, as a change.
 
 ## Behaviour differences
 
@@ -68,7 +79,7 @@ Fixture runs, in test builds only:
 - Stores load when their view or a snapshot hook asks, as in the live app. Learned Workloads opens at its projects, and About shows no update check until one is requested.
 - Stores never poll on a timer, so a window that stays open does not reload by itself.
 - The job log shows a sample line instead of the previous preview-mode message.
-- Open log, Copy address, Open, release notes and Show in Finder are recorded, not performed.
+- Open log, Copy address, Open, release notes and the remote certificate's Show in Finder are recorded as desktop requests, not performed. An update download is recorded as a change and saves nothing.
 - Password verification reports `rejectionsSentNothing` and `acceptedPasswordReachedTheFixture`; confirmation verification reports `limitReachedOnlyTheFixture`. These replace the three fields that asserted preview mode dispatched nothing.
 
 The committed screenshots in `docs/screenshots/` will differ once regenerated. They were not regenerated here.

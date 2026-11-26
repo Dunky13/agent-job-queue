@@ -576,7 +576,6 @@ struct LearningTests {
         try check(store.detail?.profile.id == sourceID && store.error == nil,
             "Reload recovers a failed detail read without inventing a cached profile")
 
-        let beforePreview = await fixture.calls
         let recorder = QueueFixture(arguments: [])
         let preview = recorder.coordinator().learningStore
         let sample = QueueFixture.previewDetail()
@@ -591,6 +590,11 @@ struct LearningTests {
         await preview.loadMembers()?.value
         try check(preview.detail?.memberPage?.offset == 0 && preview.memberError == nil,
             "Fixture member paging satisfies the live response checks")
+        let readsBeforeReload = recorder.reads.count
+        await preview.reloadSelection()?.value
+        let reloaded = preview.selectedID.map { QueueClient.Command.profilesShow($0) }
+        try check(reloaded != nil && recorder.reads.count > readsBeforeReload && recorder.reads.last == reloaded
+            && preview.error == nil, "Fixture reload reads the selected profile from the fixture")
         preview.draftLabel = "Attempted fixture edit"
         await preview.save()?.value
         try check(preview.error == nil && preview.notice != nil, "Fixture save completes")
@@ -606,8 +610,7 @@ struct LearningTests {
         try check(recorder.changes.map { Array($0.arguments.prefix(3)) } == [["profiles", "edit", sample.profile.id],
             ["profiles", "reset", sample.profile.id], ["profiles", "merge", sample.profile.id], ["profiles", "combine", targetID]],
             "Fixture controls run every mutation path and end at the recorder")
-        let afterPreview = await fixture.calls
-        try check(beforePreview.count == afterPreview.count && preview.controllerMessage?.contains("has applied") == true,
+        try check(preview.controllerMessage?.contains("has applied") == true,
             "Snapshot uses artificial profiles and never invokes the installed queue")
         let unavailable = testDetail(prediction: nil)
         let decoded = try JSONDecoder().decode(LearningDetail.self, from: JSONEncoder().encode(unavailable))

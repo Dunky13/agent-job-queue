@@ -98,7 +98,7 @@ final class QueueUpdateStore: ObservableObject {
     let running: RunningQueueVersion
     private let command: @Sendable (QueueClient.Command) async throws -> Data
 
-    init(running: RunningQueueVersion = .current(),
+    init(running: RunningQueueVersion,
          command: @escaping @Sendable (QueueClient.Command) async throws -> Data) {
         self.running = running
         self.command = command

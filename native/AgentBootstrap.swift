@@ -34,11 +34,12 @@ struct QueueBootstrapEnvironment: Sendable {
         }
         #if AGENT_QUEUE_TEST_HOOKS
         let fixtureIndices = arguments.indices.filter { arguments[$0] == "--fixture" }
-        if !fixtureIndices.isEmpty || arguments.contains(where: { $0.hasPrefix("--fixture=") }) {
+        // Any other spelling would pick the fixture backend while the guards above read the launch as live.
+        let otherFixtureOptions = arguments.contains { $0.hasPrefix("--fixture") && $0 != "--fixture" }
+        if !fixtureIndices.isEmpty || otherFixtureOptions {
             guard fixtureIndices.count == 1, let index = fixtureIndices.first,
                   arguments.indices.contains(index + 1), !arguments[index + 1].isEmpty,
-                  !arguments[index + 1].hasPrefix("-"),
-                  !arguments.contains(where: { $0.hasPrefix("--fixture=") }) else {
+                  !arguments[index + 1].hasPrefix("-"), !otherFixtureOptions else {
                 throw ClientError.message("--fixture requires a JSONFILE argument. No backend changes have been made.")
             }
         }

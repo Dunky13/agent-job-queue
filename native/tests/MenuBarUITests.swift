@@ -469,10 +469,12 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await settle()
         try check(controller.popover.isShown, "anotherAppTakingFocusKeepsPopoverOpen")
         let shownTitle = controller.statusItem.button?.title
-        // A refresh landing during these checks must not report the queue as healthy again.
+        // Fail the queue through a real read: a refresh already in flight reads again once it ends,
+        // so no healthy answer can land after the error and clear it.
         let healthy = fixture.snapshot
         fixture.snapshot = nil
-        coordinator.store.error = "Simulated unavailable queue"
+        await coordinator.store.refresh()
+        try await waitUntil { coordinator.store.error != nil }
         try check(shownTitle != "!" && controller.statusItem.button?.title == shownTitle, "statusTitleHoldsWidthWhilePopoverShown")
         controller.closePopover()
         try await settle()
