@@ -208,9 +208,9 @@ jobs:
           path: ${{ runner.temp }}/receipts-export/*
           if-no-files-found: error
           retention-days: 90
-      - name: Generate final immutable manifest and Homebrew cask
+      - name: Generate final immutable manifest
         run: |
-          "$QUEUE_NOTARY_TOOL" render-cask \
+          "$QUEUE_NOTARY_TOOL" render-manifest \
             --archive "dist/Agent-Queue-$BUILD_VERSION-universal.zip" \
             --version "$BUILD_VERSION" --tag "$BUILD_TAG" \
             --commit "$BUILD_SHA" --build "$BUILD_RUN_NUMBER" --output dist
@@ -278,16 +278,6 @@ jobs:
           scripts/test-notarized-installer.sh "dist/Agent-Queue-$BUILD_VERSION-universal.zip" "dist/Agent-Queue-$BUILD_VERSION-universal.dmg" "$APPLE_TEAM_ID"
       - name: Exercise the hardened packaged queue and HTTPS gateway
         run: scripts/test-installer.sh "dist/Agent-Queue-$BUILD_VERSION-universal.zip"
-      - name: Install through the real Homebrew DSL with quarantine retained
-        env:
-          APPLE_TEAM_ID: ${{ needs.notarize.outputs.team_id }}
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-          HOMEBREW_DEVELOPER: '1'
-        run: |
-          mkdir prepared-signed-app
-          ditto -x -k "dist/Agent-Queue-$BUILD_VERSION-universal.zip" prepared-signed-app
-          export AGENT_QUEUE_TEST_NOTARIZED_APP="$PWD/prepared-signed-app/Agent Queue.app"
-          go test -p 2 -parallel 2 ./internal/tooling -run '^TestNotarizedHomebrew' -count=1 -v -timeout 3m
 
   publish:
     name: Publish main installer
@@ -327,23 +317,25 @@ jobs:
           QUEUE_NOTARY_TOOL: ${{ runner.temp }}/queue-notary-tool
         run: scripts/distribution-publish.sh dist
 
-  homebrew-sync:
-    name: Verify Homebrew delivery
+  delivery:
+    name: Publish Sparkle feed and homepage
     needs: [source, publish, notarize]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    runs-on: macos-15
+    timeout-minutes: 20
+    # One deployment at a time, so prepare re-checks the live site after any earlier deploy finished.
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
     permissions:
       contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     env:
-      BUILD_RUN_ID: ${{ needs.source.outputs.run_id }}
-      BUILD_RUN_NUMBER: ${{ needs.source.outputs.run_number }}
-      BUILD_RUN_ATTEMPT: ${{ needs.source.outputs.run_attempt }}
       BUILD_SHA: ${{ needs.source.outputs.sha }}
-      BUILD_ARTIFACT_ID: ${{ needs.source.outputs.artifact_id }}
-      BUILD_ARTIFACT_DIGEST: ${{ needs.source.outputs.artifact_digest }}
-      BUILD_VERSION: ${{ needs.source.outputs.version }}
       BUILD_TAG: ${{ needs.source.outputs.tag }}
-      AUTOMATION_SHA: ${{ needs.source.outputs.automation_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -357,29 +349,46 @@ jobs:
         with:
           name: ${{ needs.notarize.outputs.artifact_name }}
           path: dist
-      - name: Require Homebrew dispatch configuration
+      - name: Require Sparkle signing configuration
         env:
-          APP_CLIENT_ID: ${{ vars.HOMEBREW_SYNC_APP_CLIENT_ID }}
-          APP_PRIVATE_KEY: ${{ secrets.HOMEBREW_SYNC_APP_PRIVATE_KEY }}
+          HAS_SPARKLE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY != '' }}
         run: |
-          if [[ -z "$APP_CLIENT_ID" || -z "$APP_PRIVATE_KEY" ]]; then
-            echo '::error::Configure HOMEBREW_SYNC_APP_CLIENT_ID and HOMEBREW_SYNC_APP_PRIVATE_KEY before Homebrew delivery. See docs/homebrew-delivery.md.'
+          if [[ "$HAS_SPARKLE_KEY" != true ]]; then
+            echo '::error::Configure SPARKLE_ED_PRIVATE_KEY and enable GitHub Pages with the GitHub Actions source before delivery. See docs/pages-delivery.md.'
             exit 1
           fi
-      - name: Create token for the tap workflow only
-        id: tap-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ vars.HOMEBREW_SYNC_APP_CLIENT_ID }}
-          private-key: ${{ secrets.HOMEBREW_SYNC_APP_PRIVATE_KEY }}
-          owner: Dunky13
-          repositories: homebrew-agent-job-queue
-          permission-actions: write
-      - name: Dispatch and verify the published Homebrew build
+      - name: Build the delivery tool before any secret is in the environment
+        run: go build -p 2 -trimpath -o "$RUNNER_TEMP/queue-pages" ./cmd/queue-pages
+      - name: Fetch the pinned Sparkle signing tool
+        id: sparkle
+        run: |
+          dir=$(packaging/sparkle/fetch.sh "$RUNNER_TEMP/sparkle")
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+      - name: Verify the release, sign the feed and assemble the site
+        id: prepare
         shell: bash
         env:
-          GH_TOKEN: ${{ steps.tap-token.outputs.token }}
-          SOURCE_GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          SPARKLE_DIR: ${{ steps.sparkle.outputs.dir }}
         run: |
-          go run -p 2 ./cmd/queue-delivery --manifest dist/agent-job-queue.json \
-            --timeout 600 --poll-interval 5 | tee -a "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/queue-pages" prepare --expected-tag "$BUILD_TAG" --expected-commit "$BUILD_SHA" \
+            --artifact-dir dist --site-dir site --output-dir "$RUNNER_TEMP/site" --result-file "$GITHUB_OUTPUT" \
+            --sign-update "$SPARKLE_DIR/bin/sign_update" >"$RUNNER_TEMP/prepare-summary.md"
+      - name: Summarize the delivery decision
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        run: tee -a "$GITHUB_STEP_SUMMARY" <"$RUNNER_TEMP/prepare-summary.md"
+      - name: Upload the site
+        if: steps.prepare.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        if: steps.prepare.outputs.deploy == 'true'
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+      - name: Read the live site back
+        if: steps.prepare.outputs.deploy == 'true'
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/queue-pages" verify-live --artifact-dir dist --output-dir "$RUNNER_TEMP/site" | tee -a "$GITHUB_STEP_SUMMARY"

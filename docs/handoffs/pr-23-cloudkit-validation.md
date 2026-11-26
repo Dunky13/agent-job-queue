@@ -58,7 +58,7 @@ Recovered stages must retain the original source and signed bytes; completed
 submissions are reused. See [Apple recovery](../apple-signing.md#resuming-a-pending-ci-submission).
 
 Successful Apple Silicon and Intel acceptance, public publication, and exact
-[Homebrew delivery](../homebrew-delivery.md) remain separate required proofs.
+[Homebrew delivery](https://github.com/Dunky13/agent-job-queue/blob/8015b73531218665d4ac216b76fa34ba7d9ae177/docs/homebrew-delivery.md) remain separate required proofs.
 An automatic newer main build can supersede delivery only through the same
 verified publication and tap contract.
 

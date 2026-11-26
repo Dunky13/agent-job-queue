@@ -156,7 +156,7 @@ func VerifyBuildArtifact(archive, digest, commit string, build int, output strin
 		return "", errors.New("Source artifact manifest repository, commit or build mismatch")
 	}
 	image := strings.TrimSuffix(manifest.Asset, ".zip") + ".dmg"
-	expected := []string{manifest.Asset, manifest.Asset + ".sha256", image, image + ".sha256", "agent-job-queue.json", "agent-job-queue.rb"}
+	expected := []string{manifest.Asset, manifest.Asset + ".sha256", image, image + ".sha256", "agent-job-queue.json"}
 	if len(files) != len(expected) {
 		return "", errors.New("Unexpected source artifact contents")
 	}

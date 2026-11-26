@@ -51,4 +51,4 @@ Local validation passed:
 
 Independent source review has no unresolved findings. It caught a fixture-environment omission when setup moved outside Ruby; the corrected request explicitly supplies private test mode and launchctl tools, and the actual signed-artifact test passes with that isolation. The operator's installed app and queue were not updated by this repair.
 
-Hosted CI, merge, new artifact publication, and public tap delivery remain separate gates. The first-launch request was exercised directly with the signed helper; no production app was opened in the operator's graphical session. The operating contract is in [Homebrew delivery](../homebrew-delivery.md).
+Hosted CI, merge, new artifact publication, and public tap delivery remain separate gates. The first-launch request was exercised directly with the signed helper; no production app was opened in the operator's graphical session. The operating contract is in [Homebrew delivery](https://github.com/Dunky13/agent-job-queue/blob/8015b73531218665d4ac216b76fa34ba7d9ae177/docs/homebrew-delivery.md).

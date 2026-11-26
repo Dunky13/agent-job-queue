@@ -20,7 +20,7 @@ esac
 bcrypt_flags=(-gcflags='golang.org/x/crypto/blowfish=-race=false')
 
 # Keep the original CI scope dynamic, and stop before testing on list errors.
-packages=$(go list -p 2 ./cmd/... ./internal/... ./packaging/homebrew ./remote/static)
+packages=$(go list -p 2 ./cmd/... ./internal/... ./remote/static)
 module=github.com/Dunky13/agent-job-queue
 tooling="$module/internal/tooling"
 https="$module/internal/remote"
@@ -37,7 +37,7 @@ found_https=false
 found_backend=false
 while IFS= read -r package || [[ -n "$package" ]]; do
   case "$package" in
-    "$module"/cmd|"$module"/cmd/*|"$module"/internal|"$module"/internal/*|"$module"/packaging/homebrew|"$module"/remote/static) ;;
+    "$module"/cmd|"$module"/cmd/*|"$module"/internal|"$module"/internal/*|"$module"/remote/static) ;;
     *) printf 'Unexpected Go package: %s\n' "$package" >&2; exit 1 ;;
   esac
   case "$package" in

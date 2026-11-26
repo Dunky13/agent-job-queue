@@ -55,7 +55,7 @@ One download runs at a time. Private staging is removed after every attempt, and
 
 The public GitHub release is the distribution trust boundary. New main releases produced by the notarized pipeline use Developer ID signatures and Apple notarization, with a stapled ticket on the app and the DMG. Historical releases and local development packages can remain ad hoc signed. The updater checks signature integrity and release identity; those checks alone do not establish Apple notarization or Gatekeeper acceptance. It does not disable Gatekeeper, remove quarantine from the delivered copy (it adds it), or add a background installation service. Copying and replacing the app in Applications is left to the user, so the updater never writes code into Applications. Older archives without embedded build metadata or in the earlier installer layout remain available through their release pages; the updater refuses to present them as verified new-format downloads. Builds that predate this flow cannot update in place and need one manual download from the release page.
 
-Homebrew's generated manifest remains compatible. Direct updates through the app do not rewrite Homebrew's receipt; Homebrew-managed installations can keep using their cask upgrade flow.
+Agent Queue is no longer distributed through Homebrew. See [Pages delivery](pages-delivery.md).
 
 ## Validation contract
 

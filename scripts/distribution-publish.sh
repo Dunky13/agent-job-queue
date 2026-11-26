@@ -43,7 +43,7 @@ jq -e --arg repository "$GITHUB_REPOSITORY" --arg sha "$BUILD_SHA" --arg tag "$B
 ' "$manifest" >/dev/null || fail 'Candidate manifest does not match the release source.'
 version=$(jq -r '.version' "$manifest")
 base="Agent-Queue-$version-universal"
-names=("$base.dmg" "$base.dmg.sha256" "$base.zip" "$base.zip.sha256" agent-job-queue.json agent-job-queue.rb apple-notarization.json)
+names=("$base.dmg" "$base.dmg.sha256" "$base.zip" "$base.zip.sha256" agent-job-queue.json apple-notarization.json)
 entries=("$candidate"/*)
 [[ ${#entries[@]} == "${#names[@]}" ]] || fail 'Unexpected candidate asset inventory.'
 : > "$temporary/checksums"
@@ -86,8 +86,8 @@ for stage in app dmg; do
 done
 {
   printf '%s\n\n%s\n\n' \
-    "Automated app from validated main commit ${BUILD_SHA}. Includes Apple Silicon and Intel executables plus checksum-pinned Homebrew metadata." \
-    'Signed with Apple Developer ID and notarized by Apple. The menu app and DMG carry stapled tickets; drag Agent Queue to Applications and open it to finish setup. Homebrew preserves quarantine. Standalone CLI first launch can require access to Apple notarization services.'
+    "Automated app from validated main commit ${BUILD_SHA}. Includes Apple Silicon and Intel executables plus checksum-pinned release metadata." \
+    'Signed with Apple Developer ID and notarized by Apple. The menu app and DMG carry stapled tickets; drag Agent Queue to Applications and open it to finish setup. Standalone CLI first launch can require access to Apple notarization services.'
   printf 'Immutable candidate SHA-256 inventory:\n'
   cat "$temporary/checksums"
 } > "$temporary/notes"

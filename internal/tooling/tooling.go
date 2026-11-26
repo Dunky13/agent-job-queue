@@ -306,22 +306,8 @@ func CreateManifest(archive, version, tag, commit string, build int) (backend.Ma
 	}
 	return backend.ValidateManifest(data)
 }
-func RenderCask(item backend.Manifest) (string, error) {
-	data, err := json.Marshal(item)
-	if err != nil {
-		return "", err
-	}
-	if _, err = backend.ValidateManifest(data); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf(caskTemplate, item.Version, *item.Build, item.SHA256, backend.ReleaseRepository, item.Tag, item.Asset, backend.ReleaseRepository), nil
-}
 func RenderRelease(archive, version, tag, commit string, build int, output string) error {
 	manifest, err := CreateManifest(archive, version, tag, commit, build)
-	if err != nil {
-		return err
-	}
-	cask, err := RenderCask(manifest)
 	if err != nil {
 		return err
 	}
@@ -332,10 +318,7 @@ func RenderRelease(archive, version, tag, commit string, build int, output strin
 	if err != nil {
 		return err
 	}
-	if err = os.WriteFile(filepath.Join(output, "agent-job-queue.json"), append(data, '\n'), 0o644); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(output, "agent-job-queue.rb"), []byte(cask), 0o644)
+	return os.WriteFile(filepath.Join(output, "agent-job-queue.json"), append(data, '\n'), 0o644)
 }
 func VerifyRelease(existing, assets, commit string) error {
 	data, err := os.ReadFile(filepath.Join(existing, "release.json"))
@@ -375,28 +358,3 @@ func VerifyRelease(existing, assets, commit string) error {
 	fmt.Println("Existing release target and all assets match; no overwrite performed.")
 	return nil
 }
-
-const caskTemplate = `cask "agent-job-queue" do
-  version "%s,%d"
-  sha256 "%s"
-
-  url "https://github.com/%s/releases/download/%s/%s"
-  name "Agent Queue"
-  desc "Shared heavy-command queue with a macOS menu-bar app"
-  homepage "https://github.com/%s"
-
-  depends_on macos: :sequoia
-
-  # Preserve quarantine so macOS can assess the notarized release.
-
-  app "Agent Queue.app"
-
-  uninstall quit: "io.went.agent-queue"
-
-  caveats <<~EOS
-    Open Agent Queue from Applications to use its menu bar.
-    Before removing the app, finish its jobs, then run this. It quits the app and removes its login item:
-      ~/.local/bin/agent-heavy install --app-bundle "#{appdir}/Agent Queue.app" --unregister-services
-  EOS
-end
-`

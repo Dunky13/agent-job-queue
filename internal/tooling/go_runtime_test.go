@@ -148,7 +148,6 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 		goRuntimeModule + "/internal/tooling/child",
 		goRuntimeModule + "/internal/tooling-extra",
 		goRuntimeModule + "/internal/new-package",
-		goRuntimeModule + "/packaging/homebrew",
 		goRuntimeModule + "/remote/static",
 		goRuntimeModule + "/cmd",
 		goRuntimeModule + "/internal",
@@ -160,7 +159,7 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runtime suite: %v: %s", err, output)
 	}
-	if got, want := goRuntimeArguments(t, root, "list"), []string{"list", "-p", "2", "./cmd/...", "./internal/...", "./packaging/homebrew", "./remote/static"}; !reflect.DeepEqual(got, want) {
+	if got, want := goRuntimeArguments(t, root, "list"), []string{"list", "-p", "2", "./cmd/...", "./internal/...", "./remote/static"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("enumeration scope: got %q, want %q", got, want)
 	}
 	cwd, err := os.ReadFile(filepath.Join(root, "cwd"))
@@ -175,7 +174,7 @@ func TestGoRuntimePartitionsCompleteScopeWithExactFlags(t *testing.T) {
 		t.Fatalf("enumerated in %q, want repository %q", cwd, repository)
 	}
 	want := []string{"test", "-p", "2", "-parallel", "2", "-race", goRuntimeBlowfishFlag}
-	for _, index := range []int{0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12} {
+	for _, index := range []int{0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11} {
 		want = append(want, packages[index])
 	}
 	want = append(want, "-timeout", "12m")

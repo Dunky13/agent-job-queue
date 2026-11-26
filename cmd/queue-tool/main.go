@@ -15,7 +15,7 @@ import (
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("Expected check-source, check-commits, render-cask, verify-release, verify-app, or notarize")
+		return errors.New("Expected check-source, check-commits, render-manifest, verify-release, verify-app, or notarize")
 	}
 	flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	switch args[0] {
@@ -81,7 +81,7 @@ func run(args []string) error {
 			return err
 		}
 		return tooling.CheckCommits(*base, *head, *local, *repo)
-	case "render-cask":
+	case "render-manifest":
 		archive := flags.String("archive", "", "app ZIP")
 		version := flags.String("version", "", "version")
 		tag := flags.String("tag", "", "immutable tag")

@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Verified delivery through GitHub Pages</title><style>html{color-scheme:light dark;font:1.0625rem/1.65 system-ui,sans-serif}body{margin:0 auto;max-width:76ch;padding:2rem 1.25rem 5rem}h1,h2{line-height:1.25}h2{margin-top:2rem}a{color:light-dark(#175bb7,#95bfff)}pre{padding:1rem;overflow:auto;border:1px solid #8886;border-radius:.5rem;white-space:pre-wrap;overflow-wrap:anywhere}code{font-size:.88em;overflow-wrap:anywhere}li{margin:.5rem 0}h1 span,h2 span{display:none}@media print{body{max-width:none;padding:0}}</style></head><body id="top"><main>
+<h1 id="verified-delivery-through-github-pages">Verified delivery through GitHub Pages<span><a href="#verified-delivery-through-github-pages">&para;</a> <a href="#top">&uarr;</a></span></h1>
+
+<p>The Sparkle update feed and the project homepage are served by GitHub Pages at <code>https://dunky13.github.io/agent-job-queue/</code> (<a href="adr/0003-drop-homebrew-feed-on-github-pages.md">ADR 0003</a>). Nothing is committed to <code>main</code> for delivery. Main CI validates and retains the self-contained app. The separate distribution workflow signs, notarizes, tests and publishes that exact build as a GitHub prerelease, and only then runs its <strong>Publish Sparkle feed and homepage</strong> job. A failed app build or distribution attempt leaves the live site as it was.</p>
+
+<p>The feed URL baked into the app is <code>https://dunky13.github.io/agent-job-queue/appcast.xml</code>. The same site serves <code>latest.json</code>, which the homepage reads, and the homepage files from <code>site/</code>.</p>
+
+<h2 id="installing">Installing<span><a href="#installing">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Open the homepage, or take the DMG or ZIP from the <a href="https://github.com/Dunky13/agent-job-queue/releases">latest release</a>. Drag <strong>Agent Queue</strong> to Applications and open it to finish setup. The app then updates itself through Sparkle.</p>
+
+<h2 id="existing-homebrew-users">Existing Homebrew users<span><a href="#existing-homebrew-users">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Nothing is required. The installed app keeps working and receives updates through Sparkle once it includes the new feed address.</p>
+
+<ul>
+<li>Optional: remove the tap with <code>brew untap dunky13/agent-job-queue</code>. This changes only Homebrew&#x27;s own records.</li>
+<li>Do not run <code>brew uninstall</code>: it deletes the app. The cask is no longer updated, so Homebrew no longer reports new versions, which is expected.</li>
+<li>To reinstall by hand later, use the DMG or ZIP from the homepage or the release page.</li>
+</ul>
+
+<h2 id="delivery-contract">Delivery contract<span><a href="#delivery-contract">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The delivery job runs on <code>macos-15</code> from the exact automation commit of the distribution run (the prebuilt <code>cmd/queue-pages</code>, package <code>internal/pages</code>). The tool is built before any secret is in the environment, and the Sparkle key is read once and removed from the process environment. Only <code>gh</code> receives the workflow token; <code>sign_update</code> gets a minimal environment with neither secret. The job has <code>contents: read</code>, <code>pages: write</code> and <code>id-token: write</code>, runs in the <code>github-pages</code> environment and holds no App token. It:</p>
+
+<ol>
+<li>Verifies the requested public release, its manifest, the app ZIP checksum and the published DMG checksum file, and finds the highest published numbered build through a bounded paginated search. It then requires this run&#x27;s notarized artifact (<code>--artifact-dir</code>) to carry exactly the public manifest, ZIP and DMG, SHA-256 included, so a replaced release asset is never signed. If a newer public build exists (verified by release and source ancestry), this run is <strong>superseded</strong>: it reports that and deploys nothing, because only the requested build has a notarized artifact to bind, and the newer run publishes the newer build.</li>
+<li>Fetches the live <code>https://dunky13.github.io/agent-job-queue/latest.json</code>. Only an HTTP 404 means no site yet; every other fetch or parse failure fails the job. A live build that is newer than this run means <strong>Superseded</strong> and deploys nothing. A live build that is older must be a verified public release and an ancestor of this run. The same build with identical feed content (signatures ignored) means <strong>Already current</strong> and skips the deploy. A live <code>latest.json</code> that differs from its own public release fails the job.</li>
+<li>Signs the published ZIP with Sparkle&#x27;s <code>sign_update --ed-key-file - -p</code>. The private key <code>SPARKLE_ED_PRIVATE_KEY</code> goes in on stdin only, never as an argument or in logs. Before anything is deployed, the tool verifies with <code>crypto/ed25519</code> that the enclosure signature matches the exact ZIP and that the feed signature matches the feed bytes Sparkle signs (everything before the trailing <code>sparkle-signatures</code> comment, whose <code>length</code> is that byte count), both against <code>packaging/sparkle/public-ed-key.txt</code>, the key the app trusts. A missing or malformed key file, or a secret that does not match it, fails the job visibly instead of stranding installed apps.</li>
+<li>Renders <code>appcast.xml</code> with one item for that build (<code>sparkle:version</code> is the build number, <code>sparkle:shortVersionString</code> the version, <code>sparkle:minimumSystemVersion</code> 15.0, an enclosure with the immutable release ZIP URL, its length, type and <code>sparkle:edSignature</code>, and the release page as link), then signs the feed with <code>sign_update --ed-key-file - appcast.xml</code>. Sparkle reserializes the XML, so the signed feed is parsed as XML and must contain exactly the produced item and a feed signature; byte comparison is never used.</li>
+<li>Writes <code>latest.json</code> with <code>schemaVersion</code>, <code>version</code>, <code>build</code>, <code>commit</code>, <code>tag</code>, <code>publishedAt</code>, <code>releaseUrl</code>, <code>dmgUrl</code>, <code>dmgSha256</code>, <code>zipUrl</code> and <code>zipSha256</code>. The links are derived from the tag and must match.</li>
+<li>Assembles the site: the files under <code>site/</code> plus <code>appcast.xml</code> and <code>latest.json</code>. The assembler accepts only regular files inside <code>site/</code> and refuses symbolic links, hidden files other than <code>.nojekyll</code>, special files, files over 8 MiB, more than 1000 files or 64 MiB in total, and any file named like a generated one. A <code>site/</code> with only the homepage is enough, and a missing <code>site/</code> fails with a clear message.</li>
+<li>Uploads the assembled directory with the SHA-pinned <code>actions/upload-pages-artifact</code> and deploys it with <code>actions/deploy-pages</code>. A deployment replaces the whole site, which is why the job reads the live site first.</li>
+<li>Reads the live <code>latest.json</code> and <code>appcast.xml</code> back with a bounded retry (18 attempts, 10 seconds apart). The live feed must equal the deployed feed and verify against the public key. A newer build deployed meanwhile by a later run is accepted.</li>
+</ol>
+
+<p>A missing secret fails the job visibly and points here. Pull requests receive neither Pages permissions nor the Sparkle key.</p>
+
+<h2 id="one-time-setup">One-time setup<span><a href="#one-time-setup">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Key creation and Pages settings need the repository owner&#x27;s GitHub session. Keep private key contents out of chat and source files.</p>
+
+<ol>
+<li>Generate the Sparkle EdDSA key pair with the pinned Sparkle tooling and store the private key as the repository Actions secret, never pasting it into chat. In a checkout, set <code>dir</code> to the output of <code>packaging/sparkle/fetch.sh &quot;$TMPDIR/sparkle&quot;</code>, then run these four commands in order: <code>&quot;$dir/bin/generate_keys&quot; --account agent-queue</code> creates the key in your login keychain and prints the public key; <code>&quot;$dir/bin/generate_keys&quot; --account agent-queue -x sparkle-private-key</code> exports the private key to a file; <code>gh secret set SPARKLE_ED_PRIVATE_KEY --repo Dunky13/agent-job-queue &lt; sparkle-private-key</code> stores it; <code>rm sparkle-private-key</code> removes the file. Commit only the public key (the base64 line <code>generate_keys</code> printed) to <code>packaging/sparkle/public-ed-key.txt</code>. The public key file must exist on <code>main</code> before the first delivery; delivery fails without it. Expected result: <code>gh secret list --repo Dunky13/agent-job-queue</code> shows <code>SPARKLE_ED_PRIVATE_KEY</code> and the exported file is gone.</li>
+<li>Enable GitHub Pages with the source set to <strong>GitHub Actions</strong>: in the repository, open <strong>Settings &gt; Pages</strong> and choose <strong>GitHub Actions</strong> under <strong>Build and deployment</strong>. The <code>github-pages</code> environment is created with it; keep its branch rule limited to <code>main</code>. Expected result: the first delivery deploys without a &quot;Pages not enabled&quot; error.</li>
+<li>Make sure the <code>site/</code> directory with the homepage exists on <code>main</code>. The homepage is owned separately from delivery.</li>
+</ol>
+
+<p>The old App token needs no replacement: remove the <code>HOMEBREW_SYNC_APP_CLIENT_ID</code> variable and <code>HOMEBREW_SYNC_APP_PRIVATE_KEY</code> secret, uninstall the Homebrew-sync App from this repository and drop it as a bypass actor on the <code>main</code> and <code>main-ci</code> rulesets. Nothing else in delivery writes to <code>main</code>.</p>
+
+<h2 id="app-installation-and-upgrade-recovery">App installation and upgrade recovery<span><a href="#app-installation-and-upgrade-recovery">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The app is installed by dragging it from the DMG or ZIP into <code>/Applications</code>, or by a Sparkle update. Nothing runs at install: there is no installer script or setup command.</p>
+
+<p>The first launch completes setup. Opening the app from Applications writes the <code>agent-heavy</code> and <code>agent-remote</code> wrappers to <code>~/.local/bin</code>, migrates state and unregisters any queue, resource or phone-access services that older versions registered. The app then starts and supervises its own queue processes; only its login item is registered with Service Management. An update replaces the app, and the next launch completes the upgrade. Normal app launch only reads installation and authorization state until setup runs; it never deletes executable code.</p>
+
+<p>Services, jobs, history and credentials are removed only by the app&#x27;s ownership-checked service-removal command, which must run before deleting the app. It asks a running app&#x27;s queue whether it is drained and then quits the app. With active jobs it refuses and leaves the app running:</p>
+
+<pre><code>~/.local/bin/agent-heavy install --app-bundle &quot;/Applications/Agent Queue.app&quot; --unregister-services
+</code></pre>
+
+<p>Private history, configuration and credentials remain retained.</p>
+
+<p>Setup waits for a running queue daemon&#x27;s active and queued jobs before replacing it, and never starts a live handover. After a normal quit no daemon remains: running jobs continue and their outcomes are recorded without replay, attached <code>agent-heavy run</code> callers exit with status 125 within about a second, and if jobs were running the next daemon comes up paused, so queued jobs run after <code>agent-heavy resume</code> with no caller attached. Original callers keep their outcomes and exit statuses only when finishing a handover an older release left behind, using that exact build&#x27;s bundle. Uncertain attempts or ownership fail closed. Removal still requires a drained queue.</p>
+
+<p>Whole previous signed app generations remain visible under <code>~/Applications/Agent Queue Runtimes</code>, bound to exact filesystem and attempt identities. Only a later setup operation can reclaim them after verifying terminal attempts and dead original callers and owned workers.</p>
+
+<p>macOS Login Items approval remains an operating-system decision, but it concerns only the app&#x27;s login item (opening at login) and never blocks setup or the queue, because the queue processes are the app&#x27;s own children rather than registered background services. Setup also retires registrations from older versions that are still awaiting approval. Setup cannot bypass this approval or endpoint-protection policy. Unsafe ownership, malformed retained configuration and uncertain job attempts are not guessed or discarded. Deliberately held jobs remain held and can require an operator decision when drain is required. Local fixtures do not establish native Service Management worker survival, Apple acceptance or SentinelOne acceptance.</p>
+
+<h3 id="upgrading-from-the-installer">Upgrading from the installer<span><a href="#upgrading-from-the-installer">&para;</a> <a href="#top">&uarr;</a></span></h3>
+
+<p>Users of the installer era have <code>~/Applications/Agent Queue.app</code> recorded as the managed location, with the services running from it. Setup refuses a new copy placed elsewhere (such as <code>/Applications</code>) while the recorded copy exists. Those users must first stop the services, move the old app to the Trash, then install and open the new app:</p>
+
+<pre><code>~/.local/bin/agent-heavy install --app-bundle &quot;$HOME/Applications/Agent Queue.app&quot; --unregister-services
+</code></pre>
+
+<p>Existing releases remain immutable. Setup can retire and back up legacy <code>~/Library/LaunchAgents/io.went.agent-*.plist</code> definitions during migration; it applies its own drain and ownership checks first.</p>
+
+<h2 id="recovery">Recovery<span><a href="#recovery">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>Inspect the failed distribution <strong>Publish Sparkle feed and homepage</strong> job. Rerun failed distribution jobs to retry unchanged automation: a repeated run reads the live site first and deploys nothing when it is already current. A red delivery job with signing and acceptance green is classed as <code>delivery</code> and retried automatically by <code>scripts/distribution-recover.sh</code>, first immediately and then at least 15 minutes apart, up to attempt 48 or 7 days for each run. The observer requests at most five reruns per pass and reaches older builds first. It still recognises the earlier job names, so runs started before this change recover as before.</p>
+
+<p>If the automation itself needs a fix, merge the repair and dispatch distribution against the original build run ID as documented in <a href="apple-signing.html#resuming-a-pending-ci-submission">Apple signing and notarization</a>. A matching immutable release is verified rather than overwritten.</p>
+
+<p>Common failures:</p>
+
+<ul>
+<li><code>Configure SPARKLE_ED_PRIVATE_KEY and enable GitHub Pages</code>: the secret is missing or Pages is not set to the GitHub Actions source.</li>
+<li>A 404 or &quot;Pages not enabled&quot; error from the deploy step: Pages is not enabled, or the <code>github-pages</code> environment forbids the <code>main</code> branch.</li>
+<li><code>The live site answered HTTP ...</code> or <code>could not be read</code>: the live site could not be read. This is never treated as an empty site; rerun the job.</li>
+<li><code>differs from its validated public release</code> or <code>conflicting release metadata</code>: the live <code>latest.json</code> disagrees with the public releases. Do not edit the site by hand; investigate the releases first.</li>
+<li><code>did not serve the deployed build after N attempts</code>: the deployment finished but the site still serves something else. Check the <strong>github-pages</strong> environment deployments, then rerun.</li>
+<li>The site directory is missing: add <code>site/</code> with the homepage to <code>main</code>.</li>
+</ul>
+
+<p>Rolling back means delivering a newer build; the feed never serves an older one. Never edit generated files by hand, and never execute code from a release to repair drift.</p>
+
+<p>Publishing a release or updating the feed does not modify the operator&#x27;s Mac. Version visibility requires the new app to be installed and running; open its gear menu and choose <strong>About and updates</strong>.</p>
+
+<h2 id="validation">Validation<span><a href="#validation">&para;</a> <a href="#top">&uarr;</a></span></h2>
+
+<p>The tests simulate pagination, requested release validation, checksum failures, conflicting identities, supersession by a newer release or live build, the already-current skip, 404 versus other fetch failures, the <code>latest.json</code> golden file, assembler refusal of symbolic links, files outside <code>site/</code> and oversized files, live read-back mismatches and signing with an inert fake <code>sign_update</code> that proves the key never appears in arguments. They do not call GitHub, deploy a site or use the live queue. From the source checkout:</p>
+
+<pre><code>go test -p 2 ./internal/pages ./internal/tooling -v
+</code></pre>
+
+<p>This guide has a complete standalone <a href="pages-delivery.html">HTML version</a>.</p>
+</main></body></html>

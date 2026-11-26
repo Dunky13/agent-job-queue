@@ -107,7 +107,7 @@ func distributionRecoveryCandidate(f checkpointFixture, id, build int) *distribu
 	r.jobs = []map[string]any{
 		job(10, id, "Verify original build provenance", "success", sha, 1), job(11, id, "Sign and notarize main installer", "failure", sha, 2),
 		job(12, id, "Notarized distribution (macos-15)", "skipped", sha, 2), job(13, id, "Notarized distribution (macos-15-intel)", "skipped", sha, 2),
-		job(14, id, "Publish main installer", "skipped", sha, 2), job(15, id, "Verify Homebrew delivery", "skipped", sha, 2),
+		job(14, id, "Publish main installer", "skipped", sha, 2), job(15, id, "Publish Sparkle feed and homepage", "skipped", sha, 2),
 	}
 	r.gates = []map[string]any{job(20, build, "ci-required", "success", checkpointSHA, 3)}
 	r.app = []map[string]any{job(21, build, "Universal app", "success", checkpointSHA, 1)}
@@ -497,7 +497,7 @@ func (f *distributionRecoveryFixture) ticket() {
 
 func TestDistributionRecoveryTicketAndDeliveryOnlyRetries(t *testing.T) {
 	t.Parallel()
-	for _, variant := range []string{"ticket accepted", "ticket finished", "ticket legacy filename", "ticket bound filename", "publish", "homebrew", "retained signing", "publish validation failed", "homebrew signing failed", "missing intel", "delivery other failure", "legacy delivery", "ticket missing acceptance"} {
+	for _, variant := range []string{"ticket accepted", "ticket finished", "ticket legacy filename", "ticket bound filename", "publish", "pages", "homebrew job", "retained signing", "publish validation failed", "pages signing failed", "missing intel", "delivery other failure", "legacy delivery", "ticket missing acceptance"} {
 		t.Run(variant, func(t *testing.T) {
 			f := newDistributionRecoveryFixture(t)
 			f.ticket()
@@ -520,15 +520,18 @@ func TestDistributionRecoveryTicketAndDeliveryOnlyRetries(t *testing.T) {
 					job["conclusion"] = "success"
 				}
 				f.jobs[4]["conclusion"] = "failure"
-				if strings.HasPrefix(variant, "homebrew") {
+				if variant == "pages" || variant == "homebrew job" {
 					f.jobs[4]["conclusion"] = "success"
 					f.jobs[5]["conclusion"] = "failure"
+					if variant == "homebrew job" {
+						f.jobs[5]["name"] = "Verify Homebrew delivery"
+					}
 				}
 				switch variant {
 				case "publish validation failed":
 					f.jobs[2]["conclusion"] = "failure"
 					want = 0
-				case "homebrew signing failed":
+				case "pages signing failed":
 					f.jobs[1]["conclusion"] = "failure"
 					want = 0
 				case "missing intel":
