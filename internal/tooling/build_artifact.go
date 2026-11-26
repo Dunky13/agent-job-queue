@@ -33,7 +33,7 @@ var archiveLinks = func() map[string]string {
 // archiveLinks before any extraction. Resource forks remain opaque __MACOSX
 // entries for ditto to restore on macOS.
 func checkedZIP(files []*zip.File) (map[string]*zip.File, error) {
-	result := make(map[string]*zip.File)
+	result, folded := make(map[string]*zip.File), make(map[string]*zip.File)
 	for _, file := range files {
 		name := strings.TrimSuffix(file.Name, "/")
 		if !artifactPath.MatchString(file.Name) || name == "" || path.Clean(name) != name || strings.HasPrefix(name, "/") || name == ".." || strings.HasPrefix(name, "../") {
@@ -46,14 +46,16 @@ func checkedZIP(files []*zip.File) (map[string]*zip.File, error) {
 		} else if !file.Mode().IsRegular() && !file.Mode().IsDir() {
 			return nil, errors.New("Unsafe source artifact archive entry")
 		}
-		if _, exists := result[name]; exists {
+		// Extraction runs on case-insensitive APFS, so names that differ only in case collide.
+		if _, exists := folded[strings.ToLower(name)]; exists {
 			return nil, errors.New("Duplicate source artifact archive entry")
 		}
 		result[name] = file
+		folded[strings.ToLower(name)] = file
 	}
 	for name := range result {
 		for parent := path.Dir(name); parent != "."; parent = path.Dir(parent) {
-			if file, exists := result[parent]; exists && !file.Mode().IsDir() {
+			if file, exists := folded[strings.ToLower(parent)]; exists && !file.Mode().IsDir() {
 				return nil, errors.New("Archive file shadows a directory")
 			}
 		}
