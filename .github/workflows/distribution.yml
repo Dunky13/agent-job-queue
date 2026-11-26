@@ -266,8 +266,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      # CI saves only per-job caches from main, so reuse its installer build read-only;
-      # a cold race build of the installer fixtures outlasts their one-minute build limit.
+      # No setup-go cache holds the race-built installer fixtures, so reuse CI's installer
+      # cache from main read-only; a cold build outlasts the fixtures' one-minute limit.
       - id: go-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
