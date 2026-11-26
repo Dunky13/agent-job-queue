@@ -360,7 +360,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         let point = NSPoint(x: view.bounds.maxX - offset,
                             y: view.isFlipped ? view.bounds.maxY - 22 : view.bounds.minY + 22)
         try postSystemClick(in: window, at: view.convert(point, to: nil))
-        try await settle(0.3)
+        // The system delivers the posted click asynchronously, later on a busy or freshly built host.
+        try await waitUntil { footerMenuOpenCount > 0 }
         try check(footerMenuOpenCount == 1 && controller.popover.isShown,
                   "firstSettingsClickOpensMenuInInactivePopover")
     }
