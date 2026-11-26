@@ -65,7 +65,7 @@ Independent Standards and Spec reviews (Opus) found no live regression and no ne
 - The update store read the running version when the coordinator was built. It is now a `QueueBackend` member read on first use, as before, and the store requires it.
 - The menu-bar status check could race a refresh already in flight. It now fails the queue through a real fixture read and waits for the error.
 - Vacuous count conditions in `UpdateTests` and `LearningTests` were removed; `LearningTests` now checks that a reload reads the selected profile from the fixture. `ResumeUITests` refreshes through the fixture before checking that it recorded no change.
-- `firstSettingsClickOpensMenuInInactivePopover` failed on the first run after a build on this branch and on main's predecessor PR. The posted click arrives asynchronously, and the check waited a fixed 0.3 s; it now waits for the menu to open, up to 5 s.
+- `firstSettingsClickOpensMenuInInactivePopover` failed intermittently, here and on the window coordinator branch, always on the first run of a session and never on an immediate rerun. Its fixed 0.3 s wait for an asynchronously delivered click is now a wait for the menu, up to 5 s, but that did not remove the failure: one more first run failed afterwards. Fresh binaries, 4 minutes of idle and a bootstrap run beforehand did not reproduce it, and in every diagnosed pass the click reached the popover's settings button. The check now reports where the click landed when it fails, so the next failure names its cause. Not resolved.
 - Docs said the fixture only records what it would open or reveal; an update download is also recorded, as a change.
 
 ## Behaviour differences

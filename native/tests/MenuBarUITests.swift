@@ -359,9 +359,19 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         let offset = CommandLine.arguments.contains("--settings-chevron") ? 25.0 : 40.0
         let point = NSPoint(x: view.bounds.maxX - offset,
                             y: view.isFlipped ? view.bounds.maxY - 22 : view.bounds.minY + 22)
+        // Records where the posted click landed, so an intermittent failure names its cause.
+        var landed: [String] = []
+        let monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            landed.append(event.window === window ? "popover at \(event.locationInWindow)" : "another window")
+            return event
+        }
+        defer { if let monitor { NSEvent.removeMonitor(monitor) } }
         try postSystemClick(in: window, at: view.convert(point, to: nil))
         // The system delivers the posted click asynchronously, later on a busy or freshly built host.
         try await waitUntil { footerMenuOpenCount > 0 }
+        if footerMenuOpenCount != 1 {
+            FileHandle.standardError.write(Data("Settings click aimed at \(point) reached: \(landed.isEmpty ? "nothing in this app" : landed.joined(separator: ", ")); menus opened \(footerMenuOpenCount); app active \(NSApp.isActive)\n".utf8))
+        }
         try check(footerMenuOpenCount == 1 && controller.popover.isShown,
                   "firstSettingsClickOpensMenuInInactivePopover")
     }
