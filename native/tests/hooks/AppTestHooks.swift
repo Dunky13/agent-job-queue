@@ -65,27 +65,27 @@ extension AppDelegate {
             }
             if arguments.contains("--snapshot-remote-settings") {
                 window.contentView = NSHostingView(rootView: RemoteAccessSettings(store: coordinator.remoteStore))
-                window.minSize = NSSize(width: 500, height: 570)
-                window.setContentSize(NSSize(width: 580, height: 780))
+                window.minSize = QueueWindowKind.remote.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.remote.spec.size)
                 window.center()
             }
             if arguments.contains("--snapshot-agent-integration") {
                 window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: coordinator.integrationStore) {})
-                window.minSize = NSSize(width: 520, height: 540)
-                window.setContentSize(NSSize(width: 600, height: 720))
+                window.minSize = QueueWindowKind.integration.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.integration.spec.size)
                 window.center()
             }
             if arguments.contains("--snapshot-learning") {
                 if arguments.contains("--snapshot-learning-projects") { coordinator.learningStore.showFixtureLevel(.projects) }
                 window.contentView = NSHostingView(rootView: LearningWindow(store: coordinator.learningStore) {})
-                window.minSize = NSSize(width: 800, height: 550)
-                window.setContentSize(NSSize(width: 1000, height: 780))
+                window.minSize = QueueWindowKind.learning.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.learning.spec.size)
                 window.center()
             }
             if arguments.contains("--snapshot-updates") {
                 window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: coordinator.updateStore) {})
-                window.minSize = NSSize(width: 590, height: 500)
-                window.setContentSize(NSSize(width: 620, height: 620))
+                window.minSize = QueueWindowKind.updates.spec.minSize ?? .zero
+                window.setContentSize(QueueWindowKind.updates.spec.size)
                 window.center()
             }
         }

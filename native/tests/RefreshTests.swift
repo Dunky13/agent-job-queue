@@ -227,7 +227,7 @@ struct RefreshTests {
         try check(commands == Array(repeating: .remoteStatus, count: 5), "Restarted polling keeps the 5 s cadence")
     }
 
-    /// Every store the coordinator builds, and the merge-target picker, reaches only the injected adapter.
+    /// Every store the coordinator builds, and the merge-target picker, sends its commands through the injected adapter.
     @MainActor private static func checkCoordinatorAdapters(_ check: (Bool, String) throws -> Void) async throws {
         let log = CommandLog()
         let coordinator = WindowCoordinator(command: { await log.record($0); throw ClientError.message("Recorded") },

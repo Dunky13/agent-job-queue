@@ -1137,7 +1137,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate, QueueSurface {
         popover.behavior = .applicationDefined
         popover.delegate = self
         popover.contentSize = NSSize(width: 500, height: 650)
-        popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, app: app, tracksVisibility: false))
+        popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, app: app, refreshesOnAppear: false))
         if let button = self.statusItem.button {
             button.image = NSImage(systemSymbolName: QueueBrand.symbolName, accessibilityDescription: nil)
             button.image?.isTemplate = true
@@ -1348,18 +1348,18 @@ struct QueuePanel: View {
     @ObservedObject var store: QueueStore
     let app: QueueAppRoutes
     var fullWindow = false
-    var tracksVisibility = true
+    var refreshesOnAppear = true
     @StateObject private var navigation: QueueNavigation
     // The requested value shows until the queue reports it, so a menu never snaps back mid-change.
     @State private var pendingLimit: Int?
     @State private var pendingMode: SchedulingMode?
 
-    init(store: QueueStore, app: QueueAppRoutes, fullWindow: Bool = false, tracksVisibility: Bool = true,
+    init(store: QueueStore, app: QueueAppRoutes, fullWindow: Bool = false, refreshesOnAppear: Bool = true,
          navigation: QueueNavigation = QueueNavigation()) {
         self.store = store
         self.app = app
         self.fullWindow = fullWindow
-        self.tracksVisibility = tracksVisibility
+        self.refreshesOnAppear = refreshesOnAppear
         _navigation = StateObject(wrappedValue: navigation)
     }
 
@@ -1410,7 +1410,7 @@ struct QueuePanel: View {
         .frame(minWidth: 470, minHeight: 440)
         .frame(width: fullWindow ? nil : 500, height: fullWindow ? nil : 650)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear { if tracksVisibility { store.appear() } }
+        .onAppear { if refreshesOnAppear { store.appear() } }
         .onChange(of: store.snapshot?.queue.limit) { pendingLimit = nil }
         .onChange(of: store.snapshot?.scheduler?.mode) { pendingMode = nil }
         .onChange(of: store.error) { pendingLimit = nil; pendingMode = nil }
@@ -2109,8 +2109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     @objc private func selectApplicationAction(_ sender: NSMenuItem) {
-        guard let action = QueueAppAction(rawValue: sender.tag) else { return }
-        coordinator?.perform(action)
+        guard let action = QueueAppAction(rawValue: sender.tag) else { preconditionFailure("Application menu item has no app action") }
+        guard let coordinator else { preconditionFailure("Application menu used before the coordinator exists") }
+        coordinator.perform(action)
     }
 
     func makeMainMenu() -> NSMenu {

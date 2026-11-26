@@ -92,6 +92,12 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try await Task.sleep(for: .seconds(interval))
     }
 
+    /// Waits for an asynchronous window change such as the miniaturize animation, up to 5 s.
+    private func waitUntil(_ condition: () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition() && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+    }
+
     private func click(count: Int = 1, secondary: Bool = false,
                        modifiers: NSEvent.ModifierFlags = []) throws {
         guard let button = controller?.statusItem.button, let window = button.window else {
@@ -173,13 +179,13 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         try check(coordinator.windows[.queue] === queueWindow && queueWindow?.isVisible == true,
                   "doubleClickReopensClosedSingletonWindow")
         queueWindow?.miniaturize(nil)
-        try await settle(0.3)
+        try await waitUntil { queueWindow?.isMiniaturized == true }
         try check(queueWindow?.isMiniaturized == true, "mainWindowCanBeMiniaturized")
         try check(store.surfaces.visibleCount == 0, "miniaturizedQueueWindowLeavesNoVisibleQueueSurface")
         if let item = controller.menu.items.first(where: { $0.action != nil && $0.tag == QueueAppAction.openWindow.rawValue }) {
             controller.menu.performActionForItem(at: controller.menu.index(of: item))
         }
-        try await settle(0.3)
+        try await waitUntil { queueWindow?.isVisible == true && queueWindow?.isMiniaturized == false }
         try check(coordinator.windows[.queue] === queueWindow && queueWindow?.isVisible == true && queueWindow?.isMiniaturized == false,
                   "openWindowRestoresMiniaturizedSingleton")
         try check(store.surfaces.visibleCount == 1, "restoredQueueWindowCountsAsVisibleQueueSurface")
@@ -291,8 +297,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
             try check(window.identifier == nil, "\(title) window has no identifier")
             try check(!window.isReleasedWhenClosed, "\(title) window survives closing")
             try check(window.contentRect(forFrameRect: window.frame).size == size, "\(title) window opens at its content size")
-            // SwiftUI replaces the live minSize with one derived from the content, so pin the configured value.
-            try check(kind.spec.minSize == minimum, "\(title) window configures its minimum size")
+            // SwiftUI replaces the live minSize with one derived from its content, so check the factory with plain content.
+            try check(kind.spec.makeWindow(content: NSView()).minSize == minimum, "\(title) window applies its minimum size")
             window.close()
             try await settle()
             coordinator.perform(action)
@@ -302,7 +308,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         let remote = coordinator.windows[.remote]
         try check(coordinator.remoteStore.surfaces.visibleCount == 1, "openRemoteWindowIsAVisibleRemoteSurface")
         remote?.miniaturize(nil)
-        try await settle(0.3)
+        try await waitUntil { remote?.isMiniaturized == true }
         try check(coordinator.remoteStore.surfaces.visibleCount == 0, "miniaturizedRemoteWindowLeavesNoVisibleRemoteSurface")
         remote?.close()
     }

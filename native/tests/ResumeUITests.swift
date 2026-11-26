@@ -114,7 +114,7 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
             window.isReleasedWhenClosed = false
             window.appearance = NSAppearance(named: .darkAqua)
             let view = NSHostingView(rootView: QueuePanel(store: store, app: coordinator.routes, fullWindow: fullWindow,
-                                                         tracksVisibility: false, navigation: QueueNavigation()))
+                                                         refreshesOnAppear: false, navigation: QueueNavigation()))
             window.contentView = view
             window.setContentSize(size)
             window.orderFront(nil)
