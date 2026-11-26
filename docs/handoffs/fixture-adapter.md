@@ -19,7 +19,7 @@ A test build launched with `--fixture` cannot reach the installed queue, its lau
 | --- | --- |
 | Controller commands, log reads, update checks, desktop requests, running version | `QueueBackend`, replaced as a whole by the fixture |
 | A command the fixture does not know | It throws; nothing is passed on |
-| Helper processes | A test build never builds the supervisor for a fixture launch. Independently, `makeSupervisor()` returns nil because `supervisesHelpers` requires `allowsInstallation`, which is false with `--fixture` |
+| Helper processes | `makeSupervisor()` returns nil because `supervisesHelpers` requires `allowsInstallation`, which is false with `--fixture`. Only a test that injects a fake supervisor gets one |
 | Setup and installation | `inspect()` answers `.legacy`, `serviceStatusRequests()` is empty and `allowsInstallation` is false |
 | Snapshot or verification hooks against a live app | They require the coordinator that the fixture built |
 | Test options on the shipped app | `validateDiagnostics()` refuses them |
@@ -30,7 +30,7 @@ Bootstrap guards:
 | --- | --- |
 | `allowsInstallation` is false with `--fixture` | Kept |
 | `isTestOption` and the release build's refusal | Kept |
-| Test build validation of `--fixture` and `--snapshot` values | Kept, and tightened: any other argument starting with `--fixture`, or a repeated `--fixture`, is refused, so no spelling can select the fixture backend while the guards read the launch as live |
+| Test build validation of `--fixture` and `--snapshot` values | Kept, and tightened: any other argument starting with `--fixture`, or a repeated `--fixture`, is refused, so on the real launch path no spelling can select the fixture backend while the guards read the launch as live. The test-only injected environment can differ from the process arguments |
 | `inspect()` returns `.legacy` for `--fixture` | Kept |
 | `serviceStatusRequests()` is empty for `--fixture` | Kept |
 | `makeSupervisor(fixtureMode:)` | Parameter removed. The flag came from the same command line that `--fixture` is read from, so `supervisesHelpers` already refuses those launches |
@@ -61,7 +61,7 @@ What the new checks cover:
 
 Independent Standards and Spec reviews (Opus) found no live regression and no new route from a fixture launch to the real controllers. Fixed:
 
-- A `--fixture` spelling the guards did not recognise could select the fixture backend while the launch read as live. Test builds now refuse such spellings, and `finishLaunching` skips the helper supervisor for any fixture launch.
+- A `--fixture` spelling the guards did not recognise could select the fixture backend while the launch read as live. Test builds now refuse such spellings. A second layer that skipped the supervisor for any fixture launch was dropped after re-review: it was redundant on the real launch path and removed the fake supervisor the bootstrap UI `supervised-quit` scenario injects.
 - The update store read the running version when the coordinator was built. It is now a `QueueBackend` member read on first use, as before, and the store requires it.
 - The menu-bar status check could race a refresh already in flight. It now fails the queue through a real fixture read and waits for the error.
 - Vacuous count conditions in `UpdateTests` and `LearningTests` were removed; `LearningTests` now checks that a reload reads the selected profile from the fixture. `ResumeUITests` refreshes through the fixture before checking that it recorded no change.

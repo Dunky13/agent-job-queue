@@ -142,8 +142,10 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
                 try check(list.bounds.height < pausedHeight, "\(name): paused control disappears after resume")
                 try capture(view, to: output.appendingPathComponent("resumed-\(name).png"))
             }
+            let readsBeforeRefresh = fixture.reads.count
             await coordinator.store.refresh()
-            try check(fixture.reads.contains(.status) && fixture.changes.isEmpty, "\(name): app controllers remain inert")
+            try check(fixture.reads.count > readsBeforeRefresh && fixture.reads.last == .status
+                && fixture.changes.isEmpty && fixture.desktopRequests.isEmpty, "\(name): app controllers remain inert")
             window.orderOut(nil)
             window.close()
         }

@@ -485,6 +485,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         fixture.snapshot = nil
         await coordinator.store.refresh()
         try await waitUntil { coordinator.store.error != nil }
+        try check(coordinator.store.error != nil, "statusFixtureFailsThroughRead")
         try check(shownTitle != "!" && controller.statusItem.button?.title == shownTitle, "statusTitleHoldsWidthWhilePopoverShown")
         controller.closePopover()
         try await settle()

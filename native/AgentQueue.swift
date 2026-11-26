@@ -1998,12 +1998,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `--fixture` in either argument list selects the stand-in backend, never the live one.
         let fixture = QueueFixture.launch(arguments: environment.arguments + CommandLine.arguments)
         let coordinator = fixture ?? WindowCoordinator(backend: .live)
-        // Whatever the bootstrap guards read, a fixture launch never starts the real helpers.
-        let helpers = fixture == nil ? makeSupervisor(environment) : nil
         #else
         let coordinator = WindowCoordinator(backend: .live)
-        let helpers = makeSupervisor(environment)
         #endif
+        let helpers = makeSupervisor(environment)
         self.coordinator = coordinator
         coordinator.showMenuBar(statusItem: statusItem)
         if let helpers {
