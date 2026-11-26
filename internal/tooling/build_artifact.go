@@ -19,29 +19,68 @@ import (
 
 var artifactPath = regexp.MustCompile(`^[A-Za-z0-9./_+() -]+$`)
 
-// checkedZIP refuses ambiguous paths and links before any extraction. Resource
-// forks remain opaque __MACOSX entries for ditto to restore on macOS.
+// archiveLinks are the only links an app archive may hold: Sparkle's framework
+// version links, each with its exact target.
+var archiveLinks = func() map[string]string {
+	links := make(map[string]string)
+	for name, target := range backend.SparkleLinks() {
+		links["Agent Queue.app/"+backend.SparkleFramework+"/"+name] = target
+	}
+	return links
+}()
+
+// checkedZIP refuses ambiguous paths, special files and links other than
+// archiveLinks before any extraction. Resource forks remain opaque __MACOSX
+// entries for ditto to restore on macOS.
 func checkedZIP(files []*zip.File) (map[string]*zip.File, error) {
-	result := make(map[string]*zip.File)
+	result, folded := make(map[string]*zip.File), make(map[string]*zip.File)
 	for _, file := range files {
 		name := strings.TrimSuffix(file.Name, "/")
-		if !artifactPath.MatchString(file.Name) || name == "" || path.Clean(name) != name || strings.HasPrefix(name, "/") || name == ".." || strings.HasPrefix(name, "../") ||
-			(!file.Mode().IsRegular() && !file.Mode().IsDir()) {
+		if !artifactPath.MatchString(file.Name) || name == "" || path.Clean(name) != name || strings.HasPrefix(name, "/") || name == ".." || strings.HasPrefix(name, "../") {
 			return nil, errors.New("Unsafe source artifact archive entry")
 		}
-		if _, exists := result[name]; exists {
+		if file.Mode()&os.ModeSymlink != 0 {
+			if err := checkedLink(file, name); err != nil {
+				return nil, err
+			}
+		} else if !file.Mode().IsRegular() && !file.Mode().IsDir() {
+			return nil, errors.New("Unsafe source artifact archive entry")
+		}
+		// Extraction runs on case-insensitive APFS, so names that differ only in case collide.
+		if _, exists := folded[strings.ToLower(name)]; exists {
 			return nil, errors.New("Duplicate source artifact archive entry")
 		}
 		result[name] = file
+		folded[strings.ToLower(name)] = file
 	}
 	for name := range result {
 		for parent := path.Dir(name); parent != "."; parent = path.Dir(parent) {
-			if file, exists := result[parent]; exists && !file.Mode().IsDir() {
+			if file, exists := folded[strings.ToLower(parent)]; exists && !file.Mode().IsDir() {
 				return nil, errors.New("Archive file shadows a directory")
 			}
 		}
 	}
 	return result, nil
+}
+
+// A ZIP stores a link's target as its contents.
+func checkedLink(file *zip.File, name string) error {
+	expected, allowed := archiveLinks[name]
+	if !allowed || file.Name != name || file.UncompressedSize64 != uint64(len(expected)) {
+		return fmt.Errorf("Unexpected symlink in source artifact: %s", name)
+	}
+	reader, err := file.Open()
+	if err != nil {
+		return err
+	}
+	target, err := io.ReadAll(io.LimitReader(reader, int64(len(expected))+1))
+	if err = errors.Join(err, reader.Close()); err != nil {
+		return err
+	}
+	if string(target) != expected {
+		return fmt.Errorf("Unexpected symlink in source artifact: %s", name)
+	}
+	return nil
 }
 
 func zipMetadata(file *zip.File) ([]byte, error) {

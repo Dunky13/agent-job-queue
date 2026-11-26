@@ -1,6 +1,8 @@
 package tooling
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -29,12 +31,19 @@ func buildArtifactFixture(t *testing.T, change func(map[string][]byte)) (string,
 		base + "Contents/Resources/payload/source/VERSION":         []byte("0.1.0\n"),
 		base + "Contents/MacOS/AgentQueue":                         []byte("original executable bytes"),
 	}
+	for name, target := range archiveLinks {
+		contents[name] = []byte(target)
+	}
 	if change != nil {
 		change(contents)
 	}
 	var entries []checkpointEntry
 	for name, data := range contents {
-		entries = append(entries, checkpointEntry{name, data, 0755})
+		mode := os.FileMode(0755)
+		if _, link := archiveLinks[name]; link {
+			mode |= os.ModeSymlink
+		}
+		entries = append(entries, checkpointEntry{name, data, mode})
 	}
 	inner := checkpointZIP(t, entries...)
 	asset := "Agent-Queue-0.1.0-universal.zip"
@@ -131,10 +140,68 @@ func TestBuildArtifactRejectsUntrustedIdentityAndArchivePaths(t *testing.T) {
 	}
 }
 
-func TestCheckpointOriginRequiresExactBytesModesAndResourceMetadata(t *testing.T) {
-	for _, variant := range []string{"same", "bytes", "mode", "xattr", "missing", "link"} {
+// Only Sparkle's version links pass, each with its exact target, and nothing may sit beneath one.
+func TestCheckedZIPAcceptsOnlySparkleLinks(t *testing.T) {
+	framework := "Agent Queue.app/" + backend.SparkleFramework + "/"
+	link := func(name, target string) checkpointEntry {
+		return checkpointEntry{name, []byte(target), os.ModeSymlink | 0755}
+	}
+	for variant, want := range map[string]string{
+		"exact":                "",
+		"retargeted":           "Unexpected symlink",
+		"stray":                "Unexpected symlink",
+		"outside the app":      "Unexpected symlink",
+		"named as a directory": "Unexpected symlink",
+		"beneath a link":       "shadows a directory",
+		"case-folded beneath":  "shadows a directory",
+		"case-folded link":     "Duplicate",
+	} {
 		t.Run(variant, func(t *testing.T) {
-			entries := []checkpointEntry{{"Agent Queue.app/", nil, os.ModeDir | 0755}, {"Agent Queue.app/executable", []byte("original"), 0755}, {"__MACOSX/._Agent Queue.app", []byte("opaque resource metadata"), 0600}}
+			var entries []checkpointEntry
+			for name, target := range archiveLinks {
+				if variant == "retargeted" && name == framework+"Versions/Current" {
+					target = "A" // the same length as "B", so only the target comparison refuses it
+				}
+				entries = append(entries, link(name, target))
+			}
+			switch variant {
+			case "stray":
+				entries = append(entries, link(framework+"Headers", "Versions/Current/Headers"))
+			case "outside the app":
+				entries = append(entries, link("Versions/Current", "B"))
+			case "named as a directory":
+				// A ZIP directory entry cannot carry data, so its declared size cannot match the target either.
+				entries = append(entries, checkpointEntry{framework + "Versions/Current/", nil, os.ModeSymlink | 0755})
+			case "beneath a link":
+				entries = append(entries, checkpointEntry{framework + "Versions/Current/Sparkle", []byte("shadowed"), 0755})
+			case "case-folded beneath":
+				entries = append(entries, checkpointEntry{framework + "versions/current/Sparkle", []byte("shadowed"), 0755})
+			case "case-folded link":
+				entries = append(entries, checkpointEntry{framework + "sparkle", []byte("replaces the link"), 0755})
+			}
+			data := checkpointZIP(t, entries...)
+			reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			files, err := checkedZIP(reader.File)
+			if want == "" {
+				if err != nil || len(files) != len(archiveLinks) {
+					t.Fatalf("exact links: %d entries, err %v", len(files), err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("got %v, want an error containing %q", err, want)
+			}
+		})
+	}
+}
+
+func TestCheckpointOriginRequiresExactBytesModesAndResourceMetadata(t *testing.T) {
+	for _, variant := range []string{"same", "bytes", "mode", "xattr", "missing", "link", "retargeted framework link"} {
+		t.Run(variant, func(t *testing.T) {
+			framework := "Agent Queue.app/" + backend.SparkleFramework + "/"
+			entries := []checkpointEntry{{"Agent Queue.app/", nil, os.ModeDir | 0755}, {"Agent Queue.app/executable", []byte("original"), 0755}, {"__MACOSX/._Agent Queue.app", []byte("opaque resource metadata"), 0600},
+				{framework + "Versions/Current", []byte("B"), os.ModeSymlink | 0755}}
 			original := checkpointZIP(t, entries...)
 			switch variant {
 			case "bytes":
@@ -147,6 +214,8 @@ func TestCheckpointOriginRequiresExactBytesModesAndResourceMetadata(t *testing.T
 				entries = entries[:2]
 			case "link":
 				entries[1].mode = os.ModeSymlink | 0777
+			case "retargeted framework link":
+				entries[3].data = []byte("A")
 			}
 			root := t.TempDir()
 			left, right := filepath.Join(root, "original.zip"), filepath.Join(root, "initial.zip")
