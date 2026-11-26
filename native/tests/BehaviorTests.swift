@@ -71,19 +71,19 @@ struct BehaviorTests {
             queue: QueueSummary(status: "paused", limit: original.queue.limit, running: 0,
                                 waiting: original.queue.waiting, legacyOccupied: false), jobs: original.jobs)
         let beforeResume = recorder.actions.count
-        try check(store.dispatchResume() == nil && recorder.actions.count == beforeResume,
+        try check(store.dispatch(.resume) == nil && recorder.actions.count == beforeResume,
                   "Read-only fixtures cannot dispatch Resume even with an action recorder")
         store.snapshot = original
         navigation.show(queued)
         navigation.back()
         try check(navigation.selected == nil, "Done returns to queue navigation")
-        for action in [ConfirmationAction.start, .cancel] {
+        for kind in [QueueConfirmationKind.start, .cancel] {
             let before = recorder.actions.count
-            navigation.request(action, job: queued)
+            navigation.request(kind, job: queued)
             try check(recorder.actions.count == before, "Opening confirmation sends no action")
             navigation.decline()
             try check(recorder.actions.count == before && navigation.confirmation == nil, "Declining confirmation sends no action")
-            navigation.request(action, job: queued)
+            navigation.request(kind, job: queued)
             let task = navigation.confirm(in: store)
             try check(task != nil && store.isMutating, "Confirm reserves action before I/O")
             try check(navigation.confirm(in: store) == nil, "Duplicate confirmation is rejected")
@@ -108,7 +108,7 @@ struct BehaviorTests {
         try check(decoded.resources?.observed?.summary.contains("Memory 1 GiB") == true &&
                   decoded.resources?.observed?.summary.contains(expectedPeak) == true,
                   "Native observations show current and peak memory with the current locale")
-        try check(decoded.canStart == false && !decoded.permitsStart,
+        try check(decoded.canStart == false && !QueueAction.start(decoded).isAllowed(in: nil),
                   "Native decoding preserves explicit start denial")
         store.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [measured])
         navigation.request(.start, job: queued)
@@ -116,6 +116,87 @@ struct BehaviorTests {
                   "Start confirmation rechecks explicit permission")
         store.snapshot = original
         navigation.decline()
+        func job(_ id: Int, state: String, canReorder: Bool, canCancel: Bool, canStart: Bool? = nil) -> QueueJob {
+            var job = QueueJob(id: id, state: state, title: "Action rules", project: "Fixture", branch: "", directory: "",
+                executable: "", priority: 0, queuePosition: nil, submittedAt: nil, startedAt: nil, finishedAt: nil,
+                exitCode: nil, logPath: "", canReorder: canReorder, canCancel: canCancel, phase: state)
+            job.canStart = canStart
+            return job
+        }
+        let movable = job(7, state: "queued", canReorder: true, canCancel: true)
+        let pinned = job(8, state: "waiting", canReorder: false, canCancel: true)
+        let denied = job(9, state: "waiting", canReorder: true, canCancel: true, canStart: false)
+        let granted = job(12, state: "waiting", canReorder: false, canCancel: true, canStart: true)
+        let running = job(10, state: "running", canReorder: true, canCancel: true)
+        let finished = job(11, state: "succeeded", canReorder: false, canCancel: false)
+        func allowed(_ action: QueueAction, _ expected: Bool, _ name: String) throws {
+            try check(action.isAllowed(in: nil) == expected, name)
+        }
+        try allowed(.next(movable), true, "Run next accepts a waiting reorderable job")
+        try allowed(.next(pinned), false, "Run next refuses a job that cannot be reordered")
+        try allowed(.next(running), false, "Run next refuses a running job")
+        try allowed(.next(finished), false, "Run next refuses a finished job")
+        try allowed(.last(movable), true, "Move to end accepts a waiting reorderable job")
+        try allowed(.last(running), false, "Move to end refuses a running job")
+        try allowed(.start(movable), true, "Start now falls back to reorderability when no start permission is reported")
+        try allowed(.start(denied), false, "Start now refuses a waiting job whose start permission is false, even when reorderable")
+        try allowed(.start(granted), true, "Start now accepts a waiting job whose start permission is true, even when not reorderable")
+        try allowed(.start(running), false, "Start now refuses a running job")
+        try allowed(.cancel(movable), true, "Cancel accepts a cancellable waiting job")
+        try allowed(.cancel(running), true, "Cancel accepts a cancellable running job")
+        try allowed(.cancel(finished), false, "Cancel refuses a job that cannot be cancelled")
+        let pausedQueue = QueueSnapshot(updatedAt: original.updatedAt, queue: QueueSummary(status: "Paused", limit: 2,
+            running: 0, waiting: 1, legacyOccupied: false), jobs: [movable])
+        var activeQueue = QueueSnapshot(updatedAt: original.updatedAt, queue: QueueSummary(status: "running", limit: 2,
+            running: 0, waiting: 1, legacyOccupied: false), jobs: [movable])
+        activeQueue.scheduler = QueueScheduler(mode: .fixed, available: true, reason: "", updatedAt: nil, host: nil)
+        try check(QueueAction.resume.isAllowed(in: pausedQueue), "Resume is allowed on a paused queue")
+        try check(!QueueAction.resume.isAllowed(in: activeQueue), "Resume is refused on a running queue")
+        try check(!QueueAction.resume.isAllowed(in: nil), "Resume is refused without a snapshot")
+        for limit in QueueAction.limits {
+            try check(QueueAction.limit(limit).isAllowed(in: nil) == true, "Limit \(limit) is in range")
+        }
+        try check(!QueueAction.limit(0).isAllowed(in: nil) && !QueueAction.limit(9).isAllowed(in: nil), "Limit outside one to eight is refused")
+        try check(QueueAction.limit(3).isAllowed(in: activeQueue), "Limit accepts a different value")
+        try check(!QueueAction.limit(2).isAllowed(in: activeQueue), "Limit refuses the current value")
+        try check(QueueAction.scheduling(.adaptive).isAllowed(in: activeQueue), "Scheduling accepts a different mode")
+        try check(!QueueAction.scheduling(.fixed).isAllowed(in: activeQueue), "Scheduling refuses the current mode")
+        try check(!QueueAction.scheduling(.adaptive).isAllowed(in: pausedQueue), "Scheduling needs a reported scheduler")
+        let sent: [(QueueAction, [String], String, Bool)] = [
+            (.next(movable), ["next", "7"], "Job #7 will run next.", false),
+            (.last(movable), ["last", "7"], "Job #7 moved to the end.", false),
+            (.start(movable), ["start", "7"], "Job #7 requested to start outside the parallel limit.", true),
+            (.cancel(movable), ["cancel", "7"], "Cancellation requested for job #7.", true),
+            (.resume, ["resume"], "Queue resumed.", false),
+            (.limit(3), ["limit", "3"], "Parallel job limit changed to 3.", false),
+            (.scheduling(.shadow), ["scheduling", "shadow"], "Scheduling changed to Learn only.", false)]
+        for (action, arguments, notice, confirms) in sent {
+            try check(action.command.arguments == arguments, "\(action.name) sends its controller arguments")
+            try check(action.notice == notice, "\(action.name) shows its notice")
+            try check((action.confirmation != nil) == confirms, "\(action.name) confirmation need")
+        }
+        for kind in [QueueConfirmationKind.start, .cancel] {
+            try check(kind.action(for: movable).confirmation == kind && kind.action(for: movable).name == kind.rawValue,
+                      "\(kind.rawValue) confirmation builds the matching action")
+        }
+        // Any command reaching this store fails and sets its error; it ignores the CLI fixture.
+        let rejecting = QueueStore(statusLoader: { Data() }, command: { _ in throw ClientError.message("A command was sent") },
+                                   arguments: [])
+        rejecting.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [running])
+        try check(rejecting.dispatch(.next(running)) == nil && !rejecting.isMutating, "The store rejects a disallowed action")
+        await rejecting.dispatch(.cancel(running))?.value
+        try check(rejecting.error?.contains("A command was sent") == true, "The rejecting store sends an allowed action")
+        // Surfaces go through navigation: confirming actions only ask, the others are sent.
+        let surface = QueueNavigation()
+        rejecting.error = nil
+        try check(surface.perform(.cancel(running), in: rejecting) == nil, "A confirming action sends nothing yet")
+        try check(surface.confirmation?.kind == .cancel && !rejecting.isMutating, "A confirming action asks before sending")
+        surface.decline()
+        rejecting.snapshot = QueueSnapshot(updatedAt: original.updatedAt, queue: original.queue, jobs: [movable])
+        let sentTask = surface.perform(.next(movable), in: rejecting)
+        try check(sentTask != nil && surface.confirmation == nil && rejecting.isMutating, "A non-confirming action is sent without asking")
+        await sentTask?.value
+        try check(!rejecting.isMutating && rejecting.error?.contains("A command was sent") == true, "The sent action reaches the command")
         let passwords: [(String, Bool)] = [("", false), ("abc", false), ("word", true), ("2468", true),
             ("simple", true), (String(repeating: "a", count: 72), true),
             (String(repeating: "a", count: 73), false), (String(repeating: "é", count: 36), true),

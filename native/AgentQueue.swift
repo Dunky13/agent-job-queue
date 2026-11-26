@@ -170,7 +170,6 @@ struct QueueJob: Codable, Identifiable, Sendable, Equatable {
     var name: String { title.isEmpty ? executable : title }
     var isWaiting: Bool { state == "queued" || state == "waiting" }
     var isRunning: Bool { state == "running" || state == "starting" || state == "cancelling" }
-    var permitsStart: Bool { isWaiting && (canStart ?? canReorder) }
     var distinctPhase: String? {
         let display = phase.replacingOccurrences(of: "_", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -691,7 +690,7 @@ final class QueueStore: ObservableObject {
     var running: [QueueJob] { prepared?.running ?? [] }
     var waiting: [QueueJob] { prepared?.waiting ?? [] }
     var recent: [QueueJob] { prepared?.recent ?? [] }
-    var isPaused: Bool { snapshot?.queue.status.lowercased() == "paused" }
+    var isPaused: Bool { QueueAction.resume.isAllowed(in: snapshot) }
     var actionsDisabled: Bool {
         #if AGENT_QUEUE_TEST_HOOKS
         if fixtureMode && fixtureRecorder == nil { return true }
@@ -755,110 +754,42 @@ final class QueueStore: ObservableObject {
     }
 
     @discardableResult
-    func dispatch(_ action: String, job: QueueJob) -> Task<Void, Never>? {
-        guard !actionsDisabled, ["next", "last", "cancel", "start"].contains(action) else { return nil }
-        guard action == "cancel" ? job.canCancel : action == "start" ? job.permitsStart : job.isWaiting && job.canReorder else { return nil }
+    func dispatch(_ action: QueueAction) -> Task<Void, Never>? {
+        guard !actionsDisabled, action.isAllowed(in: snapshot) else { return nil }
+        // Only job actions reach a fixture recorder; queue-level changes stay refused in fixtures.
+        guard action.job != nil || !fixtureMode else { return nil }
         // Reserve before scheduling asynchronous I/O so polling and other windows
         // cannot silently consume the user's confirmed action between these steps.
         isMutating = true
+        if action == .resume { isResuming = true }
         mutationRevision += 1
         notice = nil
-        return Task { await completeAction(action, job: job) }
+        return Task { await complete(action) }
     }
 
-    private func completeAction(_ action: String, job: QueueJob) async {
+    private func complete(_ action: QueueAction) async {
         #if AGENT_QUEUE_TEST_HOOKS
         if fixtureMode {
             // Fixture actions can only reach this recorder, never the live CLI.
-            fixtureRecorder?.record(action: action, jobID: job.id)
+            if let job = action.job { fixtureRecorder?.record(action: action.name, jobID: job.id) }
+            isResuming = false
             isMutating = false
             return
         }
         #endif
         do {
-            _ = try await command(.jobAction(action, id: job.id))
-            switch action {
-            case "next": notice = "Job #\(job.id) will run next."
-            case "last": notice = "Job #\(job.id) moved to the end."
-            case "start": notice = "Job #\(job.id) requested to start outside the parallel limit."
-            default: notice = "Cancellation requested for job #\(job.id)."
-            }
+            _ = try await command(action.command)
+            notice = action.notice
             error = nil
         } catch {
             self.error = error.localizedDescription
-            isMutating = false
-            return
-        }
-        isMutating = false
-        await refresh()
-    }
-
-    @discardableResult
-    func dispatchResume() -> Task<Void, Never>? {
-        guard !fixtureMode, !actionsDisabled, isPaused else { return nil }
-        isMutating = true
-        isResuming = true
-        mutationRevision += 1
-        notice = nil
-        return Task {
-            do {
-                _ = try await command(.resume)
-                notice = "Queue resumed."
-                error = nil
-            } catch {
-                self.error = error.localizedDescription
-                isResuming = false
-                isMutating = false
-                return
-            }
             isResuming = false
             isMutating = false
-            await refresh()
-        }
-    }
-
-    @discardableResult
-    func dispatchLimit(_ limit: Int) -> Task<Void, Never>? {
-        guard !fixtureMode, !actionsDisabled, (1...8).contains(limit) else { return nil }
-        isMutating = true
-        mutationRevision += 1
-        notice = nil
-        return Task { await completeLimit(limit) }
-    }
-
-    private func completeLimit(_ limit: Int) async {
-        do {
-            _ = try await command(.limit(limit))
-            notice = "Parallel job limit changed to \(limit)."
-            error = nil
-        } catch {
-            self.error = error.localizedDescription
-            isMutating = false
             return
         }
+        isResuming = false
         isMutating = false
         await refresh()
-    }
-
-    @discardableResult
-    func dispatchScheduling(_ mode: SchedulingMode) -> Task<Void, Never>? {
-        guard !fixtureMode, !actionsDisabled, let scheduler = snapshot?.scheduler, scheduler.mode != mode else { return nil }
-        isMutating = true
-        mutationRevision += 1
-        notice = nil
-        return Task {
-            do {
-                _ = try await command(.scheduling(mode))
-                notice = "Scheduling changed to \(mode.label)."
-                error = nil
-            } catch {
-                self.error = error.localizedDescription
-                isMutating = false
-                return
-            }
-            isMutating = false
-            await refresh()
-        }
     }
 }
 
@@ -1492,12 +1423,8 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
     }
 }
 
-enum ConfirmationAction: String, CaseIterable {
-    case start, cancel
-}
-
 struct QueueConfirmation {
-    let action: ConfirmationAction
+    let kind: QueueConfirmationKind
     let job: QueueJob
 }
 
@@ -1507,27 +1434,26 @@ final class QueueNavigation: ObservableObject {
     @Published var confirmation: QueueConfirmation?
     func show(_ job: QueueJob) { selected = job }
     func back() { selected = nil }
-    func request(_ action: ConfirmationAction, job: QueueJob) {
+    func request(_ kind: QueueConfirmationKind, job: QueueJob) {
         selected = nil
-        confirmation = QueueConfirmation(action: action, job: job)
+        confirmation = QueueConfirmation(kind: kind, job: job)
     }
     func decline() { confirmation = nil }
+
+    /// The one entry point for surfaces: asks first when the action needs confirmation.
+    @discardableResult
+    func perform(_ action: QueueAction, in store: QueueStore) -> Task<Void, Never>? {
+        guard let kind = action.confirmation else { return store.dispatch(action) }
+        if let job = action.job { request(kind, job: job) }
+        return nil
+    }
 
     func unavailability(in store: QueueStore) -> String? {
         guard let confirmation else { return "No action is awaiting confirmation." }
         guard let current = store.snapshot?.jobs.first(where: { $0.id == confirmation.job.id }) else {
             return "This job is no longer in the current queue. Return to the queue to see its latest status."
         }
-        switch confirmation.action {
-        case .start:
-            guard current.permitsStart else {
-                return "This job cannot be started from its current state. Return to the queue to see its latest status."
-            }
-        case .cancel:
-            guard current.canCancel else {
-                return "This job is no longer available to cancel."
-            }
-        }
+        if !confirmation.kind.action(for: current).isAllowed(in: store.snapshot) { return confirmation.kind.unavailableMessage }
         return nil
     }
 
@@ -1536,7 +1462,7 @@ final class QueueNavigation: ObservableObject {
         guard !store.actionsDisabled, unavailability(in: store) == nil,
               let confirmation,
               let current = store.snapshot?.jobs.first(where: { $0.id == confirmation.job.id }) else { return nil }
-        guard let dispatch = store.dispatch(confirmation.action.rawValue, job: current) else { return nil }
+        guard let dispatch = store.dispatch(confirmation.kind.action(for: current)) else { return nil }
         // Reservation and consumption both finish before yielding the main actor.
         self.confirmation = nil
         return dispatch
@@ -1592,7 +1518,7 @@ struct QueuePanel: View {
             .opacity(overlaid ? 0 : 1).disabled(overlaid).accessibilityHidden(overlaid)
             if let confirmation = navigation.confirmation {
                 let currentJob = store.snapshot?.jobs.first(where: { $0.id == confirmation.job.id }) ?? confirmation.job
-                JobConfirmationPanel(action: confirmation.action, job: currentJob,
+                JobConfirmationPanel(kind: confirmation.kind, job: currentJob,
                     unavailable: navigation.unavailability(in: store), error: store.error,
                     disabled: store.actionsDisabled, onDecline: navigation.decline,
                     onConfirm: { navigation.confirm(in: store) })
@@ -1617,13 +1543,13 @@ struct QueuePanel: View {
     private var limitSelection: Binding<Int> {
         Binding(get: { pendingLimit ?? store.snapshot?.queue.limit ?? 1 },
                 set: { value in
-                    guard value != store.snapshot?.queue.limit, store.dispatchLimit(value) != nil else { return }
+                    guard store.dispatch(.limit(value)) != nil else { return }
                     pendingLimit = value
                 })
     }
     private var modeSelection: Binding<SchedulingMode> {
         Binding(get: { pendingMode ?? store.snapshot?.scheduler?.mode ?? .fixed },
-                set: { value in if store.dispatchScheduling(value) != nil { pendingMode = value } })
+                set: { value in if store.dispatch(.scheduling(value)) != nil { pendingMode = value } })
     }
 
     private var header: some View {
@@ -1644,7 +1570,7 @@ struct QueuePanel: View {
             }.font(.system(size: 12, weight: .medium))
             HStack(spacing: 14) {
                 Picker("Parallel", selection: limitSelection) {
-                    ForEach(1...8, id: \.self) { Text(String($0)).tag($0) }
+                    ForEach(QueueAction.limits, id: \.self) { Text(String($0)).tag($0) }
                 }
                 .fixedSize()
                 .help("How many jobs run at a time, 1 to 8. Lowering the limit lets active jobs finish.")
@@ -1713,7 +1639,7 @@ struct QueuePanel: View {
                             .foregroundStyle(.orange)
                         Spacer(minLength: 0)
                         Button(store.isResuming ? "Resuming…" : "Resume", systemImage: "play.fill") {
-                            store.dispatchResume()
+                            store.dispatch(.resume)
                         }
                         .buttonStyle(.bordered)
                         .fixedSize()
@@ -1797,17 +1723,17 @@ struct QueuePanel: View {
                 }
                 HStack(spacing: 2) {
                     // Icon buttons keep every row the same height; titles are in the tooltips and the ⋯ menu.
-                    if job.canReorder {
+                    if QueueAction.next(job).isAllowed(in: store.snapshot) {
                         iconAction("Run job \(job.id) next", symbol: "arrow.up.to.line", help: "Run job #\(job.id) after the current job finishes") {
-                            store.dispatch("next", job: job)
+                            navigation.perform(.next(job), in: store)
                         }
                         iconAction("Move job \(job.id) to the end", symbol: "arrow.down.to.line", help: "Move job #\(job.id) to the end of the queue") {
-                            store.dispatch("last", job: job)
+                            navigation.perform(.last(job), in: store)
                         }
                     }
-                    if job.permitsStart {
+                    if QueueAction.start(job).isAllowed(in: store.snapshot) {
                         iconAction("Start job \(job.id) now", symbol: "play.fill", help: "Start job #\(job.id) now, bypassing the parallel limit and adaptive resource checks") {
-                            navigation.request(.start, job: job)
+                            navigation.perform(.start(job), in: store)
                         }
                     }
                     Menu {
@@ -1817,19 +1743,19 @@ struct QueuePanel: View {
                                 AppRuntime.showLearningWindow(profileID: learning.id)
                             }
                         }
-                        if job.canReorder || job.permitsStart {
+                        if QueueAction.next(job).isAllowed(in: store.snapshot) || QueueAction.start(job).isAllowed(in: store.snapshot) {
                             Divider()
-                            if job.canReorder {
-                                Button("Run next", systemImage: "arrow.up.to.line") { store.dispatch("next", job: job) }.disabled(store.actionsDisabled)
-                                Button("Move to end", systemImage: "arrow.down.to.line") { store.dispatch("last", job: job) }.disabled(store.actionsDisabled)
+                            if QueueAction.next(job).isAllowed(in: store.snapshot) {
+                                Button("Run next", systemImage: "arrow.up.to.line") { navigation.perform(.next(job), in: store) }.disabled(store.actionsDisabled)
+                                Button("Move to end", systemImage: "arrow.down.to.line") { navigation.perform(.last(job), in: store) }.disabled(store.actionsDisabled)
                             }
-                            if job.permitsStart {
-                                Button("Start now…", systemImage: "play.fill") { navigation.request(.start, job: job) }.disabled(store.actionsDisabled)
+                            if QueueAction.start(job).isAllowed(in: store.snapshot) {
+                                Button("Start now…", systemImage: "play.fill") { navigation.perform(.start(job), in: store) }.disabled(store.actionsDisabled)
                             }
                         }
-                        if job.canCancel {
+                        if QueueAction.cancel(job).isAllowed(in: store.snapshot) {
                             Divider()
-                            Button("Cancel job…", systemImage: "stop.circle", role: .destructive) { navigation.request(.cancel, job: job) }.disabled(store.actionsDisabled)
+                            Button("Cancel job…", systemImage: "stop.circle", role: .destructive) { navigation.perform(.cancel(job), in: store) }.disabled(store.actionsDisabled)
                         }
                     } label: { Image(systemName: "ellipsis").frame(width: 22, height: 22) }
                         .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().help("Actions for job #\(job.id)")
@@ -1996,7 +1922,7 @@ struct RemoteAccessSettings: View {
 }
 
 struct JobConfirmationPanel: View {
-    let action: ConfirmationAction
+    let kind: QueueConfirmationKind
     let job: QueueJob
     let unavailable: String?
     let error: String?
@@ -2004,11 +1930,12 @@ struct JobConfirmationPanel: View {
     let onDecline: () -> Void
     let onConfirm: () -> Void
 
-    private var title: String { action == .start ? "Start this job now?" : "Cancel this job?" }
-    private var confirmLabel: String { action == .start ? "Start now" : "Cancel job" }
-    private var declineLabel: String { action == .start ? "Keep waiting" : "Keep job" }
+    private var starts: Bool { kind == .start }
+    private var title: String { starts ? "Start this job now?" : "Cancel this job?" }
+    private var confirmLabel: String { starts ? "Start now" : "Cancel job" }
+    private var declineLabel: String { starts ? "Keep waiting" : "Keep job" }
     private var explanation: String {
-        if action == .start {
+        if starts {
             return "This bypasses the parallel limit and adaptive resource checks and may increase CPU and memory pressure. Other queued jobs keep their order."
         }
         return job.isRunning || job.state == "paused"
@@ -2026,8 +1953,8 @@ struct JobConfirmationPanel: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    Image(systemName: action == .start ? "play.circle" : "stop.circle")
-                        .font(.system(size: 34, weight: .regular)).foregroundStyle(action == .start ? Color.orange : Color.red)
+                    Image(systemName: starts ? "play.circle" : "stop.circle")
+                        .font(.system(size: 34, weight: .regular)).foregroundStyle(starts ? Color.orange : Color.red)
                         .accessibilityHidden(true)
                     Text(title).font(.title2.weight(.semibold))
                     VStack(alignment: .leading, spacing: 7) {
@@ -2051,9 +1978,9 @@ struct JobConfirmationPanel: View {
                 Spacer()
                 Button(declineLabel, action: onDecline)
                 Button(confirmLabel, action: onConfirm).buttonStyle(.borderedProminent)
-                    .tint(action == .start ? Color.accentColor : Color.red)
+                    .tint(starts ? Color.accentColor : Color.red)
                     .disabled(disabled || unavailable != nil)
-                    .accessibilityIdentifier("confirm-\(action.rawValue)-job")
+                    .accessibilityIdentifier("confirm-\(kind.rawValue)-job")
             }.padding(18)
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
