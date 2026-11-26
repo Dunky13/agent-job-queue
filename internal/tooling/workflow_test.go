@@ -78,7 +78,11 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 				step.Uses == "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9" &&
 				step.Run == "" && (step.If == "${{ !cancelled() && steps.bootstrap-ui.outcome != 'skipped' }}" ||
 				step.If == "${{ !cancelled() && steps.resume-ui.outcome != 'skipped' }}")
-			if step.ContinueOnError || (step.If != "" && !retainsFailedFixture) {
+			// The Go cache is saved only from main, after every validation step passed.
+			savesMainCache := name != "native-tests" &&
+				step.Uses == "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9" && step.Run == "" &&
+				step.If == "github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'"
+			if step.ContinueOnError || (step.If != "" && !retainsFailedFixture && !savesMainCache) {
 				t.Fatalf("%s may skip or ignore a validation failure", name)
 			}
 			found = found || strings.TrimSpace(step.Run) == command
@@ -108,6 +112,61 @@ func TestMacOSGoAndNativeValidationHaveIndependentBudgets(t *testing.T) {
 		return !step.ContinueOnError && step.If == "" && strings.Contains(step.Run, `all(.[]; .result == "success")`)
 	}) {
 		t.Fatal("aggregate check no longer rejects incomplete validation")
+	}
+}
+
+// Pull requests must never write Go caches, and a cache save must not be able to
+// skip or follow a validation step.
+func TestGoCachesAreRestoredPerJobAndSavedOnlyFromMain(t *testing.T) {
+	type step struct {
+		ID   string            `yaml:"id"`
+		Uses string            `yaml:"uses"`
+		If   string            `yaml:"if"`
+		With map[string]string `yaml:"with"`
+	}
+	body, err := os.ReadFile("../../.github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []step `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(body, &workflow); err != nil {
+		t.Fatal(err)
+	}
+	const restore = "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+	const save = "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+	const mainOnly = "github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'"
+	goJobs := 0
+	for name, job := range workflow.Jobs {
+		usesGo, restored := false, false
+		for index, current := range job.Steps {
+			switch {
+			case strings.HasPrefix(current.Uses, "actions/setup-go@"):
+				usesGo = true
+				if current.With["cache"] != "false" {
+					t.Fatalf("%s lets setup-go write a shared cache from any branch", name)
+				}
+			case current.Uses == restore:
+				restored = current.ID == "go-cache" && current.If == "" && strings.HasSuffix(current.With["key"], "-${{ github.sha }}")
+			case current.Uses == save:
+				if current.If != mainOnly || index != len(job.Steps)-1 || current.With["key"] != "${{ steps.go-cache.outputs.cache-primary-key }}" {
+					t.Fatalf("%s saves a Go cache outside main or before validation finishes", name)
+				}
+			}
+		}
+		if usesGo {
+			goJobs++
+			last := job.Steps[len(job.Steps)-1]
+			if !restored || last.Uses != save {
+				t.Fatalf("%s must restore its own Go cache and save it last", name)
+			}
+		}
+	}
+	if goJobs == 0 {
+		t.Fatal("no Go jobs found")
 	}
 }
 

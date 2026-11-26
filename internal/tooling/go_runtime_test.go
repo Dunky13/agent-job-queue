@@ -30,6 +30,9 @@ type goRuntimeFixtureConfig struct {
 	inventory       string
 	inventoryStatus string
 	failTestCall    int
+	// weights replaces the repository's backend shard weights when set.
+	weights        string
+	missingWeights bool
 }
 
 func goRuntimeDefaultConfig(packages, listStatus, testStatus string) goRuntimeFixtureConfig {
@@ -80,6 +83,16 @@ test)
   exit 0;;
 *) exit 99;;
 esac`)
+	weights := []string{}
+	if config.weights != "" || config.missingWeights {
+		path := filepath.Join(root, "backend-weights.tsv")
+		if !config.missingWeights {
+			if err := os.WriteFile(path, []byte(config.weights), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		weights = append(weights, "AGENT_QUEUE_BACKEND_WEIGHTS="+path)
+	}
 	script, err := filepath.Abs("../../scripts/test-go-runtime.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -92,6 +105,7 @@ esac`)
 	cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"GO_RUNTIME_TEST_ROOT="+root, "GO_RUNTIME_LIST_STATUS="+config.listStatus, "GO_RUNTIME_TEST_STATUS="+config.testStatus,
 		"GO_RUNTIME_INVENTORY_STATUS="+config.inventoryStatus, "GO_RUNTIME_FAIL_TEST_CALL="+strconv.Itoa(config.failTestCall))
+	cmd.Env = append(cmd.Env, weights...)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
 		t.Fatalf("runtime script did not finish: %v: %s", ctx.Err(), output)
@@ -202,11 +216,12 @@ func TestGoRuntimeCoreHTTPSAndInstallerCoverOriginalScopeExactlyOnce(t *testing.
 		calls     [][]string
 		inventory bool
 	}{
-		{"core", [][]string{
-			append(append([]string{}, base...), backend, "-skip", goRuntimeInstallerPattern, "-timeout", "12m"),
+		{"core", [][]string{append(append([]string{}, base...), backend, "-skip", goRuntimeInstallerPattern, "-timeout", "12m")}, true},
+		// The gateway runs alone before the other runtime packages that share its caddy build.
+		{"https", [][]string{
+			append(append([]string{}, flagged...), packages[2], "-timeout", "12m"),
 			append(append([]string{}, flagged...), packages[3], packages[4], packages[5], packages[6], packages[7], "-timeout", "12m"),
-		}, true},
-		{"https", [][]string{append(append([]string{}, flagged...), packages[2], "-timeout", "12m")}, false},
+		}, false},
 		{"installer", [][]string{append(append([]string{}, base...), backend, "-run", goRuntimeInstallerPattern, "-timeout", "12m")}, true},
 	} {
 		root, err, output := goRuntimeFixture(t, strings.Join(packages, "\n"), "0", "0", suite.name)
@@ -217,7 +232,7 @@ func TestGoRuntimeCoreHTTPSAndInstallerCoverOriginalScopeExactlyOnce(t *testing.
 		if !reflect.DeepEqual(calls, suite.calls) {
 			t.Fatalf("%s changed scope or flags: got %q, want %q", suite.name, calls, suite.calls)
 		}
-		wantActions := "packages\ntests\n"
+		wantActions := "packages\n" + strings.Repeat("tests\n", len(calls))
 		if suite.inventory {
 			want := []string{"test", "-race", "-p", "2", "./internal/backend", "-list", goRuntimeInstallerPattern}
 			if got := goRuntimeArguments(t, root, "inventory"); !reflect.DeepEqual(got, want) {
@@ -361,26 +376,26 @@ func TestGoRuntimePreservesTestFailure(t *testing.T) {
 	}
 }
 
-func TestGoRuntimeCoreWithOnlyBackendAvoidsEmptyOtherInvocation(t *testing.T) {
+func TestGoRuntimeHTTPSWithOnlyRemoteAvoidsEmptyOtherInvocation(t *testing.T) {
 	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n" + goRuntimeModule + "/internal/remote\n"
-	root, err, output := goRuntimeFixture(t, packages, "0", "0", "core")
+	root, err, output := goRuntimeFixture(t, packages, "0", "0", "https")
 	if err != nil {
-		t.Fatalf("minimal core partition failed: %v: %s", err, output)
+		t.Fatalf("minimal HTTPS partition failed: %v: %s", err, output)
 	}
-	want := [][]string{{"test", "-p", "2", "-parallel", "2", "-race", goRuntimeModule + "/internal/backend", "-skip", goRuntimeInstallerPattern, "-timeout", "12m"}}
+	want := [][]string{{"test", "-p", "2", "-parallel", "2", "-race", goRuntimeBlowfishFlag, goRuntimeModule + "/internal/remote", "-timeout", "12m"}}
 	if got := goRuntimeTestCalls(t, root); !reflect.DeepEqual(got, want) {
-		t.Fatalf("minimal core tested an empty package selection: got %q, want %q", got, want)
+		t.Fatalf("minimal HTTPS tested an empty package selection: got %q, want %q", got, want)
 	}
 }
 
-func TestGoRuntimeCorePreservesOtherPackageFailure(t *testing.T) {
+func TestGoRuntimeHTTPSPreservesOtherPackageFailure(t *testing.T) {
 	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n" + goRuntimeModule + "/internal/remote\n" + goRuntimeModule + "/cmd/future\n"
 	config := goRuntimeDefaultConfig(packages, "0", "37")
 	config.failTestCall = 2
-	root, err, output := goRuntimeConfiguredFixture(t, config, "core")
+	root, err, output := goRuntimeConfiguredFixture(t, config, "https")
 	var exit *exec.ExitError
 	if !errors.As(err, &exit) || exit.ExitCode() != 37 || len(goRuntimeTestCalls(t, root)) != 2 {
-		t.Fatalf("other core package failure was lost: %v: %s", err, output)
+		t.Fatalf("other HTTPS package failure was lost: %v: %s", err, output)
 	}
 }
 
@@ -449,7 +464,7 @@ func TestGoRuntimeCoreShardsCoverInventoryAndPackagesExactlyOnce(t *testing.T) {
 		}
 		calls := goRuntimeTestCalls(t, root)
 		wantCount := 1
-		if scope == "core-1" {
+		if scope == "https" {
 			wantCount = 2
 		}
 		if len(calls) != wantCount {
@@ -534,18 +549,64 @@ func TestGoRuntimeCoreShardsRefuseIncompleteInventory(t *testing.T) {
 func TestGoRuntimeCoreShardsPreserveFailures(t *testing.T) {
 	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n" + goRuntimeModule + "/internal/remote\n" + goRuntimeModule + "/cmd/future\n"
 	for _, scope := range []string{"core-1", "core-2"} {
-		for _, call := range []int{1, 2} {
-			if scope == "core-2" && call == 2 {
-				continue
-			}
-			config := goRuntimeDefaultConfig(packages, "0", "37")
-			config.inventory = "TestAlpha\nTestBeta\n" + goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary
-			config.failTestCall = call
-			root, err, output := goRuntimeConfiguredFixture(t, config, scope)
-			var exit *exec.ExitError
-			if !errors.As(err, &exit) || exit.ExitCode() != 37 || len(goRuntimeTestCalls(t, root)) != call {
-				t.Fatalf("%s failure %d lost: %v: %s", scope, call, err, output)
-			}
+		config := goRuntimeDefaultConfig(packages, "0", "37")
+		config.inventory = "TestAlpha\nTestBeta\n" + goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary
+		root, err, output := goRuntimeConfiguredFixture(t, config, scope)
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 37 || len(goRuntimeTestCalls(t, root)) != 1 {
+			t.Fatalf("%s failure lost: %v: %s", scope, err, output)
 		}
+	}
+}
+
+func TestGoRuntimeCoreShardsBalanceMeasuredWeights(t *testing.T) {
+	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n" + goRuntimeModule + "/internal/remote\n"
+	config := goRuntimeDefaultConfig(packages, "0", "0")
+	// TestNew has no measurement and counts one second; TestStale no longer exists.
+	config.inventory = "TestA\nTestB\nTestC\nTestD\nTestHeavy\nTestNew\n" + goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary
+	config.weights = "# comment\n\nTestHeavy\t9000\nTestA\t1000\nTestB\t1000\nTestC\t1000\nTestD\t500\nTestStale\t99999\n"
+	for _, shard := range []struct{ scope, pattern, weights string }{
+		{"core-1", "^(TestHeavy)$", "Backend shard weights: 9000 ms and 4500 ms; 0 selected tests unweighted"},
+		{"core-2", "^(TestA|TestB|TestC|TestD|TestNew)$", "Backend shard weights: 9000 ms and 4500 ms; 1 selected tests unweighted"},
+	} {
+		root, err, output := goRuntimeConfiguredFixture(t, config, shard.scope)
+		if err != nil {
+			t.Fatalf("%s: %v: %s", shard.scope, err, output)
+		}
+		want := [][]string{{"test", "-p", "2", "-parallel", "2", "-race", "-v", goRuntimeModule + "/internal/backend", "-run", shard.pattern, "-timeout", "12m"}}
+		if got := goRuntimeTestCalls(t, root); !reflect.DeepEqual(got, want) || !strings.Contains(output, shard.weights) ||
+			!strings.Contains(output, "Backend weights: 1 recorded tests are no longer listed") {
+			t.Fatalf("%s did not balance measured weights: got %q, want %q: %s", shard.scope, got, want, output)
+		}
+	}
+}
+
+func TestGoRuntimeCoreShardsRefuseInvalidWeights(t *testing.T) {
+	packages := goRuntimeModule + "/internal/tooling\n" + goRuntimeModule + "/internal/backend\n" + goRuntimeModule + "/internal/remote\n"
+	for _, test := range []struct {
+		name, weights string
+		missing       bool
+	}{
+		{"missing file", "", true},
+		{"zero", "TestAlpha\t0\n", false},
+		{"fraction", "TestAlpha\t1.5\n", false},
+		{"space separated", "TestAlpha 10\n", false},
+		{"extra field", "TestAlpha\t10\t1\n", false},
+		{"duplicate", "TestAlpha\t10\nTestAlpha\t20\n", false},
+		{"benchmark", "BenchmarkAlpha\t10\n", false},
+		{"unsafe name", "TestAlpha|TestBeta\t10\n", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, scope := range []string{"core-1", "core-2"} {
+				config := goRuntimeDefaultConfig(packages, "0", "0")
+				config.inventory = "TestAlpha\nTestBeta\n" + goRuntimeInstallerTest + "\n" + goRuntimeInstallerSummary
+				config.weights, config.missingWeights = test.weights, test.missing
+				root, err, output := goRuntimeConfiguredFixture(t, config, scope)
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || !strings.Contains(strings.ToLower(output), "backend weight") || len(goRuntimeTestCalls(t, root)) != 0 {
+					t.Fatalf("%s accepted invalid weights: %v: %s", scope, err, output)
+				}
+			}
+		})
 	}
 }
