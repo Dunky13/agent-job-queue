@@ -53,7 +53,7 @@ func managedRelocationFixture(t *testing.T, pending bool, backup ...bool) (*mana
 	for _, service := range []string{"queue", "resources", "remote"} {
 		services[service] = old
 	}
-	print := m.services.print
+	answer := m.services.print
 	m.services.print = func(label string) ([]byte, error) {
 		service := map[string]string{"io.went.agent-heavy": "queue", "io.went.agent-resources": "resources", "io.went.agent-remote": "remote"}[label]
 		if service != "" && m.loaded[label] && m.statuses[service] == "enabled" {
@@ -65,7 +65,7 @@ func managedRelocationFixture(t *testing.T, pending bool, backup ...bool) (*mana
 			}
 			return []byte("program = " + filepath.Join(services[service], "Contents/MacOS", helper) + "\narguments = {\n" + helper + "\n" + command + "\n}\n"), nil
 		}
-		return print(label)
+		return answer(label)
 	}
 	original := i.command
 	i.command = func(ctx context.Context, args []string) ([]byte, error) {

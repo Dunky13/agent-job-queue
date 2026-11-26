@@ -314,12 +314,12 @@ func TestInstallerModernUpgradeRejectsMismatchedLoadedServicesBeforeMutation(t *
 				integrationTestWrite(t, filepath.Join(f.installer.config, "remote.json"), []byte(`{"enabled":true}`))
 			}
 			before := installTreeWitness(t, f.installer.root)
-			print := f.services.print
+			answer := f.services.print
 			f.services.print = func(asked string) ([]byte, error) {
 				if asked == label {
 					return []byte("program = /usr/bin/unrelated\narguments = {\n/usr/bin/unrelated\nserve\n}\n"), nil
 				}
-				return print(asked)
+				return answer(asked)
 			}
 			f.services.bootout = func(stopped string) { t.Fatalf("unverified service mutation: bootout %s", stopped) }
 			if err := f.run(t); err == nil {

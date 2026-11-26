@@ -34,12 +34,12 @@ func TestInstallerPhoneAccessRecoveryLegacyRemoteVirtualenv(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.loaded["io.went.agent-remote"] = true
-			print := f.services.print
+			answer := f.services.print
 			f.services.print = func(label string) ([]byte, error) {
 				if kind == "loaded-mismatch" && label == "io.went.agent-remote" {
 					return []byte("program = /usr/bin/unrelated\narguments = {\n/usr/bin/unrelated\nserve\n}\n"), nil
 				}
-				return print(label)
+				return answer(label)
 			}
 			originalCommand := install.command
 			install.command = func(ctx context.Context, args []string) ([]byte, error) {

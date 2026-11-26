@@ -383,12 +383,12 @@ func TestManagedRemovalFinalCheckRefusalsSayToRetry(t *testing.T) {
 			i := m.installer
 			managedRemovalTarget(i)
 			reads, loaded := 0, false
-			print := m.services.print
+			answer := m.services.print
 			m.services.print = func(label string) ([]byte, error) {
 				if loaded && label == "io.went.agent-heavy" {
 					return []byte("state = running\n"), nil
 				}
-				return print(label)
+				return answer(label)
 			}
 			original := i.command
 			i.command = func(ctx context.Context, args []string) ([]byte, error) {

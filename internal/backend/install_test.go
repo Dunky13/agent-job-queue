@@ -1205,12 +1205,12 @@ func TestInstallerAbsentLegacyStatePublishesExplicitFreshDefaults(t *testing.T) 
 func TestInstallerLegacyLoadedOwnershipMismatchRefusesShutdown(t *testing.T) {
 	f := installTestFixture(t)
 	f.externalGoQueue(t)
-	print := f.services.print
+	answer := f.services.print
 	f.services.print = func(label string) ([]byte, error) {
 		if label == "io.went.agent-heavy" {
 			return []byte("program = /different/daemon\narguments = {\n/different/daemon\n}\n"), nil
 		}
-		return print(label)
+		return answer(label)
 	}
 	if err := f.run(t); err == nil || !strings.Contains(err.Error(), "differs") {
 		t.Fatalf("unowned loaded daemon accepted: %v", err)
@@ -1560,7 +1560,7 @@ func TestInstallerPhoneAccessRecoveryRejectsUnownedServices(t *testing.T) {
 				}
 			}
 			f.services.bootout = func(label string) { t.Fatalf("unowned service permitted a shutdown: bootout %s", label) }
-			print := f.services.print
+			answer := f.services.print
 			f.services.print = func(label string) ([]byte, error) {
 				if kind == "loaded-mismatch" && label == "io.went.agent-remote" {
 					return []byte("program = /usr/bin/unrelated\narguments = {\n/usr/bin/unrelated\nserve\n}\n"), nil
@@ -1568,7 +1568,7 @@ func TestInstallerPhoneAccessRecoveryRejectsUnownedServices(t *testing.T) {
 				if kind == "query-failed" && label == "io.went.agent-remote" {
 					return nil, errors.New("fixture service inspection failed")
 				}
-				return print(label)
+				return answer(label)
 			}
 			command := install.command
 			install.command = func(ctx context.Context, args []string) ([]byte, error) {
