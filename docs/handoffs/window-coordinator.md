@@ -11,6 +11,7 @@
 - **Clock:** both polling stores take a `PollSleep` closure that defaults to `Task.sleep` on `ContinuousClock`. `RemoteAccessStore.startPolling()` returns the new loop, or nil when it started none.
 - **Injected routes:** views and the menu bar controller receive `QueueAppRoutes` (`perform`, `openLearning`) through their initializers. `QueueMenuBarController.init` has no default performer.
 - **Setup window:** `AppDelegate` keeps its guard and reuse rule, because the window exists before the coordinator and an open one is not brought forward again. It is built from the same `QueueWindowSpec`, with its own style (no resize or close button).
+- **Menus and views:** `QueuePanel`'s `tracksVisibility` is renamed `refreshesOnAppear`, since visibility now comes from `QueueSurfaces` and the flag only decides whether the panel refreshes when it appears. An app menu item fails visibly (`preconditionFailure`) if it has no app action or runs before the coordinator exists; neither can happen today.
 - **Untouched:** `fixtureMode` and the PREVIEW badge behave as before. Store initializers keep their existing parameters and add only a defaulted one.
 
 ## Behaviour differences
@@ -33,19 +34,23 @@ So most windows report a live minimum far below the configured one. Resizing the
 
 ## Evidence
 
-Counts are from one run through the shared queue. Only `MenuBarUITests.swift` and this file changed afterwards.
+All on `8e76364` with a clean tree. The menu-bar suite ran directly from a logged-in session, because the shared queue's process has no event-posting permission and would skip its system-click checks; everything else ran through the shared queue.
 
 - `bash scripts/test-native.sh`: exit 0, 1125 PASS.
+- `bash native/tests/run-menu-bar-ui-tests.sh <scratch>/menu-bar.json`: exit 0, 86 PASS, 0 FAIL, 0 SKIP. One earlier run on `e55b5f2` failed `firstSettingsClickOpensMenuInInactivePopover`, an unchanged check that posts real clicks on screen; the rerun and every later run passed.
 - `bash native/tests/run-resume-ui-tests.sh <scratch dir>`: exit 0, 10 PASS.
+- `bash native/tests/run-resume-ui-tests.sh <scratch dir> --before-ref 2295abe1e786dd8b6b4984356c2b51583558d2d3` (the historical build CI uses): exit 0, 14 PASS.
 - `bash native/tests/run-bootstrap-ui-tests.sh <scratch dir>`: exit 0, 93 PASS.
 - `ARCHS=arm64 bash native/build.sh <scratch file>`: exit 0, so no test hook symbol reached the release binary.
 - `go run -p 2 ./cmd/queue-tool check-source`: exit 0.
-- `bash native/tests/run-menu-bar-ui-tests.sh <scratch>/menu-bar.json`: run by parent. The queued run stopped after 35 PASS on a window check that expected the configured `minSize`; the test now pins it on the window spec, and the updated target type-checks.
 
-- New headless `RefreshTests` checks drive both poll loops with a manual clock and count status loads: 2 s visible, 10 s hidden counted from the start, immediate load on appear, a window that is visible without announcing itself, popover and window together, remote 5 s, stop when hidden and restart when shown. A further check records that every coordinator store, including the merge-target picker, reaches only the injected adapter.
-- `MenuBarUITests` now also pins each window's title, content size, configured minimum size, style, identifier and reuse after closing, and queue and remote surface visibility when open, closed, miniaturized and restored. `BootstrapUITests` also pins the setup window's title and style.
-- `native/tests/run-resume-ui-tests.sh` rewrites the new calls back to the old ones for `--before-ref` builds. The rewritten text was compared by diff; a `--before-ref` build was not run.
-- `scripts/capture-native-screenshots.sh` was not run because it overwrites the committed screenshots.
+What the new checks cover:
+
+- New headless `RefreshTests` checks drive both poll loops with a manual clock and count status loads: 2 s visible, 10 s hidden counted from the start, immediate load on appear, a window that is visible without announcing itself, popover and window together, remote 5 s, stop when hidden and restart when shown. A further check records that every coordinator store, including the merge-target picker, sends its commands through the injected adapter. It shows the adapter is used, not that nothing else is: `JobDetail` still calls `QueueClient.logTail` directly (see Next steps).
+- `MenuBarUITests` now also pins each window's title, content size, style, identifier and reuse after closing, that the window factory applies each minimum size, and queue and remote surface visibility when open, closed, miniaturized and restored.
+- `BootstrapUITests` also pins the setup window's title and style.
+- Independent Standards and Spec reviews and a re-review of the fixes; all findings fixed except making `menuBarController` `private(set)`, which would need a test-only parameter.
+- `scripts/capture-native-screenshots.sh` was not run because it overwrites the committed screenshots; nothing visual changed.
 
 ## Next steps
 
