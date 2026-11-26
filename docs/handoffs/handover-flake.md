@@ -63,9 +63,10 @@ integration files that the daemon does not replace.
 - `internal/backend/queue_handover_test.go`: the live test backdates
   `expiresAt` only after both callers have printed job output written after the
   daemon exited. A caller copies output and reads the receipt in one loop, so
-  this proves every earlier read has finished. A second barrier per caller then
-  proves both keep following the expired released receipt (the queued caller was
-  not asserted before). No deadline, sleep or retry changed.
+  this proves every earlier read has finished. Two more barriers per caller
+  then prove each completed at least one read of the expired released receipt:
+  a read in flight at the first may have started before the rewrite. The queued
+  caller was not asserted before. No deadline, sleep or retry changed.
 - New `TestQueueHandoverReceiptReadSurvivesAtomicReplacement` covers race 2.
 
 ## Reproduction
@@ -103,3 +104,17 @@ All passed:
 The backend suite ran on base 219ff73 without the race detector.
 
 Not checked: hosted CI, and an Intel host.
+
+## Review dispositions
+
+An independent Opus review (Standards and Spec) confirmed the 0-link read is real
+on APFS (the new test fails 10 of 10 with the old check) and safe: the receipt is
+opened by path with `O_NOFOLLOW` under owner-checked 0700 directories and is only
+ever replaced whole by rename, so a 0-link file is a complete receipt that was
+current at open. More than one link is still refused.
+
+| Severity | Finding | Disposition |
+| --- | --- | --- |
+| Medium | One barrier per caller after the backdate did not prove a complete read of the expired receipt | Fixed: the active script gains a third command barrier and the queued caller a third log barrier, so each caller passes two barriers after the rewrite |
+| Low | `TestQueueHandoverReceiptReadSurvivesAtomicReplacement` cannot prove a 0-link read happened, so it could pass vacuously on another filesystem | Accepted: making it deterministic needs a test seam inside the reader; on APFS it fails 10 of 10 without the fix |
+| Low | The sibling `queuePrivateFilesInspect` looks a 0-link name up again instead of accepting it | Accepted: here the open descriptor already holds a complete receipt, so re-lookup adds nothing |
