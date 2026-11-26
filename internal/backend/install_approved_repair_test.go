@@ -79,7 +79,7 @@ func TestInstallerAutomaticLegacyServiceBackupRefusesChangedEvidence(t *testing.
 		t.Fatal("failed automatic backup changed original or retained evidence")
 	}
 	for _, call := range m.calls {
-		if len(call) > 2 && ((call[0] == "launchctl" && call[1] == "bootout") || (call[1] == "--service-management" && call[2] != "status")) {
+		if len(call) > 2 && ((call[0] == "service" && call[1] == "bootout") || (call[1] == "--service-management" && call[2] != "status")) {
 			t.Fatal("automatic setup stopped a service before retaining its original definition", call)
 		}
 	}

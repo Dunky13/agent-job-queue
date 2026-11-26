@@ -22,7 +22,7 @@ func TestPackagedSetupRetriesOnlyUnacceptedKernelBusy(t *testing.T) {
 		}
 		calls++
 		if calls == 1 {
-			f.calls = append(f.calls, []string{"launchctl", "print", "private-read"})
+			f.calls = append(f.calls, []string{"service", "print", "private-read"})
 			return fmt.Errorf("private scheduling lock: %w", syscall.EWOULDBLOCK)
 		}
 		return nil
@@ -33,7 +33,7 @@ func TestPackagedSetupRetriesOnlyUnacceptedKernelBusy(t *testing.T) {
 }
 
 func TestPackagedSetupNeverRetriesMutationOrUncertainHistory(t *testing.T) {
-	for _, phase := range []string{"existing-pending", "new-pending", "metadata", "wrapper", "same-content-replacement", "native", "menu", "launchctl", "lost-history", "changed-history"} {
+	for _, phase := range []string{"existing-pending", "new-pending", "metadata", "wrapper", "same-content-replacement", "native", "menu", "service", "lost-history", "changed-history"} {
 		t.Run(phase, func(t *testing.T) {
 			f := installTestFixture(t)
 			i := f.installer
@@ -65,8 +65,8 @@ func TestPackagedSetupNeverRetriesMutationOrUncertainHistory(t *testing.T) {
 					f.calls = append(f.calls, []string{"AgentQueue", "--service-management", "unregister", "resources"})
 				case "menu":
 					f.calls = append(f.calls, []string{"AgentQueue", "--prepare-app-replacement", i.app})
-				case "launchctl":
-					f.calls = append(f.calls, []string{"launchctl", "bootout", "private-service"})
+				case "service":
+					f.calls = append(f.calls, []string{"service", "bootout", "private-service"})
 				case "lost-history":
 					f.calls = nil
 				case "changed-history":

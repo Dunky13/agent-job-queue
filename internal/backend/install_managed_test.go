@@ -92,27 +92,27 @@ func managedTestFixture(t *testing.T) *managedFixture {
 			}
 			return nil, nil
 		}
-		if len(args) > 2 && args[0] == "launchctl" && args[1] == "print" {
-			label := filepath.Base(args[2])
-			service := map[string]string{"io.went.agent-heavy": "queue", "io.went.agent-resources": "resources", "io.went.agent-remote": "remote"}[label]
-			if service != "" && m.statuses[service] == "enabled" && f.loaded[label] {
-				f.calls = append(f.calls, slices.Clone(args))
-				helper, command := "agent-heavy", "daemon"
-				if service == "resources" {
-					command = "scheduler"
-				}
-				if service == "remote" {
-					helper, command = "agent-remote", "serve"
-				}
-				executable := filepath.Join(f.installer.app, "Contents/MacOS", helper)
-				return []byte("program = " + executable + "\narguments = {\n" + helper + "\n" + command + "\n}\n"), nil
-			}
-		}
 		if len(args) == 3 && args[0] == filepath.Join(f.installer.app, "Contents/MacOS/agent-heavy") && args[1] == "status" {
 			f.calls = append(f.calls, slices.Clone(args))
 			return mustMetadataJSON(t, Object{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": Object{"status": "running", "limit": 1, "running": 0, "waiting": 0}, "jobs": []any{}, "scheduler": Object{}}), nil
 		}
 		return original(ctx, args)
+	}
+	definition := f.services.output
+	f.services.output = func(label string) []byte {
+		service := map[string]string{"io.went.agent-heavy": "queue", "io.went.agent-resources": "resources", "io.went.agent-remote": "remote"}[label]
+		if service == "" || m.statuses[service] != "enabled" {
+			return definition(label)
+		}
+		helper, command := "agent-heavy", "daemon"
+		if service == "resources" {
+			command = "scheduler"
+		}
+		if service == "remote" {
+			helper, command = "agent-remote", "serve"
+		}
+		executable := filepath.Join(f.installer.app, "Contents/MacOS", helper)
+		return []byte("program = " + executable + "\narguments = {\n" + helper + "\n" + command + "\n}\n")
 	}
 	return m
 }
@@ -143,7 +143,7 @@ func TestManagedFreshInstallUsesOnlyBundleHelpers(t *testing.T) {
 		}
 	}
 	for _, args := range m.calls {
-		if args[0] == "launchctl" && args[1] != "print" {
+		if args[0] == "service" && args[1] != "print" {
 			t.Fatalf("fresh install used user service mutation %v", args)
 		}
 	}
@@ -218,12 +218,12 @@ func TestManagedResumedActivationRejectsWrongLoadedHelper(t *testing.T) {
 	if err := i.managedVerifyRegistrations(context.Background(), false, false, false); err != nil {
 		t.Fatal("registered helpers were refused", err)
 	}
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if slices.Equal(args, []string{"launchctl", "print", i.domain() + "/io.went.agent-heavy"}) {
+	original := m.services.print
+	m.services.print = func(label string) ([]byte, error) {
+		if label == "io.went.agent-heavy" {
 			return []byte("program = /unknown\narguments = {\n/unknown\n}\n"), nil
 		}
-		return original(ctx, args)
+		return original(label)
 	}
 	if err := i.managedVerifyRegistrations(context.Background(), false, false, false); err == nil {
 		t.Fatal("foreign readiness accepted")
@@ -259,7 +259,7 @@ func TestManagedDrainGatePrecedesEveryMutation(t *testing.T) {
 				t.Fatal("drain refusal mutated installation")
 			}
 			for _, args := range m.calls {
-				if args[0] == "launchctl" && args[1] != "print" || len(args) > 2 && args[1] == "--service-management" && args[2] != "status" {
+				if args[0] == "service" && args[1] != "print" || len(args) > 2 && args[1] == "--service-management" && args[2] != "status" {
 					t.Fatal("drain refusal mutated services", args)
 				}
 			}
@@ -328,12 +328,12 @@ func TestManagedRefusesUnownedAndCustomizedLegacyServices(t *testing.T) {
 			}
 			m.loaded["io.went.agent-heavy"] = true
 			if kind == "wrong-loaded-executable" {
-				original := i.command
-				i.command = func(ctx context.Context, args []string) ([]byte, error) {
-					if slices.Equal(args, []string{"launchctl", "print", i.domain() + "/io.went.agent-heavy"}) {
+				original := m.services.print
+				m.services.print = func(label string) ([]byte, error) {
+					if label == "io.went.agent-heavy" {
 						return []byte("program = /unknown\narguments = {\n/unknown\n}\n"), nil
 					}
-					return original(ctx, args)
+					return original(label)
 				}
 			}
 			before := installTreeWitness(t, i.home)
@@ -588,20 +588,20 @@ func TestManagedLegacyOwnershipIsRecheckedImmediatelyBeforeShutdown(t *testing.T
 		t.Fatal(err)
 	}
 	m.loaded["io.went.agent-heavy"] = true
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if slices.Equal(args, []string{"launchctl", "print", i.domain() + "/io.went.agent-heavy"}) {
+	original := m.services.print
+	m.services.print = func(label string) ([]byte, error) {
+		if label == "io.went.agent-heavy" {
 			if _, err := os.Stat(filepath.Join(i.root, "install-in-progress.json")); err == nil {
 				return []byte("program = /unknown\narguments = {\n/unknown\n}\n"), nil
 			}
 		}
-		return original(ctx, args)
+		return original(label)
 	}
 	if err := m.run(t); err == nil {
 		t.Fatal("changed loaded ownership accepted")
 	}
 	for _, args := range m.calls {
-		if len(args) > 1 && args[0] == "launchctl" && args[1] == "bootout" {
+		if len(args) > 1 && args[0] == "service" && args[1] == "bootout" {
 			t.Fatal("stopped changed process", args)
 		}
 	}

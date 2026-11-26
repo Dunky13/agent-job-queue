@@ -53,25 +53,25 @@ func managedRelocationFixture(t *testing.T, pending bool, backup ...bool) (*mana
 	for _, service := range []string{"queue", "resources", "remote"} {
 		services[service] = old
 	}
+	answer := m.services.print
+	m.services.print = func(label string) ([]byte, error) {
+		service := map[string]string{"io.went.agent-heavy": "queue", "io.went.agent-resources": "resources", "io.went.agent-remote": "remote"}[label]
+		if service != "" && m.loaded[label] && m.statuses[service] == "enabled" {
+			helper, command := "agent-heavy", "daemon"
+			if service == "resources" {
+				command = "scheduler"
+			} else if service == "remote" {
+				helper, command = "agent-remote", "serve"
+			}
+			return []byte("program = " + filepath.Join(services[service], "Contents/MacOS", helper) + "\narguments = {\n" + helper + "\n" + command + "\n}\n"), nil
+		}
+		return answer(label)
+	}
 	original := i.command
 	i.command = func(ctx context.Context, args []string) ([]byte, error) {
 		if len(args) == 3 && args[0] == filepath.Join(old, "Contents/MacOS/agent-heavy") && args[1] == "status" {
 			m.calls = append(m.calls, slices.Clone(args))
 			return mustMetadataJSON(t, Object{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": Object{"status": "running", "limit": 1, "running": 0, "waiting": 0}, "jobs": []any{}, "scheduler": Object{}}), nil
-		}
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" {
-			label := filepath.Base(args[2])
-			service := map[string]string{"io.went.agent-heavy": "queue", "io.went.agent-resources": "resources", "io.went.agent-remote": "remote"}[label]
-			if service != "" && m.loaded[label] && m.statuses[service] == "enabled" {
-				m.calls = append(m.calls, slices.Clone(args))
-				helper, command := "agent-heavy", "daemon"
-				if service == "resources" {
-					command = "scheduler"
-				} else if service == "remote" {
-					helper, command = "agent-remote", "serve"
-				}
-				return []byte("program = " + filepath.Join(services[service], "Contents/MacOS", helper) + "\narguments = {\n" + helper + "\n" + command + "\n}\n"), nil
-			}
 		}
 		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" {
 			services[args[3]] = filepath.Dir(filepath.Dir(filepath.Dir(args[0])))
@@ -219,12 +219,12 @@ func TestManagedRecordedPendingRefusesChangedOrUnsafeApp(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "unrelated-loaded-service":
-				original := i.command
-				i.command = func(ctx context.Context, args []string) ([]byte, error) {
-					if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && strings.HasSuffix(args[2], "/io.went.agent-heavy") {
+				original := m.services.print
+				m.services.print = func(label string) ([]byte, error) {
+					if label == "io.went.agent-heavy" {
 						return []byte("program = /unrelated/helper\narguments = {\nagent-heavy\ndaemon\n}\n"), nil
 					}
-					return original(ctx, args)
+					return original(label)
 				}
 			}
 			before := installTreeWitness(t, i.home)

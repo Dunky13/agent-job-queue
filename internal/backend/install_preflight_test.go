@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -134,13 +135,7 @@ func TestInstallerPreflightPrivateSymlinkAndInspectionErrorsFailClosed(t *testin
 					t.Fatal(err)
 				}
 			} else {
-				original := f.installer.command
-				f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-					if args[0] == "launchctl" && args[1] == "print" {
-						return nil, errors.New("inspection timeout")
-					}
-					return original(ctx, args)
-				}
+				f.services.print = func(string) ([]byte, error) { return nil, errors.New("inspection timeout") }
 			}
 			report := f.installer.preflight(context.Background())
 			ids := preflightIDs(report)
@@ -263,6 +258,9 @@ func TestInstallerPreflightModernUpgradeRetainsActiveJobsAndOffersStoppedService
 	if !f.loaded["io.went.agent-heavy"] {
 		t.Fatal("verified stopped service was not started")
 	}
+	if want := []string{"service", "bootstrap", filepath.Join(f.installer.launch, "io.went.agent-heavy.plist")}; !slices.ContainsFunc(f.calls, func(call []string) bool { return slices.Equal(call, want) }) {
+		t.Fatalf("service started from the wrong definition: %v", f.calls)
+	}
 }
 
 func TestInstallerRecoveryArgumentParserRejectsAmbiguity(t *testing.T) {
@@ -320,16 +318,14 @@ func TestInstallerModernUpgradeRejectsMismatchedLoadedServicesBeforeMutation(t *
 				integrationTestWrite(t, filepath.Join(f.installer.config, "remote.json"), []byte(`{"enabled":true}`))
 			}
 			before := installTreeWitness(t, f.installer.root)
-			command := f.installer.command
-			f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if args[0] == "launchctl" && args[1] == "print" && filepath.Base(args[2]) == label {
+			answer := f.services.print
+			f.services.print = func(asked string) ([]byte, error) {
+				if asked == label {
 					return []byte("program = /usr/bin/unrelated\narguments = {\n/usr/bin/unrelated\nserve\n}\n"), nil
 				}
-				if args[0] == "launchctl" && (args[1] == "bootout" || args[1] == "kickstart") {
-					t.Fatalf("unverified service mutation: %v", args)
-				}
-				return command(ctx, args)
+				return answer(asked)
 			}
+			f.services.bootout = func(stopped string) { t.Fatalf("unverified service mutation: bootout %s", stopped) }
 			if err := f.run(t); err == nil {
 				t.Fatal("mismatched loaded service accepted")
 			}

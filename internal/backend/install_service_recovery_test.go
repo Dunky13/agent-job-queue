@@ -35,15 +35,12 @@ func missingServiceFixture(t *testing.T) (*installFixture, map[string]string) {
 			t.Fatal(err)
 		}
 	}
-	original := f.installer.command
-	f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" {
-			label := filepath.Base(args[2])
-			if output, ok := outputs[label]; ok && f.loaded[label] {
-				return []byte(output), nil
-			}
+	original := f.services.print
+	f.services.print = func(label string) ([]byte, error) {
+		if output, ok := outputs[label]; ok && f.loaded[label] {
+			return []byte(output), nil
 		}
-		return original(ctx, args)
+		return original(label)
 	}
 	return f, outputs
 }
@@ -84,7 +81,7 @@ func TestInstallerMissingServiceDefinitionsRecovery(t *testing.T) {
 		}
 	}
 	for _, call := range f.calls {
-		if len(call) > 1 && call[0] == "launchctl" && call[1] != "print" {
+		if len(call) > 1 && call[0] == "service" && call[1] != "print" {
 			t.Fatalf("recovery changed live service: %v", call)
 		}
 	}
@@ -306,11 +303,11 @@ func TestInstallerMissingServiceDefinitionsRechecksAndPreservesRaceWinner(t *tes
 			if !offersServiceRestore(f.installer.preflight(context.Background())) {
 				t.Fatal("setup not eligible")
 			}
-			original := f.installer.command
+			original := f.services.print
 			queries := 0
 			filename := filepath.Join(f.installer.launch, "io.went.agent-resources.plist")
-			f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && filepath.Base(args[2]) == "io.went.agent-resources" {
+			f.services.print = func(label string) ([]byte, error) {
+				if label == "io.went.agent-resources" {
 					queries++
 					if queries == 2 {
 						switch kind {
@@ -327,7 +324,7 @@ func TestInstallerMissingServiceDefinitionsRechecksAndPreservesRaceWinner(t *tes
 						}
 					}
 				}
-				return original(ctx, args)
+				return original(label)
 			}
 			if err := f.installer.recover(context.Background(), installRestoreServices, nil, ""); err == nil {
 				t.Fatal("stale service or concurrent file accepted")

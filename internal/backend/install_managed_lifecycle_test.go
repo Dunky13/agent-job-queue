@@ -131,7 +131,7 @@ func managedRemovalTarget(i *installer) {
 func managedRequireNoServiceMutation(t *testing.T, calls [][]string) {
 	t.Helper()
 	for _, args := range calls {
-		if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" || len(args) > 1 && args[0] == "launchctl" && args[1] != "print" {
+		if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" || len(args) > 1 && args[0] == "service" && args[1] != "print" {
 			t.Fatal("unexpected service mutation", args)
 		}
 	}
@@ -356,13 +356,13 @@ func TestManagedLifecycleForeignServicesAndCustomWrappersFailBeforeChanges(t *te
 			}
 			i := m.installer
 			managedRemovalTarget(i)
-			original := i.command
-			i.command = func(ctx context.Context, args []string) ([]byte, error) {
+			original := m.services.print
+			m.services.print = func(asked string) ([]byte, error) {
 				label := map[string]string{"queue": "io.went.agent-heavy", "remote": "io.went.agent-remote"}[kind]
-				if label != "" && slices.Equal(args, []string{"launchctl", "print", i.domain() + "/" + label}) {
+				if label != "" && asked == label {
 					return []byte("program = /foreign\narguments = {\n/foreign\n}\n"), nil
 				}
-				return original(ctx, args)
+				return original(asked)
 			}
 			if kind == "custom-wrapper" {
 				integrationTestWrite(t, filepath.Join(i.home, ".local/bin/agent-heavy"), []byte("#!/bin/sh\necho custom\n"))

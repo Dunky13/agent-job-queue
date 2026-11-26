@@ -108,7 +108,7 @@ func TestManagedAppBundleRegistersOnlyTheLoginItem(t *testing.T) {
 		if slices.Contains(args, "status") && slices.Contains(args, "--json") {
 			t.Fatalf("setup waited on the daemon: %v", args)
 		}
-		if args[0] == "launchctl" && args[1] != "print" {
+		if args[0] == "service" && args[1] != "print" {
 			t.Fatalf("setup changed launchd directly: %v", args)
 		}
 	}
@@ -225,13 +225,12 @@ func TestManagedAppBundleUnregistersCrashLoopingRegistrationWithoutProcess(t *te
 	m.loaded["io.went.agent-heavy"] = true
 	delete(m.loaded, "io.went.agent-resources")
 	m.statuses["resources"] = "notRegistered"
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && args[2] == i.domain()+"/io.went.agent-heavy" && m.loaded["io.went.agent-heavy"] {
-			m.calls = append(m.calls, slices.Clone(args))
+	original := m.services.print
+	m.services.print = func(label string) ([]byte, error) {
+		if label == "io.went.agent-heavy" && m.loaded[label] {
 			return managedCrashLoopOutput(i.domain()), nil
 		}
-		return original(ctx, args)
+		return original(label)
 	}
 	m.calls = nil
 	managedSetupNotices(m)
@@ -258,15 +257,14 @@ func TestManagedAppBundleRefusesRegistrationWhoseProcessIsNotThisHelper(t *testi
 	i := m.installer
 	m.statuses["queue"] = "enabled"
 	m.loaded["io.went.agent-heavy"] = true
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && args[2] == i.domain()+"/io.went.agent-heavy" && m.loaded["io.went.agent-heavy"] {
-			m.calls = append(m.calls, slices.Clone(args))
+	original := m.services.print
+	m.services.print = func(label string) ([]byte, error) {
+		if label == "io.went.agent-heavy" && m.loaded[label] {
 			// A live process whose executable is the test binary, not the helper.
 			output := strings.Replace(string(managedCrashLoopOutput(i.domain())), "\tstate = spawn scheduled\n", fmt.Sprintf("\tstate = running\n\tpid = %d\n", os.Getpid()), 1)
 			return []byte(output), nil
 		}
-		return original(ctx, args)
+		return original(label)
 	}
 	before := installTreeWitness(t, i.home)
 	m.calls = nil
@@ -305,12 +303,12 @@ func TestManagedAppBundlePreflightAcceptsLoadedCrashLoopingRegistration(t *testi
 	i := m.installer
 	m.statuses["queue"] = "enabled"
 	m.loaded["io.went.agent-heavy"] = true
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && args[2] == i.domain()+"/io.went.agent-heavy" && m.loaded["io.went.agent-heavy"] {
+	original := m.services.print
+	m.services.print = func(label string) ([]byte, error) {
+		if label == "io.went.agent-heavy" && m.loaded[label] {
 			return managedCrashLoopOutput(i.domain()), nil
 		}
-		return original(ctx, args)
+		return original(label)
 	}
 	before := installTreeWitness(t, i.home)
 	m.calls = nil
@@ -449,13 +447,12 @@ func TestManagedAppBundleCrashLoopingRegistrationWithUnfinishedJobsCompletes(t *
 	// Launchd keeps the registration but never runs it, so it answers nothing.
 	m.statuses["queue"] = "enabled"
 	m.loaded["io.went.agent-heavy"] = true
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && args[2] == i.domain()+"/io.went.agent-heavy" && m.loaded["io.went.agent-heavy"] {
-			m.calls = append(m.calls, slices.Clone(args))
+	original := m.services.print
+	m.services.print = func(label string) ([]byte, error) {
+		if label == "io.went.agent-heavy" && m.loaded[label] {
 			return managedCrashLoopOutput(i.domain()), nil
 		}
-		return original(ctx, args)
+		return original(label)
 	}
 	i.queueSnapshot = func(context.Context) (Object, error) { return nil, errors.New("queue daemon unavailable") }
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

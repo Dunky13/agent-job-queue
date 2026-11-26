@@ -30,6 +30,10 @@ _Avoid_: Command, button, operation
 
 ## Upgrades and setup
 
+**Service**:
+A background program registered with the user's login session so macOS keeps it running. Older versions registered the queue, the resource controller and phone access as services; current setup retires those and registers only the app's login item.
+_Avoid_: Daemon (for every service), agent (unqualified)
+
 **Drain**:
 An operator-declared window, started with `agent-heavy drain`, during which new runs wait so a restart cannot strand their callers.
 _Avoid_: Pause, freeze

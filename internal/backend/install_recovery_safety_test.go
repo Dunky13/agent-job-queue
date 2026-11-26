@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 	"testing"
 )
 
@@ -86,7 +85,7 @@ func TestInstallerRecoveryRejectsSymlinkedExecutableParent(t *testing.T) {
 		t.Fatal("recovery started an executable through a symlinked parent")
 	}
 	for _, args := range f.calls {
-		if len(args) > 1 && args[0] == "launchctl" && args[1] == "bootstrap" {
+		if len(args) > 1 && args[0] == "service" && args[1] == "bootstrap" {
 			t.Fatal("unsafe executable parent authorized service bootstrap")
 		}
 	}
@@ -197,21 +196,16 @@ func TestInstallerPreflightReviewsStateBesideAnInvalidBundle(t *testing.T) {
 }
 
 func TestInstallerPreflightLegacyDiagnostics(t *testing.T) {
-	failing := func(f *installFixture, match func([]string) bool, output string) {
-		original := f.installer.command
-		f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-			if match(args) {
+	failing := func(f *installFixture, label, output string) {
+		original := f.services.print
+		f.services.print = func(asked string) ([]byte, error) {
+			if asked == label {
 				if output == "" {
 					return nil, errors.New("inspection timeout")
 				}
 				return []byte(output), nil
 			}
-			return original(ctx, args)
-		}
-	}
-	print := func(label string) func([]string) bool {
-		return func(args []string) bool {
-			return len(args) == 3 && args[0] == "launchctl" && args[1] == "print" && strings.HasSuffix(args[2], "/"+label)
+			return original(asked)
 		}
 	}
 	const foreign = "program = /unknown\narguments = {\n/unknown\n}\n"
@@ -243,26 +237,26 @@ func TestInstallerPreflightLegacyDiagnostics(t *testing.T) {
 			}
 		}, "Review background service configuration", false},
 		"loaded service differs": {func(t *testing.T, f *installFixture) {
-			failing(f, print("io.went.agent-resources"), foreign)
+			failing(f, "io.went.agent-resources", foreign)
 		}, "Review loaded background service ownership", false},
 		"queue inspection fails": {func(t *testing.T, f *installFixture) {
-			failing(f, print("io.went.agent-heavy"), "")
+			failing(f, "io.went.agent-heavy", "")
 		}, "Cannot inspect the old queue service", false},
 		"loaded queue changes": {func(t *testing.T, f *installFixture) {
-			original := f.installer.command
+			original := f.services.print
 			reads := 0
-			f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if print("io.went.agent-heavy")(args) {
+			f.services.print = func(label string) ([]byte, error) {
+				if label == "io.went.agent-heavy" {
 					// Finding missing definitions and checking loaded services read it first.
 					if reads++; reads > 2 {
 						return []byte(foreign), nil
 					}
 				}
-				return original(ctx, args)
+				return original(label)
 			}
 		}, "Review loaded queue ownership", false},
 		"phone inspection fails": {func(t *testing.T, f *installFixture) {
-			failing(f, print("io.went.agent-remote"), "")
+			failing(f, "io.went.agent-remote", "")
 		}, "Cannot inspect phone access service", false},
 		"loaded phone differs": {func(t *testing.T, f *installFixture) {
 			f.loaded["io.went.agent-remote"] = true

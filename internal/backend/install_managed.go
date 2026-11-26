@@ -804,7 +804,7 @@ func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan)
 		if _, loaded, err := install.inspectService(ctx, "io.went.agent-remote"); err != nil {
 			return err
 		} else if loaded {
-			if _, err := install.run(ctx, "launchctl", "bootout", install.domain()+"/io.went.agent-remote"); err != nil {
+			if err := install.loginServices().Bootout(ctx, "io.went.agent-remote"); err != nil {
 				return err
 			}
 		}
@@ -836,7 +836,7 @@ func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan)
 			if err != nil || !installLoadedServiceMatches(output, arguments) {
 				return errors.New("Loaded legacy ownership changed before shutdown; no uncertain process was stopped")
 			}
-			if _, err := install.run(ctx, "launchctl", "bootout", install.domain()+"/"+label); err != nil {
+			if err := install.loginServices().Bootout(ctx, label); err != nil {
 				return err
 			}
 		}
@@ -857,7 +857,7 @@ func (install *installer) stopManagedLegacy(ctx context.Context, p *managedPlan)
 		if err != nil || loaded && !installLoadedServiceMatches(output, arguments) {
 			return errors.New("Loaded menu ownership changed before shutdown")
 		}
-		if _, err := install.run(ctx, "launchctl", "bootout", install.domain()+"/io.went.agent-queue"); err != nil {
+		if err := install.loginServices().Bootout(ctx, "io.went.agent-queue"); err != nil {
 			return err
 		}
 	}
