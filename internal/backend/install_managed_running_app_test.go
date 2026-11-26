@@ -110,12 +110,9 @@ func runningAppFixture(t *testing.T, start bool) *runningApp {
 	}
 	a := &runningApp{managedFixture: m, helper: filepath.Join(i.app, "Contents/MacOS/agent-heavy")}
 	original := i.command
+	// A separate installer without the fixture's command fake runs the real lsof.
+	m.host.holders = installMacOSHost{&installer{}}.LockHolders
 	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if args[0] == "/usr/sbin/lsof" {
-			m.calls = append(m.calls, slices.Clone(args))
-			output, err := exec.CommandContext(ctx, args[0], args[1:]...).Output()
-			return output, err
-		}
 		if len(args) == 3 && args[1] == "--prepare-app-replacement" {
 			a.quits++
 			a.stop(t)
@@ -231,7 +228,7 @@ func TestManagedRemovalOfRunningAppQuitsItOnceDrained(t *testing.T) {
 	}
 	quit := slices.IndexFunc(a.calls, func(args []string) bool { return len(args) == 3 && args[1] == "--prepare-app-replacement" })
 	unregister := slices.IndexFunc(a.calls, func(args []string) bool { return len(args) == 4 && args[2] == "unregister" && args[3] == "login" })
-	checked := slices.IndexFunc(a.calls, func(args []string) bool { return args[0] == "/usr/sbin/lsof" })
+	checked := slices.IndexFunc(a.calls, func(args []string) bool { return args[0] == "host" && args[1] == "lock-holders" })
 	if checked < 0 || quit < checked || unregister < quit {
 		t.Fatal("removal must check the holder, then quit, then unregister", checked, quit, unregister)
 	}

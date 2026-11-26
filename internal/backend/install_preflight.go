@@ -640,22 +640,15 @@ func (install *installer) preflightLegacyProcesses(ctx context.Context, report *
 	} else if busy && !resourcesLoaded {
 		report.add("controller-stopping", "The old resource controller is still stopping", "Wait for its lifetime lock to be released. Setup will not remove the lock or force-stop its holder.", "", "wait")
 	}
-	output, err := install.run(ctx, "ps", "-axo", "pid=,command=")
+	processes, err := install.host().Processes(ctx)
 	if err != nil {
 		report.add("legacy-processes", "Cannot inspect old queue processes", err.Error(), "", "wait")
 		return
 	}
-	for _, line := range strings.Split(string(output), "\n") {
+	for _, process := range processes {
+		line := process.Command
 		legacy := strings.Contains(line, filepath.Join(install.root, ".venv/bin/python")) || strings.Contains(line, filepath.Join(install.root, "agent_heavy.py")) || strings.Contains(line, filepath.Join(install.root, "remote/control.py")) || (strings.Contains(line, "pueued") && strings.Contains(line, filepath.Join(install.config, "pueue.yml")))
-		if !legacy {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		pid, err := strconv.Atoi(fields[0])
-		if err != nil || owned[pid] {
+		if !legacy || process.Unparsed || owned[process.PID] {
 			continue
 		}
 		report.add("legacy-processes", "Review old queue processes", "An old queue process remains outside a verified loaded service. Finish its work and stop it in the existing installation; setup will not kill an unidentified process.", install.root, "reveal", "wait")

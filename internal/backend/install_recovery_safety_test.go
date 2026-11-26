@@ -187,7 +187,7 @@ func TestInstallerPreflightReviewsStateBesideAnInvalidBundle(t *testing.T) {
 			}
 			managedRequireNoServiceMutation(t, f.calls)
 			for _, args := range f.calls {
-				if args[0] == "/usr/bin/codesign" || len(args) > 1 && args[1] == "--service-management" {
+				if args[0] == "host" && args[1] == "verify-signature" || len(args) > 1 && args[1] == "--service-management" {
 					t.Fatal("preflight used an invalid bundle", args)
 				}
 			}

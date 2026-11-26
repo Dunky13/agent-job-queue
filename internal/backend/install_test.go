@@ -29,6 +29,7 @@ type installFixture struct {
 	groups    Object
 	loaded    map[string]bool
 	services  *memoryServices
+	host      *memoryHost
 	calls     [][]string
 	fail      string
 	// seededPending marks a pending marker the fixture wrote itself, not setup.
@@ -41,7 +42,7 @@ func installTestFixture(t *testing.T) *installFixture {
 }
 
 // installBaseFixture puts a marked bundle where the user dropped it, with its
-// services and commands in memory.
+// services, host and commands in memory.
 func installBaseFixture(t *testing.T) *installFixture {
 	t.Helper()
 	base, err := filepath.EvalSymlinks(t.TempDir())
@@ -110,9 +111,14 @@ func installBaseFixture(t *testing.T) *installFixture {
 		}
 	}
 	install.services = f.services
+	f.host = newMemoryHost(record)
+	install.queries = f.host
 	install.command = func(_ context.Context, args []string) ([]byte, error) {
 		if args[0] == "launchctl" {
 			t.Errorf("launchctl bypassed the service port: %v", args)
+		}
+		if tool := filepath.Base(args[0]); tool == "ps" || tool == "lsof" || tool == "codesign" {
+			t.Errorf("%s bypassed the host port: %v", tool, args)
 		}
 		if err := record(append([]string{}, args...)); err != nil {
 			return nil, err
@@ -1406,13 +1412,7 @@ func TestInstallerLegacyActiveQueuesAndRemoteFailBeforeReplacement(t *testing.T)
 				configuration = mustMetadataJSON(t, config)
 				integrationTestWrite(t, filepath.Join(install.config, "pueue.yml"), configuration)
 			case "unowned-process":
-				command := install.command
-				install.command = func(ctx context.Context, args []string) ([]byte, error) {
-					if args[0] == "ps" {
-						return []byte("123 " + filepath.Join(install.root, ".venv/bin/python") + " unexplained.py"), nil
-					}
-					return command(ctx, args)
-				}
+				f.host.processes = []installProcess{{PID: 123, Command: filepath.Join(install.root, ".venv/bin/python") + " unexplained.py"}}
 			default:
 				f.tasks = Object{"4": Object{"status": Object{kind: Object{}}}}
 			}

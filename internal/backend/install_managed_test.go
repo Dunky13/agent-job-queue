@@ -367,7 +367,7 @@ func TestManagedInvalidNativeJSONAndInstallationMetadata(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "signature":
-				m.fail = "codesign --verify"
+				m.fail = "host verify-signature"
 			}
 			before := installTreeWitness(t, i.home)
 			if err := m.run(t); err == nil {

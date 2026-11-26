@@ -46,6 +46,7 @@ type installer struct {
 	keepCustomCallback                           bool
 	command                                      func(context.Context, []string) ([]byte, error)
 	services                                     installServices
+	queries                                      installHost
 	notice                                       func(string)
 }
 
@@ -1565,16 +1566,16 @@ func (install *installer) stopLegacy(ctx context.Context, node *yaml.Node) error
 	}
 	// An independently started Python process is outside launchd ownership.
 	// Never kill it or remove its interpreter while it may own work.
-	output, err := install.run(ctx, "ps", "-axo", "pid=,command=")
+	processes, err := install.host().Processes(ctx)
 	if err != nil {
 		return err
 	}
-	for _, line := range strings.Split(string(output), "\n") {
-		if strings.Contains(line, "pueued") && strings.Contains(line, filepath.Join(install.config, "pueue.yml")) {
+	for _, process := range processes {
+		if strings.Contains(process.Command, "pueued") && strings.Contains(process.Command, filepath.Join(install.config, "pueue.yml")) {
 			return errors.New("An external queue daemon is still running outside its owned launch agent; stop that daemon before retrying installation")
 		}
 		for _, legacy := range []string{filepath.Join(install.root, ".venv/bin/python"), filepath.Join(install.root, "agent_heavy.py"), filepath.Join(install.root, "remote/control.py")} {
-			if strings.Contains(line, legacy) {
+			if strings.Contains(process.Command, legacy) {
 				return errors.New("An existing Python queue process is still running. Stop that owned process before migrating; the installer did not remove its runtime")
 			}
 		}
