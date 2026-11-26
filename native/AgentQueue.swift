@@ -649,8 +649,9 @@ final class QueueStore: ObservableObject {
     @Published var isMutating = false
     @Published private(set) var isResuming = false
     @Published var notice: String?
-    private(set) var visibleSurfaces = 0
+    var surfaces = QueueSurfaces()
     private var pollTask: Task<Void, Never>?
+    private let pollSleep: PollSleep
     private let statusLoader: @Sendable () async throws -> Data
     private let command: @Sendable (QueueClient.Command) async throws -> Data
     private let snapshotPreparer: @Sendable (Data, QueueSnapshot?) async throws -> PreparedQueueSnapshot?
@@ -667,7 +668,9 @@ final class QueueStore: ObservableObject {
     }, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = { try await QueueClient.run($0) },
          snapshotPreparer: @escaping @Sendable (Data, QueueSnapshot?) async throws -> PreparedQueueSnapshot? = {
              try await PreparedQueueSnapshot.decode($0, comparedTo: $1)
-         }, arguments: [String] = CommandLine.arguments) {
+         }, arguments: [String] = CommandLine.arguments,
+         pollSleep: @escaping PollSleep = { try await Task.sleep(for: $0, clock: .continuous) }) {
+        self.pollSleep = pollSleep
         self.statusLoader = statusLoader
         self.command = command
         self.snapshotPreparer = snapshotPreparer
@@ -699,25 +702,21 @@ final class QueueStore: ObservableObject {
     }
     func start() {
         guard !fixtureMode, pollTask == nil else { return }
-        pollTask = Task { [weak self] in
+        pollTask = Task { [weak self, pollSleep] in
             await self?.refresh()
             var ticks = 0
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                do { try await pollSleep(.seconds(2)) } catch { return }
                 guard let self else { return }
                 ticks += 1
-                if visibleSurfaces > 0 || AppRuntime.queueWindow?.isVisible == true || ticks % 5 == 0 { await refresh() }
+                if surfaces.visibleCount > 0 || ticks % 5 == 0 { await refresh() }
             }
         }
     }
 
-    func appear(fullWindow: Bool) {
-        if !fullWindow { visibleSurfaces += 1 }
-        Task { await refresh() }
-    }
-    func disappear(fullWindow: Bool) {
-        if !fullWindow { visibleSurfaces = max(0, visibleSurfaces - 1) }
-    }
+    /// A surface just came on screen: refresh without waiting for the next poll.
+    @discardableResult
+    func appear() -> Task<Void, Never> { Task { await refresh() } }
 
     func refresh(manual: Bool = false) async {
         guard !fixtureMode, !isMutating else { return }
@@ -813,13 +812,17 @@ final class RemoteAccessStore: ObservableObject {
     @Published var notice: String?
     @Published var isBusy = false
     @Published var isRefreshing = false
+    var surfaces = QueueSurfaces()
     private var pollTask: Task<Void, Never>?
+    private let pollSleep: PollSleep
     let fixtureMode: Bool
     /// Runs `agent-remote serve` as a child of the app. Nil for fixtures and unmanaged launches.
     var supervisor: QueueHelperSupervisor?
     private let command: @Sendable (QueueClient.Command) async throws -> Data
 
-    init(fixtureMode: Bool, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = { try await QueueClient.run($0) }) {
+    init(fixtureMode: Bool, command: @escaping @Sendable (QueueClient.Command) async throws -> Data = { try await QueueClient.run($0) },
+         pollSleep: @escaping PollSleep = { try await Task.sleep(for: $0, clock: .continuous) }) {
+        self.pollSleep = pollSleep
         self.fixtureMode = fixtureMode
         self.command = command
         #if AGENT_QUEUE_TEST_HOOKS
@@ -844,16 +847,19 @@ final class RemoteAccessStore: ObservableObject {
         return "Off"
     }
 
-    func startPolling() {
-        guard !fixtureMode, pollTask == nil else { return }
-        pollTask = Task { [weak self] in
+    /// Polls while a surface is visible. Returns the new loop, or nil when none was started.
+    @discardableResult
+    func startPolling() -> Task<Void, Never>? {
+        guard !fixtureMode, pollTask == nil else { return nil }
+        pollTask = Task { [weak self, pollSleep] in
             while !Task.isCancelled {
                 guard let self else { return }
-                guard AppRuntime.remoteWindow?.isVisible == true else { pollTask = nil; return }
+                guard surfaces.visibleCount > 0 else { pollTask = nil; return }
                 await refresh()
-                do { try await Task.sleep(for: .seconds(5)) } catch { return }
+                do { try await pollSleep(.seconds(5)) } catch { return }
             }
         }
+        return pollTask
     }
 
     func refresh() async {
@@ -930,137 +936,6 @@ final class RemoteAccessStore: ObservableObject {
     }
 }
 
-@MainActor enum AppRuntime {
-    static let store = QueueStore()
-    static let remoteStore = RemoteAccessStore(fixtureMode: store.fixtureMode)
-    static let integrationStore = AgentIntegrationStore(fixtureMode: store.fixtureMode)
-    static let updateStore = QueueUpdateStore(fixtureMode: store.fixtureMode)
-    static let learningStore = LearningStore(fixtureMode: store.fixtureMode)
-    static var queueWindow: NSWindow?
-    static var remoteWindow: NSWindow?
-    static var integrationWindow: NSWindow?
-    static var updatesWindow: NSWindow?
-    static var learningWindow: NSWindow?
-    static var menuBarController: QueueMenuBarController?
-
-    static func perform(_ action: QueueAppAction) {
-        menuBarController?.closePopover()
-        switch action {
-        case .openWindow: showWindow()
-        case .learnedWorkloads: showLearningWindow()
-        case .updates: showUpdatesWindow()
-        case .integration: showIntegrationWindow()
-        case .remoteAccess: showRemoteWindow()
-        case .quit: NSApp.terminate(nil)
-        }
-    }
-
-    static func showLearningWindow(profileID: String? = nil) {
-        if let learningWindow {
-            learningWindow.makeKeyAndOrderFront(nil)
-            NSApp.activate()
-            if let profileID { learningStore.select(profileID) }
-            return
-        }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 780),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Learned Workloads"
-        window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 800, height: 550)
-        window.contentView = NSHostingView(rootView: LearningWindow(store: learningStore) {
-            AppRuntime.learningWindow?.close()
-        })
-        learningWindow = window
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate()
-        if let profileID {
-            Task {
-                await learningStore.loadPage(preserveSelection: true)?.value
-                await learningStore.select(profileID)?.value
-            }
-        }
-    }
-
-    static func showUpdatesWindow() {
-        if let updatesWindow {
-            updatesWindow.makeKeyAndOrderFront(nil)
-            NSApp.activate()
-            Task { await updateStore.refreshInstalled() }
-            return
-        }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 620),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "About Agent Queue"
-        window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 590, height: 500)
-        window.contentView = NSHostingView(rootView: QueueUpdatesSettings(store: updateStore) {
-            AppRuntime.updatesWindow?.close()
-        })
-        updatesWindow = window
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate()
-    }
-
-    static func showIntegrationWindow() {
-        if let integrationWindow {
-            integrationWindow.makeKeyAndOrderFront(nil)
-            NSApp.activate()
-            Task { await integrationStore.refresh() }
-            return
-        }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 720),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Agent Integration"
-        window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 520, height: 540)
-        window.contentView = NSHostingView(rootView: AgentIntegrationSettings(store: integrationStore) {
-            AppRuntime.integrationWindow?.close()
-        })
-        integrationWindow = window
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate()
-    }
-
-    static func showWindow() {
-        if let queueWindow { queueWindow.makeKeyAndOrderFront(nil); NSApp.activate(); return }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 760),
-                              styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                              backing: .buffered, defer: false)
-        window.title = "Agent Queue"
-        window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 490, height: 480)
-        window.contentView = NSHostingView(rootView: QueuePanel(store: store, fullWindow: true))
-        queueWindow = window
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate()
-    }
-
-    static func showRemoteWindow() {
-        if let remoteWindow {
-            remoteWindow.makeKeyAndOrderFront(nil)
-            NSApp.activate()
-            remoteStore.startPolling()
-            Task { await remoteStore.refresh() }
-            return
-        }
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 780),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Remote Access"
-        window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 500, height: 570)
-        window.contentView = NSHostingView(rootView: RemoteAccessSettings(store: remoteStore))
-        remoteWindow = window
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate()
-        remoteStore.startPolling()
-    }
-}
-
 enum QueueAppAction: Int, CaseIterable, Identifiable {
     case openWindow, learnedWorkloads, updates, integration, remoteAccess, quit
     var id: Int { rawValue }
@@ -1117,7 +992,7 @@ struct QueueStatusPresentation {
     }
 }
 
-// Owns only startup presentation. It never initializes AppRuntime or exposes
+// Owns only startup presentation. It never creates the window coordinator or exposes
 // queue commands until the bootstrap controller has verified readiness.
 @MainActor
 final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
@@ -1234,7 +1109,7 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
 }
 
 @MainActor
-final class QueueMenuBarController: NSObject, NSPopoverDelegate {
+final class QueueMenuBarController: NSObject, NSPopoverDelegate, QueueSurface {
     let statusItem: NSStatusItem
     let popover = NSPopover()
     let menu = NSMenu()
@@ -1247,20 +1122,22 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
     var isMonitoringEvents: Bool { eventMonitor != nil || globalMouseMonitor != nil }
     private var isTornDown = false
     private let store: QueueStore
-    private var registeredVisibleSurface = false
-    private let perform: @MainActor (QueueAppAction) -> Void
+    /// True from `popoverWillShow` until the popover is closed, ahead of its close animation.
+    private(set) var isVisible = false
+    private let app: QueueAppRoutes
 
-    init(store: QueueStore, statusItem: NSStatusItem? = nil, perform: @escaping @MainActor (QueueAppAction) -> Void = AppRuntime.perform) {
+    init(store: QueueStore, statusItem: NSStatusItem? = nil, app: QueueAppRoutes) {
         self.statusItem = statusItem ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         self.store = store
-        self.perform = perform
+        self.app = app
         super.init()
+        store.surfaces.add(self)
         // Transient popovers consume Control-clicks on the status button while
         // shown. Own dismissal so every status-button gesture remains available.
         popover.behavior = .applicationDefined
         popover.delegate = self
         popover.contentSize = NSSize(width: 500, height: 650)
-        popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, tracksVisibility: false))
+        popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, app: app, tracksVisibility: false))
         if let button = self.statusItem.button {
             button.image = NSImage(systemSymbolName: QueueBrand.symbolName, accessibilityDescription: nil)
             button.image?.isTemplate = true
@@ -1372,7 +1249,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
 
     private func performAction(_ action: QueueAppAction) {
         closePopover()
-        perform(action)
+        app.perform(action)
     }
 
     private func togglePopover() {
@@ -1395,10 +1272,10 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
     }
 
     func popoverWillShow(_ notification: Notification) {
-        guard !registeredVisibleSurface else { return }
-        registeredVisibleSurface = true
+        guard !isVisible else { return }
+        isVisible = true
         startMonitoringEvents()
-        store.appear(fullWindow: false)
+        store.appear()
     }
 
     func popoverDidClose(_ notification: Notification) {
@@ -1408,9 +1285,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate {
     private func releaseVisibleSurface() {
         stopMonitoringEvents()
         if let pendingTitle { statusItem.button?.title = pendingTitle; self.pendingTitle = nil }
-        guard registeredVisibleSurface else { return }
-        registeredVisibleSurface = false
-        store.disappear(fullWindow: false)
+        isVisible = false
     }
 
     func tearDown() {
@@ -1471,6 +1346,7 @@ final class QueueNavigation: ObservableObject {
 
 struct QueuePanel: View {
     @ObservedObject var store: QueueStore
+    let app: QueueAppRoutes
     var fullWindow = false
     var tracksVisibility = true
     @StateObject private var navigation: QueueNavigation
@@ -1478,8 +1354,10 @@ struct QueuePanel: View {
     @State private var pendingLimit: Int?
     @State private var pendingMode: SchedulingMode?
 
-    init(store: QueueStore, fullWindow: Bool = false, tracksVisibility: Bool = true, navigation: QueueNavigation = QueueNavigation()) {
+    init(store: QueueStore, app: QueueAppRoutes, fullWindow: Bool = false, tracksVisibility: Bool = true,
+         navigation: QueueNavigation = QueueNavigation()) {
         self.store = store
+        self.app = app
         self.fullWindow = fullWindow
         self.tracksVisibility = tracksVisibility
         _navigation = StateObject(wrappedValue: navigation)
@@ -1525,15 +1403,14 @@ struct QueuePanel: View {
                     .background(Color(nsColor: .windowBackgroundColor))
             } else if let job = navigation.selected {
                 let currentJob = store.snapshot?.jobs.first(where: { $0.id == job.id }) ?? job
-                JobDetail(job: currentJob, fixtureMode: store.fixtureMode, onClose: navigation.back)
+                JobDetail(job: currentJob, fixtureMode: store.fixtureMode, openLearning: app.openLearning, onClose: navigation.back)
                     .background(Color(nsColor: .windowBackgroundColor))
             }
         }
         .frame(minWidth: 470, minHeight: 440)
         .frame(width: fullWindow ? nil : 500, height: fullWindow ? nil : 650)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear { if tracksVisibility { store.appear(fullWindow: fullWindow) } }
-        .onDisappear { if tracksVisibility { store.disappear(fullWindow: fullWindow) } }
+        .onAppear { if tracksVisibility { store.appear() } }
         .onChange(of: store.snapshot?.queue.limit) { pendingLimit = nil }
         .onChange(of: store.snapshot?.scheduler?.mode) { pendingMode = nil }
         .onChange(of: store.error) { pendingLimit = nil; pendingMode = nil }
@@ -1740,7 +1617,7 @@ struct QueuePanel: View {
                         Button("View details and output", systemImage: "doc.text") { navigation.show(job) }
                         if let learning = job.resources?.learning {
                             Button("View learned workload", systemImage: "chart.bar.doc.horizontal") {
-                                AppRuntime.showLearningWindow(profileID: learning.id)
+                                app.openLearning(learning.id)
                             }
                         }
                         if QueueAction.next(job).isAllowed(in: store.snapshot) || QueueAction.start(job).isAllowed(in: store.snapshot) {
@@ -1785,15 +1662,15 @@ struct QueuePanel: View {
                 else { Text("Connecting…") }
             }
             Spacer(minLength: 8)
-            if !fullWindow { Button(QueueAppAction.openWindow.title, systemImage: QueueAppAction.openWindow.symbol) { AppRuntime.perform(.openWindow) }.buttonStyle(.borderless) }
+            if !fullWindow { Button(QueueAppAction.openWindow.title, systemImage: QueueAppAction.openWindow.symbol) { app.perform(.openWindow) }.buttonStyle(.borderless) }
             Menu {
                 ForEach(QueueAppAction.settings) { action in
-                    Button(action.title, systemImage: action.symbol) { AppRuntime.perform(action) }
+                    Button(action.title, systemImage: action.symbol) { app.perform(action) }
                 }
                 Divider()
                 Text(QueueAppAction.quitExplanation)
                 Divider()
-                Button(QueueAppAction.quit.title, systemImage: QueueAppAction.quit.symbol) { AppRuntime.perform(.quit) }.keyboardShortcut("q")
+                Button(QueueAppAction.quit.title, systemImage: QueueAppAction.quit.symbol) { app.perform(.quit) }.keyboardShortcut("q")
             } label: { Image(systemName: "gearshape") }.menuStyle(.borderlessButton).allowsWindowActivationEvents(true).fixedSize().help("Application options").accessibilityLabel("Application options")
         }
         .font(.caption).foregroundStyle(.secondary)
@@ -1997,6 +1874,7 @@ func parseDate(_ value: String) -> Date? {
 struct JobDetail: View {
     let job: QueueJob
     let fixtureMode: Bool
+    let openLearning: @MainActor (String) -> Void
     let onClose: () -> Void
     @State private var output = "Loading output…"
     @State private var loading = false
@@ -2034,7 +1912,7 @@ struct JobDetail: View {
                         GridRow {
                             Text("Learning").foregroundStyle(.secondary)
                             VStack(alignment: .leading, spacing: 5) {
-                                Button(learning.label) { AppRuntime.showLearningWindow(profileID: learning.id) }
+                                Button(learning.label) { openLearning(learning.id) }
                                     .buttonStyle(.link)
                                 Text(learning.reason).foregroundStyle(.secondary).textSelection(.enabled)
                             }.frame(maxWidth: .infinity, alignment: .leading)
@@ -2086,14 +1964,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var setupWindow: NSWindow?
     private(set) var startupMenuBarController: QueueStartupMenuBarController?
     private(set) var supervisor: QueueHelperSupervisor?
+    /// Nil until setup is verified: nothing before that may reach the queue.
+    private(set) var coordinator: WindowCoordinator?
     private var helperStartup: Task<Void, Never>?
     private var terminationPending = false
     private var normalLaunchStarted = false
     private var bootstrapEnvironment: QueueBootstrapEnvironment?
     private var bootstrapExecutor: QueueBootstrapModel.Executor = QueueBootstrapModel.runInstaller
     private var replyToTermination: @MainActor () -> Void = { NSApp.reply(toApplicationShouldTerminate: true) }
-    private var makeSupervisor: @MainActor (QueueBootstrapEnvironment) -> QueueHelperSupervisor? = {
-        $0.makeSupervisor(fixtureMode: AppRuntime.store.fixtureMode)
+    private var makeSupervisor: @MainActor (QueueBootstrapEnvironment, Bool) -> QueueHelperSupervisor? = {
+        $0.makeSupervisor(fixtureMode: $1)
     }
 
     override init() { super.init() }
@@ -2108,7 +1988,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         bootstrapEnvironment = environment
         bootstrapExecutor = executor
         replyToTermination = terminationReply
-        makeSupervisor = { _ in supervisor }
+        makeSupervisor = { _, _ in supervisor }
         super.init()
     }
 
@@ -2148,15 +2028,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         application.submenu = menu
         main.addItem(application)
         NSApp.mainMenu = main
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 410),
-            styleMask: [.titled, .miniaturizable], backing: .buffered, defer: false)
-        window.title = "Set up Agent Queue"
-        window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: QueueBootstrapView(model: bootstrap))
+        let window = QueueWindowSpec(title: "Set up Agent Queue", size: NSSize(width: 560, height: 410),
+                                     style: [.titled, .miniaturizable])
+            .makeWindow(content: NSHostingView(rootView: QueueBootstrapView(model: bootstrap)))
         setupWindow = window
-        window.center()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate()
+        window.present(isNew: true)
     }
 
     private func finishLaunching() {
@@ -2165,27 +2041,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = makeMainMenu()
         let statusItem = startupMenuBarController?.transferStatusItem()
         startupMenuBarController = nil
-        AppRuntime.menuBarController = QueueMenuBarController(store: AppRuntime.store, statusItem: statusItem)
-        if let helpers = makeSupervisor(bootstrapEnvironment ?? .current()) { startHelpers(helpers) }
-        else { AppRuntime.store.start() }
+        let coordinator = WindowCoordinator()
+        self.coordinator = coordinator
+        coordinator.showMenuBar(statusItem: statusItem)
+        if let helpers = makeSupervisor(bootstrapEnvironment ?? .current(), coordinator.store.fixtureMode) {
+            startHelpers(helpers, for: coordinator)
+        } else { coordinator.store.start() }
         #if AGENT_QUEUE_TEST_HOOKS
-        if runSnapshotHooks() { return }
+        if runSnapshotHooks(coordinator) { return }
         #endif
-        if CommandLine.arguments.contains("--open-window"), supervisor == nil { AppRuntime.showWindow() }
+        if CommandLine.arguments.contains("--open-window"), supervisor == nil { coordinator.show(.queue) }
     }
 
     /// Bootstrap has completed, so setup is no longer running: nothing here can race the installer.
-    private func startHelpers(_ helpers: QueueHelperSupervisor) {
+    private func startHelpers(_ helpers: QueueHelperSupervisor, for coordinator: WindowCoordinator) {
         supervisor = helpers
-        AppRuntime.remoteStore.supervisor = helpers
+        coordinator.remoteStore.supervisor = helpers
         // The phone service is always started: it exits at once while phone access is off.
         helpers.startAll()
         helperStartup = Task { @MainActor in
             // Let the daemon come up first so the menu does not flash "Queue unavailable".
             _ = await helpers.waitUntilQueueReachable(timeout: .seconds(5))
             guard !Task.isCancelled else { return }
-            AppRuntime.store.start()
-            if CommandLine.arguments.contains("--open-window") { AppRuntime.showWindow() }
+            coordinator.store.start()
+            if CommandLine.arguments.contains("--open-window") { coordinator.show(.queue) }
         }
     }
 
@@ -2194,8 +2073,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         supervisor?.terminateRemaining()
         startupMenuBarController?.tearDown()
         startupMenuBarController = nil
-        AppRuntime.menuBarController?.tearDown()
-        AppRuntime.menuBarController = nil
+        coordinator?.tearDown()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -2232,7 +2110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func selectApplicationAction(_ sender: NSMenuItem) {
         guard let action = QueueAppAction(rawValue: sender.tag) else { return }
-        AppRuntime.perform(action)
+        coordinator?.perform(action)
     }
 
     func makeMainMenu() -> NSMenu {

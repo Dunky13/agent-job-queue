@@ -94,6 +94,7 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
             from: Data(contentsOf: URL(fileURLWithPath: try option("--input"))))
         guard let queued = original.jobs.first(where: \.isWaiting) else { throw ClientError.message("Waiting fixture job missing") }
         let captureOnly = CommandLine.arguments.contains("--capture-only")
+        let coordinator = WindowCoordinator()
         for fullWindow in [false, true] {
             let name = fullWindow ? "window-waiting" : "menu-empty"
             let jobs = fullWindow ? [queued] : []
@@ -102,17 +103,17 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
                 jobs: jobs, scheduler: original.scheduler)
             let backend = ResumeUIBackend(snapshot)
             // Only this store opts out of CLI fixtures, with both providers injected.
-            // All global settings stores retain --fixture and cannot reach live controllers.
+            // The coordinator's stores retain --fixture and cannot reach live controllers.
             let store = QueueStore(statusLoader: { try await backend.load() }, command: { try await backend.command($0.arguments) }, arguments: [])
-            try check(AppRuntime.store.fixtureMode && AppRuntime.remoteStore.fixtureMode,
-                      "\(name): global controllers remain inert")
+            try check(coordinator.store.fixtureMode && coordinator.remoteStore.fixtureMode,
+                      "\(name): app controllers remain inert")
             await store.refresh()
             let size = NSSize(width: fullWindow ? 800 : 500, height: fullWindow ? 700 : 650)
             let window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                                   styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
             window.appearance = NSAppearance(named: .darkAqua)
-            let view = NSHostingView(rootView: QueuePanel(store: store, fullWindow: fullWindow,
+            let view = NSHostingView(rootView: QueuePanel(store: store, app: coordinator.routes, fullWindow: fullWindow,
                                                          tracksVisibility: false, navigation: QueueNavigation()))
             window.contentView = view
             window.setContentSize(size)
