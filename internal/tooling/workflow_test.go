@@ -171,6 +171,65 @@ func TestGoCachesAreRestoredPerJobAndSavedOnlyFromMain(t *testing.T) {
 	}
 }
 
+// No setup-go cache holds the race-built installer fixtures, so notarized
+// tests reuse CI's installer cache from main, read-only, before running them.
+func TestNotarizedTestsRestoreTheInstallerCacheReadOnly(t *testing.T) {
+	read := func(name string) []byte {
+		body, err := os.ReadFile("../../.github/workflows/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	type workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string            `yaml:"uses"`
+				Run  string            `yaml:"run"`
+				With map[string]string `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	var release, ci workflow
+	if err := yaml.Unmarshal(read("distribution.yml"), &release); err != nil {
+		t.Fatal(err)
+	}
+	if err := yaml.Unmarshal(read("ci.yml"), &ci); err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]string
+	var action string
+	for _, step := range ci.Jobs["macos-tests"].Steps {
+		if strings.HasPrefix(step.Uses, "actions/cache/restore@") {
+			saved, action = step.With, step.Uses
+		}
+	}
+	installer := func(key string) string {
+		return strings.ReplaceAll(strings.ReplaceAll(key, "${{ matrix.scope }}", "installer"), "${{ github.sha }}", "${{ needs.source.outputs.automation_sha }}")
+	}
+	restores, tested := 0, false
+	for _, step := range release.Jobs["notarized-tests"].Steps {
+		switch {
+		case strings.HasPrefix(step.Uses, "actions/setup-go@") && step.With["cache"] != "false":
+			t.Fatal("notarized tests must not use setup-go's cache, which holds no installer fixtures")
+		case strings.HasPrefix(step.Uses, "actions/cache@"), strings.HasPrefix(step.Uses, "actions/cache/save@"):
+			t.Fatal("notarized tests must not write a Go cache")
+		case strings.HasPrefix(step.Uses, "actions/cache/restore@"):
+			// The cache version hashes the paths and the action's compression, so both must match CI's.
+			if tested || saved == nil || step.Uses != action || step.With["path"] != saved["path"] ||
+				step.With["key"] != installer(saved["key"]) || step.With["restore-keys"] != installer(saved["restore-keys"]) {
+				t.Fatalf("notarized tests must restore CI's installer cache before testing, with CI's action, paths and keys: %v", step.With)
+			}
+			restores++
+		case strings.Contains(step.Run, "scripts/test-"):
+			tested = true
+		}
+	}
+	if restores != 1 || !tested {
+		t.Fatalf("notarized tests restore %d Go caches and test=%v, want exactly one before the tests", restores, tested)
+	}
+}
+
 func TestWorkflowPreservesDownloadedArtifacts(t *testing.T) {
 	// Checkout cleans untracked and ignored workspace files by default. Main
 	// publication previously downloaded dist first, then deleted it at checkout.
