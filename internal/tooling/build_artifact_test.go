@@ -1,6 +1,8 @@
 package tooling
 
 import (
+	"archive/zip"
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -29,12 +31,19 @@ func buildArtifactFixture(t *testing.T, change func(map[string][]byte)) (string,
 		base + "Contents/Resources/payload/source/VERSION":         []byte("0.1.0\n"),
 		base + "Contents/MacOS/AgentQueue":                         []byte("original executable bytes"),
 	}
+	for name, target := range archiveLinks {
+		contents[name] = []byte(target)
+	}
 	if change != nil {
 		change(contents)
 	}
 	var entries []checkpointEntry
 	for name, data := range contents {
-		entries = append(entries, checkpointEntry{name, data, 0755})
+		mode := os.FileMode(0755)
+		if _, link := archiveLinks[name]; link {
+			mode |= os.ModeSymlink
+		}
+		entries = append(entries, checkpointEntry{name, data, mode})
 	}
 	inner := checkpointZIP(t, entries...)
 	asset := "Agent-Queue-0.1.0-universal.zip"
@@ -126,6 +135,47 @@ func TestBuildArtifactRejectsUntrustedIdentityAndArchivePaths(t *testing.T) {
 			}
 			if _, err := os.Lstat(output); !os.IsNotExist(err) {
 				t.Fatalf("rejected artifact left output: %v", err)
+			}
+		})
+	}
+}
+
+// Only Sparkle's version links pass, each with its exact target, and nothing may sit beneath one.
+func TestCheckedZIPAcceptsOnlySparkleLinks(t *testing.T) {
+	framework := "Agent Queue.app/" + backend.SparkleFramework + "/"
+	link := func(name, target string) checkpointEntry {
+		return checkpointEntry{name, []byte(target), os.ModeSymlink | 0755}
+	}
+	for _, variant := range []string{"exact", "retargeted", "stray", "outside the app", "beneath a link", "directory link"} {
+		t.Run(variant, func(t *testing.T) {
+			var entries []checkpointEntry
+			for name, target := range archiveLinks {
+				entries = append(entries, link(name, target))
+			}
+			switch variant {
+			case "retargeted":
+				entries[0].data = []byte("../../../../../../etc")
+			case "stray":
+				entries = append(entries, link(framework+"Headers", "Versions/Current/Headers"))
+			case "outside the app":
+				entries = append(entries, link("Versions/Current", "B"))
+			case "beneath a link":
+				entries = append(entries, checkpointEntry{framework + "Versions/Current/Sparkle", []byte("shadowed"), 0755})
+			case "directory link":
+				// A ZIP directory entry cannot carry a target, so a link named as one is refused by name.
+				entries = append(entries, checkpointEntry{framework + "Versions/B/", nil, os.ModeSymlink | 0755})
+			}
+			data := checkpointZIP(t, entries...)
+			reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			files, err := checkedZIP(reader.File)
+			if (err == nil) != (variant == "exact") {
+				t.Fatalf("checked links: %v", err)
+			}
+			if err == nil && len(files) != len(archiveLinks) {
+				t.Fatalf("checked %d entries, want %d", len(files), len(archiveLinks))
 			}
 		})
 	}
