@@ -25,7 +25,7 @@ struct QueueAppRoutes {
     let perform: @MainActor (QueueAppAction) -> Void
     let openLearning: @MainActor (String) -> Void
     /// Opens Sparkle's install dialog for an update a background check found.
-    var installUpdate: @MainActor () -> Void = {}
+    let installUpdate: @MainActor () -> Void
 }
 
 struct QueueWindowSpec {
@@ -76,7 +76,8 @@ enum QueueWindowKind: CaseIterable {
 /// The composition root once setup is complete: owns the stores, the menu bar controller and the app windows.
 @MainActor final class WindowCoordinator {
     let store: QueueStore
-    // Built on first use: the update store reads the bundle's build metadata and creates Sparkle's updater when it is created.
+    // Built on first use: the update store reads the bundle's build metadata when it is created.
+    // The menu bar builds it at launch; Sparkle's updater starts only in `updateStore.start()`, after setup.
     private(set) lazy var remoteStore = RemoteAccessStore(fixtureMode: store.fixtureMode, command: command, pollSleep: pollSleep)
     private(set) lazy var integrationStore = AgentIntegrationStore(fixtureMode: store.fixtureMode, command: command)
     private(set) lazy var updateStore = QueueUpdateStore(fixtureMode: store.fixtureMode, command: command)

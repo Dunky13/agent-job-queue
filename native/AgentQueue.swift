@@ -2065,6 +2065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let coordinator = WindowCoordinator()
         self.coordinator = coordinator
         coordinator.showMenuBar(statusItem: statusItem)
+        // Without helpers (previews and fixtures) there is no queue to release a drain on, so a marker stays for a later launch.
         if let helpers = makeSupervisor(bootstrapEnvironment ?? .current(), coordinator.store.fixtureMode) {
             startHelpers(helpers, for: coordinator)
         } else { coordinator.store.start() }
