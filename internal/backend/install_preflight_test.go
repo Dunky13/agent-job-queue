@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -256,6 +257,9 @@ func TestInstallerPreflightModernUpgradeRetainsActiveJobsAndOffersStoppedService
 	}
 	if !f.loaded["io.went.agent-heavy"] {
 		t.Fatal("verified stopped service was not started")
+	}
+	if want := []string{"service", "bootstrap", filepath.Join(f.installer.launch, "io.went.agent-heavy.plist")}; !slices.ContainsFunc(f.calls, func(call []string) bool { return slices.Equal(call, want) }) {
+		t.Fatalf("service started from the wrong definition: %v", f.calls)
 	}
 }
 

@@ -56,6 +56,16 @@ Run locally on macOS, base `5ff1b82`:
 - Injected forbidden calls failed the migrated checks: an extra bootout (`TestManagedFreshInstallUsesOnlyBundleHelpers`, `TestManagedLegacyOwnershipIsRecheckedImmediatelyBeforeShutdown`, `TestInstallerPhoneAccessRecoveryRejectsUnownedServices`), an extra bootstrap (`TestInstallerRecoveryRejectsSymlinkedExecutableParent`) and a direct `launchctl kickstart` through the runner.
 - Not run: race detection, the CI partition scripts and Intel hardware.
 
+## Review dispositions
+
+An independent Opus review (Standards and Spec) found no high findings. Each finding was fixed on this branch:
+
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| Medium | The **Service** glossary entry named services current setup no longer registers, and used launchd vocabulary | The entry now says older versions registered the queue, resource controller and phone access, and current setup retires them and registers only the login item |
+| Low | The in-memory adapter accepted a bootout of an unloaded service and a bootstrap of a loaded one, which `launchctl` refuses | Both now fail the operation |
+| Low | No fixture test checked which definition `repair-service` bootstraps | `TestInstallerPreflightModernUpgradeRetainsActiveJobsAndOffersStoppedServiceStart` asserts the bootstrap of `io.went.agent-heavy.plist` under the launch directory |
+
 ## Remaining steps
 
 1. Process list (`ps`) behind a typed port.

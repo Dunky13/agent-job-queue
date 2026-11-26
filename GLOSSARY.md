@@ -31,7 +31,7 @@ _Avoid_: Command, button, operation
 ## Upgrades and setup
 
 **Service**:
-A background program the installer registers with the user's login session, such as the queue, the resource sampler or phone access. It is either loaded or not loaded.
+A background program registered with the user's login session so macOS keeps it running. Older versions registered the queue, the resource controller and phone access as services; current setup retires those and registers only the app's login item.
 _Avoid_: Daemon (for every service), agent (unqualified)
 
 **Drain**:

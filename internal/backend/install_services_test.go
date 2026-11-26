@@ -48,6 +48,10 @@ func (services *memoryServices) Bootout(_ context.Context, label string) error {
 	if err := services.record([]string{"service", "bootout", label}); err != nil {
 		return err
 	}
+	// launchctl refuses to boot out a service that is not loaded.
+	if !(*services.loaded)[label] {
+		return errors.New("memory services: bootout of unloaded " + label)
+	}
 	services.bootout(label)
 	delete(*services.loaded, label)
 	return nil
@@ -57,7 +61,12 @@ func (services *memoryServices) Bootstrap(_ context.Context, definition string) 
 	if err := services.record([]string{"service", "bootstrap", definition}); err != nil {
 		return err
 	}
-	(*services.loaded)[strings.TrimSuffix(filepath.Base(definition), ".plist")] = true
+	label := strings.TrimSuffix(filepath.Base(definition), ".plist")
+	// launchctl refuses to bootstrap a service that is already loaded.
+	if (*services.loaded)[label] {
+		return errors.New("memory services: bootstrap of loaded " + label)
+	}
+	(*services.loaded)[label] = true
 	return nil
 }
 
