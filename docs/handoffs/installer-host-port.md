@@ -42,6 +42,8 @@ Migrated files, all `internal/backend/*_test.go`:
 | `install_recovery_safety_test.go` | the invalid bundle assertion matches the host record |
 | `install_managed_running_app_test.go` | holders come from the real adapter on a separate installer, so `lsof` stays real; the order assertion matches the host record |
 
+The real `lsof` in the running app tests now runs through the production runner, as in setup: standard error is captured with the output, the command has the 30 second bound and a failure carries the `Installer command lsof failed:` prefix.
+
 Still on commands, on purpose:
 
 - `TestInstallMacOSHost`: the command fake is the adapter's own seam.
