@@ -171,6 +171,58 @@ func TestGoCachesAreRestoredPerJobAndSavedOnlyFromMain(t *testing.T) {
 	}
 }
 
+// Nothing saves setup-go's shared cache any more, so notarized tests reuse
+// CI's installer cache from main, read-only.
+func TestNotarizedTestsRestoreTheInstallerCacheReadOnly(t *testing.T) {
+	read := func(name string) []byte {
+		body, err := os.ReadFile("../../.github/workflows/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	type workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Uses string            `yaml:"uses"`
+				With map[string]string `yaml:"with"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	var release, ci workflow
+	if err := yaml.Unmarshal(read("distribution.yml"), &release); err != nil {
+		t.Fatal(err)
+	}
+	if err := yaml.Unmarshal(read("ci.yml"), &ci); err != nil {
+		t.Fatal(err)
+	}
+	var saved map[string]string
+	for _, step := range ci.Jobs["macos-tests"].Steps {
+		if strings.HasPrefix(step.Uses, "actions/cache/restore@") {
+			saved = step.With
+		}
+	}
+	installer := func(key string) string {
+		return strings.ReplaceAll(strings.ReplaceAll(key, "${{ matrix.scope }}", "installer"), "${{ github.sha }}", "${{ needs.source.outputs.automation_sha }}")
+	}
+	restored := false
+	for _, step := range release.Jobs["notarized-tests"].Steps {
+		switch {
+		case strings.HasPrefix(step.Uses, "actions/setup-go@") && step.With["cache"] != "false":
+			t.Fatal("notarized tests use setup-go's cache, which nothing saves")
+		case strings.HasPrefix(step.Uses, "actions/cache@"), strings.HasPrefix(step.Uses, "actions/cache/save@"):
+			t.Fatal("notarized tests must not write a Go cache")
+		case strings.HasPrefix(step.Uses, "actions/cache/restore@"):
+			// The cache version hashes the path list, so paths must match CI's exactly.
+			restored = saved != nil && step.With["path"] == saved["path"] &&
+				step.With["key"] == installer(saved["key"]) && step.With["restore-keys"] == installer(saved["restore-keys"])
+		}
+	}
+	if !restored {
+		t.Fatal("notarized tests must restore CI's installer cache with CI's paths and keys")
+	}
+}
+
 func TestWorkflowPreservesDownloadedArtifacts(t *testing.T) {
 	// Checkout cleans untracked and ignored workspace files by default. Main
 	// publication previously downloaded dist first, then deleted it at checkout.
