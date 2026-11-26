@@ -15,6 +15,7 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     private var childSelections = 0
     private var outsideClicks = 0
     private var footerMenuOpenCount = 0
+    private var footerMenuEndCount = 0
     private var footerMenu: NSMenu?
     private let applicationMenuDelegate = AppDelegate()
     private let fixture = QueueFixture(arguments: CommandLine.arguments)
@@ -76,6 +77,11 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         let timer = Timer(timeInterval: 0.08, target: self,
                           selector: #selector(closeFooterMenu(_:)), userInfo: nil, repeats: false)
         RunLoop.main.add(timer, forMode: .common)
+    }
+
+    @objc private func footerMenuEndedTracking(_ notification: Notification) {
+        guard let menu = notification.object as? NSMenu, menu !== controller?.menu else { return }
+        footerMenuEndCount += 1
     }
 
     @objc private func closeFooterMenu(_ timer: Timer) {
@@ -340,8 +346,11 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     private func verifySettingsFirstClick(_ controller: QueueMenuBarController) async throws {
         NotificationCenter.default.addObserver(self, selector: #selector(footerMenuBeganTracking(_:)),
             name: NSMenu.didBeginTrackingNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(footerMenuEndedTracking(_:)),
+            name: NSMenu.didEndTrackingNotification, object: nil)
         defer {
             NotificationCenter.default.removeObserver(self, name: NSMenu.didBeginTrackingNotification, object: nil)
+            NotificationCenter.default.removeObserver(self, name: NSMenu.didEndTrackingNotification, object: nil)
             controller.closePopover()
         }
         // Each hit target runs in a fresh fixture process. A previous system
@@ -354,8 +363,10 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
             throw ClientError.message("Settings first-click verification requires the real popover")
         }
         window.resignKey()
-        try check(!NSApp.isActive && !window.isKeyWindow && controller.popover.isShown,
-                  "settingsFixtureStartsWithInactivePopover")
+        // The popover reports shown before its window is on screen; a click posted earlier reaches the app below.
+        try await waitUntil { window.isVisible && window.occlusionState.contains(.visible) }
+        try check(!NSApp.isActive && !window.isKeyWindow && controller.popover.isShown
+                  && window.isVisible && window.occlusionState.contains(.visible), "settingsFixtureStartsWithInactivePopover")
         let offset = CommandLine.arguments.contains("--settings-chevron") ? 25.0 : 40.0
         let point = NSPoint(x: view.bounds.maxX - offset,
                             y: view.isFlipped ? view.bounds.maxY - 22 : view.bounds.minY + 22)
@@ -374,6 +385,9 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         }
         try check(footerMenuOpenCount == 1 && controller.popover.isShown,
                   "firstSettingsClickOpensMenuInInactivePopover")
+        // The queue ignores outside clicks while a menu tracks, so the next check needs this menu closed.
+        try await waitUntil { footerMenuEndCount == footerMenuOpenCount }
+        try check(footerMenuEndCount == footerMenuOpenCount, "firstSettingsMenuEndsTracking")
     }
 
     private func postSystemClick(in window: NSWindow, at point: NSPoint) throws {
@@ -417,7 +431,9 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
         }
         controller.activate(.accessible)
         try await settle()
-        try check(controller.popover.isShown, "externalClickStartsWithShownPopover")
+        let popoverOnScreen = { controller.popover.contentViewController?.view.window.map { $0.isVisible && $0.occlusionState.contains(.visible) } ?? false }
+        try await waitUntil(popoverOnScreen)
+        try check(controller.popover.isShown && popoverOnScreen(), "externalClickStartsWithShownPopover")
         // Click only the owned helper. Its nonactivating panel does not send
         // an application-deactivation notification to the queue fixture.
         guard let screen = NSScreen.screens.first else { throw ClientError.message("No fixture screen") }
@@ -429,7 +445,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
             }
             event.post(tap: .cghidEventTap)
         }
-        try await settle(0.3)
+        // The helper and the queue's global monitor receive the posted click asynchronously.
+        try await waitUntil { FileManager.default.fileExists(atPath: clicked.path) && !controller.popover.isShown && !controller.isMonitoringEvents }
         try check(FileManager.default.fileExists(atPath: clicked.path), "externalClickReachesOwnedHelper")
         try check(!controller.popover.isShown && !controller.isMonitoringEvents,
                   "externalClickDismissesPopoverWithoutApplicationDeactivation")

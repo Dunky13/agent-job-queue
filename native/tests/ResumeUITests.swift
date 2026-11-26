@@ -144,8 +144,9 @@ private final class ResumeUIDelegate: NSObject, NSApplicationDelegate {
             }
             let readsBeforeRefresh = fixture.reads.count
             await coordinator.store.refresh()
-            try check(fixture.reads.count > readsBeforeRefresh && fixture.reads.last == .status
-                && fixture.changes.isEmpty && fixture.desktopRequests.isEmpty, "\(name): app controllers remain inert")
+            let inert = fixture.reads.count > readsBeforeRefresh && fixture.reads.last == .status
+                && fixture.changes.isEmpty && fixture.desktopRequests.isEmpty
+            try check(inert, "\(name): app controllers remain inert")
             window.orderOut(nil)
             window.close()
         }

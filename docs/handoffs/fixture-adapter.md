@@ -41,14 +41,15 @@ Not behind the new seam, because fixture mode never suppressed them: the setup w
 
 ## Evidence
 
-SUITE_EVIDENCE
+Queued batch on 5f7cddd (arm64): `scripts/test-native.sh` 1147 PASS, `run-resume-ui-tests.sh` 10, `run-bootstrap-ui-tests.sh` 93 (including the `supervised-quit` scenario), the release build and `check-source` (455 files) passed. The resume runner with `--before-ref 2295abe1` failed to compile: its source rewrite did not cover the new inertness check. The rewrite now covers it, and both resume runs pass on the final commit (10 and 14 checks).
+
+The later commits change only `MenuBarUITests.swift`, `ResumeUITests.swift` and `run-resume-ui-tests.sh`. `run-menu-bar-ui-tests.sh` ran directly from the session (the queue's process lacks event-posting permission) 13 times in a row on the final test source, all 88 checks passing each time.
 
 Implementation checks, run directly on the working tree before the commit (arm64):
 
 - Release and test library flavours compile with warnings as errors. Hook symbols: 0 in the release library.
 - `native/tests/run-refresh-tests.sh` 50 PASS, `run-bootstrap-tests.sh` 259, `run-service-management-tests.sh` 239, `run-supervisor-tests.sh` 119, `BehaviorTests` 126, `UpdateTests` 34, `LearningTests` 86, `TransportTests` 234; no failures.
-- `MenuBarUITests`, `BootstrapUITests` and `ResumeUITests` compile but were not run. The resume runner's historical build at `2295abe1` compiles but was not run.
-- `go run -p 2 ./cmd/queue-tool check-source`, ShellCheck on the changed Bash scripts, `git diff --check`.
+- - `go run -p 2 ./cmd/queue-tool check-source`, ShellCheck on the changed Bash scripts, `git diff --check`.
 
 What the new checks cover:
 
@@ -65,7 +66,7 @@ Independent Standards and Spec reviews (Opus) found no live regression and no ne
 - The update store read the running version when the coordinator was built. It is now a `QueueBackend` member read on first use, as before, and the store requires it.
 - The menu-bar status check could race a refresh already in flight. It now fails the queue through a real fixture read and waits for the error.
 - Vacuous count conditions in `UpdateTests` and `LearningTests` were removed; `LearningTests` now checks that a reload reads the selected profile from the fixture. `ResumeUITests` refreshes through the fixture before checking that it recorded no change.
-- `firstSettingsClickOpensMenuInInactivePopover` failed intermittently, here and on the window coordinator branch, always on the first run of a session and never on an immediate rerun. Its fixed 0.3 s wait for an asynchronously delivered click is now a wait for the menu, up to 5 s, but that did not remove the failure: one more first run failed afterwards. Fresh binaries, 4 minutes of idle and a bootstrap run beforehand did not reproduce it, and in every diagnosed pass the click reached the popover's settings button. The check now reports where the click landed when it fails, so the next failure names its cause. Not resolved.
+- `firstSettingsClickOpensMenuInInactivePopover` failed intermittently, here and on the window coordinator branch, on about one run in five. Diagnostics showed the posted click reaching the app below: `NSPopover.isShown` was already true, but the popover's window was not yet on screen (absent from the on-screen window list), and it becomes visible 0.3 to 0.5 s after the show. The check now waits until the popover window is visible before it posts the click, and the precondition check asserts that; on failure it reports where the click landed. Its sibling `externalClickDismissesPopoverWithoutApplicationDeactivation`, which runs next in the same process, then failed two runs in ten. The first check no longer slept 0.3 s, so it moved on while its footer menu was still tracking, and the queue ignores outside clicks during menu tracking. The first check now waits for that menu to end tracking (`firstSettingsMenuEndsTracking`), and the outside-click check waits for its outcome instead of sleeping and requires the popover on screen first. Two quirks of the earlier diagnosis are worth knowing: a status item's own window always reports `isOnActiveSpace` false and a placeholder window number, so neither indicates a missing menu bar item.
 - Docs said the fixture only records what it would open or reveal; an update download is also recorded, as a change.
 
 ## Behaviour differences
@@ -82,10 +83,9 @@ Fixture runs, in test builds only:
 - Open log, Copy address, Open, release notes and the remote certificate's Show in Finder are recorded as desktop requests, not performed. An update download is recorded as a change and saves nothing.
 - Password verification reports `rejectionsSentNothing` and `acceptedPasswordReachedTheFixture`; confirmation verification reports `limitReachedOnlyTheFixture`. These replace the three fields that asserted preview mode dispatched nothing.
 
-The committed screenshots in `docs/screenshots/` will differ once regenerated. They were not regenerated here.
+The screenshots in `docs/screenshots/` that showed the PREVIEW badge were regenerated with `scripts/capture-native-screenshots.sh`.
 
 ## Next steps
 
-1. Run `bash scripts/test-native.sh`, the menu-bar, resume (also with `--before-ref`) and bootstrap UI suites, and the release build, then fill in `SUITE_EVIDENCE`. The popover now refreshes through the fixture, so if the menu-bar suite flakes, look first at `statusTitleHoldsWidthWhilePopoverShown`, `heldStatusTitleAppliesOnClose` and `closedStatusTitleUpdatesImmediately`: a refresh finishing during their wait could change the simulated error.
-2. Regenerate the screenshots with `scripts/capture-native-screenshots.sh` and review them.
-3. PR 5: the installer platform port in Go.
+1. Review and merge the PR after hosted CI passes.
+2. PR 5: the installer platform port in Go.

@@ -34,7 +34,9 @@ build_before_fixture() {
   # and compiles into one module with the test rather than linking a library.
   sed -e 's/\(backend\.command(.0\)\.arguments) })/\1) }, arguments: [])/' -e '/^@testable import AgentQueueCore$/d' \
     -e '/let fixture = QueueFixture(/d' -e '/let coordinator = fixture\.coordinator()/d' \
-    -e 's/fixture\.changes\.isEmpty/AppRuntime.store.fixtureMode \&\& AppRuntime.remoteStore.fixtureMode/' \
+    -e '/let readsBeforeRefresh = fixture/d' -e '/await coordinator\.store\.refresh()/d' \
+    -e '/fixture\.changes\.isEmpty \&\& fixture\.desktopRequests\.isEmpty$/d' \
+    -e 's/let inert = fixture\.reads.*/let inert = AppRuntime.store.fixtureMode \&\& AppRuntime.remoteStore.fixtureMode/' \
     -e 's/app: coordinator\.routes, //' \
     -e 's/refreshesOnAppear:/tracksVisibility:/' \
     "$root/native/tests/ResumeUITests.swift" > "$temporary/before-ResumeUITests.swift"
