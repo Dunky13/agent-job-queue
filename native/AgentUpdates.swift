@@ -360,7 +360,7 @@ final class QueueUpdateStore: ObservableObject {
 
     init(running: RunningQueueVersion,
          testHooks: Bool = QueueUpdatePolicy.isTestHookBuild,
-         environment: @escaping @Sendable () -> QueueBootstrapEnvironment = { .current() },
+         environment: @escaping @Sendable () -> QueueBootstrapEnvironment,
          command: @escaping @Sendable (QueueClient.Command) async throws -> Data) {
         self.running = running
         self.command = command

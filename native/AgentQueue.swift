@@ -2025,7 +2025,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let helpers = makeSupervisor(environment)
         self.coordinator = coordinator
         coordinator.showMenuBar(statusItem: statusItem)
-        // Without helpers (fixture launches) there is no queue to release a drain on, so a marker stays for a later launch.
+        // Without helpers (fixture, setup-disabled and unmanaged launches) there is no queue to release a drain on, so a marker stays for a later launch.
         if let helpers {
             startHelpers(helpers, for: coordinator)
         } else { coordinator.store.start() }

@@ -52,10 +52,17 @@ final class QueueFixture {
         return coordinator
     }
 
+    /// A home that never exists, so no setup or drain marker of the real user is ever read or removed.
+    let home = FileManager.default.temporaryDirectory.appendingPathComponent("agent-queue-fixture-\(UUID().uuidString)")
+
     var backend: QueueBackend {
-        QueueBackend(command: { try await self.respond($0) }, logTail: { await self.logTail($0) },
+        let home = home
+        let environment = QueueBootstrapEnvironment(app: home.appendingPathComponent("Agent Queue.app"),
+            resources: home.appendingPathComponent("Resources"), home: home)
+        return QueueBackend(command: { try await self.respond($0) }, logTail: { await self.logTail($0) },
             desktop: { self.desktopRequests.append($0) },
-            runningVersion: { RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100) })
+            runningVersion: { RunningQueueVersion(version: "1.0.0", bundleBuild: "100", publishedBuild: 100) },
+            environment: { environment })
     }
 
     /// Each store loads once and never polls on a timer, so nothing changes under a check.

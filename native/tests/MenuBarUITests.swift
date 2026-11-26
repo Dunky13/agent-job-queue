@@ -299,7 +299,8 @@ final class MenuBarFixtureDelegate: NSObject, NSApplicationDelegate, NSMenuDeleg
     /// A background update adds a hidden-until-announced item that opens Sparkle's dialog through the install route.
     private func verifyUpdateItem() async throws {
         let backend = fixture.backend
-        let updates = QueueUpdateStore(running: backend.runningVersion(), command: backend.command)
+        let updates = QueueUpdateStore(running: backend.runningVersion(), environment: backend.environment,
+            command: backend.command)
         let routes = coordinator.routes
         let controller = QueueMenuBarController(store: coordinator.store, updates: updates, app: QueueAppRoutes(
             perform: routes.perform, openLearning: routes.openLearning, logTail: routes.logTail, desktop: routes.desktop,

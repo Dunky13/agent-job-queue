@@ -317,6 +317,13 @@ struct UpdateTests {
         try check(!fixtureUpdates.updaterCreated && fixtureUpdates.unavailableReason != nil
             && recorder.reads == [.version] && recorder.changes.isEmpty && fixtureUpdates.installed != nil,
             "A fixture update store creates no updater and reads only from the fixture")
+        let fixtureHome = recorder.home
+        await fixtureUpdates.releaseDrainAfterRelaunch()
+        fixtureUpdates.discardStaleDrainMarker()
+        try check(!fixtureUpdates.hasPendingDrain && recorder.reads == [.version] && recorder.changes.isEmpty
+            && fixtureHome != FileManager.default.homeDirectoryForCurrentUser
+            && !FileManager.default.fileExists(atPath: fixtureHome.path),
+            "A fixture update store finds no drain and sends no drain command, outside the user's home")
         for service in QueueServiceManagement.Service.allCases {
             try check(QueueClient.Command.serviceStatus(service).timeout == 5,
                 "Exact native status for \(service.rawValue) has a five-second read budget")

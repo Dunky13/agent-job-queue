@@ -33,6 +33,8 @@ struct QueueBackend {
     var logTail: QueueLogTail
     var desktop: QueueDesktop
     var runningVersion: @MainActor () -> RunningQueueVersion
+    /// Where the update flow finds setup's markers, including the drain it may release.
+    var environment: @Sendable () -> QueueBootstrapEnvironment
 
     /// The installed controllers and this Mac.
     @MainActor static var live: QueueBackend {
@@ -45,7 +47,7 @@ struct QueueBackend {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(text, forType: .string)
                 }
-            }, runningVersion: { .current() })
+            }, runningVersion: { .current() }, environment: { .current() })
     }
 }
 
@@ -111,7 +113,8 @@ enum QueueWindowKind: CaseIterable {
     // The menu bar builds it at launch; Sparkle's updater starts only in `updateStore.start()`, after setup.
     private(set) lazy var remoteStore = RemoteAccessStore(command: backend.command, pollSleep: pollSleep)
     private(set) lazy var integrationStore = AgentIntegrationStore(command: backend.command)
-    private(set) lazy var updateStore = QueueUpdateStore(running: backend.runningVersion(), command: backend.command)
+    private(set) lazy var updateStore = QueueUpdateStore(running: backend.runningVersion(),
+        environment: backend.environment, command: backend.command)
     private(set) lazy var learningStore = LearningStore(command: backend.command)
     private(set) var windows: [QueueWindowKind: NSWindow] = [:]
     var menuBarController: QueueMenuBarController?

@@ -17,7 +17,7 @@ A test build launched with `--fixture` cannot reach the installed queue, its lau
 
 | Path out of the app | What stops it |
 | --- | --- |
-| Controller commands, log reads, desktop requests, running version | `QueueBackend`, replaced as a whole by the fixture |
+| Controller commands, log reads, desktop requests, running version, setup and drain markers | `QueueBackend`, replaced as a whole by the fixture |
 | A command the fixture does not know | It throws; nothing is passed on |
 | Helper processes | `makeSupervisor()` returns nil because `supervisesHelpers` requires `allowsInstallation`, which is false with `--fixture`. Only a test that injects a fake supervisor gets one |
 | Setup and installation | `inspect()` answers `.legacy`, `serviceStatusRequests()` is empty and `allowsInstallation` is false |
@@ -48,7 +48,7 @@ The later commits change only `MenuBarUITests.swift`, `ResumeUITests.swift` and 
 Implementation checks, run directly on the working tree before the commit (arm64):
 
 - Release and test library flavours compile with warnings as errors. Hook symbols: 0 in the release library.
-- `native/tests/run-refresh-tests.sh` 50 PASS, `run-bootstrap-tests.sh` 259, `run-service-management-tests.sh` 239, `run-supervisor-tests.sh` 119, `BehaviorTests` 126, `UpdateTests` 63 (after the merge with #90), `LearningTests` 86, `TransportTests` 234; no failures.
+- `native/tests/run-refresh-tests.sh` 50 PASS, `run-bootstrap-tests.sh` 259, `run-service-management-tests.sh` 239, `run-supervisor-tests.sh` 119, `BehaviorTests` 126, `UpdateTests` 64 (after the merge with #90), `LearningTests` 86, `TransportTests` 234; no failures.
 - - `go run -p 2 ./cmd/queue-tool check-source`, ShellCheck on the changed Bash scripts, `git diff --check`.
 
 What the new checks cover:
@@ -63,7 +63,7 @@ What the new checks cover:
 Main replaced the download flow with Sparkle and added `fixtureMode` branches to `QueueUpdateStore`. The merge removes them the same way as in the other stores:
 
 - `QueueUpdatePolicy.unavailableReason` no longer takes `fixtureMode`. A fixture launch is always a test-hook build, which already never creates the updater.
-- The store requires `running` and `command`; the coordinator passes `backend.runningVersion()` and `backend.command`. The drain methods lose their guards: they run only on the helper path, which a fixture launch never takes (only the bootstrap UI test injects a fake supervisor, under a temporary home).
+- The store requires `running`, `environment` and `command`; the coordinator passes the backend's. `QueueBackend.environment` is where the update flow finds setup's markers, including the drain it may release. The fixture's environment points at a home that never exists. The drain methods lose their guards: they run only on the helper path, which a fixture launch takes only when a test injects a fake supervisor, and even then they find no marker and send no drain command. Re-review found that the first version of the merge left the store's live `.current()` default in place, which made that isolation depend on the bootstrap UI runner's `CFFIXED_USER_HOME`.
 - The fixture no longer answers the removed `updates check` and `updates download` commands. `UpdateTests` replaces its preview cases with a fixture coordinator check; `RefreshTests` expects 11 commands.
 - `docs/updates.md`, `docs/updates.html` and the README now describe fixture launches as test-hook builds. The Sparkle ADR and spec still mention preview mode as part of their historical record.
 
