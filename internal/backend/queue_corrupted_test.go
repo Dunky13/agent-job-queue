@@ -300,6 +300,12 @@ func TestCorruptedRowWithLiveProcessIsNotSettledAway(t *testing.T) {
 		}
 	})
 	t.Run("Cancel on a Done reading row reports no false cancel", func(t *testing.T) {
+		// The refusal arrives when the cleanup window ends, so end it early. The
+		// daemon's lane clock is frozen and the Done branch never signals, so a
+		// shorter window observes the same unsignalled worker and unchanged row.
+		oldWindow := queueCleanupWindow
+		queueCleanupWindow = 3 * time.Second
+		t.Cleanup(func() { queueCleanupWindow = oldWindow })
 		d, s, _, _ := corruptedDaemon(t)
 		worker, pgid, _ := liveWorker(t)
 		j := runningWithWorker(t, s, 0, worker)

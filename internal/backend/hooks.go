@@ -32,10 +32,12 @@ type hookRunner struct {
 	drops        map[string]int
 	running      sync.WaitGroup
 	inspectGroup func(int) ([]Object, error)
+	// timeout is hookTimeout outside tests, which shorten it per runner.
+	timeout time.Duration
 }
 
 func newHookRunner(g *Gate) *hookRunner {
-	return &hookRunner{g: g, slots: make(chan struct{}, hookConcurrency), drops: map[string]int{}}
+	return &hookRunner{g: g, slots: make(chan struct{}, hookConcurrency), drops: map[string]int{}, timeout: hookTimeout}
 }
 
 func (r *hookRunner) dropped(name string) int {
@@ -166,7 +168,7 @@ exit "$status"`, "agent-queue-hook", path)
 	cmd.Stderr = output
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = time.Second
-	deadline := time.NewTimer(hookTimeout)
+	deadline := time.NewTimer(r.timeout)
 	defer deadline.Stop()
 	if err = cmd.Start(); err != nil {
 		r.log(plugin.Name, event, relative, "failed to start: "+err.Error(), output)
@@ -216,7 +218,7 @@ exit "$status"`, "agent-queue-hook", path)
 		}
 	case <-deadline.C:
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		result = "timed out after 10 seconds; process group terminated"
+		result = fmt.Sprintf("timed out after %d seconds; process group terminated", int(r.timeout/time.Second))
 	}
 	finish.Close()
 	// Only now may Wait reap the supervisor and release its numerical PID.
