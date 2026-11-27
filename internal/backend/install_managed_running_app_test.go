@@ -347,12 +347,39 @@ func TestManagedHeldByAppDisregardsOnlyAHolderThatLeftTheListing(t *testing.T) {
 			}
 			return nil, failure
 		}, want: "cannot be read"},
-		"only a transient": {holders: func(call int, owned []int) ([]int, error) {
+		"helper joins the second listing": {holders: func(call int, owned []int) ([]int, error) {
 			if call == 1 {
 				return []int{dead}, nil
 			}
 			return owned, nil
+		}},
+		"only a transient": {holders: func(call int, owned []int) ([]int, error) {
+			if call == 1 {
+				return []int{dead}, nil
+			}
+			return nil, nil
 		}, want: "no holder found"},
+		"live stranger leaves": {holders: func(call int, owned []int) ([]int, error) {
+			if call == 1 {
+				return append([]int{os.Getpid()}, owned...), nil
+			}
+			return owned, nil
+		}},
+		"stranger joins the second listing": {holders: func(call int, owned []int) ([]int, error) {
+			if call == 1 {
+				return append([]int{dead}, owned...), nil
+			}
+			return append([]int{os.Getpid()}, owned...), nil
+		}, want: "runs "},
+		"two transients list once more": {holders: func(call int, owned []int) ([]int, error) {
+			if call > 2 {
+				return nil, failure
+			}
+			if call == 1 {
+				return append([]int{dead, os.Getpid()}, owned...), nil
+			}
+			return owned, nil
+		}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			calls := 0

@@ -29,12 +29,12 @@ The CI logs carry only a PID and do not name the lock, so the identity of PIDs 7
 
 ## Fix
 
-A holder that fails any ownership check is listed once more. It is disregarded only when the second listing succeeds and no longer names it. It stays fail-closed:
+The first holder that fails any ownership check makes the lock be listed once more, a single time per check. A failing holder is disregarded only when that second listing succeeds and no longer names it. It stays fail-closed:
 
 - A holder that is still listed is refused with the original error, readable or not.
 - A failed second listing refuses with the original error.
 - A disregarded process never counts: with no verified holder the result is `no holder found`.
-- PIDs that appear only in the second listing are not added to the check, as with the single listing before. After the app quits, `managedStopped` still refuses if any of the three lifetime locks is held.
+- Every PID that appears only in the second listing must pass the same ownership check, or the check refuses with its error. Without this, a stranger that forked a child sharing the lock and then exited between the listings would pass, and the app quit and service unregistration both run before `managedStopped` rechecks the locks.
 - No ownership rule is widened. A helper's child is not accepted as owned. There is no sleep, retry loop or longer timeout.
 
 Alternative rejected: stopping inheritance. `O_CLOEXEC` is already set, and closing the descriptor between fork and exec is not available through `os/exec`.
@@ -61,7 +61,7 @@ The real removal tests, `-run '^TestManagedRemovalOfRunningApp'` (three tests), 
 
 The flake did not reproduce without the injected delay.
 
-Regression test: `TestManagedHeldByAppDisregardsOnlyAHolderThatLeftTheListing` covers the accepted transient and the three refusals (still listed, second listing fails, only a transient). Its row in `scripts/backend-test-weights.tsv` is an estimate; replace it with a measured Intel race duration at the next refresh.
+Regression test: `TestManagedHeldByAppDisregardsOnlyAHolderThatLeftTheListing` covers the accepted transients (a dead child, a live stranger that left, the helper joining the second listing, two transients with one relisting) and the refusals (still listed, second listing fails, only a transient, a stranger joining the second listing). Its row in `scripts/backend-test-weights.tsv` is an estimate; replace it with a measured Intel race duration at the next refresh.
 
 ## Validation
 

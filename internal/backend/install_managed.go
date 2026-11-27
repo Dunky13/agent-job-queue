@@ -306,19 +306,37 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 //
 // A child that a helper forks shares the lock descriptor until it execs, so a
 // listing can name a process that holds nothing by the time it is read. A holder
-// that fails the check is therefore listed again: only one that is gone from a
-// successful second listing is disregarded, and it never counts as a holder.
+// that fails the check makes the locks be listed once more: only a holder gone
+// from that successful second listing is disregarded, and it never counts as a
+// holder. Every holder that the second listing adds must pass the check too.
 func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helper string) error {
 	holders, listErr := install.hostQueries().LockHolders(ctx, lock)
 	owned := 0
+	var relisted []int
+	relistedOK := false
 	for _, pid := range holders {
 		refusal := installAppOwnsHolder(app, helper, pid)
 		if refusal == nil {
 			owned++
 			continue
 		}
-		current, err := install.hostQueries().LockHolders(ctx, lock)
-		if err != nil || slices.Contains(current, pid) {
+		if !relistedOK {
+			current, err := install.hostQueries().LockHolders(ctx, lock)
+			if err != nil {
+				return refusal
+			}
+			for _, added := range current {
+				if slices.Contains(holders, added) {
+					continue
+				}
+				if err := installAppOwnsHolder(app, helper, added); err != nil {
+					return err
+				}
+				owned++
+			}
+			relisted, relistedOK = current, true
+		}
+		if slices.Contains(relisted, pid) {
 			return refusal
 		}
 	}
