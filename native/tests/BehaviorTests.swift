@@ -367,6 +367,11 @@ func checkLaneStatusDecoding(_ check: (Bool, String) throws -> Void) throws {
     try check(variants["empty"]?.jobs.isEmpty == true && variants["empty"]?.lanes?.map(\.name) == ["default"] &&
               variants["leaseStates"]?.jobs.contains { $0.position == 1 } == true,
               "Every generated status variant decodes")
+    let marks = variants.mapValues { QueueStatusPresentation(snapshot: $0, error: nil) }
+    try check(marks["draining"]?.mark == .draining && marks["invalidDrainFile"]?.mark == .attention
+        && marks["invalidDrainFile"]?.accessibilityLabel == "Agent Queue, drain needs attention, 0 running, 0 waiting"
+        && marks["pausedWithPublishedLanes"]?.mark == .paused && marks["empty"]?.mark == .idle,
+              "The status mark reads the producer's drain and pause fields")
     guard let lease = snapshot.jobs.first(where: \.isLease) else {
         throw ClientError.message("Generated status has no lease")
     }

@@ -940,14 +940,16 @@ struct QueueStatusPresentation {
     init(snapshot: QueueSnapshot?, error: String?) {
         let running = snapshot?.queue.running ?? 0
         let waiting = snapshot?.queue.waiting ?? 0
-        let draining = snapshot?.queue.drainUntil != nil || snapshot?.queue.drainError != nil
+        // An untrusted drain file keeps intake closed until someone runs undrain, so it needs attention.
+        let untrustedDrain = error == nil && snapshot?.queue.drainError != nil
         title = error != nil ? "!" : (running == 0 && waiting == 0 ? "" : "\(running) · \(waiting)")
         // A pause outranks a drain: queued jobs wait for a resume either way.
-        mark = error != nil ? .attention : QueueAction.resume.isAllowed(in: snapshot) ? .paused
-            : draining ? .draining : running > 0 ? .running : .idle
+        mark = error != nil || untrustedDrain ? .attention : QueueAction.resume.isAllowed(in: snapshot) ? .paused
+            : snapshot?.queue.drainUntil != nil ? .draining : running > 0 ? .running : .idle
         let state = switch mark {
         case .paused: "paused, "
         case .draining: "draining, "
+        case .attention where untrustedDrain: "drain needs attention, "
         default: ""
         }
         accessibilityLabel = "Agent Queue, \(state)\(running) running, \(waiting) waiting" + (error == nil ? "" : ", queue unavailable")

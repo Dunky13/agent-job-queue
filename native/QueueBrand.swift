@@ -29,9 +29,10 @@ enum QueueBrand {
             if closed { path.close() }
             path.transform(using: transform)
             path.lineWidth = 1.5 * scale
-            path.lineCapStyle = .round
+            // Round caps would close the gaps of a dash, so the dashed plate uses butt caps.
+            path.lineCapStyle = dashed ? .butt : .round
             path.lineJoinStyle = .round
-            if dashed { path.setLineDash([1.6 * scale, 1.6 * scale], count: 2, phase: 0) }
+            if dashed { path.setLineDash([1.5 * scale, 1.5 * scale], count: 2, phase: 0) }
             path.stroke()
         }
         color.set()
@@ -49,7 +50,8 @@ enum QueueBrand {
             plate.close()
             // Even-odd fill cuts these out of the plate.
             let holes: [NSRect] = switch mark {
-            case .paused: [NSRect(x: 6.6, y: 3.6, width: 1, height: 2.8), NSRect(x: 8.4, y: 3.6, width: 1, height: 2.8)]
+            // Bars and gap of 1.2 points stay apart even on a 1x display.
+            case .paused: [NSRect(x: 6.2, y: 3.5, width: 1.2, height: 3), NSRect(x: 8.6, y: 3.5, width: 1.2, height: 3)]
             case .attention: [NSRect(x: 7.4, y: 3.2, width: 1.2, height: 2.2), NSRect(x: 7.4, y: 6, width: 1.2, height: 1)]
             default: []
             }

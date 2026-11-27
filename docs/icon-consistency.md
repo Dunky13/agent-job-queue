@@ -10,7 +10,7 @@ The menu-bar mark carries the queue state in its top plate, so the outline stays
 | Running | Solid | At least one job runs |
 | Paused | Solid, pause sign cut out | The queue is paused; this outranks a drain |
 | Draining | Dashed outline | A drain closes intake |
-| Attention | Solid, exclamation mark cut out | The queue is unavailable, or setup is blocked |
+| Attention | Solid, exclamation mark cut out | The queue is unavailable, setup is blocked, or the drain file cannot be trusted (run `agent-heavy undrain`) |
 
 The app packages `native/Resources/AppIcon.icns` and declares it through `CFBundleIconFile`. The icon has a blue tile with the white mark in its running state. The macOS version has transparent outer padding; the menu bar uses the monochrome template for system appearance and selection. The dashboard header and README use the matching `remote/static/app-icon.png`. Browser tabs use `favicon.png`; phone home screens use the opaque `apple-touch-icon.png`, allowing the device to apply its own corner mask. The homepage uses `site/img/icon.png` and `site/favicon.png`.
 
