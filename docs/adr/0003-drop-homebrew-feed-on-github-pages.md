@@ -9,7 +9,7 @@ This supersedes [ADR 0002](0002-homebrew-tap-in-source-repository.md). Sparkle u
 ## Consequences
 
 - No delivery commits reach `main`. The GitHub App, its ruleset bypass and the CI path filter are not needed.
-- Releases no longer publish `agent-job-queue.rb`. `agent-job-queue.json` and the ZIP stay unchanged, because installed pre-Sparkle builds read them for their last manual update.
+- Releases no longer publish `agent-job-queue.rb`. `agent-job-queue.json` and the ZIP stay unchanged, because installed pre-Sparkle builds read them to offer the new build. Correction (2026-11-27): their built-in download refuses the Sparkle ZIP, which contains the framework's symbolic links, so their last manual update is the DMG.
 - Runtime support for apps already installed through Homebrew stays. Sparkle updates them in place, and their stale Homebrew receipt is harmless.
 - The `Dunky13/homebrew-agent-job-queue` tap is frozen: its refresh workflow is disabled, a README notice points to the homepage, and it is archived.
 - A Pages deployment replaces the whole site, so the feed, `latest.json` and the homepage are always published together from one verified build. A run for an older build never replaces a newer live site.
