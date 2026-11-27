@@ -1454,7 +1454,8 @@ struct QueuePanel: View {
                     .help("Adaptive fits jobs within your parallel limit. Learn only records predictions. Running jobs are never stopped automatically.")
                 }
                 Menu("Drain") {
-                    Section("Close intake for") {
+                    // Durations count from now, so a new choice replaces the current end time.
+                    Section(store.snapshot?.queue.drainUntil == nil ? "Close intake for" : "Restart the drain for") {
                         ForEach(QueueAction.drainMinutes, id: \.self) { minutes in
                             Button(QueueAction.drainLabel(minutes)) { store.dispatch(.drain(minutes: minutes)) }
                         }
@@ -1542,6 +1543,7 @@ struct QueuePanel: View {
                         .buttonStyle(.bordered)
                         .fixedSize()
                         .disabled(store.actionsDisabled)
+                        .accessibilityLabel(queue.drainError == nil ? "Stop draining" : "Remove drain file")
                         .accessibilityIdentifier("queue.undrain")
                         .help("Accept new jobs again now. A paused queue stays paused.")
                     }.font(.callout).padding(.top, 10)
@@ -1886,13 +1888,18 @@ struct JobConfirmationPanel: View {
 /// The drain banner text: when intake reopens, or why the drain cannot be trusted.
 func drainBanner(_ queue: QueueSummary, now: Date = Date()) -> String {
     if let problem = queue.drainError { return problem }
-    guard let text = queue.drainUntil, let until = parseDate(text) else { return "Draining. New jobs wait; queued and running jobs continue." }
+    guard let text = queue.drainUntil, let until = parseDate(text) else { return "Draining until \(queue.drainUntil ?? "an unknown time"). \(QueueAction.drainEffect)" }
     let calendar = Calendar.current
     let time = until.formatted(date: .omitted, time: .shortened)
-    let end = calendar.isDate(until, inSameDayAs: now) ? time
-        : calendar.date(byAdding: .day, value: 1, to: now).map { calendar.isDate(until, inSameDayAs: $0) } == true ? "tomorrow \(time)"
-        : until.formatted(date: .abbreviated, time: .shortened)
-    return "Draining until \(end). New jobs wait; queued and running jobs continue."
+    let end: String
+    if calendar.isDate(until, inSameDayAs: now) {
+        end = time
+    } else if let tomorrow = calendar.date(byAdding: .day, value: 1, to: now), calendar.isDate(until, inSameDayAs: tomorrow) {
+        end = "tomorrow \(time)"
+    } else {
+        end = until.formatted(date: .abbreviated, time: .shortened)
+    }
+    return "Draining until \(end). \(QueueAction.drainEffect)"
 }
 
 func parseDate(_ value: String) -> Date? {

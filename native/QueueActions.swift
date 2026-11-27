@@ -62,6 +62,7 @@ enum QueueAction: Equatable {
 
     static let limits = 1...8
     static let drainMinutes = [30, 60, 120, 240]
+    static let drainEffect = "New jobs are not accepted; queued and running jobs are unaffected."
 
     static func drainLabel(_ minutes: Int) -> String {
         minutes < 60 ? "\(minutes) minutes" : minutes == 60 ? "1 hour" : "\(minutes / 60) hours"
@@ -86,8 +87,8 @@ enum QueueAction: Equatable {
         case .start(let job): "Job #\(job.id) requested to start outside the parallel limit."
         case .cancel(let job): "Cancellation requested for job #\(job.id)."
         case .resume: "Queue resumed."
-        case .drain(let minutes): "Draining for \(Self.drainLabel(minutes)). New jobs wait; queued and running jobs continue."
-        case .undrain: "Draining stopped. New jobs are accepted."
+        case .drain(let minutes): "Draining for \(Self.drainLabel(minutes)). \(Self.drainEffect)"
+        case .undrain: "Drain removed. New jobs are accepted."
         case .limit(let limit): "Parallel job limit changed to \(limit)."
         case .scheduling(let mode): "Scheduling changed to \(mode.label)."
         }

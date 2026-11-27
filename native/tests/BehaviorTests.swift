@@ -190,19 +190,21 @@ struct BehaviorTests {
             let time = until.formatted(date: .omitted, time: .shortened)
             let end = [1.0: time, 23.0: "tomorrow \(time)"][hours] ?? until.formatted(date: .abbreviated, time: .shortened)
             try check(drainBanner(drained(until: ISO8601DateFormatter().string(from: until)).queue, now: morning)
-                      == "Draining until \(end). New jobs wait; queued and running jobs continue.",
+                      == "Draining until \(end). New jobs are not accepted; queued and running jobs are unaffected.",
                       "The drain banner shows when intake reopens, \(hours) hours ahead")
         }
         try check(drainBanner(untrustedQueue.queue) == "Invalid drain file", "An untrusted drain file shows its problem")
+        try check(drainBanner(drained(until: "soon").queue) == "Draining until soon. New jobs are not accepted; queued and running jobs are unaffected.",
+                  "An unreadable end time is shown as reported")
         let sent: [(QueueAction, [String], String, Bool)] = [
             (.next(movable), ["next", "7"], "Job #7 will run next.", false),
             (.last(movable), ["last", "7"], "Job #7 moved to the end.", false),
             (.start(movable), ["start", "7"], "Job #7 requested to start outside the parallel limit.", true),
             (.cancel(movable), ["cancel", "7"], "Cancellation requested for job #7.", true),
             (.resume, ["resume"], "Queue resumed.", false),
-            (.drain(minutes: 30), ["drain", "--for", "30m"], "Draining for 30 minutes. New jobs wait; queued and running jobs continue.", false),
-            (.drain(minutes: 120), ["drain", "--for", "120m"], "Draining for 2 hours. New jobs wait; queued and running jobs continue.", false),
-            (.undrain, ["undrain", "--keep-paused"], "Draining stopped. New jobs are accepted.", false),
+            (.drain(minutes: 30), ["drain", "--for", "30m"], "Draining for 30 minutes. New jobs are not accepted; queued and running jobs are unaffected.", false),
+            (.drain(minutes: 120), ["drain", "--for", "120m"], "Draining for 2 hours. New jobs are not accepted; queued and running jobs are unaffected.", false),
+            (.undrain, ["undrain", "--keep-paused"], "Drain removed. New jobs are accepted.", false),
             (.limit(3), ["limit", "3"], "Parallel job limit changed to 3.", false),
             (.scheduling(.shadow), ["scheduling", "shadow"], "Scheduling changed to Learn only.", false)]
         for (action, arguments, notice, confirms) in sent {
