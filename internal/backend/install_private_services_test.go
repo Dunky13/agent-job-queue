@@ -50,19 +50,21 @@ func newPrivateNativeFixture(t *testing.T, parent, prefix, homeName string) priv
 	}
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", "private-native-lifecycle")
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", tools)
-	f.installer.controller = installTestController(f.installer)
+	f.installer.selectTestLifecycle()
 	return f
 }
 
+// The guards are checked on the adapter itself: the installer would not choose it
+// outside test mode.
 func (f privateNativeFixture) status() ([]byte, error) {
-	return f.installer.appController().ServiceManagement(context.Background(), f.installer.app, "status", "queue")
+	return installPrivateController{f.installer}.ServiceManagement(context.Background(), f.installer.app, "status", "queue")
 }
 
 // requireRefused expects both operations refused with the isolation error.
 func (f privateNativeFixture) requireRefused(t *testing.T) {
 	t.Helper()
 	_, status := f.status()
-	_, replacement := f.installer.appController().PrepareAppReplacement(context.Background())
+	_, replacement := installPrivateController{f.installer}.PrepareAppReplacement(context.Background(), f.installer.app)
 	for _, err := range []error{status, replacement} {
 		if err == nil || err.Error() != errInstallNativeRefused.Error() {
 			t.Fatal("accepted unsafe fixture", err)
@@ -74,23 +76,37 @@ func TestManagedPrivateNativeCommandsCannotReachRealServices(t *testing.T) {
 	f := newPrivateNativeFixture(t, "/tmp", "agent-queue-install-test-", "User With Spaces")
 	i, ctx := f.installer, context.Background()
 	t.Setenv("AGENT_HEAVY_STATE", "/foreign/queue")
-	output, err := f.status()
+	output, err := i.appController().ServiceManagement(ctx, i.app, "status", "queue")
 	if want := strings.Join([]string{"status", "queue", i.home, i.state, ""}, "\n"); err != nil || string(output) != want {
 		t.Fatalf("private lifecycle tool lost argument or environment isolation: %q: %v", output, err)
 	}
-	output, err = i.appController().PrepareAppReplacement(ctx)
+	output, err = i.appController().PrepareAppReplacement(ctx, i.app)
 	if want := strings.Join([]string{"prepare-app-replacement", i.app, i.home, i.state, ""}, "\n"); err != nil || string(output) != want {
 		t.Fatalf("private UI shutdown tool lost argument or environment isolation: %q: %v", output, err)
 	}
-	for _, change := range [][]string{
-		{filepath.Join(i.home, "Another.app"), "status", "queue"},
-		{i.app + "/", "status", "queue"},
-		{i.app, "unknown", "queue"},
-		{i.app, "status", "unknown"},
-	} {
-		if _, err := i.appController().ServiceManagement(ctx, change[0], change[1], change[2]); err == nil || err.Error() != errInstallNativeRefused.Error() {
-			t.Fatal("accepted foreign native command", change, err)
+	other := filepath.Join(i.home, "Another.app")
+	_, status := i.appController().ServiceManagement(ctx, other, "status", "queue")
+	_, replacement := i.appController().PrepareAppReplacement(ctx, other)
+	for _, err := range []error{status, replacement} {
+		if err == nil || err.Error() != errInstallNativeRefused.Error() {
+			t.Fatal("accepted another app's native command", err)
 		}
+	}
+	for _, change := range [][]string{{i.app + "/", "status", "queue"}, {i.app, "unknown", "queue"}, {i.app, "status", "unknown"}} {
+		if _, err := i.appController().ServiceManagement(ctx, change[0], change[1], change[2]); err == nil || err.Error() != "invalid service management command" {
+			t.Fatal("accepted invalid native command", change, err)
+		}
+	}
+	// Pending recovery works on a copy pointed at the retained app.
+	retained := *i
+	retained.app = other
+	output, err = retained.appController().ServiceManagement(ctx, other, "status", "login")
+	if want := strings.Join([]string{"status", "login", i.home, i.state, ""}, "\n"); err != nil || string(output) != want {
+		t.Fatalf("copied installer lost its own app: %q: %v", output, err)
+	}
+	output, err = retained.appController().PrepareAppReplacement(ctx, other)
+	if want := strings.Join([]string{"prepare-app-replacement", other, i.home, i.state, ""}, "\n"); err != nil || string(output) != want {
+		t.Fatalf("copied installer prepared another app: %q: %v", output, err)
 	}
 	// A failing tool is reported as itself, not as the app executable.
 	integrationTestWrite(t, f.tool, []byte("#!/bin/sh\nexit 3\n"))
@@ -125,7 +141,6 @@ func TestInstallPrivateControllerGuards(t *testing.T) {
 		"foreign tools": func(t *testing.T, f privateNativeFixture) {
 			t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", f.root)
 		},
-		"unclean app":  func(_ *testing.T, f privateNativeFixture) { f.installer.app += "/" },
 		"shared tool":  func(t *testing.T, f privateNativeFixture) { chmod(t, f.tool, 0710) },
 		"inert tool":   func(t *testing.T, f privateNativeFixture) { chmod(t, f.tool, 0600) },
 		"missing tool": func(t *testing.T, f privateNativeFixture) { remove(t, f.tool) },
@@ -181,6 +196,18 @@ func TestInstallPrivateControllerGuards(t *testing.T) {
 			f.requireRefused(t)
 		})
 	}
+	// An unclean app is an invalid service command anywhere, so only replacement
+	// preparation needs the adapter's own guard.
+	t.Run("unclean app", func(t *testing.T) {
+		f := newPrivateNativeFixture(t, "/tmp", "agent-queue-install-test-", "User With Spaces")
+		f.installer.app += "/"
+		if _, err := f.status(); err == nil || err.Error() != "invalid service management command" {
+			t.Fatal("accepted unclean service command", err)
+		}
+		if _, err := (installPrivateController{f.installer}).PrepareAppReplacement(context.Background(), f.installer.app); err == nil || err.Error() != errInstallNativeRefused.Error() {
+			t.Fatal("prepared an unclean app", err)
+		}
+	})
 	t.Run("foreign home name", func(t *testing.T) {
 		newPrivateNativeFixture(t, "/tmp", "agent-queue-install-test-", "User").requireRefused(t)
 	})

@@ -21,18 +21,20 @@ type installPrivateController struct{ install *installer }
 
 func (adapter installPrivateController) ServiceManagement(ctx context.Context, app, action, service string) ([]byte, error) {
 	native, err := appservices.Arguments(app, action, service)
-	if err != nil || app != adapter.install.app {
+	if err != nil {
+		return nil, err
+	}
+	if app != adapter.install.app {
 		return nil, errInstallNativeRefused
 	}
 	return adapter.run(ctx, native, action, service)
 }
 
-func (adapter installPrivateController) PrepareAppReplacement(ctx context.Context) ([]byte, error) {
-	app := adapter.install.app
-	if app != filepath.Clean(app) {
+func (adapter installPrivateController) PrepareAppReplacement(ctx context.Context, app string) ([]byte, error) {
+	if app != adapter.install.app || app != filepath.Clean(app) {
 		return nil, errInstallNativeRefused
 	}
-	return adapter.run(ctx, adapter.install.replacementArguments(), "prepare-app-replacement", app)
+	return adapter.run(ctx, installReplacementArguments(app), "prepare-app-replacement", app)
 }
 
 // run executes the private tool in place of native, keeping native's isolated

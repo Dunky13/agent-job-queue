@@ -13,26 +13,28 @@ import (
 // running copy of the installer's app before it is replaced.
 type installController interface {
 	ServiceManagement(ctx context.Context, app, action, service string) ([]byte, error)
-	PrepareAppReplacement(ctx context.Context) ([]byte, error)
+	PrepareAppReplacement(ctx context.Context, app string) ([]byte, error)
 }
 
+// The adapter binds to the installer that asks, because pending recovery copies
+// the installer and points the copy at the retained app.
 func (install *installer) appController() installController {
-	if install.controller != nil {
+	switch {
+	case install.controller != nil:
 		return install.controller
-	}
-	// A test-mode installer with no chosen adapter must not reach macOS.
-	if install.testing {
-		return installRefusingController{}
-	}
-	return installAppExecutable{install}
-}
-
-// installTestController chooses test mode's adapter when the installer is built.
-func installTestController(install *installer) installController {
-	if os.Getenv("AGENT_QUEUE_INSTALL_TEST_MANAGED") == "private-native-lifecycle" {
+	case !install.testing:
+		return installAppExecutable{install}
+	case install.privateLifecycle:
 		return installPrivateController{install}
 	}
+	// Test mode without the private fixture must not reach macOS.
 	return installRefusingController{}
+}
+
+// selectTestLifecycle records, when the installer is built, whether test mode
+// uses the private lifecycle adapter.
+func (install *installer) selectTestLifecycle() {
+	install.privateLifecycle = os.Getenv("AGENT_QUEUE_INSTALL_TEST_MANAGED") == "private-native-lifecycle"
 }
 
 type installAppExecutable struct{ install *installer }
@@ -45,20 +47,23 @@ func (adapter installAppExecutable) ServiceManagement(ctx context.Context, app, 
 	return adapter.install.run(ctx, args...)
 }
 
-func (adapter installAppExecutable) PrepareAppReplacement(ctx context.Context) ([]byte, error) {
-	return adapter.install.run(ctx, adapter.install.replacementArguments()...)
+func (adapter installAppExecutable) PrepareAppReplacement(ctx context.Context, app string) ([]byte, error) {
+	return adapter.install.run(ctx, installReplacementArguments(app)...)
 }
 
-func (install *installer) replacementArguments() []string {
-	return []string{filepath.Join(install.app, "Contents/MacOS/AgentQueue"), "--prepare-app-replacement", install.app}
+func installReplacementArguments(app string) []string {
+	return []string{filepath.Join(app, "Contents/MacOS/AgentQueue"), "--prepare-app-replacement", app}
 }
 
 type installRefusingController struct{}
 
-func (installRefusingController) ServiceManagement(context.Context, string, string, string) ([]byte, error) {
+func (installRefusingController) ServiceManagement(_ context.Context, app, action, service string) ([]byte, error) {
+	if _, err := appservices.Arguments(app, action, service); err != nil {
+		return nil, err
+	}
 	return nil, errInstallNativeRefused
 }
 
-func (installRefusingController) PrepareAppReplacement(context.Context) ([]byte, error) {
+func (installRefusingController) PrepareAppReplacement(context.Context, string) ([]byte, error) {
 	return nil, errInstallNativeRefused
 }

@@ -1076,7 +1076,7 @@ func (install *installer) managedStopMenu(ctx context.Context) error {
 	if err != nil || !exists {
 		return err
 	}
-	output, err := install.appController().PrepareAppReplacement(ctx)
+	output, err := install.appController().PrepareAppReplacement(ctx, install.app)
 	if err != nil {
 		return fmt.Errorf("The previous menu app could not quit; preserve its bundle and retry after quitting: %w", err)
 	}

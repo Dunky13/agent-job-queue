@@ -225,7 +225,7 @@ func TestManagedRefusedMenuShutdownPreservesPreviousBundle(t *testing.T) {
 			managedRemovalTarget(i)
 			before := installBundleSnapshot(t, i.app)
 			prepare := m.controller.prepare
-			m.controller.prepare = func(ctx context.Context) ([]byte, error) {
+			m.controller.prepare = func(ctx context.Context, app string) ([]byte, error) {
 				switch response {
 				case "refused":
 					return nil, fmt.Errorf("menu refused termination")
@@ -236,7 +236,7 @@ func TestManagedRefusedMenuShutdownPreservesPreviousBundle(t *testing.T) {
 				case "wrong-schema":
 					return mustMetadataJSON(t, Object{"schemaVersion": 2, "app": i.app, "status": "stopped"}), nil
 				}
-				return prepare(ctx)
+				return prepare(ctx, app)
 			}
 			if err := m.run(t); err == nil {
 				t.Fatal("unconfirmed menu shutdown allowed replacement")

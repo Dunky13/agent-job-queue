@@ -112,10 +112,10 @@ func runningAppFixture(t *testing.T, start bool) *runningApp {
 	quit := m.controller.prepare
 	// A separate installer without the fixture's command fake runs the real lsof.
 	m.host.holders = installMacOSHost{&installer{}}.LockHolders
-	m.controller.prepare = func(ctx context.Context) ([]byte, error) {
+	m.controller.prepare = func(ctx context.Context, app string) ([]byte, error) {
 		a.quits++
 		a.stop(t)
-		return quit(ctx)
+		return quit(ctx, app)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -485,8 +485,8 @@ func TestManagedRemovalRefusalAfterTheQuitSaysToReopen(t *testing.T) {
 	a := runningAppFixture(t, true)
 	i := a.installer
 	quit := a.controller.prepare
-	a.controller.prepare = func(ctx context.Context) ([]byte, error) {
-		output, err := quit(ctx)
+	a.controller.prepare = func(ctx context.Context, app string) ([]byte, error) {
+		output, err := quit(ctx, app)
 		if a.quits == 1 {
 			store, storeErr := openQueueStore(i.state, false)
 			if storeErr != nil {
@@ -525,8 +525,8 @@ func TestManagedRemovalHeldLifetimeLockNamesIt(t *testing.T) {
 	a := runningAppFixture(t, true)
 	i := a.installer
 	quit := a.controller.prepare
-	a.controller.prepare = func(ctx context.Context) ([]byte, error) {
-		output, err := quit(ctx)
+	a.controller.prepare = func(ctx context.Context, app string) ([]byte, error) {
+		output, err := quit(ctx, app)
 		if a.quits == 1 {
 			lock, lockErr := installLock(i.state, "queue-daemon.lock")
 			if lockErr != nil {
@@ -553,11 +553,11 @@ func TestManagedRemovalRefusedQuitLeavesARunningAppComplete(t *testing.T) {
 	i := a.installer
 	quit := a.controller.prepare
 	refuse := true
-	a.controller.prepare = func(ctx context.Context) ([]byte, error) {
+	a.controller.prepare = func(ctx context.Context, app string) ([]byte, error) {
 		if refuse {
 			return nil, errors.New("a running setup change cancelled the quit")
 		}
-		return quit(ctx)
+		return quit(ctx, app)
 	}
 	managedRemovalTarget(i)
 	a.calls = nil

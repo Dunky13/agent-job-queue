@@ -17,17 +17,16 @@ import (
 // {"controller", action, service, app} and
 // {"controller", "prepare-app-replacement", app}.
 type memoryController struct {
-	install  *installer
 	statuses map[string]string
 	// manage answers ServiceManagement; a test wraps it to act or fail then.
 	manage func(ctx context.Context, app, action, service string) ([]byte, error)
 	// prepare answers PrepareAppReplacement; a test wraps it likewise.
-	prepare func(ctx context.Context) ([]byte, error)
+	prepare func(ctx context.Context, app string) ([]byte, error)
 	record  func(call []string) error
 }
 
-func newMemoryController(install *installer, record func([]string) error) *memoryController {
-	controller := &memoryController{install: install, record: record,
+func newMemoryController(record func([]string) error) *memoryController {
+	controller := &memoryController{record: record,
 		statuses: map[string]string{"queue": "notRegistered", "resources": "notRegistered", "remote": "notRegistered", "login": "notRegistered"}}
 	controller.manage = func(_ context.Context, _, action, service string) ([]byte, error) {
 		switch action {
@@ -40,8 +39,8 @@ func newMemoryController(install *installer, record func([]string) error) *memor
 		}
 		return nil, nil
 	}
-	controller.prepare = func(context.Context) ([]byte, error) {
-		return json.Marshal(Object{"schemaVersion": 1, "app": controller.install.app, "status": "stopped"})
+	controller.prepare = func(_ context.Context, app string) ([]byte, error) {
+		return json.Marshal(Object{"schemaVersion": 1, "app": app, "status": "stopped"})
 	}
 	return controller
 }
@@ -57,11 +56,11 @@ func (controller *memoryController) ServiceManagement(ctx context.Context, app, 
 	return controller.manage(ctx, app, action, service)
 }
 
-func (controller *memoryController) PrepareAppReplacement(ctx context.Context) ([]byte, error) {
-	if err := controller.record([]string{"controller", "prepare-app-replacement", controller.install.app}); err != nil {
+func (controller *memoryController) PrepareAppReplacement(ctx context.Context, app string) ([]byte, error) {
+	if err := controller.record([]string{"controller", "prepare-app-replacement", app}); err != nil {
 		return nil, err
 	}
-	return controller.prepare(ctx)
+	return controller.prepare(ctx, app)
 }
 
 // controllerCall reports a recorded Service Management operation on service.
@@ -90,7 +89,7 @@ func TestInstallAppController(t *testing.T) {
 			t.Fatalf("service management: %q %v", output, err)
 		}
 	}
-	if output, err := controller.PrepareAppReplacement(ctx); err != nil || string(output) != "answer" {
+	if output, err := controller.PrepareAppReplacement(ctx, install.app); err != nil || string(output) != "answer" {
 		t.Fatalf("prepare replacement: %q %v", output, err)
 	}
 	for _, invalid := range [][]string{{"relative.app", "status", "queue"}, {install.app, "enable", "queue"}, {install.app, "status", "daemon"}} {
@@ -102,7 +101,7 @@ func TestInstallAppController(t *testing.T) {
 	if _, err := controller.ServiceManagement(ctx, install.app, "status", "queue"); !errors.Is(err, failure) {
 		t.Fatal("service management hid its failure", err)
 	}
-	if _, err := controller.PrepareAppReplacement(ctx); !errors.Is(err, failure) {
+	if _, err := controller.PrepareAppReplacement(ctx, install.app); !errors.Is(err, failure) {
 		t.Fatal("replacement preparation hid its failure", err)
 	}
 
@@ -138,7 +137,7 @@ func TestInstallAppControllerIsolatesEnvironment(t *testing.T) {
 	if err != nil || string(status) != want {
 		t.Fatalf("service management environment: %q %v", status, err)
 	}
-	replacement, err := install.appController().PrepareAppReplacement(context.Background())
+	replacement, err := install.appController().PrepareAppReplacement(context.Background(), install.app)
 	if err != nil || string(replacement) != want {
 		t.Fatalf("replacement environment: %q %v", replacement, err)
 	}
@@ -153,19 +152,24 @@ func TestInstallTestModeWithoutFixtureRefusesNativeOperations(t *testing.T) {
 	}
 	for _, managed := range []string{"", "1", "private-native-lifecycle "} {
 		t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", managed)
-		install := &installer{app: app, testing: true}
-		chosen := installTestController(install)
-		if _, refusing := chosen.(installRefusingController); !refusing {
-			t.Fatalf("managed %q chose %T", managed, chosen)
-		}
-		// A test-mode installer that skipped the choice refuses too.
-		for _, controller := range []installController{chosen, install.appController()} {
+		// A test-mode installer that never made the choice refuses too.
+		unchosen, chosen := &installer{app: app, testing: true}, &installer{app: app, testing: true}
+		chosen.selectTestLifecycle()
+		for _, install := range []*installer{unchosen, chosen} {
+			controller := install.appController()
+			if _, refusing := controller.(installRefusingController); !refusing {
+				t.Fatalf("managed %q chose %T", managed, controller)
+			}
 			_, status := controller.ServiceManagement(context.Background(), app, "status", "queue")
-			_, replacement := controller.PrepareAppReplacement(context.Background())
+			_, replacement := controller.PrepareAppReplacement(context.Background(), app)
 			for _, err := range []error{status, replacement} {
 				if err == nil || err.Error() != "Managed installer tests require the private native lifecycle fixture; real service management is disabled in test mode" {
 					t.Fatalf("managed %q: %v", managed, err)
 				}
+			}
+			// A command that is invalid anywhere keeps saying so.
+			if _, err := controller.ServiceManagement(context.Background(), "relative.app", "status", "queue"); err == nil || err.Error() != "invalid service management command" {
+				t.Fatalf("managed %q: invalid command: %v", managed, err)
 			}
 		}
 	}
@@ -173,9 +177,9 @@ func TestInstallTestModeWithoutFixtureRefusesNativeOperations(t *testing.T) {
 		t.Fatal("test mode ran the app executable", err)
 	}
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", "private-native-lifecycle")
-	if chosen := installTestController(&installer{testing: true}); chosen == nil {
-		t.Fatal("no adapter chosen")
-	} else if _, private := chosen.(installPrivateController); !private {
-		t.Fatalf("managed fixture chose %T", chosen)
+	install := &installer{app: app, testing: true}
+	install.selectTestLifecycle()
+	if controller, private := install.appController().(installPrivateController); !private || controller.install != install {
+		t.Fatalf("managed fixture chose %T", install.appController())
 	}
 }

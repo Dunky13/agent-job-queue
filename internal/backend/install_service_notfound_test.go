@@ -474,9 +474,9 @@ func TestManagedRemovalRefusalGuidanceAfterTheQuit(t *testing.T) {
 		i := m.installer
 		managedRemovalTarget(i)
 		prepare := m.controller.prepare
-		m.controller.prepare = func(ctx context.Context) ([]byte, error) {
+		m.controller.prepare = func(ctx context.Context, app string) ([]byte, error) {
 			integrationTestWrite(t, filepath.Join(i.state, "remote/processes.json"), []byte(`{"active":true}`))
-			return prepare(ctx)
+			return prepare(ctx, app)
 		}
 		if err := m.run(t); err == nil || !strings.Contains(err.Error(), "Open Agent Queue, then run removal again") {
 			t.Fatal("a stuck phone record did not say to reopen the app", err)

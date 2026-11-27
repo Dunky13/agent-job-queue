@@ -115,7 +115,7 @@ func installBaseFixture(t *testing.T) *installFixture {
 	install.services = f.services
 	f.host = newMemoryHost(record)
 	install.host = f.host
-	f.controller = newMemoryController(install, record)
+	f.controller = newMemoryController(record)
 	install.controller = f.controller
 	install.command = func(_ context.Context, args []string) ([]byte, error) {
 		if args[0] == "launchctl" {

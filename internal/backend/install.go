@@ -48,6 +48,7 @@ type installer struct {
 	services                                     installServices
 	host                                         installHost
 	controller                                   installController
+	privateLifecycle                             bool
 	notice                                       func(string)
 }
 
@@ -1702,7 +1703,7 @@ func InstallMain(args []string) int {
 	}
 	install := &installer{home: home, root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: options.app, path: path, testing: testing, disablePhoneAccess: options.disablePhoneAccess, unregisterServices: options.unregisterServices, keepCustomCallback: options.keepCustomCallback}
 	if testing {
-		install.controller = installTestController(install)
+		install.selectTestLifecycle()
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

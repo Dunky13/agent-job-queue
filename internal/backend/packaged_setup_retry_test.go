@@ -64,7 +64,7 @@ func TestPackagedSetupNeverRetriesMutationOrUncertainHistory(t *testing.T) {
 				case "native":
 					_, _ = f.controller.ServiceManagement(context.Background(), i.app, "unregister", "resources")
 				case "menu":
-					_, _ = f.controller.PrepareAppReplacement(context.Background())
+					_, _ = f.controller.PrepareAppReplacement(context.Background(), i.app)
 				case "service":
 					f.calls = append(f.calls, []string{"service", "bootout", "private-service"})
 				case "lost-history":
