@@ -181,7 +181,13 @@ func installAtomic(filename string, data []byte, mode os.FileMode) error {
 }
 
 func (install *installer) executable(name string) (string, error) {
-	for _, directory := range filepath.SplitList(install.path) {
+	directories := filepath.SplitList(install.path)
+	if install.testing {
+		// The test tools folder leads the path. A tool missing there must not
+		// resolve to the real one further along, such as /bin/launchctl.
+		directories = directories[:min(1, len(directories))]
+	}
+	for _, directory := range directories {
 		filename := filepath.Join(directory, name)
 		info, err := os.Stat(filename)
 		if err == nil && info.Mode().IsRegular() && info.Mode().Perm()&0111 != 0 {
@@ -223,7 +229,8 @@ func (install *installer) commandEnvironment(args []string) []string {
 		environment["HOME"] = install.home
 	}
 	if managedRemote && install.testing {
-		environment["AGENT_QUEUE_INSTALL_TEST_MODE"] = "1" // agent-remote then refuses real service control.
+		// agent-remote then refuses to change services, settings or processes.
+		environment["AGENT_QUEUE_INSTALL_TEST_MODE"] = "1"
 	}
 	replacement := len(args) == 3 && args[1] == "--prepare-app-replacement" && args[2] == install.app && args[0] == filepath.Join(install.app, "Contents/MacOS/AgentQueue")
 	if replacement || slices.Equal(args, []string{filepath.Join(install.root, "bin/agent-heavy"), "status", "--json"}) || slices.Equal(args, []string{filepath.Join(install.app, "Contents/MacOS/agent-heavy"), "status", "--json"}) || len(args) > 1 && args[0] == filepath.Join(install.app, "Contents/MacOS/AgentQueue") && args[1] == "--service-management" {
@@ -285,6 +292,25 @@ func (install *installer) runAs(ctx context.Context, standsFor, args []string) (
 		return output.Bytes(), fmt.Errorf("Installer command %s failed: %w", filepath.Base(args[0]), err)
 	}
 	return output.Bytes(), nil
+}
+
+// runRemote runs the app's agent-remote and keeps the reason it reports.
+func (install *installer) runRemote(ctx context.Context, action string) error {
+	output, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-remote"), action)
+	if err == nil {
+		return nil
+	}
+	// A failure is one JSON object on the combined output; other lines may surround it.
+	for _, line := range strings.Split(string(output), "\n") {
+		var failure struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal([]byte(line), &failure) == nil && failure.Error != "" {
+			// One line only: the app reads setup state markers from this output.
+			return fmt.Errorf("%w: %s", err, DisplayText(failure.Error, 500))
+		}
+	}
+	return err
 }
 
 func installServiceAbsent(output []byte, exitCode int, label string) bool {
@@ -1683,6 +1709,8 @@ func installReportFailure(output io.Writer, err error) {
 	}
 }
 
+const installTestLayoutRequired = "Installer test mode requires a private test home: HOME must be \"User With Spaces\" in a canonical agent-queue-install-test-* folder, AGENT_QUEUE_INSTALL_TEST_TOOLS must be its tools sibling, and all three folders must be yours with mode 0700"
+
 func InstallMain(args []string) int {
 	options, optionErr := installParseOptions(args)
 	if optionErr != nil {
@@ -1700,6 +1728,10 @@ func InstallMain(args []string) int {
 		tools := os.Getenv("AGENT_QUEUE_INSTALL_TEST_TOOLS")
 		if !integrationValidPath(tools) {
 			fmt.Fprintln(os.Stderr, "Installer test tools must name an absolute directory")
+			return 1
+		}
+		if !installPrivateTestLayout(home, tools) {
+			fmt.Fprintln(os.Stderr, installTestLayoutRequired)
 			return 1
 		}
 		path = tools + string(os.PathListSeparator) + path

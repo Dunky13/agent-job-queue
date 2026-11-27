@@ -116,5 +116,5 @@ The reviewer recommends keeping the `User With Spaces` check: real Service Manag
 
 ## Remaining steps
 
-1. Owner decision: keep the `User With Spaces` check (recommended) or rename it together with the root prefix in its own change.
-2. Separate investigation: in test mode the installer runs `agent-remote disable` and `migrate` through `run`; `commandEnvironment` strips `AGENT_REMOTE_*`, so `agent-remote` runs outside test mode and may call `AgentQueue --service-management` for the app recorded in the test home. This predates the refactor and was never covered by the argv rewrite.
+1. Decided: the owner keeps the `User With Spaces` check. `InstallMain` now demands the same private layout in test mode (`remote-test-mode-guard.md`).
+2. Addressed in `remote-test-mode-guard.md`. The original item: separate investigation: in test mode the installer runs `agent-remote disable` and `migrate` through `run`; `commandEnvironment` strips `AGENT_REMOTE_*`, so `agent-remote` runs outside test mode and may call `AgentQueue --service-management` for the app recorded in the test home. This predates the refactor and was never covered by the argv rewrite.

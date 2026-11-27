@@ -75,23 +75,44 @@ itself.
 
 - `newPaths` records `AGENT_QUEUE_INSTALL_TEST_MODE=1`, and `serviceAction`
   refuses every action when it is set. This is the single entry point for both
-  routes, so it fails closed for Service Management and `launchctl`.
+  service routes, so it fails closed for Service Management and `launchctl`.
 - `commandEnvironment` sets that variable for the installer's `agent-remote`
   calls whenever the installer is in test mode. It already survived the
   `AGENT_REMOTE_*` strip, but the installer state is now the source of truth.
-- With test mode off, behaviour is unchanged.
+- With test mode off, behaviour is unchanged apart from the added refusal reason
+  in installer errors.
 
-Effect: in installer test mode, a real `agent-remote disable` or `migrate` now
-fails, and the installer reports the failure. `disable` still writes the phone
-settings in the installer home and runs its own process cleanup there before
-reporting. No current test relied on success. A future test that needs success
-must supply a private fixture; the refusal should not be relaxed for it.
+## Review follow-up
 
-## Out of scope
+An independent review of `8a5bfc3` found that the command as a whole did not fail
+closed: with a real home, `disable` still rewrote `remote.json`, deactivated
+`processes.json` and signalled recorded processes before or after the refusal.
 
-- Process cleanup in `stopOwnedService` still acts on processes recorded in the
-  installer home. It does not use Service Management or `launchctl`, but with a
-  real home it would act on real phone access processes.
+| Severity | Finding | Disposition |
+| --- | --- | --- |
+| Medium | Test mode accepted a real home | Fixed. `installPrivateTestLayout` (`install_private_services.go`) is shared by `InstallMain` and the private adapter's `tool()`. `InstallMain` refuses to start outside the layout. `tool()` keeps its managed value, tool file and socket checks. Both now also refuse a root containing the path list separator, which would split the tools folder out of the test `PATH` |
+| Medium | Refusal came after side effects | Fixed as a backstop. In installer test mode `runMain` refuses every action except `status` (help returns earlier) before `prepare`, the lock or any write: `configure`, `enable`, `disable`, `migrate`, `serve`, `child`. The `serviceAction` check stays |
+| Medium (older) | A bare tool missing from the test folder resolved to the real one, such as `/bin/launchctl` | Fixed. In test mode `executable` searches only the first `PATH` entry, the test tools folder. This covers `launchctl`, `ps`, `pueue` and any later bare name |
+| Low | The installer dropped the refusal reason | Fixed. `runRemote` appends the decoded `error` field, on one line and at most 500 characters, at all three `agent-remote` call sites |
+| Low | Loop variable shadowed `testing`; end-of-line comment | Fixed |
+
+The owner decided to keep the `User With Spaces` check.
+
+The failure state file is no longer written for a refusal in installer test mode,
+because that write is itself a side effect in the installer home.
+`TestInstallerTestModeControllerNeverRunsAgentQueue` read that file; it now reads
+the command output and asserts that the file is absent.
+
+## Limits
+
+- The tool lookup rule covers commands the installer resolves itself. `PATH` in
+  the child environment still ends with the real tool folders, so a script in the
+  test folder that calls a bare name can still reach them.
+- Absolute tool paths (`/usr/sbin/lsof`, `/usr/bin/codesign`) are unaffected.
+  Both only read.
+- A private acceptance harness outside this repository would now need every bare
+  tool it exercises in its tools folder. No script or workflow in this repository
+  sets installer test mode; only Go tests do.
 - The installer's own `--service-management` calls go through the controller
   port. This change does not touch them.
 
@@ -115,6 +136,26 @@ Without the fix all three failed (run with `/bin/launchctl` execution denied by
 unmanaged route and `--service-management status remote` on the managed route.
 The stub helper received no signal. All pass with the fix.
 
+### Review follow-up tests
+
+Each failed with the five changed production files restored to `8a5bfc3` in a
+scratch copy (with a stand-in `runRemote` that drops output, so the tests
+compile), and passes with the fix.
+
+- `TestInstallMainTestModeRequiresPrivateTestHome`: five layouts outside the
+  rules, each refused with the home left empty.
+- `TestInstallerTestModeResolvesToolsOnlyInTestFolder`: `launchctl`, `ps` and
+  `pueue` stand-ins later on the path are not resolved or run in test mode.
+- `TestInstallerReportsRemoteHelperReason`: the reason is appended, also after
+  other output, and cannot start a new line.
+- `TestInstallerTestModeLeavesSettingsAndProcesses`: every changing action leaves
+  the home byte for byte and two test-owned processes running. `runMain` builds
+  its own controller, so the test uses real processes instead of the `killFn` and
+  `killGroupFn` seams.
+
+`TestInstallerAppBundleCLIValidatesBundleBeforeSetup` moved to the private layout
+and now asserts that it reaches bundle validation.
+
 ### Real binary probe
 
 The first version of the backend test built `./cmd/agent-remote` from this tree
@@ -127,19 +168,21 @@ Caddy, which made its 2 minute bound unsafe on slower CI runners.
 
 ## Validation
 
-- `gofmt -l cmd internal`: clean.
-- `go vet -p 2 ./internal/remote/... ./internal/backend/...`: passed.
-- `go run -p 2 ./cmd/queue-tool check-source`: passed.
-- Through the shared queue (job 8220, on the `ed2e75d` base):
-  `go test -p 2 -parallel 2 -timeout 20m -skip '^TestInstallerOwnershipParsesRealPrivateLaunchctlService$' ./internal/backend/... ./internal/remote/...`
-  passed (`internal/backend` 401 s, `internal/remote` 25 s). This run did not use
-  `-race`.
+For the review follow-up:
 
-Not run: `-race`, the packaged app tests, the full lint script, native tests and
-hosted CI. No independent review has run.
+- `gofmt -l cmd internal`: clean.
+- `go vet -p 2 ./internal/backend/... ./internal/remote/...`: passed.
+- `go run -p 2 ./cmd/queue-tool check-source`: passed.
+- Through the shared queue (job 8228):
+  `go test -p 2 -parallel 2 -count=1 -skip '^TestInstallerOwnershipParsesRealPrivateLaunchctlService$' ./internal/backend/... ./internal/remote/...`
+  passed (`internal/backend` 536 s of the default 600 s package timeout,
+  `internal/remote` 31 s). This run did not use `-race`.
+
+Not run: `-race`, the packaged app tests, the full lint script (its web lint
+needs `node_modules`, absent in this worktree), native tests and hosted CI.
 
 ## Next steps
 
-1. Run independent Standards and Spec review.
+1. Run independent Standards and Spec review of the follow-up.
 2. Push the branch and open a PR.
 3. Wait for required CI before merging.

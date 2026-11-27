@@ -924,8 +924,7 @@ func (install *installer) recover(ctx context.Context, action string, jobID *int
 		if err := install.requirePhoneAccessDrained(ctx, node); err != nil {
 			return err
 		}
-		_, err = install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-remote"), "disable")
-		return err
+		return install.runRemote(ctx, "disable")
 	case "repair-service":
 		if !install.embeddedDefinition() {
 			return errors.New("Only an installed Go service can be started by this recovery")

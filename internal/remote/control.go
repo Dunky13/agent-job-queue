@@ -1711,6 +1711,11 @@ func runMain(arguments []string, inputReader io.Reader, prepare func(map[string]
 	if err != nil {
 		return printFailure(err)
 	}
+	// Every action but status changes settings, services or processes. Refuse
+	// before the first write: the failure state file is one of them.
+	if p.installTesting && action != "status" {
+		return printFailure(errors.New("Installer test mode cannot change phone access"))
+	}
 	var prepared *preparedConfiguration
 	var preparationErr error
 	if action == "configure" {

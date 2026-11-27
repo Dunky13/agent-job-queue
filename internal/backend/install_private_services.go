@@ -54,21 +54,11 @@ func (adapter installPrivateController) tool() (string, error) {
 	if !install.testing || os.Getenv("AGENT_QUEUE_INSTALL_TEST_MANAGED") != "private-native-lifecycle" {
 		return "", errInstallNativeRefused
 	}
+	tools := os.Getenv("AGENT_QUEUE_INSTALL_TEST_TOOLS")
+	if !installPrivateTestLayout(install.home, tools) {
+		return "", errInstallNativeRefused
+	}
 	root := filepath.Dir(install.home)
-	tools := filepath.Join(root, "tools")
-	if filepath.Base(install.home) != "User With Spaces" || !strings.HasPrefix(filepath.Base(root), "agent-queue-install-test-") || os.Getenv("AGENT_QUEUE_INSTALL_TEST_TOOLS") != tools {
-		return "", errInstallNativeRefused
-	}
-	canonical, err := filepath.EvalSymlinks(root)
-	if err != nil || canonical != root {
-		return "", errInstallNativeRefused
-	}
-	for _, directory := range []string{root, install.home, tools} {
-		var info unix.Stat_t
-		if unix.Lstat(directory, &info) != nil || info.Mode&unix.S_IFMT != unix.S_IFDIR || info.Mode&0777 != 0700 || info.Uid != uint32(os.Getuid()) {
-			return "", errInstallNativeRefused
-		}
-	}
 	tool := filepath.Join(tools, "service-management")
 	var executable, socket unix.Stat_t
 	if unix.Lstat(tool, &executable) != nil || executable.Mode&unix.S_IFMT != unix.S_IFREG || executable.Mode&0077 != 0 || executable.Mode&0100 == 0 || executable.Uid != uint32(os.Getuid()) || executable.Nlink != 1 {
@@ -78,4 +68,25 @@ func (adapter installPrivateController) tool() (string, error) {
 		return "", errInstallNativeRefused
 	}
 	return tool, nil
+}
+
+// installPrivateTestLayout reports whether home and tools sit in a private test
+// root. Installer test mode starts only there, so a real home is never its target.
+func installPrivateTestLayout(home, tools string) bool {
+	root := filepath.Dir(home)
+	// A list separator in root would split the tools folder out of the test PATH.
+	if filepath.Base(home) != "User With Spaces" || !strings.HasPrefix(filepath.Base(root), "agent-queue-install-test-") || strings.ContainsRune(root, os.PathListSeparator) || tools != filepath.Join(root, "tools") {
+		return false
+	}
+	canonical, err := filepath.EvalSymlinks(root)
+	if err != nil || canonical != root {
+		return false
+	}
+	for _, directory := range []string{root, home, tools} {
+		var info unix.Stat_t
+		if unix.Lstat(directory, &info) != nil || info.Mode&unix.S_IFMT != unix.S_IFDIR || info.Mode&0777 != 0700 || info.Uid != uint32(os.Getuid()) {
+			return false
+		}
+	}
+	return true
 }
