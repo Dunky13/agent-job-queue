@@ -1,0 +1,69 @@
+<!doctype html>
+<!-- PROTOTYPE, throwaway. Three menu-bar mark concepts for Agent Queue, each in five states,
+     switchable with ?variant=A|B|C. One colour only, like a template image. -->
+<html lang="en"><head><meta charset="utf-8"><title>Agent Queue menu-bar mark prototype</title>
+<style>
+:root{font:14px/1.4 -apple-system,BlinkMacSystemFont,sans-serif}
+body{margin:0}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:15px;margin:22px 0 4px}
+.legend{display:flex;gap:18px;padding:0 14px;font-size:11px;opacity:.6}.legend span{min-width:16px}
+p{margin:0 0 8px;opacity:.75;max-width:75ch}
+.bar{display:flex;align-items:center;gap:18px;height:24px;padding:0 14px;border-radius:6px;margin:6px 0;width:max-content}
+.bar.light{background:rgba(246,246,246,.92);color:#000;box-shadow:0 0 0 1px #ddd}
+.bar.dark{background:#2a2a2c;color:#fff}
+.bar.tint{background:linear-gradient(90deg,#5b7fb5,#7c5fa8);color:#fff}
+.item{display:flex;align-items:center;gap:4px;min-width:16px;font:13px -apple-system;font-variant-numeric:tabular-nums}
+.item svg{width:16px;height:16px;display:block}
+.label{font-size:11px;opacity:.55;width:64px}
+.neigh{width:15px;height:15px;opacity:.85}
+.zoom{display:grid;grid-template-columns:repeat(5,96px);gap:12px;margin-top:10px}
+.zoom figure{margin:0;text-align:center}
+.zoom svg{width:72px;height:72px;background:#fff;color:#000;border-radius:10px;padding:6px;box-shadow:0 0 0 1px #ddd}
+.zoom figcaption{font-size:12px;margin-top:4px}
+.switch{position:static;margin-top:18px;width:max-content;display:flex;gap:6px;background:#1d1d1f;padding:6px;border-radius:999px}
+.switch a{color:#fff;text-decoration:none;padding:6px 14px;border-radius:999px;font-size:13px}
+.switch a.on{background:#0a84ff}
+</style></head><body>
+<div id="out"></div>
+<nav class="switch" id="switch"></nav>
+<script>
+const S='stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"';
+const F='fill="currentColor"';
+// Each concept: name, idea, and an SVG body (viewBox 0 0 16 16) per state.
+const concepts={
+A:{name:"A · Lanes",idea:"Three queue lanes, longest first. The right-hand end carries the state, so the mark keeps its outline in every state.",
+ states:{
+  idle:`<path ${S} d="M2 4h12M2 8h9M2 12h6"/>`,
+  running:`<path ${S} d="M2 4h12M2 8h9M2 12h6"/><circle ${F} cx="14" cy="12" r="2"/>`,
+  paused:`<path ${S} d="M2 4h7M2 8h7M2 12h6"/><path ${S} d="M12 3.5v9M15 3.5v9"/>`,
+  draining:`<path ${S} d="M2 4h6M2 8h4M2 12h2"/><path ${S} d="M10 8h5M12.5 5.5 15 8l-2.5 2.5"/>`,
+  attention:`<path ${S} d="M2 4h8M2 8h8M2 12h6"/><path ${S} d="M14 3v6"/><circle ${F} cx="14" cy="12.5" r="1.1"/>`}},
+B:{name:"B · Stack",idea:"An owned redraw of today's stacked plates, so the brand stays recognisable. The top plate carries the state as a cut-out.",
+ states:{
+  idle:`<path ${S} d="M8 2 14 5 8 8 2 5Z"/><path ${S} d="M2 8l6 3 6-3M2 11l6 3 6-3"/>`,
+  running:`<path ${F} d="M8 1.6 14.6 5 8 8.4 1.4 5Z"/><path ${S} d="M2 8l6 3 6-3M2 11l6 3 6-3"/>`,
+  paused:`<path ${F} fill-rule="evenodd" d="M8 1.6 14.6 5 8 8.4 1.4 5Z M6.6 3.6h1v2.8h-1Z M8.4 3.6h1v2.8h-1Z"/><path ${S} d="M2 8l6 3 6-3M2 11l6 3 6-3"/>`,
+  draining:`<path ${S} stroke-dasharray="1.6 1.6" d="M8 2 14 5 8 8 2 5Z"/><path ${S} d="M2 8l6 3 6-3M2 11l6 3 6-3"/>`,
+  attention:`<path ${F} fill-rule="evenodd" d="M8 1.6 14.6 5 8 8.4 1.4 5Z M7.4 3.2h1.2v2.2h-1.2Z M7.4 6h1.2v1h-1.2Z"/><path ${S} d="M2 8l6 3 6-3M2 11l6 3 6-3"/>`}},
+C:{name:"C · Slot",idea:"A rounded slot that jobs pass through, read like a transport control: play while running, pause, an eject-style arrow while draining.",
+ states:{
+  idle:`<rect ${S} x="1.75" y="2.75" width="12.5" height="10.5" rx="3"/>`,
+  running:`<rect ${S} x="1.75" y="2.75" width="12.5" height="10.5" rx="3"/><path ${F} d="M6.3 5.4v5.2L10.6 8Z"/>`,
+  paused:`<rect ${S} x="1.75" y="2.75" width="12.5" height="10.5" rx="3"/><path ${F} d="M5.8 5.3h1.5v5.4H5.8ZM8.7 5.3h1.5v5.4H8.7Z"/>`,
+  draining:`<path ${S} d="M14.25 6V5.75a3 3 0 0 0-3-3h-6.5a3 3 0 0 0-3 3v4.5a3 3 0 0 0 3 3h6.5a3 3 0 0 0 3-3V10"/><path ${S} d="M6 8h9M12.5 5.5 15 8l-2.5 2.5"/>`,
+  attention:`<rect ${S} x="1.75" y="2.75" width="12.5" height="10.5" rx="3"/><path ${S} d="M8 5.2v3.3"/><circle ${F} cx="8" cy="10.6" r="1"/>`}}};
+const order=["idle","running","paused","draining","attention"];
+const counts={idle:"",running:"2 · 3",paused:"2 · 3",draining:"1 · 0",attention:"!"};
+const svg=b=>`<svg viewBox="0 0 16 16" aria-hidden="true">${b}</svg>`;
+const neighbours=`<svg class="neigh" viewBox="0 0 16 16"><path ${S} d="M3 6a5 5 0 0 1 10 0M5 8.5a3 3 0 0 1 6 0"/><circle ${F} cx="8" cy="11" r="1.2"/></svg><svg class="neigh" viewBox="0 0 16 16"><rect ${S} x="2" y="5" width="11" height="6" rx="1.5"/><path ${F} d="M14 7h1v2h-1z"/></svg><span class="item">Thu 27 Nov 10:05</span>`;
+const v=new URLSearchParams(location.search).get("variant")||"all";
+const shown=v==="all"?Object.keys(concepts):[v in concepts?v:"A"];
+const row=(c,tone)=>`<div class="bar ${tone}">${order.map(st=>`<span class="item" title="${st}">${svg(c.states[st])}${counts[st]}</span>`).join("")}${neighbours}</div>`;
+let html="";
+for(const k of shown){const c=concepts[k];
+ html+=`<h2>${c.name}</h2><p>${c.idea}</p><div class="legend">${order.map(st=>`<span>${st}</span>`).join("")}</div>`;
+ for(const tone of ["light","dark","tint"])html+=row(c,tone);
+ html+=`<div class="zoom">${order.map(st=>`<figure>${svg(c.states[st])}<figcaption>${st}</figcaption></figure>`).join("")}</div>`;}
+document.getElementById("out").innerHTML=html;
+document.getElementById("switch").innerHTML=["all",...Object.keys(concepts)].map(k=>`<a class="${k===v?"on":""}" href="?variant=${k}">${k==="all"?"All":concepts[k].name}</a>`).join("");
+</script></body></html>
