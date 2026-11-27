@@ -46,7 +46,7 @@ type installer struct {
 	keepCustomCallback                           bool
 	command                                      func(context.Context, []string) ([]byte, error)
 	services                                     installServices
-	queries                                      installHost
+	host                                         installHost
 	notice                                       func(string)
 }
 
@@ -1566,7 +1566,7 @@ func (install *installer) stopLegacy(ctx context.Context, node *yaml.Node) error
 	}
 	// An independently started Python process is outside launchd ownership.
 	// Never kill it or remove its interpreter while it may own work.
-	processes, err := install.host().Processes(ctx)
+	processes, err := install.hostQueries().Processes(ctx)
 	if err != nil {
 		return err
 	}

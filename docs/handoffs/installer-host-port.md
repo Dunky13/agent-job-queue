@@ -4,7 +4,7 @@ Step 2 of the installer refactor, after `installer-service-port.md`: setup asks 
 
 ## Result
 
-- `internal/backend/install_host.go` defines `installHost` (`Processes()`, `LockHolders(path)`, `VerifySignature(path)`), `installProcess` and the `installMacOSHost` adapter. `installer.queries` is nil in production and `host()` supplies the adapter. The adapter runs through `installer.run` with the same argv, so executable resolution, environment, timeouts and output limits are the same.
+- `internal/backend/install_host.go` defines `installHost` (`Processes()`, `LockHolders(path)`, `VerifySignature(path)`), `installProcess` and the `installMacOSHost` adapter. `installer.host` is nil in production and `hostQueries()` supplies the adapter, mirroring `services` and `loginServices()` from step 1. The adapter runs through `installer.run` with the same argv, so executable resolution, environment, timeouts and output limits are the same.
 - The adapter owns the parsing. `installServices` is unchanged and separate.
 - `GLOSSARY.md` is unchanged: no new domain term.
 
@@ -19,7 +19,7 @@ Step 2 of the installer refactor, after `installer-service-port.md`: setup asks 
 
 ## Preserved parsing behaviour
 
-- Process list: `Command` is the text after the process ID, with outer blanks trimmed and inner spacing kept. A line with fewer than two fields or a non-integer process ID is returned with `Unparsed` set and the whole line as `Command`. The check before migration still stops on such a line when it names old queue code. Preflight still skips it. Every searched text starts with `pueued` or an absolute path, so no match can depend on the process ID prefix.
+- Process list: `Command` is the text after the process ID, with outer blanks trimmed and inner spacing kept. A line with fewer than two fields or a non-integer process ID is returned with `Unparsed` set and the whole line as `Command`. The check before migration still stops on such a line when it names old queue code. Preflight still skips it. Every searched text is `pueued` or a path under the home directory, which setup refuses unless it is a valid absolute path (`integrationValidPath`), so no match can depend on the process ID prefix.
 - Lock holders, no holder: `lsof` exits 1 when nothing holds the path. Before this change that surfaced as `Installer command lsof failed: exit status 1`, and it still does. `no holder found` remains reachable only when `lsof` succeeds with empty output. No exit code is interpreted.
 - Lock holders, invalid entry: the adapter fails with the same `holder %q is not a process` on the listed text, and also returns the holders before it. `managedHeldByApp` checks those first, so the first problem in listing order is still the one reported.
 - Signature check: the command error is returned as is and `managedVerify` adds the same prefix.
@@ -64,7 +64,19 @@ Run locally on macOS, base `88d4071`, code commit `f4461cb`:
 - Deliberate breakages each failed a test: verifying through the runner, no signature check, a signature check during preflight of an invalid bundle, preflight or migration ignoring the process list, preflight reporting an unparsed line and no lock holder check.
 - Skipped by their own conditions: `TestRealDaemonPreservesRawUnixDirectoryExecutableAndFilenames`, `TestInstallerPackagedLiveResume` and `TestInstallerPackagedAppBundle`.
 - The test excluded with `-skip` bootstraps a temporary agent into the user's real `launchd`, which this task excluded from local runs. Hosted CI still selects it.
-- Not run: race detection, the CI partition scripts, Intel hardware and an independent review.
+- Not run locally: race detection, the CI partition scripts and Intel hardware.
+
+## Review dispositions
+
+An independent Opus review (Standards and Spec) traced process-list matching and lock-holder error order and found them equivalent to the old code for every input. Its findings were fixed on this branch:
+
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| Low-medium | No test pinned that an unowned holder listed before an invalid one is reported first | `TestManagedHeldByAppRefusesWithoutEvidence` gains an "unowned then invalid" case |
+| Low | Names ran the other way from step 1 (`queries` field, `host()` accessor) | Field `host`, accessor `hostQueries()` |
+| Low | The process ID prefix claim did not cite why paths are absolute | Cites `integrationValidPath` |
+
+Noted, not changed: the running-app test now captures `lsof` standard error as setup does, so a host where `lsof` prints warnings would fail that test. The preflight `owned[pid]` skip is untested, before and after this branch.
 
 ## Remaining steps
 

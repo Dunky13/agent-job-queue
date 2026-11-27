@@ -113,7 +113,7 @@ func TestInstallMacOSHost(t *testing.T) {
 		calls = append(calls, slices.Clone(args))
 		return []byte(output), failure
 	}}
-	host, ctx := install.host(), context.Background()
+	host, ctx := install.hostQueries(), context.Background()
 
 	output = "    1 /sbin/launchd\n  123 /Users/A  B/.venv/bin/python  agent_heavy.py \nlone\n x /legacy.py\n"
 	processes, err := host.Processes(ctx)

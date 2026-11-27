@@ -25,11 +25,11 @@ type installProcess struct {
 	Unparsed bool
 }
 
-func (install *installer) host() installHost {
-	if install.queries == nil {
+func (install *installer) hostQueries() installHost {
+	if install.host == nil {
 		return installMacOSHost{install}
 	}
-	return install.queries
+	return install.host
 }
 
 type installMacOSHost struct{ install *installer }

@@ -640,7 +640,7 @@ func (install *installer) preflightLegacyProcesses(ctx context.Context, report *
 	} else if busy && !resourcesLoaded {
 		report.add("controller-stopping", "The old resource controller is still stopping", "Wait for its lifetime lock to be released. Setup will not remove the lock or force-stop its holder.", "", "wait")
 	}
-	processes, err := install.host().Processes(ctx)
+	processes, err := install.hostQueries().Processes(ctx)
 	if err != nil {
 		report.add("legacy-processes", "Cannot inspect old queue processes", err.Error(), "", "wait")
 		return

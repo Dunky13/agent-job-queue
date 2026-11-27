@@ -112,7 +112,7 @@ func installBaseFixture(t *testing.T) *installFixture {
 	}
 	install.services = f.services
 	f.host = newMemoryHost(record)
-	install.queries = f.host
+	install.host = f.host
 	install.command = func(_ context.Context, args []string) ([]byte, error) {
 		if args[0] == "launchctl" {
 			t.Errorf("launchctl bypassed the service port: %v", args)

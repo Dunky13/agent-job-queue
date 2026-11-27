@@ -121,7 +121,7 @@ func (install *installer) managedVerify(ctx context.Context, app string) error {
 		return err
 	}
 	for _, target := range []string{filepath.Join(app, "Contents/MacOS/agent-heavy"), filepath.Join(app, "Contents/MacOS/agent-remote"), app} {
-		if err := install.host().VerifySignature(ctx, target); err != nil {
+		if err := install.hostQueries().VerifySignature(ctx, target); err != nil {
 			return fmt.Errorf("Managed bundle signature verification failed: %w", err)
 		}
 	}
@@ -312,7 +312,7 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 // Anything else, including no evidence, leaves the holder unowned, and the error
 // says which evidence was missing.
 func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helper string) error {
-	holders, listErr := install.host().LockHolders(ctx, lock)
+	holders, listErr := install.hostQueries().LockHolders(ctx, lock)
 	for _, pid := range holders {
 		executable, err := installProcessExecutable(pid)
 		if err != nil {
