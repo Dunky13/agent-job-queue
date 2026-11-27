@@ -38,7 +38,8 @@ func (adapter installPrivateController) PrepareAppReplacement(ctx context.Contex
 }
 
 // run executes the private tool in place of native, keeping native's isolated
-// environment.
+// environment. It bypasses installer.command on purpose: only tests set that seam,
+// and the private tool must run for real.
 func (adapter installPrivateController) run(ctx context.Context, native []string, toolArgs ...string) ([]byte, error) {
 	tool, err := adapter.tool()
 	if err != nil {

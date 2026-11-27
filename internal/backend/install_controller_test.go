@@ -182,4 +182,9 @@ func TestInstallTestModeWithoutFixtureRefusesNativeOperations(t *testing.T) {
 	if controller, private := install.appController().(installPrivateController); !private || controller.install != install {
 		t.Fatalf("managed fixture chose %T", install.appController())
 	}
+	// Outside test mode the fixture choice is ignored.
+	install.testing = false
+	if _, production := install.appController().(installAppExecutable); !production {
+		t.Fatalf("setup outside test mode chose %T", install.appController())
+	}
 }

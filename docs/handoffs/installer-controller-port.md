@@ -85,7 +85,7 @@ No script or workflow sets `AGENT_QUEUE_INSTALL_TEST_MANAGED`. The private fixtu
 
 ## Validation
 
-Run locally on macOS 27.2.1 (Apple Silicon), base `0bf247c` (open PR #102), code commits `718b601` and `0b85674`, run on `0b85674`:
+Run locally on macOS 27.2.1 (Apple Silicon) on the code tree of `0b85674`, then based on #102 before it merged. After #102 merged as `9f57b7c` the branch was rebased onto it; the code commits are now `f6f7993` and `43136ed` with an identical tree. The review fixes below were checked with `go vet` and the focused controller, private fixture, packaged retry and `InstallMain` tests:
 
 | Command | Result |
 | --- | --- |
@@ -99,6 +99,22 @@ Run locally on macOS 27.2.1 (Apple Silicon), base `0bf247c` (open PR #102), code
 - The test excluded with `-skip` bootstraps a temporary agent into the user's real `launchd`, which this task excluded from local runs. Hosted CI still selects it.
 - Not run locally: `scripts/test-installer.sh` as a whole (it selects that `launchd` test), the packaged gateway test, race detection, the CI partition scripts and Intel hardware.
 
+## Review dispositions
+
+An independent Opus review (Standards and Spec, security focus) found no high or medium findings: no path from test mode reaches the production adapter, every guard keeps its refusal message, and `run` with its policy helpers sees the same argv as before.
+
+| Severity | Finding | Disposition |
+| --- | --- | --- |
+| Low | Handoff cited pre-rebase commits and an open #102 | Fixed: provenance above |
+| Low | The private adapter bypasses `installer.command` | Kept on purpose, now commented: only tests set that seam, and the private tool must run |
+| Low | No test pinned that outside test mode a recorded fixture choice is ignored | Fixed: `TestInstallTestModeWithoutFixtureRefusesNativeOperations` asserts the production adapter |
+| Nit | `packaged_setup_retry_test.go` discarded controller errors | Fixed: they fail the test |
+| Low | `PrepareAppReplacement(app)` duplicates `install.app` | Kept: copies bind per call, and the private adapter's target guard is testable through it |
+| Info | With the rewrite gone from `run`, only the base fixture's guard stops a future direct native call in tests | Noted: new native calls must go through `appController()` |
+
+The reviewer recommends keeping the `User With Spaces` check: real Service Management is kept away by adapter selection and by the private adapter never running `AgentQueue`, and the root prefix already refuses a real home. The check only pins which child of the test root is the home, at no cost.
+
 ## Remaining steps
 
-None in the accepted refactor. The home name check above is open for the owner. Review, push and a pull request stacked on #102 are not done.
+1. Owner decision: keep the `User With Spaces` check (recommended) or rename it together with the root prefix in its own change.
+2. Separate investigation: in test mode the installer runs `agent-remote disable` and `migrate` through `run`; `commandEnvironment` strips `AGENT_REMOTE_*`, so `agent-remote` runs outside test mode and may call `AgentQueue --service-management` for the app recorded in the test home. This predates the refactor and was never covered by the argv rewrite.
