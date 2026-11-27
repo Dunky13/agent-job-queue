@@ -1540,7 +1540,7 @@ func (install *installer) executeManaged(ctx context.Context) error {
 		if err := install.requirePhoneAccessDrained(ctx, node); err != nil {
 			return err
 		}
-		if _, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-remote"), "disable"); err != nil {
+		if err := install.runRemote(ctx, "disable"); err != nil {
 			return err
 		}
 		if _, err := install.planManaged(ctx); err != nil {
@@ -1675,7 +1675,7 @@ func (install *installer) executeManaged(ctx context.Context) error {
 	// The shared remote controller owns migration and preserves credentials/CA.
 	// Publish location before invoking it, but keep the authoritative pending marker.
 	if p.remote || p.remoteCleanup {
-		if _, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/agent-remote"), "migrate"); err != nil {
+		if err := install.runRemote(ctx, "migrate"); err != nil {
 			return fmt.Errorf("Managed phone access migration is incomplete: %w", err)
 		}
 	}

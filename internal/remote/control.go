@@ -54,7 +54,7 @@ type Settings struct {
 }
 
 type remotePaths struct {
-	testing                                                                                 bool
+	testing, installTesting                                                                 bool
 	state, config, plist, socket, pid, gatewayConfig, certificate, log, errorFile, children string
 	home, managedApp, managedCandidate                                                      string
 }
@@ -64,7 +64,7 @@ func newPaths() (remotePaths, error) {
 	if err != nil {
 		return remotePaths{}, err
 	}
-	p := remotePaths{testing: os.Getenv("AGENT_REMOTE_TEST_MODE") == "1", home: home}
+	p := remotePaths{testing: os.Getenv("AGENT_REMOTE_TEST_MODE") == "1", installTesting: os.Getenv("AGENT_QUEUE_INSTALL_TEST_MODE") == "1", home: home}
 	p.state = filepath.Join(home, ".local/state/agent-heavy/remote")
 	p.config = filepath.Join(home, ".config/agent-heavy/remote.json")
 	p.plist = filepath.Join(home, "Library/LaunchAgents", label+".plist")
@@ -751,6 +751,12 @@ func (c *controller) launchAgent() error {
 }
 
 func (c *controller) serviceAction(action string) error {
+	// The installer strips AGENT_REMOTE_* from the helper it runs, so its test
+	// mode arrives alone. Neither a private HOME nor a test PATH isolates
+	// Service Management or /bin/launchctl.
+	if c.p.installTesting {
+		return errors.New("Installer test mode cannot control phone access services")
+	}
 	if c.p.managedApp != "" {
 		return c.managedServiceAction(action)
 	}
@@ -1704,6 +1710,11 @@ func runMain(arguments []string, inputReader io.Reader, prepare func(map[string]
 	p, err := newPaths()
 	if err != nil {
 		return printFailure(err)
+	}
+	// Every action but status changes settings, services or processes. Refuse
+	// before the first write: the failure state file is one of them.
+	if p.installTesting && action != "status" {
+		return printFailure(errors.New("Installer test mode cannot change phone access"))
 	}
 	var prepared *preparedConfiguration
 	var preparationErr error

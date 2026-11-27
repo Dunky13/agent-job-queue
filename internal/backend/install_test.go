@@ -1675,26 +1675,12 @@ func TestInstallMainLegacyPhoneAccessRecoveryDiagnostic(t *testing.T) {
 		if recovery {
 			args = append(args, "--disable-phone-access")
 		}
-		output, err := os.CreateTemp(t.TempDir(), "installer-stderr")
-		if err != nil {
-			t.Fatal(err)
-		}
-		original := os.Stderr
-		os.Stderr = output
-		code := InstallMain(args)
-		os.Stderr = original
-		if err := output.Close(); err != nil {
-			t.Fatal(err)
-		}
-		message, err := os.ReadFile(output.Name())
-		if err != nil {
-			t.Fatal(err)
-		}
-		marker := strings.Contains(string(message), "\n"+installDisablePhoneAccessRecovery+"\n")
+		code, message := installMainOutput(t, args)
+		marker := strings.Contains(message, "\n"+installDisablePhoneAccessRecovery+"\n")
 		if code != 1 || marker == recovery {
 			t.Fatalf("recovery=%v: exit=%d marker=%v diagnostic=%s", recovery, code, marker, message)
 		}
-		if recovery && !strings.Contains(string(message), "agent-remote") {
+		if recovery && !strings.Contains(message, "agent-remote") {
 			t.Fatalf("recovery failed without actionable diagnostic: %s", message)
 		}
 	}
@@ -1718,6 +1704,23 @@ func TestInstallerRemoteServiceAbsenceRequiresExactEvidence(t *testing.T) {
 			t.Fatalf("exit %d diagnostic %q: absence=%v", test.code, test.output, got)
 		}
 	}
+}
+
+// installMainOutput runs InstallMain and returns its exit code and stderr.
+func installMainOutput(t *testing.T, args []string) (int, string) {
+	t.Helper()
+	output, err := os.CreateTemp(t.TempDir(), "installer-stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stderr
+	os.Stderr = output
+	code := InstallMain(args)
+	os.Stderr = original
+	if err := output.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return code, string(integrationTestRead(t, output.Name()))
 }
 
 func TestInstallMainPhoneAccessRecoverySyntax(t *testing.T) {

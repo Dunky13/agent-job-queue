@@ -17,17 +17,16 @@ import (
 )
 
 func TestInstallerAppBundleCLIValidatesBundleBeforeSetup(t *testing.T) {
-	f := installTestFixture(t)
+	f := newPrivateNativeFixture(t, "/tmp", "agent-queue-install-test-", "User With Spaces")
+	t.Setenv("HOME", f.installer.home)
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MODE", "1")
-	t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", f.installer.path)
-	if err := os.RemoveAll(f.installer.app); err != nil {
-		t.Fatal(err)
-	}
+	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", "")
 	// A recognized mode with a missing bundle is an installation error, not usage.
-	if code := InstallMain([]string{"--app-bundle", f.installer.app}); code != 1 {
-		t.Fatalf("app-bundle mode was not recognized: exit %d", code)
+	code, message := installMainOutput(t, []string{"--app-bundle", f.installer.app})
+	if code != 1 || strings.Contains(message, installTestLayoutRequired) || !strings.Contains(message, "Agent Queue setup: ") || !strings.Contains(message, f.installer.app) {
+		t.Fatalf("app-bundle mode did not reach bundle validation: exit %d: %s", code, message)
 	}
-	if _, err := os.Stat(filepath.Join(f.installer.root, "install-in-progress.json")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(f.installer.home, ".local/share/agent-heavy/install-in-progress.json")); !os.IsNotExist(err) {
 		t.Fatalf("invalid bundle started setup: %v", err)
 	}
 }
