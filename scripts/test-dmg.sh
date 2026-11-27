@@ -2,10 +2,18 @@
 # Verify the drag-to-Applications disk image layout and the app it carries.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
-if [[ $# != 1 || -z $1 ]]; then
-  printf 'Usage: test-dmg.sh IMAGE.dmg\n' >&2
+# --finder-layout also requires the committed Finder layout. Only freshly built
+# images use it: release recovery re-verifies images built before the layout
+# existed or changed, and those must stay verifiable.
+if [[ $# == 2 && $2 == --finder-layout ]]; then
+  finder_layout=1
+elif [[ $# == 1 ]]; then
+  finder_layout=0
+else
+  printf 'Usage: test-dmg.sh IMAGE.dmg [--finder-layout]\n' >&2
   exit 2
 fi
+[[ -n $1 ]] || { printf 'Usage: test-dmg.sh IMAGE.dmg [--finder-layout]\n' >&2; exit 2; }
 image=$1
 work=$(mktemp -d)
 mountpoint="$work/image"
@@ -35,6 +43,10 @@ if [[ ! -d $app || -L $app ]]; then
 fi
 if [[ ! -L $applications ]] || ! target=$(readlink -n "$applications" && printf '.') || [[ $target != /Applications. ]]; then
   printf 'Drag disk image requires Applications -> /Applications.\n' >&2
+  exit 1
+fi
+if [[ $finder_layout == 1 ]] && ! cmp -s "$mountpoint/.DS_Store" "$root/packaging/dmg/DS_Store"; then
+  printf 'Disk image lacks the committed Finder layout.\n' >&2
   exit 1
 fi
 # Nothing but the app and the link may be offered to the user. Volume
