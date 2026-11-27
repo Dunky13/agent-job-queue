@@ -1,8 +1,18 @@
 # Icon consistency
 
-Agent Queue uses the existing `square.stack.3d.up` stacked-layers symbol throughout its branding. `native/QueueBrand.swift` owns the symbol name. The menu bar, queue header, first-launch setup, and About and updates all reference that definition. Other action and status symbols retain their distinct meanings.
+Agent Queue draws its own stacked-layers mark: a plate on two stacked layers, on a 16-point grid. `native/QueueBrand.swift` owns its geometry and renders it as a one-colour template image. The menu bar, queue header, first-launch setup, and About and updates all use that definition. Other action and status symbols retain their distinct meanings.
 
-The app packages `native/Resources/AppIcon.icns` and declare it through `CFBundleIconFile`. The icon has a blue tile with white stacked layers. The macOS version has transparent outer padding; the menu bar retains its monochrome template for system appearance and selection. The dashboard header and README use the matching `remote/static/app-icon.png`. Browser tabs use `favicon.png`; phone home screens use the opaque `apple-touch-icon.png`, allowing the device to apply its own corner mask.
+The menu-bar mark carries the queue state in its top plate, so the outline stays the same in every state:
+
+| State | Top plate | When |
+| --- | --- | --- |
+| Idle | Outlined | Nothing is running |
+| Running | Solid | At least one job runs |
+| Paused | Solid, pause sign cut out | The queue is paused; this outranks a drain |
+| Draining | Dashed outline | A drain closes intake |
+| Attention | Solid, exclamation mark cut out | The queue is unavailable, or setup is blocked |
+
+The app packages `native/Resources/AppIcon.icns` and declares it through `CFBundleIconFile`. The icon has a blue tile with the white mark in its running state. The macOS version has transparent outer padding; the menu bar uses the monochrome template for system appearance and selection. The dashboard header and README use the matching `remote/static/app-icon.png`. Browser tabs use `favicon.png`; phone home screens use the opaque `apple-touch-icon.png`, allowing the device to apply its own corner mask. The homepage uses `site/img/icon.png` and `site/favicon.png`.
 
 Run `bash scripts/generate-icons.sh` on macOS after changing the identity. It compiles the shared definition with `native/tools/GenerateIcons.swift`, renders every required resolution with AppKit, and builds the ICNS using `iconutil`. Commit all generated assets together with the source change. Builds consume those committed files and do not regenerate them or require additional image tooling.
 

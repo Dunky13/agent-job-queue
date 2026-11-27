@@ -45,6 +45,9 @@ struct QueueSummary: Codable, Sendable, Equatable {
     let running: Int
     let waiting: Int
     let legacyOccupied: Bool
+    // Set by the daemon only while a drain closes intake, or when its drain file cannot be trusted.
+    var drainUntil: String? = nil
+    var drainError: String? = nil
 }
 
 enum SchedulingMode: String, Codable, CaseIterable, Sendable {
@@ -932,12 +935,22 @@ enum QueueStatusActivation: Equatable {
 
 struct QueueStatusPresentation {
     let title: String
+    let mark: QueueBrand.Mark
     let accessibilityLabel: String
     init(snapshot: QueueSnapshot?, error: String?) {
         let running = snapshot?.queue.running ?? 0
         let waiting = snapshot?.queue.waiting ?? 0
+        let draining = snapshot?.queue.drainUntil != nil || snapshot?.queue.drainError != nil
         title = error != nil ? "!" : (running == 0 && waiting == 0 ? "" : "\(running) · \(waiting)")
-        accessibilityLabel = "Agent Queue, \(running) running, \(waiting) waiting" + (error == nil ? "" : ", queue unavailable")
+        // A pause outranks a drain: queued jobs wait for a resume either way.
+        mark = error != nil ? .attention : QueueAction.resume.isAllowed(in: snapshot) ? .paused
+            : draining ? .draining : running > 0 ? .running : .idle
+        let state = switch mark {
+        case .paused: "paused, "
+        case .draining: "draining, "
+        default: ""
+        }
+        accessibilityLabel = "Agent Queue, \(state)\(running) running, \(waiting) waiting" + (error == nil ? "" : ", queue unavailable")
     }
 }
 
@@ -976,8 +989,7 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
         let quit = NSMenuItem(title: "Quit Agent Queue", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: QueueBrand.symbolName, accessibilityDescription: nil)
-            button.image?.isTemplate = true
+            button.image = QueueBrand.image(.idle)
             button.imagePosition = .imageLeading
             button.setAccessibilityIdentifier("agent-queue-status-item")
         }
@@ -1004,6 +1016,7 @@ final class QueueStartupMenuBarController: NSObject, NSMenuDelegate {
         status.title = blocked ? model.message : waiting ? Self.waitingLine : "Starting…"
         let summary = "Agent Queue, " + status.title
         statusItem.button?.title = blocked ? "!" : ""
+        statusItem.button?.image = QueueBrand.image(blocked ? .attention : .idle)
         statusItem.button?.toolTip = summary
         statusItem.button?.setAccessibilityLabel(summary)
         // Keep the controller's bounded diagnostic readable from the menu,
@@ -1064,6 +1077,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate, QueueSurface {
     let menu = NSMenu()
     private var observation: AnyCancellable?
     private var pendingTitle: String?
+    private var mark = QueueBrand.Mark.idle
     private var menuTrackingObservations: [AnyCancellable] = []
     private var menuTrackingDepth = 0
     private var eventMonitor: Any?
@@ -1092,8 +1106,7 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate, QueueSurface {
         popover.contentSize = NSSize(width: 500, height: 650)
         popover.contentViewController = NSHostingController(rootView: QueuePanel(store: store, app: app, refreshesOnAppear: false, updates: updates))
         if let button = self.statusItem.button {
-            button.image = NSImage(systemSymbolName: QueueBrand.symbolName, accessibilityDescription: nil)
-            button.image?.isTemplate = true
+            button.image = QueueBrand.image(.idle)
             button.imagePosition = .imageLeading
             button.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
             button.target = self
@@ -1108,6 +1121,10 @@ final class QueueMenuBarController: NSObject, NSPopoverDelegate, QueueSurface {
             // A wider or narrower title moves the anchored popover sideways, so hold it while shown.
             // The accessibility label and tooltip stay current; the open popover shows the same state.
             if self.popover.isShown { self.pendingTitle = presentation.title } else { self.statusItem.button?.title = presentation.title }
+            if self.mark != presentation.mark {
+                self.mark = presentation.mark
+                self.statusItem.button?.image = QueueBrand.image(presentation.mark)
+            }
             self.statusItem.button?.setAccessibilityLabel(presentation.accessibilityLabel)
             self.statusItem.button?.toolTip = presentation.accessibilityLabel
         }
@@ -1406,7 +1423,8 @@ struct QueuePanel: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("Agent Queue", systemImage: QueueBrand.symbolName).font(.system(size: 15, weight: .semibold))
+                Label { Text("Agent Queue") } icon: { Image(nsImage: QueueBrand.image(height: 17)).renderingMode(.template) }
+                    .font(.system(size: 15, weight: .semibold))
                 Spacer()
                 Button { Task { await store.refresh(manual: true) } } label: {
                     Image(systemName: "arrow.clockwise").frame(width: 20, height: 20)

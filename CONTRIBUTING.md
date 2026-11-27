@@ -76,11 +76,11 @@ This runner uses temporary app and home directories and an injected setup execut
 
 ## Preview and screenshots
 
-The app and dashboard share the stacked-layers identity defined in
-`native/QueueBrand.swift`. Native surfaces use its template symbol so macOS can
+The app, dashboard and homepage share the stacked-layers mark drawn in
+`native/QueueBrand.swift`. Native surfaces use it as a template image so macOS can
 adapt its color. The app bundle uses `native/Resources/AppIcon.icns`;
 the dashboard header, browser favicon, and phone home-screen icon use the PNGs in
-`remote/static`. These generated files are committed, so ordinary builds require
+`remote/static`, and the homepage uses `site/img/icon.png` and `site/favicon.png`. These generated files are committed, so ordinary builds require
 no asset generation. After changing the identity, regenerate them on macOS with
 `bash scripts/generate-icons.sh`. The generator uses AppKit and `iconutil`, with
 no external image dependencies. See [icon consistency](docs/icon-consistency.md).

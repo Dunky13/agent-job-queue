@@ -453,7 +453,7 @@ struct QueueUpdatesSettings: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 14) {
-                Image(systemName: QueueBrand.symbolName).font(.system(size: 34)).foregroundStyle(.tint)
+                Image(nsImage: QueueBrand.image(height: 40)).renderingMode(.template).foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 5) {
                     Text("Agent Queue").font(.title2.weight(.semibold))
                     Text("About and updates").font(.callout).foregroundStyle(.secondary)
