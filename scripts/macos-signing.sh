@@ -491,7 +491,7 @@ macos_disk_image_source() {
   mkdir "$image" || return
   ditto "$app" "$image/Agent Queue.app" || return
   ln -s /Applications "$image/Applications" || return
-  cp "${BASH_SOURCE[0]%/*}/../packaging/dmg/DS_Store" "$image/.DS_Store" || return
+  cp "$(dirname -- "${BASH_SOURCE[0]}")/../packaging/dmg/DS_Store" "$image/.DS_Store" || return
   MACOS_DISK_IMAGE_SOURCE=$image
 }
 

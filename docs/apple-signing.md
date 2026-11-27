@@ -37,7 +37,7 @@ additional container that receives its own ticket. Notarization has two stages,
 1. Sign the two Go helpers in the app's `Contents/MacOS`, then sign the app. The agent definitions remain in the app's `Contents/Library/LaunchAgents` and use `BundleProgram` so upgrades can unregister registrations from earlier versions; the app itself no longer registers them. Submit the app as a ZIP (`ditto -c -k --sequesterRsrc --keepParent`).
 2. Require acceptance, fetch the log, then staple and validate the app.
 3. Recreate the distribution ZIP from the stapled app. It contains only `Agent Queue.app` at its top level.
-4. Package the stapled app, an `Applications` symlink and the committed Finder layout (`packaging/dmg/DS_Store`, from `packaging/dmg/generate-layout.py`) in the DMG, sign the DMG, notarize it, and staple it. The layout opens a plain window with the app on the left and the link on the right.
+4. Package the stapled app, an `Applications` symlink and the committed Finder layout (`packaging/dmg/DS_Store`, from `packaging/dmg/generate-layout.py`) in the DMG, sign the DMG, notarize it, and staple it. The layout opens a plain window with the app on the left and the link on the right. `scripts/test-dmg.sh --finder-layout` requires that exact layout for freshly built images; release verification and recovery omit the flag, so images built before the layout existed or changed stay verifiable.
 5. Generate final checksums and the release manifest after all byte changes.
 
 Final release assets are `Agent-Queue-VERSION-universal.zip` and

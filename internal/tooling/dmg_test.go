@@ -108,6 +108,7 @@ func TestDiskImageVerificationSelectsOnlyCompleteDistributionLayouts(t *testing.
 		"non executable helper",
 		"missing finder layout",
 		"changed finder layout",
+		"older image",
 	} {
 		t.Run(layout, func(t *testing.T) {
 			root := t.TempDir()
@@ -154,7 +155,7 @@ attach)
     'uppercase app') mkdir "$mountpoint/Other.APP";;
     'extra file') printf 'extra' > "$mountpoint/README.txt";;
     'volume metadata') mkdir "$mountpoint/.fseventsd" "$mountpoint/.Trashes";;
-    'missing finder layout') rm "$mountpoint/.DS_Store";;
+    'missing finder layout'|'older image') rm "$mountpoint/.DS_Store";;
     'changed finder layout') printf 'x' >> "$mountpoint/.DS_Store";;
     'missing helper') rm "$app/Contents/MacOS/agent-remote";;
     'non executable helper') chmod 600 "$app/Contents/MacOS/agent-heavy";;
@@ -168,7 +169,12 @@ esac
 for argument in "$@"; do printf '|%s' "$argument" >> "$DMG_TEST_EVENTS"; done
 printf '\n' >> "$DMG_TEST_EVENTS"
 `)
-			cmd := exec.Command("/bin/bash", script, "fixture.dmg")
+			// Fresh builds require the committed layout; re-verifying an image built before it must not.
+			arguments := []string{script, "fixture.dmg", "--finder-layout"}
+			if layout == "older image" {
+				arguments = arguments[:2]
+			}
+			cmd := exec.Command("/bin/bash", arguments...)
 			cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"), "DMG_TEST_EVENTS="+events, "DMG_TEST_RECORD="+record, "DMG_TEST_LAYOUT="+layout, "DMG_TEST_FINDER_LAYOUT="+finderLayout)
 			output, runErr := cmd.CombinedOutput()
 			mount, err := os.ReadFile(record)
@@ -188,7 +194,10 @@ printf '\n' >> "$DMG_TEST_EVENTS"
 			if _, err := os.Stat(work); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("detached fixture retained temporary state: %v", err)
 			}
-			if layout != "drag" && layout != "volume metadata" {
+			if strings.HasSuffix(layout, "finder layout") && !strings.Contains(string(output), "Disk image lacks the committed Finder layout.") {
+				t.Fatalf("layout failure did not name the Finder layout: %s", output)
+			}
+			if layout != "drag" && layout != "volume metadata" && layout != "older image" {
 				if runErr == nil || strings.Contains(log, "go|") {
 					t.Fatalf("malformed layout reached verification: %v: %s\n%s", runErr, output, log)
 				}

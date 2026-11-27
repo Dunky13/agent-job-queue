@@ -11,17 +11,19 @@ import sys
 
 from ds_store import DSStore
 
-WIDTH, HEIGHT, LEFT, TOP = 540, 360, 200, 120
+# Finder counts the window origin from the bottom-left of the screen; these are the values
+# Kanarie's image stores for create-dmg's default top-left placement.
+WIDTH, HEIGHT, LEFT, BOTTOM = 540, 360, 10, 697
 
 with DSStore.open(sys.argv[1], "w+") as store:
     store["."]["bwsp"] = {
-        "WindowBounds": "{{%d, %d}, {%d, %d}}" % (LEFT, TOP, WIDTH, HEIGHT),
+        "WindowBounds": "{{%d, %d}, {%d, %d}}" % (LEFT, BOTTOM, WIDTH, HEIGHT),
         "ShowSidebar": False, "ContainerShowSidebar": False, "SidebarWidth": 0,
         "ShowToolbar": False, "ShowStatusBar": False, "ShowPathbar": False, "ShowTabView": False,
         "PreviewPaneVisibility": False,
     }
     store["."]["icvp"] = {
-        "viewOptionsVersion": 1, "iconSize": 128.0, "textSize": 12.0, "gridSpacing": 100.0,
+        "viewOptionsVersion": 1, "iconSize": 128.0, "textSize": 16.0, "gridSpacing": 100.0,
         "gridOffsetX": 0.0, "gridOffsetY": 0.0, "labelOnBottom": True, "showItemInfo": False,
         "showIconPreview": True, "arrangeBy": "none", "backgroundType": 0,
         "backgroundColorRed": 1.0, "backgroundColorGreen": 1.0, "backgroundColorBlue": 1.0,
