@@ -302,6 +302,18 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		if err != nil {
 			return 125, err
 		}
+		if name == "Done" && argv != nil && boolean(task["withdrawn"]) {
+			var unconfirmed *queueCleanupUnconfirmed
+			if err = waitCleanupWithToken(g, id, expectedToken, signals); errors.As(err, &unconfirmed) {
+				fmt.Fprintln(os.Stderr, "agent-heavy:", err)
+			} else if err != nil {
+				return 125, err
+			}
+			if pendingSignal != nil {
+				return signalExit(pendingSignal), nil
+			}
+			return runDirect(argv, "", fmt.Sprintf("the queue is paused; job %d was withdrawn, running this command outside the queue", id), signals)
+		}
 		if name == "Done" {
 			if rpcAvailable {
 				outage.recover() // a finished job needs no mutation, so this read is recovery
@@ -346,18 +358,12 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			}
 		}
 		recovered := rpcAvailable && outage.recover()
-		if name == "Queued" && argv != nil && pendingSignal == nil && rpcAvailable && group["status"] == "Paused" {
-			_, err := g.QueueControl("withdraw", Object{"id": id, "token": expectedToken})
-			if err == nil {
-				var unconfirmed *queueCleanupUnconfirmed
-				if err = waitCleanupWithToken(g, id, expectedToken, signals); err != nil && !errors.As(err, &unconfirmed) {
-					return 125, err
-				} else if err != nil {
-					fmt.Fprintln(os.Stderr, "agent-heavy:", err)
-				}
-				return runDirect(argv, "", fmt.Sprintf("the queue is paused; job %d was withdrawn, running this command outside the queue", id), signals)
+		// The job reads as withdrawn on the next pass, even when this reply is
+		// lost; a refusal (the job started or the queue resumed) keeps waiting.
+		if (name == "Queued" || name == "Stashed") && argv != nil && pendingSignal == nil && rpcAvailable && group["status"] == "Paused" {
+			if _, err := g.QueueControl("withdraw", Object{"id": id, "token": expectedToken}); err == nil {
+				continue
 			}
-			// Refused (the job started or the queue resumed) or lost: keep waiting.
 		}
 		if name == "Missing" {
 			cancelled, err := ReadPrivate(filepath.Join(g.Cancelled, strconv.Itoa(id)+".json"))
@@ -378,7 +384,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			return code, nil
 		}
 		tick := time.Since(notice) >= 15*time.Second
-		if name == "Queued" && !pauseShown && outage.lostOnce && (recovered || tick || pauseCheckLost) {
+		if name == "Queued" && argv == nil && !pauseShown && outage.lostOnce && (recovered || tick || pauseCheckLost) {
 			var answered bool
 			pauseShown, answered = announcePausedQueue(g, id)
 			pauseCheckLost = !answered
@@ -658,8 +664,10 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 			return code, err
 		}
 	}
+	// A paused queue passes a default-lane command through; a lane keeps its exclusion.
+	passThrough := func(err error) bool { return errors.Is(err, errQueuePaused) && lane == "" }
 	snapshot, code, err := submissionPrecheck(g, lane)
-	if errors.Is(err, errQueuePaused) && lane == "" {
+	if passThrough(err) {
 		return runDirect(argv, "", pausedNotice, signals)
 	}
 	if code != 0 || err != nil {
@@ -812,7 +820,7 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 			}
 		}
 		// The queue may have changed while we waited: check it again before submitting.
-		if snapshot, code, err = submissionPrecheck(g, lane); errors.Is(err, errQueuePaused) && lane == "" {
+		if snapshot, code, err = submissionPrecheck(g, lane); passThrough(err) {
 			return runDirect(argv, "", pausedNotice, signals)
 		} else if code != 0 || err != nil {
 			return code, err
@@ -832,7 +840,7 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 		}
 		// Paused after the check above: the daemon refused before recording the
 		// token, so no job exists and the files are discarded on return.
-		if errors.Is(err, errQueuePaused) && lane == "" && !submitted {
+		if passThrough(err) && !submitted {
 			return runDirect(argv, "", pausedNotice, signals)
 		}
 		return 125, unknown(err)

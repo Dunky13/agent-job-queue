@@ -738,7 +738,7 @@ func (d *queueDaemon) cancelQueued() (Object, error) {
 	return Object{"cancelled": cancelled}, nil
 }
 
-// withdraw ends a default-lane job that has not started, for its own caller to
+// withdraw ends a default-lane job that has not started (queued or held), for its own caller to
 // run the command outside a paused queue. Under the daemon lock nothing can
 // claim the job in between; a job that already started is refused, untouched.
 func (d *queueDaemon) withdraw(p Object) (Object, error) {
@@ -763,6 +763,8 @@ func (d *queueDaemon) withdraw(p Object) (Object, error) {
 	if j.token != text(p["token"]) || taskIsLease(j.task) || taskLane(j.task) != defaultLaneName || j.phase != "queued" {
 		return nil, errors.New("Only a queued default-lane job can be withdrawn by its caller")
 	}
+	// Marks the job for its caller, which then runs the command, and for history.
+	j.task["withdrawn"] = true
 	if e = d.markCancelled(j); e != nil {
 		return nil, e
 	}

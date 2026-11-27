@@ -632,7 +632,7 @@ func TestRealDaemonCrashRetainsOwnershipAndPausesRestart(t *testing.T) {
 		t.Fatalf("withdrawn command output: %q", text)
 	}
 	task, err := f.gate.Task(secondID)
-	if name, _, statusErr := TaskStatus(task); err != nil || statusErr != nil || name != "Done" || !boolean(task["cancelled"]) {
+	if name, _, statusErr := TaskStatus(task); err != nil || statusErr != nil || name != "Done" || !boolean(task["withdrawn"]) {
 		t.Fatalf("withdrawn job: %v %v %v", task, err, statusErr)
 	}
 	notices := second.errors.String()
