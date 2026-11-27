@@ -51,52 +51,45 @@ func managedTestFixture(t *testing.T) *managedFixture {
 			t.Fatal(err)
 		}
 	}
-	m := &managedFixture{installFixture: f, statuses: map[string]string{"queue": "notRegistered", "resources": "notRegistered", "remote": "notRegistered", "login": "notRegistered"}}
+	m := &managedFixture{installFixture: f, statuses: f.controller.statuses}
 	original := f.installer.command
 	f.installer.queueSnapshot = func(context.Context) (Object, error) { return f.snapshot(), nil }
 	f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[1] == "--prepare-app-replacement" {
-			f.calls = append(f.calls, slices.Clone(args))
-			return mustMetadataJSON(t, Object{"schemaVersion": 1, "app": args[2], "status": "stopped"}), nil
-		}
-		if len(args) == 4 && args[1] == "--service-management" {
-			f.calls = append(f.calls, slices.Clone(args))
-			action, service := args[2], args[3]
-			if m.nativeFailure == action+" "+service {
-				return nil, errors.New("simulated native failure")
-			}
-			if action == "status" {
-				if m.badStatus {
-					return []byte(`{"schemaVersion":1,"service":"queue","status":"enabled","unexpected":true}`), nil
-				}
-				return mustMetadataJSON(t, appservices.Status{SchemaVersion: 1, Service: service, Status: m.statuses[service]}), nil
-			}
-			label := map[string]string{"queue": "io.went.agent-heavy", "resources": "io.went.agent-resources", "remote": "io.went.agent-remote"}[service]
-			if action == "register" {
-				if _, err := os.Stat(filepath.Join(f.installer.app, "Contents/MacOS/agent-heavy")); err != nil {
-					t.Fatal("registration preceded complete bundle publication", err)
-				}
-				if _, err := os.Stat(filepath.Join(f.installer.root, "install-in-progress.json")); err != nil {
-					t.Fatal("registration lost pending marker", err)
-				}
-				m.statuses[service] = "enabled"
-				if m.approval == service {
-					m.statuses[service] = "requiresApproval"
-				}
-				if label != "" && m.statuses[service] == "enabled" {
-					f.loaded[label] = true
-				}
-			} else if action == "unregister" {
-				m.statuses[service] = "notRegistered"
-				delete(f.loaded, label)
-			}
-			return nil, nil
-		}
 		if len(args) == 3 && args[0] == filepath.Join(f.installer.app, "Contents/MacOS/agent-heavy") && args[1] == "status" {
 			f.calls = append(f.calls, slices.Clone(args))
 			return mustMetadataJSON(t, Object{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": Object{"status": "running", "limit": 1, "running": 0, "waiting": 0}, "jobs": []any{}, "scheduler": Object{}}), nil
 		}
 		return original(ctx, args)
+	}
+	manage := f.controller.manage
+	f.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if m.nativeFailure == action+" "+service {
+			return nil, errors.New("simulated native failure")
+		}
+		if action == "status" {
+			if m.badStatus {
+				return []byte(`{"schemaVersion":1,"service":"queue","status":"enabled","unexpected":true}`), nil
+			}
+			return manage(ctx, app, action, service)
+		}
+		if action == "register" {
+			if _, err := os.Stat(filepath.Join(f.installer.app, "Contents/MacOS/agent-heavy")); err != nil {
+				t.Fatal("registration preceded complete bundle publication", err)
+			}
+			if _, err := os.Stat(filepath.Join(f.installer.root, "install-in-progress.json")); err != nil {
+				t.Fatal("registration lost pending marker", err)
+			}
+		}
+		output, err := manage(ctx, app, action, service)
+		label := map[string]string{"queue": "io.went.agent-heavy", "resources": "io.went.agent-resources", "remote": "io.went.agent-remote"}[service]
+		if action == "unregister" {
+			delete(f.loaded, label)
+		} else if m.approval == service {
+			m.statuses[service] = "requiresApproval"
+		} else if label != "" {
+			f.loaded[label] = true
+		}
+		return output, err
 	}
 	definition := f.services.output
 	f.services.output = func(label string) []byte {
@@ -161,7 +154,7 @@ func TestManagedFinderBundleAndPreflightAreReadOnly(t *testing.T) {
 		t.Fatal("preflight modified home")
 	}
 	for _, args := range m.calls {
-		if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" {
+		if controllerChange(args) {
 			t.Fatal("preflight mutated service", args)
 		}
 	}
@@ -200,7 +193,7 @@ func TestManagedResumedActivationWaitsForApprovalWithoutReregistering(t *testing
 		t.Fatal("approval-required retry completed", err)
 	}
 	for _, args := range m.calls {
-		if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" {
+		if controllerChange(args) {
 			t.Fatal("re-registered approval-required service", args)
 		}
 	}
@@ -259,7 +252,7 @@ func TestManagedDrainGatePrecedesEveryMutation(t *testing.T) {
 				t.Fatal("drain refusal mutated installation")
 			}
 			for _, args := range m.calls {
-				if args[0] == "service" && args[1] != "print" || len(args) > 2 && args[1] == "--service-management" && args[2] != "status" {
+				if args[0] == "service" && args[1] != "print" || controllerChange(args) {
 					t.Fatal("drain refusal mutated services", args)
 				}
 			}

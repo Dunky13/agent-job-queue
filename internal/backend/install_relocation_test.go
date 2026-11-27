@@ -67,14 +67,18 @@ func managedRelocationFixture(t *testing.T, pending bool, backup ...bool) (*mana
 		}
 		return answer(label)
 	}
+	manage := m.controller.manage
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if action == "register" {
+			services[service] = app
+		}
+		return manage(ctx, app, action, service)
+	}
 	original := i.command
 	i.command = func(ctx context.Context, args []string) ([]byte, error) {
 		if len(args) == 3 && args[0] == filepath.Join(old, "Contents/MacOS/agent-heavy") && args[1] == "status" {
 			m.calls = append(m.calls, slices.Clone(args))
 			return mustMetadataJSON(t, Object{"updatedAt": time.Now().UTC().Format(time.RFC3339Nano), "queue": Object{"status": "running", "limit": 1, "running": 0, "waiting": 0}, "jobs": []any{}, "scheduler": Object{}}), nil
-		}
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" {
-			services[args[3]] = filepath.Dir(filepath.Dir(filepath.Dir(args[0])))
 		}
 		return original(ctx, args)
 	}
@@ -100,16 +104,16 @@ func TestManagedDraggedAppFinishesRecordedPendingBeforeRelocation(t *testing.T) 
 		t.Fatalf("retained exact app has no usable recovery: %+v", report)
 	}
 	completedOld := false
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" && strings.HasPrefix(args[0], i.app+"/") {
+	manage := m.controller.manage
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if action == "register" && app == i.app {
 			info, err := installReadInfo(filepath.Join(i.root, "build-info.json"))
 			if err != nil || !info.Equal(retained.Build) {
 				t.Fatal("new location activated before exact retained build completed", info, err)
 			}
 			completedOld = true
 		}
-		return original(ctx, args)
+		return manage(ctx, app, action, service)
 	}
 	if err := i.repairAndExecute(context.Background()); err != nil {
 		t.Fatal("normal launch could not recover and relocate", err)
@@ -407,12 +411,12 @@ func TestManagedRecordedPendingDrainsBeforeRelocationWithoutWaitingForLoginAppro
 	// The login item only decides whether the app opens at login. Its pending
 	// approval must not hold relocation once the old jobs have drained.
 	m.approval = "login"
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] != "status" && len(m.tasks) != 0 {
+	manage := m.controller.manage
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if action != "status" && len(m.tasks) != 0 {
 			t.Fatal("pending recovery changed a service before the old jobs drained")
 		}
-		return original(ctx, args)
+		return manage(ctx, app, action, service)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()

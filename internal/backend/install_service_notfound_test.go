@@ -25,7 +25,7 @@ func TestManagedRegisterVerifiedServiceAfterNotFound(t *testing.T) {
 			}
 			calls := 0
 			for _, args := range m.calls {
-				if len(args) == 4 && slices.Equal(args[1:], []string{"--service-management", "register", service}) {
+				if controllerCall(args, "register", service) {
 					calls++
 				}
 			}
@@ -79,17 +79,17 @@ func TestManagedRemovalAfterUnregisterAcceptsNotFoundOnlyWhenUnloaded(t *testing
 			m := managedOlderRegistration(t)
 			i := m.installer
 			managedRemovalTarget(i)
-			original := i.command
-			i.command = func(ctx context.Context, args []string) ([]byte, error) {
+			manage := m.controller.manage
+			m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
 				// Only the final check reads this status once the login item is gone. A
 				// lookup there can miss a service that unregistered successfully.
-				if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" && args[3] == "queue" && m.statuses["login"] == "notRegistered" {
+				if action == "status" && service == "queue" && m.statuses["login"] == "notRegistered" {
 					m.statuses["queue"] = "notFound"
 					if loaded {
 						m.loaded["io.went.agent-heavy"] = true
 					}
 				}
-				return original(ctx, args)
+				return manage(ctx, app, action, service)
 			}
 			err := m.run(t)
 			if loaded {
@@ -166,7 +166,7 @@ func TestManagedRemovalOfSupervisedApp(t *testing.T) {
 	if got := managedServiceCalls(m, "unregister"); !slices.Equal(got, []string{"login"}) {
 		t.Fatalf("unregistered %v, want only the login item", got)
 	}
-	if !slices.ContainsFunc(m.calls, func(args []string) bool { return len(args) == 3 && args[1] == "--prepare-app-replacement" }) {
+	if !slices.ContainsFunc(m.calls, func(args []string) bool { return args[0] == "controller" && args[1] == "prepare-app-replacement" }) {
 		t.Fatal("removal did not ask a running app to quit")
 	}
 	if m.statuses["login"] != "notRegistered" {
@@ -232,7 +232,7 @@ func TestManagedInstallRegistersNotFoundServices(t *testing.T) {
 		t.Fatal("required registration was not verified")
 	}
 	for _, args := range m.calls {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" && args[3] != "login" {
+		if len(args) == 4 && args[0] == "controller" && args[1] == "register" && args[2] != "login" {
 			t.Fatal("setup registered a service it must not", args)
 		}
 	}
@@ -244,17 +244,17 @@ func TestManagedNotFoundRemoteCannotHideOwnedWork(t *testing.T) {
 			m := managedTestFixture(t)
 			i := m.installer
 			m.statuses["remote"] = "notFound"
-			original := i.command
-			i.command = func(ctx context.Context, args []string) ([]byte, error) {
+			manage := m.controller.manage
+			m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
 				_, pending := os.Stat(filepath.Join(i.root, "install-in-progress.json"))
-				if pending == nil && len(args) == 4 && slices.Equal(args[1:], []string{"--service-management", "status", "remote"}) {
+				if pending == nil && action == "status" && service == "remote" {
 					if kind == "loaded-job" {
 						m.loaded["io.went.agent-remote"] = true
 					} else {
 						integrationTestWrite(t, filepath.Join(i.state, "remote/processes.json"), []byte(`{"active":true}`))
 					}
 				}
-				return original(ctx, args)
+				return manage(ctx, app, action, service)
 			}
 			if err := m.run(t); err == nil || !strings.Contains(err.Error(), "owned work remains") {
 				t.Fatal("unresolved remote lookup hid existing work", err)
@@ -339,16 +339,16 @@ func TestManagedRemovalRefusesLoginItemItCannotVerify(t *testing.T) {
 		}
 		i := m.installer
 		managedRemovalTarget(i)
-		original := i.command
+		manage := m.controller.manage
 		reads := 0
-		i.command = func(ctx context.Context, args []string) ([]byte, error) {
-			if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" && args[3] == "login" && m.statuses["login"] == "notRegistered" {
+		m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+			if action == "status" && service == "login" && m.statuses["login"] == "notRegistered" {
 				// Unregistering read it back once; a later read is the final check.
 				if reads++; reads == 2 {
 					m.statuses["login"] = "notFound"
 				}
 			}
-			return original(ctx, args)
+			return manage(ctx, app, action, service)
 		}
 		err := m.run(t)
 		if err == nil || !strings.Contains(err.Error(), "cannot be verified") {
@@ -390,18 +390,18 @@ func TestManagedRemovalFinalCheckRefusalsSayToRetry(t *testing.T) {
 				}
 				return answer(label)
 			}
-			original := i.command
-			i.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if len(args) == 4 && args[1] == "--service-management" && args[2] == "status" {
-					if args[3] == "login" && m.statuses["login"] == "notRegistered" {
+			manage := m.controller.manage
+			m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+				if action == "status" {
+					if service == "login" && m.statuses["login"] == "notRegistered" {
 						reads++
 					}
-					if args[3] == test.service && reads > 0 && (test.service != "login" || reads == 2) {
+					if service == test.service && reads > 0 && (test.service != "login" || reads == 2) {
 						m.statuses[test.service] = test.status
 						loaded = test.service == "queue"
 					}
 				}
-				return original(ctx, args)
+				return manage(ctx, app, action, service)
 			}
 			err := m.run(t)
 			if err == nil || !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "Run removal again") {
@@ -422,11 +422,11 @@ func TestManagedRemovalRetryAfterNotFoundFollowsUnregister(t *testing.T) {
 			m := managedOlderRegistration(t)
 			i := m.installer
 			managedRemovalTarget(i)
-			original := i.command
+			manage := m.controller.manage
 			missed := false
-			i.command = func(ctx context.Context, args []string) ([]byte, error) {
-				output, err := original(ctx, args)
-				if len(args) == 4 && args[1] == "--service-management" && args[2] == "unregister" && args[3] == test.service && !missed {
+			m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+				output, err := manage(ctx, app, action, service)
+				if action == "unregister" && service == test.service && !missed {
 					missed = true
 					m.statuses[test.service] = "notFound"
 				}
@@ -473,12 +473,10 @@ func TestManagedRemovalRefusalGuidanceAfterTheQuit(t *testing.T) {
 		}
 		i := m.installer
 		managedRemovalTarget(i)
-		original := i.command
-		i.command = func(ctx context.Context, args []string) ([]byte, error) {
-			if len(args) == 3 && args[1] == "--prepare-app-replacement" {
-				integrationTestWrite(t, filepath.Join(i.state, "remote/processes.json"), []byte(`{"active":true}`))
-			}
-			return original(ctx, args)
+		prepare := m.controller.prepare
+		m.controller.prepare = func(ctx context.Context) ([]byte, error) {
+			integrationTestWrite(t, filepath.Join(i.state, "remote/processes.json"), []byte(`{"active":true}`))
+			return prepare(ctx)
 		}
 		if err := m.run(t); err == nil || !strings.Contains(err.Error(), "Open Agent Queue, then run removal again") {
 			t.Fatal("a stuck phone record did not say to reopen the app", err)
@@ -491,10 +489,10 @@ func TestManagedRemovalRefusalGuidanceAfterTheQuit(t *testing.T) {
 		}
 		i := m.installer
 		managedRemovalTarget(i)
-		original := i.command
-		i.command = func(ctx context.Context, args []string) ([]byte, error) {
-			output, err := original(ctx, args)
-			if len(args) == 4 && args[2] == "unregister" && args[3] == "login" {
+		manage := m.controller.manage
+		m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+			output, err := manage(ctx, app, action, service)
+			if action == "unregister" && service == "login" {
 				m.nativeFailure = "status queue"
 			}
 			return output, err

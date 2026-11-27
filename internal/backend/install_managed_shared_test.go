@@ -55,7 +55,7 @@ func TestManagedPublicationRejectsUnsafeParentBeforeServiceChanges(t *testing.T)
 		t.Fatal("arbitrary shared ancestor accepted")
 	}
 	for _, args := range m.calls {
-		if slices.Contains(args, "unregister") || slices.Contains(args, "register") || slices.Contains(args, "--prepare-app-replacement") {
+		if slices.Contains(args, "unregister") || slices.Contains(args, "register") || slices.Contains(args, "prepare-app-replacement") {
 			t.Fatalf("preflight changed a service: %v", args)
 		}
 	}

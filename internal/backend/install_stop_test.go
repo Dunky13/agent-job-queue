@@ -14,10 +14,10 @@ func TestManagedSetupStopRetainsAcceptedMutation(t *testing.T) {
 	i := m.installer
 	stop := make(chan struct{})
 	i.setupStop = stop
-	original := i.command
+	manage := m.controller.manage
 	requested := false
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" {
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if action == "register" {
 			if !requested {
 				close(stop)
 				requested = true
@@ -28,7 +28,7 @@ func TestManagedSetupStopRetainsAcceptedMutation(t *testing.T) {
 				t.Fatal("a late stop request cancelled an accepted registration", err)
 			}
 		}
-		return original(ctx, args)
+		return manage(ctx, app, action, service)
 	}
 	if err := i.repairAndExecute(context.Background()); err != nil {
 		t.Fatal("accepted installation did not reach its original response", err)

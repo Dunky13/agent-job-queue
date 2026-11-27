@@ -30,8 +30,10 @@ type installFixture struct {
 	loaded    map[string]bool
 	services  *memoryServices
 	host      *memoryHost
-	calls     [][]string
-	fail      string
+	// controller is the app executable: service management and replacement.
+	controller *memoryController
+	calls      [][]string
+	fail       string
 	// seededPending marks a pending marker the fixture wrote itself, not setup.
 	seededPending bool
 }
@@ -113,12 +115,17 @@ func installBaseFixture(t *testing.T) *installFixture {
 	install.services = f.services
 	f.host = newMemoryHost(record)
 	install.host = f.host
+	f.controller = newMemoryController(install, record)
+	install.controller = f.controller
 	install.command = func(_ context.Context, args []string) ([]byte, error) {
 		if args[0] == "launchctl" {
 			t.Errorf("launchctl bypassed the service port: %v", args)
 		}
 		if tool := filepath.Base(args[0]); tool == "ps" || tool == "lsof" || tool == "codesign" {
 			t.Errorf("%s bypassed the host port: %v", tool, args)
+		}
+		if len(args) > 1 && (args[1] == "--service-management" || args[1] == "--prepare-app-replacement") {
+			t.Errorf("app executable bypassed the controller port: %v", args)
 		}
 		if err := record(append([]string{}, args...)); err != nil {
 			return nil, err

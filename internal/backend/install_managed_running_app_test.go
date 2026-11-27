@@ -109,15 +109,13 @@ func runningAppFixture(t *testing.T, start bool) *runningApp {
 		m.statuses[service] = "notFound"
 	}
 	a := &runningApp{managedFixture: m, helper: filepath.Join(i.app, "Contents/MacOS/agent-heavy")}
-	original := i.command
+	quit := m.controller.prepare
 	// A separate installer without the fixture's command fake runs the real lsof.
 	m.host.holders = installMacOSHost{&installer{}}.LockHolders
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[1] == "--prepare-app-replacement" {
-			a.quits++
-			a.stop(t)
-		}
-		return original(ctx, args)
+	m.controller.prepare = func(ctx context.Context) ([]byte, error) {
+		a.quits++
+		a.stop(t)
+		return quit(ctx)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -226,8 +224,8 @@ func TestManagedRemovalOfRunningAppQuitsItOnceDrained(t *testing.T) {
 	if a.quits != 1 || !a.finished {
 		t.Fatal("removal did not quit the app once", a.quits)
 	}
-	quit := slices.IndexFunc(a.calls, func(args []string) bool { return len(args) == 3 && args[1] == "--prepare-app-replacement" })
-	unregister := slices.IndexFunc(a.calls, func(args []string) bool { return len(args) == 4 && args[2] == "unregister" && args[3] == "login" })
+	quit := slices.IndexFunc(a.calls, func(args []string) bool { return args[0] == "controller" && args[1] == "prepare-app-replacement" })
+	unregister := slices.IndexFunc(a.calls, func(args []string) bool { return controllerCall(args, "unregister", "login") })
 	checked := slices.IndexFunc(a.calls, func(args []string) bool { return args[0] == "host" && args[1] == "lock-holders" })
 	if checked < 0 || quit < checked || unregister < quit {
 		t.Fatal("removal must check the holder, then quit, then unregister", checked, quit, unregister)
@@ -486,10 +484,10 @@ func TestInstallerNewerCopyBesideRunningRecordedAppStops(t *testing.T) {
 func TestManagedRemovalRefusalAfterTheQuitSaysToReopen(t *testing.T) {
 	a := runningAppFixture(t, true)
 	i := a.installer
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		output, err := original(ctx, args)
-		if len(args) == 3 && args[1] == "--prepare-app-replacement" && a.quits == 1 {
+	quit := a.controller.prepare
+	a.controller.prepare = func(ctx context.Context) ([]byte, error) {
+		output, err := quit(ctx)
+		if a.quits == 1 {
 			store, storeErr := openQueueStore(i.state, false)
 			if storeErr != nil {
 				t.Fatal(storeErr)
@@ -526,10 +524,10 @@ func TestManagedRemovalRefusalAfterTheQuitSaysToReopen(t *testing.T) {
 func TestManagedRemovalHeldLifetimeLockNamesIt(t *testing.T) {
 	a := runningAppFixture(t, true)
 	i := a.installer
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		output, err := original(ctx, args)
-		if len(args) == 3 && args[1] == "--prepare-app-replacement" && a.quits == 1 {
+	quit := a.controller.prepare
+	a.controller.prepare = func(ctx context.Context) ([]byte, error) {
+		output, err := quit(ctx)
+		if a.quits == 1 {
 			lock, lockErr := installLock(i.state, "queue-daemon.lock")
 			if lockErr != nil {
 				t.Fatal(lockErr)
@@ -553,13 +551,13 @@ func TestManagedRemovalHeldLifetimeLockNamesIt(t *testing.T) {
 func TestManagedRemovalRefusedQuitLeavesARunningAppComplete(t *testing.T) {
 	a := runningAppFixture(t, true)
 	i := a.installer
-	original := i.command
+	quit := a.controller.prepare
 	refuse := true
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if refuse && len(args) == 3 && args[1] == "--prepare-app-replacement" {
+	a.controller.prepare = func(ctx context.Context) ([]byte, error) {
+		if refuse {
 			return nil, errors.New("a running setup change cancelled the quit")
 		}
-		return original(ctx, args)
+		return quit(ctx)
 	}
 	managedRemovalTarget(i)
 	a.calls = nil

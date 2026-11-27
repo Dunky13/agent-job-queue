@@ -131,7 +131,7 @@ func managedRemovalTarget(i *installer) {
 func managedRequireNoServiceMutation(t *testing.T, calls [][]string) {
 	t.Helper()
 	for _, args := range calls {
-		if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" || len(args) > 1 && args[0] == "service" && args[1] != "print" {
+		if controllerChange(args) || len(args) > 1 && args[0] == "service" && args[1] != "print" {
 			t.Fatal("unexpected service mutation", args)
 		}
 	}
@@ -239,10 +239,10 @@ func TestManagedRemovalHoldsLocksThroughShutdown(t *testing.T) {
 		t.Fatal(err)
 	}
 	managedRemovalTarget(i)
-	original := i.command
+	manage := m.controller.manage
 	unregistered := 0
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == "unregister" {
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if action == "unregister" {
 			unregistered++
 			for _, entry := range []struct{ directory, name string }{{i.state, "install.lock"}, {i.state, "scheduling.lock"}, {filepath.Join(i.state, "remote"), "control.lock"}} {
 				busy, err := installInspectLock(entry.directory, entry.name)
@@ -255,7 +255,7 @@ func TestManagedRemovalHoldsLocksThroughShutdown(t *testing.T) {
 				t.Fatal("shutdown lost custody", pending, err)
 			}
 		}
-		return original(ctx, args)
+		return manage(ctx, app, action, service)
 	}
 	if err := m.run(t); err != nil {
 		t.Fatal(err)
@@ -412,11 +412,11 @@ func TestManagedRemovalCanUnregisterDeniedApprovalWithoutEnabling(t *testing.T) 
 	}
 	unregisteredDenied := false
 	for _, args := range m.calls {
-		if len(args) == 4 && args[1] == "--service-management" {
-			if args[2] == "register" {
+		if len(args) == 4 && args[0] == "controller" {
+			if args[1] == "register" {
 				t.Fatal("removal tried enabling denied service", args)
 			}
-			unregisteredDenied = unregisteredDenied || args[2] == "unregister" && args[3] == "resources"
+			unregisteredDenied = unregisteredDenied || args[1] == "unregister" && args[2] == "resources"
 		}
 	}
 	if !unregisteredDenied {
@@ -433,12 +433,12 @@ func TestManagedLifecycleIncompleteUnregistrationPreservesAppAndMetadata(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == "unregister" && args[3] == "queue" {
+	manage := m.controller.manage
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if action == "unregister" && service == "queue" {
 			return nil, nil // Bridge returned, but registration did not change.
 		}
-		return original(ctx, args)
+		return manage(ctx, app, action, service)
 	}
 	if err := m.run(t); err == nil || !strings.Contains(err.Error(), "after unregister") {
 		t.Fatal("incomplete unregistration accepted", err)
@@ -531,6 +531,19 @@ func TestManagedConcurrentRemoteDisableBeforeAndDuringMigration(t *testing.T) {
 			integrationTestWrite(t, settings, []byte(`{"enabled":true,"passwordHash":"retain"}`))
 			original := i.command
 			migrated, disabled := false, false
+			manage := m.controller.manage
+			m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+				if disabled && action == "register" && service == "remote" {
+					t.Fatal("stale remote plan re-enabled phone access")
+				}
+				if migrated && action == "status" && service == "remote" {
+					busy, err := installInspectLock(filepath.Join(i.state, "remote"), "control.lock")
+					if err != nil || !busy {
+						t.Fatal("remote readback is not serialized through commit", busy, err)
+					}
+				}
+				return manage(ctx, app, action, service)
+			}
 			i.command = func(ctx context.Context, args []string) ([]byte, error) {
 				// The controller serializes both migrate and explicit disable using
 				// the real control.lock. A later disable must win even though the
@@ -621,15 +634,6 @@ func TestManagedConcurrentRemoteDisableBeforeAndDuringMigration(t *testing.T) {
 						lock.Close()
 					}
 					return nil, nil
-				}
-				if disabled && len(args) == 4 && args[1] == "--service-management" && args[2] == "register" && args[3] == "remote" {
-					t.Fatal("stale remote plan re-enabled phone access")
-				}
-				if migrated && len(args) == 4 && args[1] == "--service-management" && args[2] == "status" && args[3] == "remote" {
-					busy, err := installInspectLock(filepath.Join(i.state, "remote"), "control.lock")
-					if err != nil || !busy {
-						t.Fatal("remote readback is not serialized through commit", busy, err)
-					}
 				}
 				return original(ctx, args)
 			}

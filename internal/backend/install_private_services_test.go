@@ -5,88 +5,195 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 )
 
-func TestManagedPrivateNativeCommandsCannotReachRealServices(t *testing.T) {
+type privateNativeFixture struct {
+	installer                 *installer
+	root, tools, tool, socket string
+}
+
+// newPrivateNativeFixture builds a custody the private adapter accepts: parent
+// holds the root, named prefix plus a random suffix, with homeName and tools in it.
+func newPrivateNativeFixture(t *testing.T, parent, prefix, homeName string) privateNativeFixture {
+	t.Helper()
 	// Unix-domain socket paths on macOS cannot fit Go's long test-name roots.
-	root, err := os.MkdirTemp("/tmp", "agent-queue-install-test-")
+	root, err := os.MkdirTemp(parent, prefix)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
-	root, err = filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatal(err)
+	if parent == "/tmp" {
+		if root, err = filepath.EvalSymlinks(root); err != nil {
+			t.Fatal(err)
+		}
 	}
-	home, tools := filepath.Join(root, "User With Spaces"), filepath.Join(root, "tools")
+	home, tools := filepath.Join(root, homeName), filepath.Join(root, "tools")
 	for _, directory := range []string{home, tools} {
 		if err := os.Mkdir(directory, 0700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	i := &installer{home: home, app: filepath.Join(home, "Applications/Agent Queue.app"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), path: tools, testing: true}
-	args := []string{filepath.Join(i.app, "Contents/MacOS/AgentQueue"), "--service-management", "status", "queue"}
-	// Even before a native executable exists, missing explicit fixture custody
-	// must produce the isolation error rather than attempting that executable.
-	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", "")
-	if _, err := i.run(context.Background(), args...); err == nil || !strings.Contains(err.Error(), "real service management is disabled") {
-		t.Fatal("test mode could reach the real native path", err)
-	}
-	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", "private-native-lifecycle")
-	t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", tools)
-	t.Setenv("AGENT_HEAVY_STATE", "/foreign/queue")
-	tool := filepath.Join(tools, "service-management")
-	if err := os.WriteFile(tool, []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" \"$2\" \"$HOME\" \"$AGENT_HEAVY_STATE\"\n"), 0700); err != nil {
+	f := privateNativeFixture{root: root, tools: tools, tool: filepath.Join(tools, "service-management"), socket: filepath.Join(root, "native.sock"),
+		installer: &installer{home: home, app: filepath.Join(home, "Applications/Agent Queue.app"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), path: tools, testing: true}}
+	if err := os.WriteFile(f.tool, []byte("#!/bin/sh\nprintf '%s\\n' \"$1\" \"$2\" \"$HOME\" \"$AGENT_HEAVY_STATE\"\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	socket := filepath.Join(root, "native.sock")
-	listener, err := net.Listen("unix", socket)
+	listener, err := net.Listen("unix", f.socket)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	if err := os.Chmod(socket, 0600); err != nil {
+	if err := os.Chmod(f.socket, 0600); err != nil {
 		t.Fatal(err)
 	}
-	output, err := i.run(context.Background(), args...)
-	if want := strings.Join([]string{"status", "queue", home, i.state, ""}, "\n"); err != nil || string(output) != want {
+	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", "private-native-lifecycle")
+	t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", tools)
+	f.installer.controller = installTestController(f.installer)
+	return f
+}
+
+func (f privateNativeFixture) status() ([]byte, error) {
+	return f.installer.appController().ServiceManagement(context.Background(), f.installer.app, "status", "queue")
+}
+
+// requireRefused expects both operations refused with the isolation error.
+func (f privateNativeFixture) requireRefused(t *testing.T) {
+	t.Helper()
+	_, status := f.status()
+	_, replacement := f.installer.appController().PrepareAppReplacement(context.Background())
+	for _, err := range []error{status, replacement} {
+		if err == nil || err.Error() != errInstallNativeRefused.Error() {
+			t.Fatal("accepted unsafe fixture", err)
+		}
+	}
+}
+
+func TestManagedPrivateNativeCommandsCannotReachRealServices(t *testing.T) {
+	f := newPrivateNativeFixture(t, "/tmp", "agent-queue-install-test-", "User With Spaces")
+	i, ctx := f.installer, context.Background()
+	t.Setenv("AGENT_HEAVY_STATE", "/foreign/queue")
+	output, err := f.status()
+	if want := strings.Join([]string{"status", "queue", i.home, i.state, ""}, "\n"); err != nil || string(output) != want {
 		t.Fatalf("private lifecycle tool lost argument or environment isolation: %q: %v", output, err)
 	}
-	replacement := []string{args[0], "--prepare-app-replacement", i.app}
-	output, err = i.run(context.Background(), replacement...)
-	if want := strings.Join([]string{"prepare-app-replacement", i.app, home, i.state, ""}, "\n"); err != nil || string(output) != want {
+	output, err = i.appController().PrepareAppReplacement(ctx)
+	if want := strings.Join([]string{"prepare-app-replacement", i.app, i.home, i.state, ""}, "\n"); err != nil || string(output) != want {
 		t.Fatalf("private UI shutdown tool lost argument or environment isolation: %q: %v", output, err)
 	}
-	if _, err := i.privateManagedCommand([]string{args[0], "--prepare-app-replacement", filepath.Join(home, "Other.app")}); err == nil {
-		t.Fatal("private fixture accepted another app's UI shutdown")
-	}
-	for _, target := range []string{root, home, tools, tool, socket} {
-		info, err := os.Lstat(target)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(target, info.Mode().Perm()|0020); err != nil {
-			t.Fatal(err)
-		}
-		_, commandErr := i.privateManagedCommand(args)
-		if err := os.Chmod(target, info.Mode().Perm()); err != nil {
-			t.Fatal(err)
-		}
-		if commandErr == nil {
-			t.Fatal("accepted unsafe fixture custody", target)
-		}
-	}
 	for _, change := range [][]string{
-		{filepath.Join(home, "Another.app/Contents/MacOS/AgentQueue"), args[1], args[2], args[3]},
-		{args[0], args[1], "unknown", args[3]},
-		{args[0], args[1], args[2], "unknown"},
-		append(slices.Clone(args), "extra"),
+		{filepath.Join(i.home, "Another.app"), "status", "queue"},
+		{i.app + "/", "status", "queue"},
+		{i.app, "unknown", "queue"},
+		{i.app, "status", "unknown"},
 	} {
-		if _, err := i.privateManagedCommand(change); err == nil {
-			t.Fatal("accepted foreign native command", change)
+		if _, err := i.appController().ServiceManagement(ctx, change[0], change[1], change[2]); err == nil || err.Error() != errInstallNativeRefused.Error() {
+			t.Fatal("accepted foreign native command", change, err)
 		}
 	}
+	// A failing tool is reported as itself, not as the app executable.
+	integrationTestWrite(t, f.tool, []byte("#!/bin/sh\nexit 3\n"))
+	if err := os.Chmod(f.tool, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.status(); err == nil || err.Error() != "Installer command service-management failed: exit status 3" {
+		t.Fatal("private tool failure", err)
+	}
+}
+
+// Every guard refuses on its own: each case breaks one in an accepted fixture.
+// Foreign owners are not covered, since a test cannot give files away.
+func TestInstallPrivateControllerGuards(t *testing.T) {
+	chmod := func(t *testing.T, target string, mode os.FileMode) {
+		t.Helper()
+		if err := os.Chmod(target, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	remove := func(t *testing.T, target string) {
+		t.Helper()
+		if err := os.Remove(target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cases := map[string]func(t *testing.T, f privateNativeFixture){
+		"not testing": func(_ *testing.T, f privateNativeFixture) { f.installer.testing = false },
+		"managed unset": func(t *testing.T, _ privateNativeFixture) {
+			t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", "")
+		},
+		"foreign tools": func(t *testing.T, f privateNativeFixture) {
+			t.Setenv("AGENT_QUEUE_INSTALL_TEST_TOOLS", f.root)
+		},
+		"unclean app":  func(_ *testing.T, f privateNativeFixture) { f.installer.app += "/" },
+		"shared tool":  func(t *testing.T, f privateNativeFixture) { chmod(t, f.tool, 0710) },
+		"inert tool":   func(t *testing.T, f privateNativeFixture) { chmod(t, f.tool, 0600) },
+		"missing tool": func(t *testing.T, f privateNativeFixture) { remove(t, f.tool) },
+		"linked tool": func(t *testing.T, f privateNativeFixture) {
+			if err := os.Link(f.tool, f.tool+"-second"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"symlink tool": func(t *testing.T, f privateNativeFixture) {
+			if err := os.Rename(f.tool, f.tool+"-target"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(f.tool+"-target", f.tool); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"shared socket":  func(t *testing.T, f privateNativeFixture) { chmod(t, f.socket, 0620) },
+		"missing socket": func(t *testing.T, f privateNativeFixture) { remove(t, f.socket) },
+		"file as socket": func(t *testing.T, f privateNativeFixture) {
+			remove(t, f.socket)
+			integrationTestWrite(t, f.socket, nil)
+			chmod(t, f.socket, 0600)
+		},
+		"symlink tools": func(t *testing.T, f privateNativeFixture) {
+			if err := os.Rename(f.tools, f.tools+"-target"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(f.tools+"-target", f.tools); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, directory := range map[string]func(privateNativeFixture) string{
+		"root":  func(f privateNativeFixture) string { return f.root },
+		"home":  func(f privateNativeFixture) string { return f.installer.home },
+		"tools": func(f privateNativeFixture) string { return f.tools },
+	} {
+		for kind, mode := range map[string]os.FileMode{"shared": 0720, "narrowed": 0500} {
+			cases[kind+" "+name] = func(t *testing.T, f privateNativeFixture) {
+				target := directory(f)
+				chmod(t, target, mode)
+				t.Cleanup(func() { _ = os.Chmod(target, 0700) })
+			}
+		}
+	}
+	for name, breakGuard := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newPrivateNativeFixture(t, "/tmp", "agent-queue-install-test-", "User With Spaces")
+			if _, err := f.status(); err != nil {
+				t.Fatal("intact fixture refused", err)
+			}
+			breakGuard(t, f)
+			f.requireRefused(t)
+		})
+	}
+	t.Run("foreign home name", func(t *testing.T) {
+		newPrivateNativeFixture(t, "/tmp", "agent-queue-install-test-", "User").requireRefused(t)
+	})
+	t.Run("foreign root name", func(t *testing.T) {
+		newPrivateNativeFixture(t, "/tmp", "agent-queue-other-", "User With Spaces").requireRefused(t)
+	})
+	t.Run("root through a symlink", func(t *testing.T) {
+		base := newPrivateNativeFixture(t, "/tmp", "agent-queue-link-", "User With Spaces").root
+		parent := base + "/parent"
+		if err := os.Symlink(base, parent); err != nil {
+			t.Fatal(err)
+		}
+		// The root itself is a real private directory; only its path is not canonical.
+		newPrivateNativeFixture(t, parent, "agent-queue-install-test-", "User With Spaces").requireRefused(t)
+	})
 }

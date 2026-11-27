@@ -224,21 +224,19 @@ func TestManagedRefusedMenuShutdownPreservesPreviousBundle(t *testing.T) {
 			i := m.installer
 			managedRemovalTarget(i)
 			before := installBundleSnapshot(t, i.app)
-			original := i.command
-			i.command = func(ctx context.Context, args []string) ([]byte, error) {
-				if len(args) == 3 && args[1] == "--prepare-app-replacement" {
-					switch response {
-					case "refused":
-						return nil, fmt.Errorf("menu refused termination")
-					case "invalid-json":
-						return []byte("invalid"), nil
-					case "wrong-app":
-						return mustMetadataJSON(t, Object{"schemaVersion": 1, "app": "/Applications/Other.app", "status": "stopped"}), nil
-					case "wrong-schema":
-						return mustMetadataJSON(t, Object{"schemaVersion": 2, "app": i.app, "status": "stopped"}), nil
-					}
+			prepare := m.controller.prepare
+			m.controller.prepare = func(ctx context.Context) ([]byte, error) {
+				switch response {
+				case "refused":
+					return nil, fmt.Errorf("menu refused termination")
+				case "invalid-json":
+					return []byte("invalid"), nil
+				case "wrong-app":
+					return mustMetadataJSON(t, Object{"schemaVersion": 1, "app": "/Applications/Other.app", "status": "stopped"}), nil
+				case "wrong-schema":
+					return mustMetadataJSON(t, Object{"schemaVersion": 2, "app": i.app, "status": "stopped"}), nil
 				}
-				return original(ctx, args)
+				return prepare(ctx)
 			}
 			if err := m.run(t); err == nil {
 				t.Fatal("unconfirmed menu shutdown allowed replacement")
@@ -253,7 +251,7 @@ func TestManagedRefusedMenuShutdownPreservesPreviousBundle(t *testing.T) {
 			if err := requireCompleteInstallation(i.root); err != nil {
 				t.Fatal("refused shutdown made the running app look incomplete", err)
 			}
-			i.command = original
+			m.controller.prepare = prepare
 			if err := m.run(t); err != nil {
 				t.Fatal("removal could not finish once the app quit", err)
 			}

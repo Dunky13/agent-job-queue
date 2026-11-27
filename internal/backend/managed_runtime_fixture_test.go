@@ -90,8 +90,8 @@ func runPackagedSetup(ctx context.Context, fixture *installFixture, execute func
 			}
 		}
 		for _, args := range fixture.calls[calls:] {
-			if len(args) > 2 && args[1] == "--service-management" && args[2] != "status" ||
-				len(args) > 1 && args[1] == "--prepare-app-replacement" ||
+			if controllerChange(args) ||
+				len(args) > 1 && args[0] == "controller" && args[1] == "prepare-app-replacement" ||
 				len(args) > 1 && args[0] == "service" && args[1] != "print" {
 				return attempt, fmt.Errorf("busy setup accepted a service mutation; no retry: %w", err)
 			}
@@ -186,25 +186,25 @@ func managedPackagedRuntimeFixture(t *testing.T, m *managedFixture) {
 			ControlEnv: map[string]string{"HOME": i.home, "AGENT_HEAVY_STATE": i.state}, ControlDeadline: deadline}
 		return gate.Snapshot()
 	}
+	manage := m.controller.manage
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if service != "queue" && service != "resources" {
+			return manage(ctx, app, action, service)
+		}
+		if action == "unregister" {
+			stop(service)
+		}
+		output, err := manage(ctx, app, action, service)
+		if err == nil && action == "register" && m.statuses[service] == "enabled" {
+			err = start(service, filepath.Join(app, "Contents/MacOS/agent-heavy"))
+		}
+		return output, err
+	}
 	original := i.command
 	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 3 && args[1] == "--prepare-app-replacement" && args[2] == i.app && args[0] == filepath.Join(i.app, "Contents/MacOS/AgentQueue") {
-			m.calls = append(m.calls, slices.Clone(args))
-			return mustMetadataJSON(t, Object{"schemaVersion": 1, "app": i.app, "status": "stopped"}), nil
-		}
 		if slices.Equal(args, []string{heavy, "status", "--json"}) {
 			m.calls = append(m.calls, slices.Clone(args))
 			return status(ctx)
-		}
-		if len(args) == 4 && args[1] == "--service-management" && (args[3] == "queue" || args[3] == "resources") {
-			if args[2] == "unregister" {
-				stop(args[3])
-			}
-			output, err := original(ctx, args)
-			if err == nil && args[2] == "register" && m.statuses[args[3]] == "enabled" {
-				err = start(args[3], filepath.Join(filepath.Dir(args[0]), "agent-heavy"))
-			}
-			return output, err
 		}
 		return original(ctx, args)
 	}
