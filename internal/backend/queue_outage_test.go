@@ -140,7 +140,7 @@ func TestFollowRidesOutTransientQueueTransportFailure(t *testing.T) {
 	writeJobLog(t, g, 7, "job output\n")
 	scriptSnapshots(t, g, []step{{fail: true}, {fail: true}, {fail: true}, {task: done(Object{"Failed": 41})}}, nil)
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, make(chan os.Signal), "")
+	code, err := followWithToken(g, 7, make(chan os.Signal), "", nil)
 	stdout, stderr := read()
 	if err != nil || code != 41 {
 		t.Fatal("transient transport failure ended the follow", code, err)
@@ -158,7 +158,7 @@ func TestFollowEndsVisiblyWhenDaemonStaysUnreachable(t *testing.T) {
 	g := testGate(t)
 	g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, make(chan os.Signal), "")
+	code, err := followWithToken(g, 7, make(chan os.Signal), "", nil)
 	_, stderr := read()
 	if code != 125 || err == nil {
 		t.Fatal("sustained outage did not end the follow", code, err)
@@ -183,7 +183,7 @@ func TestFollowStillFailsAtOnceOnNonTransportError(t *testing.T) {
 	calls := 0
 	g.queueControl = func(string, Object) (Object, error) { calls++; return nil, boom }
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, make(chan os.Signal), "")
+	code, err := followWithToken(g, 7, make(chan os.Signal), "", nil)
 	_, stderr := read()
 	if code != 125 || !errors.Is(err, boom) {
 		t.Fatal("non-transport error was not returned", code, err)
@@ -199,7 +199,7 @@ func TestFollowRefusesAnotherJobUnderTheSameID(t *testing.T) {
 	other := taskWithToken(jobToken(99), "Done", Object{"result": "Success"})
 	g.queueControl = func(string, Object) (Object, error) { return testSnapshot(Object{"7": other}), nil }
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, make(chan os.Signal), jobToken(8))
+	code, err := followWithToken(g, 7, make(chan os.Signal), jobToken(8), nil)
 	read()
 	if code != 125 || err == nil || !strings.Contains(err.Error(), "no longer the command this client submitted") {
 		t.Fatal("another job's result was used", code, err)
@@ -214,7 +214,7 @@ func TestFollowDoesNotCancelAReplacedJobAfterALostRead(t *testing.T) {
 	replaced := taskWithToken(jobToken(99), "Running", Object{})
 	operations := scriptSnapshots(t, g, []step{{task: running()}, {fail: true}, {task: replaced}}, nil)
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	code, err := followWithToken(g, 7, signals(1), jobToken(8), nil)
 	read()
 	if code != 125 || err == nil || !strings.Contains(err.Error(), "no longer the command this client submitted") || len(mutations(*operations)) != 0 {
 		t.Fatal("a different job was cancelled or reported", code, err, *operations)
@@ -362,7 +362,7 @@ func TestFollowHeldInterruptEndsAtTheOutageBoundWhenOnlyMutationsFail(t *testing
 	operations := scriptSnapshots(t, g, []step{{task: running()}}, func(string) (Object, error) { return nil, transportTimeout(t) })
 	read := captureStreams(t)
 	start := time.Now()
-	code, err := followWithToken(g, 7, signals(1), "")
+	code, err := followWithToken(g, 7, signals(1), "", nil)
 	_, stderr := read()
 	if code != 125 || err == nil || !strings.Contains(err.Error(), "could not be confirmed") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
 		t.Fatal("failing mutations did not end at the bound", code, err)
@@ -386,7 +386,7 @@ func TestFollowSecondSignalDuringOutageEndsTheWait(t *testing.T) {
 		return nil, transportTimeout(t)
 	}
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, signals(2), "")
+	code, err := followWithToken(g, 7, signals(2), "", nil)
 	_, stderr := read()
 	if code != 125 || err == nil || !strings.Contains(err.Error(), "could not be confirmed") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
 		t.Fatal("second interrupt did not end the wait", code, err)
@@ -401,7 +401,7 @@ func TestFollowSaysHeldInterruptWasNotConfirmedAtBound(t *testing.T) {
 	g := testGate(t)
 	g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, signals(1), "")
+	code, err := followWithToken(g, 7, signals(1), "", nil)
 	read()
 	if code != 125 || err == nil || !strings.Contains(err.Error(), "cancellation requested by your interrupt could not be confirmed") || !strings.Contains(err.Error(), "agent-heavy logs 7") {
 		t.Fatal("held interrupt was dropped silently", code, err)
@@ -433,7 +433,7 @@ func TestFollowSaysAnAcknowledgedCancelWasAcknowledgedAtBound(t *testing.T) {
 	g := testGate(t)
 	answerUntilCancelled(t, g, func() {})
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, signals(1), "")
+	code, err := followWithToken(g, 7, signals(1), "", nil)
 	read()
 	if code != 125 || err == nil || !strings.Contains(err.Error(), "after the daemon acknowledged the cancellation") {
 		t.Fatal("an acknowledged cancel was reported as unconfirmed", code, err)
@@ -449,7 +449,7 @@ func TestFollowSaysAnAcknowledgedCancelWasAcknowledgedOnSecondInterrupt(t *testi
 	interrupts := signals(1)
 	answerUntilCancelled(t, g, func() { interrupts <- syscall.SIGINT })
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, interrupts, "")
+	code, err := followWithToken(g, 7, interrupts, "", nil)
 	read()
 	if code != 125 || err == nil || !strings.Contains(err.Error(), "Interrupted again while the queue daemon was not answering; the cancellation was acknowledged") {
 		t.Fatal("an acknowledged cancel was reported as unconfirmed", code, err)
@@ -462,7 +462,7 @@ func TestFollowReportsAFinishedJobsResultOverAHeldInterrupt(t *testing.T) {
 	g := testGate(t)
 	scriptSnapshots(t, g, []step{{task: running()}, {fail: true}, {task: done(Object{"Failed": 41})}}, nil)
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	code, err := followWithToken(g, 7, signals(1), jobToken(8), nil)
 	_, stderr := read()
 	if code != 41 || err != nil || !strings.Contains(stderr, "finished with exit status 41; no cancellation was confirmed") {
 		t.Fatal("the finished job's result was replaced", code, err, stderr)
@@ -492,7 +492,7 @@ func TestFollowReportsTheInterruptStatusWhenCleanupFailsAfterAnAcknowledgedCance
 		return nil, transportTimeout(t) // cleanup cannot be confirmed
 	}
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	code, err := followWithToken(g, 7, signals(1), jobToken(8), nil)
 	_, stderr := read()
 	if code != 128+int(syscall.SIGINT) || err != nil || !strings.Contains(stderr, "after its cancellation was acknowledged") {
 		t.Fatal("a cleanup blip decided the exit status", code, err, stderr)
@@ -507,7 +507,7 @@ func TestFollowKeepsTheResultReadByCancelWhenItsCleanupProbeIsLost(t *testing.T)
 	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
 	scriptSnapshots(t, g, []step{{task: running()}, {fail: true}, {task: running()}, {task: done("Success")}, {fail: true}}, nil)
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	code, err := followWithToken(g, 7, signals(1), jobToken(8), nil)
 	_, stderr := read()
 	if code != 0 || err != nil || !strings.Contains(stderr, "no cancellation was confirmed") || !strings.Contains(stderr, "cleanup could not be confirmed") {
 		t.Fatal("the job's result was lost", code, err, stderr)
@@ -531,7 +531,7 @@ func TestFollowDoesNotClaimTheInterruptDidNothingAfterALostCancelReply(t *testin
 		return testSnapshot(Object{"7": running()}), nil
 	}
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	code, err := followWithToken(g, 7, signals(1), jobToken(8), nil)
 	_, stderr := read()
 	if code != 41 || err != nil || strings.Contains(stderr, "did nothing") || strings.Contains(stderr, "being confirmed") || !strings.Contains(stderr, "no cancellation was confirmed") {
 		t.Fatal(code, err, stderr)
@@ -546,7 +546,7 @@ func TestFollowReportsTheJobStatusWhenAnAnsweringDaemonKeepsTheReceipt(t *testin
 	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
 	scriptSnapshots(t, g, []step{{task: done("Success")}}, nil)
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, make(chan os.Signal), "")
+	code, err := followWithToken(g, 7, make(chan os.Signal), "", nil)
 	_, stderr := read()
 	if code != 0 || err != nil || !strings.Contains(stderr, "cleanup is not confirmed") || !strings.Contains(stderr, "the job's own exit status is 0") {
 		t.Fatal(code, err, stderr)
@@ -583,7 +583,7 @@ func TestFollowKillsAJobIgnoringInterruptAcrossALostRead(t *testing.T) {
 		return testSnapshot(Object{"7": running()}), nil
 	}
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, signals(1), jobToken(8))
+	code, err := followWithToken(g, 7, signals(1), jobToken(8), nil)
 	_, stderr := read()
 	if code != 128+int(syscall.SIGINT) || err != nil || !killed {
 		t.Fatal("an acknowledged cancel was never followed by a kill", code, err, killed, operations)
@@ -608,7 +608,7 @@ func TestFollowBoundsAHeldCancellationAlternatingLostRepliesAndBusyHandovers(t *
 	})
 	read := captureStreams(t)
 	start := time.Now()
-	code, err := followWithToken(g, 7, signals(1), "")
+	code, err := followWithToken(g, 7, signals(1), "", nil)
 	read()
 	if code != 125 || err == nil || time.Since(start) > 5*time.Second {
 		t.Fatal("the held cancellation was not bounded", code, err, time.Since(start))
@@ -664,7 +664,7 @@ func TestFollowReportsAFinishedJobFromTheStoreWhenDaemonStaysGone(t *testing.T) 
 			before, _ := os.ReadFile(QueueDatabasePath(g.State))
 			g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
 			read := captureStreams(t)
-			code, err := followWithToken(g, 7, make(chan os.Signal), token)
+			code, err := followWithToken(g, 7, make(chan os.Signal), token, nil)
 			stdout, stderr := read()
 			if test.code < 0 {
 				if code != 125 || err == nil || !strings.Contains(err.Error(), "may still be running") {
@@ -686,7 +686,7 @@ func TestFollowKeepsTheJobResultWhenOnlyCleanupLosesTheDaemon(t *testing.T) {
 	mustWrite(t, g.ReceiptPath(7), Object{"task_id": 7, "token": jobToken(8)})
 	scriptSnapshots(t, g, []step{{task: done(Object{"Failed": 41})}, {task: done(Object{"Failed": 41})}, {fail: true}}, nil)
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, make(chan os.Signal), "")
+	code, err := followWithToken(g, 7, make(chan os.Signal), "", nil)
 	_, stderr := read()
 	if code != 41 || err != nil || !strings.Contains(stderr, "agent-heavy logs 7") {
 		t.Fatal("a finished job's result was replaced", code, err, stderr)
@@ -756,7 +756,7 @@ func TestFollowExplainsAPausedQueueOnceAndWithoutGuessingWhy(t *testing.T) {
 			g := testGate(t)
 			scriptSnapshots(t, g, test.steps, nil)
 			read := captureStreams(t)
-			code, err := followWithToken(g, 7, make(chan os.Signal), "")
+			code, err := followWithToken(g, 7, make(chan os.Signal), "", nil)
 			_, stderr := read()
 			if err != nil || code != 0 {
 				t.Fatal(code, err)
@@ -782,7 +782,7 @@ func TestFollowSaysNothingAboutAQueueThatIsNotPaused(t *testing.T) {
 	queued := taskWith("Queued", Object{})
 	scriptSnapshots(t, g, []step{{fail: true}, {fail: true}, {task: queued}, {task: queued}, {task: done("Success")}}, nil)
 	read := captureStreams(t)
-	code, err := followWithToken(g, 7, make(chan os.Signal), "")
+	code, err := followWithToken(g, 7, make(chan os.Signal), "", nil)
 	_, stderr := read()
 	if err != nil || code != 0 || strings.Contains(stderr, "paused") {
 		t.Fatal(code, err, stderr)

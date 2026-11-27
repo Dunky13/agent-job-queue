@@ -385,19 +385,25 @@ func (g *Gate) operationContext() context.Context {
 	return context.Background()
 }
 func (g *Gate) Task(id int) (Object, error) {
+	task, _, err := g.taskWithQueue(id)
+	return task, err
+}
+
+// taskWithQueue is Task with the default queue's settings from the same snapshot.
+func (g *Gate) taskWithQueue(id int) (Object, Object, error) {
 	snapshot, err := g.QueueControl("snapshot", Object{"id": id})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	raw := obj(snapshot["tasks"])[strconv.Itoa(id)]
 	if raw == nil {
-		return nil, nil
+		return nil, defaultGroup(snapshot), nil
 	}
 	value := obj(raw)
 	if value == nil {
-		return nil, errors.New("Queue returned an invalid task")
+		return nil, nil, errors.New("Queue returned an invalid task")
 	}
-	return value, nil
+	return value, defaultGroup(snapshot), nil
 }
 
 // errQueueLockTimeout says another process held a coordination lock for the whole wait.

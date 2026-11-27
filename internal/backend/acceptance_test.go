@@ -502,6 +502,62 @@ func TestRealDaemonLimitPreservesPausedJobAndQueue(t *testing.T) {
 	client.wait(t, 0)
 }
 
+func TestRealDaemonPausedQueuePassesCommandsThrough(t *testing.T) {
+	f := daemonAcceptance(t)
+	running := f.launch("/bin/sh", "-c", "echo started > started; while [ ! -e release ]; do sleep 0.05; done")
+	fixtureUntil(t, 8*time.Second, func() bool { return f.fileExists("started") })
+	queued := f.launch("/bin/sh", "-c", "echo $AGENT_HEAVY_ACTIVE > queued-ran; exit 3")
+	f.waitJobs(2)
+	runningID, queuedID := -1, -1
+	for _, id := range f.taskIDs() {
+		task, err := f.gate.Task(id)
+		if name, _, e := TaskStatus(task); err == nil && e == nil && name == "Queued" {
+			queuedID = id
+		} else {
+			runningID = id
+		}
+	}
+	if queuedID < 0 || runningID < 0 {
+		t.Fatal(f.taskIDs())
+	}
+	// A running queue keeps its queued jobs, even for a caller with the token.
+	if _, err := f.gate.QueueControl("withdraw", Object{"id": queuedID, "token": text(mustTask(t, f.gate, queuedID)["token"])}); err == nil || !strings.Contains(err.Error(), "paused") {
+		t.Fatal("a running queue let a job be withdrawn", err)
+	}
+	if _, err := f.gate.QueueControl("pause", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.gate.QueueControl("withdraw", Object{"id": runningID, "token": text(mustTask(t, f.gate, runningID)["token"])}); err == nil {
+		t.Fatal("a started job was withdrawn")
+	}
+	queued.wait(t, 3)
+	if !f.fileExists("queued-ran") || !strings.Contains(queued.errors.String(), "was withdrawn, running this command outside the queue") {
+		t.Fatalf("queued caller did not pass through: %q", queued.errors.String())
+	}
+	direct := f.launch("/bin/sh", "-c", "exit 5")
+	direct.wait(t, 5)
+	if !strings.Contains(direct.errors.String(), "the queue is paused; running this command outside the queue") || len(f.taskIDs()) != 2 {
+		t.Fatalf("new caller did not pass through: %q %v", direct.errors.String(), f.taskIDs())
+	}
+	running.stillRunning(t)
+	if _, err := f.gate.QueueControl("resume", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(f.root, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	running.wait(t, 0)
+}
+
+func mustTask(t *testing.T, g *Gate, id int) Object {
+	t.Helper()
+	task, err := g.Task(id)
+	if err != nil || task == nil {
+		t.Fatal(id, err)
+	}
+	return task
+}
+
 func TestRealDaemonCrashRetainsOwnershipAndPausesRestart(t *testing.T) {
 	f := daemonAcceptance(t)
 	first := f.launch("/bin/sh", "-c", "echo started > crash-started; sleep 60")
@@ -564,22 +620,23 @@ func TestRealDaemonCrashRetainsOwnershipAndPausesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	if obj(obj(snapshot["groups"])["default"])["status"] != "Paused" {
-		t.Fatal("restarted daemon did not hold queued work")
-	}
-	if _, err = os.Stat(filepath.Join(f.root, "crash-forbidden")); !os.IsNotExist(err) {
-		t.Fatal("queued target ran after daemon crash")
+		t.Fatal("restarted daemon did not pause")
 	}
 	if err = Cleanup(f.gate, firstID); err != nil {
 		t.Fatal(err)
 	}
-	// The waiter must say why its job is not starting before an operator acts.
-	fixtureUntil(t, 20*time.Second, func() bool { return strings.Contains(second.errors.String(), "the queue is paused") })
-	if err = Cancel(f.gate, secondID); err != nil {
-		t.Fatal(err)
+	// The restart pause passes through like any pause: the waiter withdraws its
+	// queued job and runs the command itself, once.
+	second.wait(t, 0)
+	if text := readText(t, filepath.Join(f.root, "crash-forbidden")); text != "forbidden\n" {
+		t.Fatalf("withdrawn command output: %q", text)
 	}
-	second.wait(t, 130)
+	task, err := f.gate.Task(secondID)
+	if name, _, statusErr := TaskStatus(task); err != nil || statusErr != nil || name != "Done" || !boolean(task["withdrawn"]) {
+		t.Fatalf("withdrawn job: %v %v %v", task, err, statusErr)
+	}
 	notices := second.errors.String()
-	if !strings.Contains(notices, "queue daemon not responding") || !strings.Contains(notices, "queue answering again") || strings.Count(notices, "the queue is paused") != 1 {
+	if !strings.Contains(notices, "queue daemon not responding") || !strings.Contains(notices, "queue answering again") || strings.Count(notices, "the queue is paused") != 1 || !strings.Contains(notices, "was withdrawn") {
 		t.Fatalf("outage or pause was not announced once: %q", notices)
 	}
 	select {

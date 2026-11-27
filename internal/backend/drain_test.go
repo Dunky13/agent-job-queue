@@ -637,12 +637,38 @@ func TestRunInLaneOnDrainRaceAppliesThePolicy(t *testing.T) {
 			t.Fatal("the submission files were still present while the command ran")
 		}
 	})
-	t.Run("a paused queue after the wait is a definite refusal", func(t *testing.T) {
+	t.Run("a paused queue after the wait runs the command outside the queue", func(t *testing.T) {
 		r := &raceScenario{reopen: true, paused: true}
 		g := r.gate(t)
-		code, err := run(g, drainWait)
-		if code != 125 || err == nil || !strings.Contains(err.Error(), "must be Running") || r.submits != 1 || len(leftovers(g)) != 0 {
+		root := t.TempDir()
+		code, err := RunInLaneOnDrain(g, []string{"/bin/sh", "-c", `echo run >> "$1/count"; exit 6`, "fixture", root}, "", "", drainWait)
+		if code != 6 || err != nil || r.submits != 1 || readText(t, filepath.Join(root, "count")) != "run\n" || len(leftovers(g)) != 0 {
 			t.Fatalf("code=%d err=%v submits=%d left=%v", code, err, r.submits, leftovers(g))
+		}
+	})
+	t.Run("a pause the daemon reports at submission runs the command outside the queue", func(t *testing.T) {
+		r := &raceScenario{noDrain: true}
+		g := r.gate(t)
+		r.outcome = func(g *Gate, n int) error { return errQueuePaused }
+		root := t.TempDir()
+		code, err := RunInLaneOnDrain(g, []string{"/bin/sh", "-c", `echo run >> "$1/count"`, "fixture", root}, "", "", drainWait)
+		if code != 0 || err != nil || r.submits != 1 || readText(t, filepath.Join(root, "count")) != "run\n" || len(leftovers(g)) != 0 {
+			t.Fatalf("code=%d err=%v submits=%d left=%v", code, err, r.submits, leftovers(g))
+		}
+	})
+	t.Run("a paused queue still refuses a lane command", func(t *testing.T) {
+		r := &raceScenario{noDrain: true}
+		g := r.gate(t)
+		g.queueControl = func(operation string, payload Object) (Object, error) {
+			return Object{"groups": Object{"default": Object{"status": "Paused", "parallel_tasks": 1}}, "tasks": Object{}}, nil
+		}
+		root := t.TempDir()
+		code, err := RunInLaneOnDrain(g, []string{"/bin/sh", "-c", "echo forbidden > " + filepath.Join(root, "ran")}, "", "qa", drainWait)
+		if code != 125 || !errors.Is(err, errQueuePaused) || len(leftovers(g)) != 0 {
+			t.Fatalf("code=%d err=%v left=%v", code, err, leftovers(g))
+		}
+		if _, err = os.Stat(filepath.Join(root, "ran")); !os.IsNotExist(err) {
+			t.Fatal("a lane command ran outside the queue")
 		}
 	})
 	t.Run("an invalid drain file refused by the daemon fails closed and cleans up", func(t *testing.T) {
@@ -1126,7 +1152,7 @@ func TestRealDaemonDrainWaitSaysWhenTheQueueIsPaused(t *testing.T) {
 	fixtureUntil(t, 8*time.Second, func() bool { return f.fileExists("started") })
 	f.cli("pause").wait(t, 0)
 	waiter := f.cli("drain", "--wait")
-	waiter.stderrHas(t, "the queue is paused, so queued jobs will not start until agent-heavy resume or agent-heavy undrain")
+	waiter.stderrHas(t, "the queue is paused, so queued lane jobs and jobs with no caller attached will not start until agent-heavy resume or agent-heavy undrain")
 	if err := os.WriteFile(filepath.Join(f.root, "release"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1374,7 +1400,7 @@ func newFollowFixture(t *testing.T, drain bool) *followFixture {
 	}
 	f.stderr = captureStderr(t)
 	go func() {
-		code, err := followWithToken(f.g, 5, f.signals, value)
+		code, err := followWithToken(f.g, 5, f.signals, value, nil)
 		f.done <- followResult{code, err}
 	}()
 	return f
@@ -1490,7 +1516,7 @@ func TestFollowReportsTheFinishedJobsStatusWhenInterruptedDuringADrain(t *testin
 	stderr := captureStderr(t)
 	signals := make(chan os.Signal, 1)
 	signals <- syscall.SIGTERM
-	code, err := followWithToken(g, 8, signals, value)
+	code, err := followWithToken(g, 8, signals, value, nil)
 	if code != 7 || err != nil {
 		t.Fatalf("code=%d err=%v", code, err)
 	}
@@ -1619,7 +1645,7 @@ func TestDrainNoticesRepeatAtTheConfiguredPeriod(t *testing.T) {
 		signals := make(chan os.Signal, 1)
 		done := make(chan int, 1)
 		go func() {
-			code, _ := followWithToken(g, 4, signals, token())
+			code, _ := followWithToken(g, 4, signals, token(), nil)
 			done <- code
 		}()
 		waiting(stderr, "(drain active); still waiting for job 4")

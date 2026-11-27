@@ -116,32 +116,34 @@ func (o *queueOutage) reset() {
 // store, read-only, the way handover inspection does: no migration, no write
 // and no lock the daemon holds. It reports false unless the stored job carries
 // exactly the submitted token and is terminal, so any doubt keeps the caller's
-// "may still be running" report.
-func queueStoredOutcome(g *Gate, id int, token string) (int, bool) {
+// "may still be running" report. withdrawn says the caller withdrew the job
+// from a paused queue to run the command itself.
+func queueStoredOutcome(g *Gate, id int, token string) (code int, withdrawn, ok bool) {
 	if !validToken(token) {
-		return 0, false
+		return 0, false, false
 	}
 	store, err := queueReadHandoverStore(g)
 	if err != nil {
-		return 0, false
+		return 0, false, false
 	}
 	defer store.close()
 	job, err := store.job(id)
 	if err != nil || job.token != token {
-		return 0, false
+		return 0, false, false
 	}
+	withdrawn = boolean(job.task["withdrawn"])
 	switch job.phase {
 	case "done":
 		name, details, err := TaskStatus(job.task)
 		if err != nil || name != "Done" {
-			return 0, false
+			return 0, false, false
 		}
 		code, err := ResultCode(details["result"])
-		return code, err == nil
+		return code, withdrawn, err == nil
 	case "outcome":
 		if job.outcome.Valid && job.outcome.Int64 >= 0 && job.outcome.Int64 <= 255 {
-			return int(job.outcome.Int64), true
+			return int(job.outcome.Int64), withdrawn, true
 		}
 	}
-	return 0, false
+	return 0, false, false
 }

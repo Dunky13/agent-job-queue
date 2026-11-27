@@ -416,17 +416,11 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 		}
 	})
 	if queued {
+		// The blocker holds the only slot through the upgrade, so the job stays
+		// queued with its caller attached. A pause cannot hold it: its caller would
+		// withdraw it and run the command outside the queue. Handover pause
+		// preservation is covered by TestRealDaemonHandoverFreezesBeforeAcceptanceAndPreservesSettings.
 		oldWait.accepted(ctx, 2)
-		if _, err := i.liveControl(ctx, "pause", nil); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(blockerRelease, nil, 0600); err != nil {
-			t.Fatal(err)
-		}
-		if err := <-blockerDone; err != nil {
-			t.Fatal("initial queue blocker", err)
-		}
-		blockerDone = nil
 	} else {
 		oldWait.accepted(ctx, 1)
 		oldWait.started(ctx, started)
@@ -516,7 +510,7 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 	defer finishVerification()
 	if queued {
 		if _, err := os.Stat(started); !os.IsNotExist(err) {
-			t.Fatal("handover resumed a deliberately paused queue", err)
+			t.Fatal("handover started a queued job while the blocker held the only slot", err)
 		}
 		// An RPC budget belongs to one operation, not the entire upgrade.
 		// Expire the earlier client deterministically so a fast local run also
@@ -525,9 +519,13 @@ func testInstallerManagedLiveResume(t *testing.T, executable, failure string) {
 		if _, err := initialControl.QueueControl("snapshot", nil); err == nil || err.Error() != "Queue control deadline expired" {
 			t.Fatal("expired initial control unexpectedly remained usable", err)
 		}
-		if _, err := i.liveControl(ctx, "resume", nil); err != nil {
+		if err := os.WriteFile(blockerRelease, nil, 0600); err != nil {
 			t.Fatal(err)
 		}
+		if err := <-blockerDone; err != nil {
+			t.Fatal("initial queue blocker", err)
+		}
+		blockerDone = nil
 		if _, err := i.liveControl(ctx, "limit", Object{"limit": 2}); err != nil {
 			t.Fatal(err)
 		}
