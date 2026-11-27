@@ -71,8 +71,8 @@ func managedAppBundleFixture(t *testing.T) *managedFixture {
 func managedServiceCalls(m *managedFixture, action string) []string {
 	services := []string{}
 	for _, args := range m.calls {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == action {
-			services = append(services, args[3])
+		if len(args) == 4 && args[0] == "controller" && args[1] == action {
+			services = append(services, args[2])
 		}
 	}
 	return services

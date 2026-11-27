@@ -47,6 +47,8 @@ type installer struct {
 	command                                      func(context.Context, []string) ([]byte, error)
 	services                                     installServices
 	host                                         installHost
+	controller                                   installController
+	privateLifecycle                             bool
 	notice                                       func(string)
 }
 
@@ -251,14 +253,11 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 	if install.command != nil {
 		return install.command(ctx, args)
 	}
-	environmentArgs := args
-	if install.testing && len(args) > 1 && (args[1] == "--service-management" || args[1] == "--prepare-app-replacement") {
-		privateArgs, err := install.privateManagedCommand(args)
-		if err != nil {
-			return nil, err
-		}
-		args = privateArgs
-	}
+	return install.runAs(ctx, args, args)
+}
+
+// runAs runs args with the environment and output limit of the command standsFor.
+func (install *installer) runAs(ctx context.Context, standsFor, args []string) ([]byte, error) {
 	commandPath := args[0]
 	if !filepath.IsAbs(commandPath) {
 		var err error
@@ -270,8 +269,8 @@ func (install *installer) run(ctx context.Context, args ...string) ([]byte, erro
 	bounded, cancel := installCommandContext(ctx, args)
 	defer cancel()
 	command := exec.CommandContext(bounded, commandPath, args[1:]...)
-	command.Env = install.commandEnvironment(environmentArgs)
-	output := &boundedOutput{limit: install.commandOutputLimit(environmentArgs)}
+	command.Env = install.commandEnvironment(standsFor)
+	output := &boundedOutput{limit: install.commandOutputLimit(standsFor)}
 	command.Stdout = output
 	command.Stderr = output
 	command.WaitDelay = time.Second
@@ -1703,6 +1702,9 @@ func InstallMain(args []string) int {
 		path = tools + string(os.PathListSeparator) + path
 	}
 	install := &installer{home: home, root: filepath.Join(home, ".local/share/agent-heavy"), state: filepath.Join(home, ".local/state/agent-heavy"), config: filepath.Join(home, ".config/agent-heavy"), launch: filepath.Join(home, "Library/LaunchAgents"), app: options.app, path: path, testing: testing, disablePhoneAccess: options.disablePhoneAccess, unregisterServices: options.unregisterServices, keepCustomCallback: options.keepCustomCallback}
+	if testing {
+		install.selectTestLifecycle()
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if options.repairAndContinue {

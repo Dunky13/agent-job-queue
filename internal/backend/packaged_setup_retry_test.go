@@ -13,7 +13,9 @@ import (
 
 func TestPackagedSetupRetriesOnlyUnacceptedKernelBusy(t *testing.T) {
 	f := installTestFixture(t)
-	f.calls = append(f.calls, []string{"AgentQueue", "--service-management", "status", "queue"})
+	if _, err := f.controller.ServiceManagement(context.Background(), f.installer.app, "status", "queue"); err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
 	calls := 0
 	retries, err := runPackagedSetup(ctx, f, func(received context.Context) error {
@@ -37,7 +39,9 @@ func TestPackagedSetupNeverRetriesMutationOrUncertainHistory(t *testing.T) {
 		t.Run(phase, func(t *testing.T) {
 			f := installTestFixture(t)
 			i := f.installer
-			f.calls = append(f.calls, []string{"AgentQueue", "--service-management", "status", "queue"})
+			if _, err := f.controller.ServiceManagement(context.Background(), i.app, "status", "queue"); err != nil {
+				t.Fatal(err)
+			}
 			pending := filepath.Join(i.root, "install-in-progress.json")
 			metadata := filepath.Join(i.root, "installation.json")
 			if phase == "existing-pending" {
@@ -62,9 +66,13 @@ func TestPackagedSetupNeverRetriesMutationOrUncertainHistory(t *testing.T) {
 					}
 					integrationTestWrite(t, metadata, []byte("retained identity"))
 				case "native":
-					f.calls = append(f.calls, []string{"AgentQueue", "--service-management", "unregister", "resources"})
+					if _, err := f.controller.ServiceManagement(context.Background(), i.app, "unregister", "resources"); err != nil {
+						t.Fatal(err)
+					}
 				case "menu":
-					f.calls = append(f.calls, []string{"AgentQueue", "--prepare-app-replacement", i.app})
+					if _, err := f.controller.PrepareAppReplacement(context.Background(), i.app); err != nil {
+						t.Fatal(err)
+					}
 				case "service":
 					f.calls = append(f.calls, []string{"service", "bootout", "private-service"})
 				case "lost-history":

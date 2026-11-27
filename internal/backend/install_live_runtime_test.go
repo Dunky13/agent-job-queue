@@ -705,12 +705,12 @@ func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string
 		}
 		return answer(label)
 	}
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" {
-			services[args[3]] = filepath.Dir(filepath.Dir(filepath.Dir(args[0])))
+	manage := m.controller.manage
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if action == "register" {
+			services[service] = app
 		}
-		return original(ctx, args)
+		return manage(ctx, app, action, service)
 	}
 	moved := filepath.Join(i.home, "Applications/Agent Queue moved.app")
 	if err := installCopyTree(i.app, moved); err != nil {
@@ -738,7 +738,7 @@ func testFinishPendingLiveResume(t *testing.T, executable, phase, failure string
 	requireLiveJournalGone(t, i)
 	// Registering helpers proves the retained app bundle activated non-supervised.
 	if !slices.ContainsFunc(m.calls, func(args []string) bool {
-		return len(args) == 4 && strings.HasPrefix(args[0], pendingBuild+"/") && args[2] == "register" && args[3] == "resources"
+		return slices.Equal(args, []string{"controller", "register", "resources", pendingBuild})
 	}) {
 		t.Fatal("the retained app bundle did not activate its registered helpers")
 	}

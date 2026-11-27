@@ -62,12 +62,12 @@ func TestManagedPendingBuild126NativeRefusalPreservesCustody(t *testing.T) {
 	managedBundleBuild(t, i, dropped, "127")
 	i.app = dropped
 	m.statuses["login"] = "notFound"
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if len(args) == 4 && args[1] == "--service-management" && args[2] == "register" {
+	manage := m.controller.manage
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		if action == "register" {
 			return nil, errors.New("build 126 native bridge returned notFound without registration")
 		}
-		return original(ctx, args)
+		return manage(ctx, app, action, service)
 	}
 	if err := i.repairAndExecute(context.Background()); err == nil || !strings.Contains(err.Error(), "custody were preserved") {
 		t.Fatal("old native policy did not fail closed with a retained-state diagnostic", err)

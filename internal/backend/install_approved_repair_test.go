@@ -79,7 +79,7 @@ func TestInstallerAutomaticLegacyServiceBackupRefusesChangedEvidence(t *testing.
 		t.Fatal("failed automatic backup changed original or retained evidence")
 	}
 	for _, call := range m.calls {
-		if len(call) > 2 && ((call[0] == "service" && call[1] == "bootout") || (call[1] == "--service-management" && call[2] != "status")) {
+		if len(call) > 2 && ((call[0] == "service" && call[1] == "bootout") || controllerChange(call)) {
 			t.Fatal("automatic setup stopped a service before retaining its original definition", call)
 		}
 	}
@@ -114,7 +114,7 @@ func TestInstallerAutomaticManagedUpgradeWaitsForActiveJobs(t *testing.T) {
 		func(context.Context) error {
 			waits++
 			for _, call := range m.calls {
-				if len(call) > 2 && call[1] == "--service-management" && call[2] == "unregister" {
+				if controllerChange(call) && call[1] == "unregister" {
 					t.Fatal("upgrade interrupted active work before drain")
 				}
 			}
@@ -134,10 +134,10 @@ func TestInstallerAutomaticManagedLoginApprovalNeverWaits(t *testing.T) {
 	if nativeExit == nil {
 		t.Fatal("approval fixture did not reproduce native exit 2")
 	}
-	original := m.installer.command
-	m.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-		output, err := original(ctx, args)
-		if err == nil && len(args) == 4 && args[1] == "--service-management" && args[2] == "register" && m.statuses[args[3]] == "requiresApproval" {
+	manage := m.controller.manage
+	m.controller.manage = func(ctx context.Context, app, action, service string) ([]byte, error) {
+		output, err := manage(ctx, app, action, service)
+		if err == nil && action == "register" && m.statuses[service] == "requiresApproval" {
 			return output, nativeExit
 		}
 		return output, err

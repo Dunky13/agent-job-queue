@@ -36,11 +36,7 @@ type managedPlan struct {
 }
 
 func (install *installer) managedStatus(ctx context.Context, app, service string) (string, error) {
-	args, err := appservices.Arguments(app, "status", service)
-	if err != nil {
-		return "", err
-	}
-	raw, err := install.run(ctx, args...)
+	raw, err := install.appController().ServiceManagement(ctx, app, "status", service)
 	if err != nil {
 		return "", err
 	}
@@ -72,12 +68,8 @@ func (install *installer) managedAction(ctx context.Context, app, action, servic
 	if action == "register" && status == "enabled" || action == "unregister" && status == "notRegistered" {
 		return nil
 	}
-	args, err := appservices.Arguments(app, action, service)
-	if err != nil {
-		return err
-	}
 	// The native bridge waits for asynchronous unregistration completion.
-	if _, err := install.run(ctx, args...); err != nil {
+	if _, err := install.appController().ServiceManagement(ctx, app, action, service); err != nil {
 		// The real native bridge exits 2 for a registered service awaiting
 		// consent. Confirm that precise state with a read-only query before
 		// treating a failed command as a resumable approval pause.
@@ -1084,7 +1076,7 @@ func (install *installer) managedStopMenu(ctx context.Context) error {
 	if err != nil || !exists {
 		return err
 	}
-	output, err := install.run(ctx, filepath.Join(install.app, "Contents/MacOS/AgentQueue"), "--prepare-app-replacement", install.app)
+	output, err := install.appController().PrepareAppReplacement(ctx, install.app)
 	if err != nil {
 		return fmt.Errorf("The previous menu app could not quit; preserve its bundle and retry after quitting: %w", err)
 	}
