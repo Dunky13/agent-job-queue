@@ -184,15 +184,14 @@ func TestManagedPublicationKeepsPendingIdentityAuthoritative(t *testing.T) {
 	i := m.installer
 	managedCandidate(t, m, "124")
 	mutated := false
-	original := i.command
-	i.command = func(ctx context.Context, args []string) ([]byte, error) {
-		last := args[len(args)-1]
+	verify := m.host.verify
+	m.host.verify = func(path string) error {
 		// Pending identity 124 is durable from here, and the bundle changes under it.
-		if _, err := os.Stat(filepath.Join(i.root, "install-in-progress.json")); err == nil && !mutated && args[0] == "/usr/bin/codesign" && last == i.app {
+		if _, err := os.Stat(filepath.Join(i.root, "install-in-progress.json")); err == nil && !mutated && path == i.app {
 			mutated = true
 			managedBundleBuild(t, i, i.app, "125")
 		}
-		return original(ctx, args)
+		return verify(path)
 	}
 	if err := m.run(t); err == nil || !mutated {
 		t.Fatal("setup accepted an identity that changed during verification", err)

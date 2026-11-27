@@ -207,12 +207,12 @@ func TestManagedRecordedPendingRefusesChangedOrUnsafeApp(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "bad-signature":
-				original := i.command
-				i.command = func(ctx context.Context, args []string) ([]byte, error) {
-					if args[0] == "/usr/bin/codesign" && strings.HasPrefix(args[len(args)-1], old) {
-						return nil, errors.New("fixture invalid signature")
+				verify := m.host.verify
+				m.host.verify = func(path string) error {
+					if strings.HasPrefix(path, old) {
+						return errors.New("fixture invalid signature")
 					}
-					return original(ctx, args)
+					return verify(path)
 				}
 			case "unowned-backup":
 				if err := installCopyTree(old, i.managedPreviousPath()); err != nil {

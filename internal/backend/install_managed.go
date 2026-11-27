@@ -121,7 +121,7 @@ func (install *installer) managedVerify(ctx context.Context, app string) error {
 		return err
 	}
 	for _, target := range []string{filepath.Join(app, "Contents/MacOS/agent-heavy"), filepath.Join(app, "Contents/MacOS/agent-remote"), app} {
-		if _, err := install.run(ctx, "/usr/bin/codesign", "--verify", "--strict", "--verbose=2", target); err != nil {
+		if err := install.hostQueries().VerifySignature(ctx, target); err != nil {
 			return fmt.Errorf("Managed bundle signature verification failed: %w", err)
 		}
 	}
@@ -312,16 +312,8 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 // Anything else, including no evidence, leaves the holder unowned, and the error
 // says which evidence was missing.
 func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helper string) error {
-	output, err := install.run(ctx, "/usr/sbin/lsof", "-nP", "-t", "--", lock)
-	if err != nil {
-		return err
-	}
-	holders := strings.Fields(string(output))
-	for _, holder := range holders {
-		pid, err := strconv.Atoi(holder)
-		if err != nil || pid <= 1 {
-			return fmt.Errorf("holder %q is not a process", holder)
-		}
+	holders, listErr := install.hostQueries().LockHolders(ctx, lock)
+	for _, pid := range holders {
 		executable, err := installProcessExecutable(pid)
 		if err != nil {
 			return fmt.Errorf("holder %d cannot be read: %w", pid, err)
@@ -340,6 +332,9 @@ func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helpe
 		} else if executable != filepath.Join(app, "Contents/MacOS/AgentQueue") {
 			return fmt.Errorf("parent %d of holder %d runs %s", parent, pid, executable)
 		}
+	}
+	if listErr != nil {
+		return listErr
 	}
 	if len(holders) == 0 {
 		return errors.New("no holder found")

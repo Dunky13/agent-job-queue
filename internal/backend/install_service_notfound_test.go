@@ -530,6 +530,8 @@ func TestManagedHeldByAppRefusesWithoutEvidence(t *testing.T) {
 		"launchd":        {output: "1\n", want: `holder "1" is not a process`},
 		"holder is gone": {output: dead + "\n", want: "holder " + dead},
 		"another binary": {output: self + "\n", want: "holder " + self + " runs "},
+		// The first problem in listing order is reported, not the parse failure.
+		"unowned then invalid": {output: self + "\nabc\n", want: "holder " + self + " runs "},
 	} {
 		t.Run(name, func(t *testing.T) {
 			i := &installer{command: func(context.Context, []string) ([]byte, error) { return []byte(test.output), test.err }}

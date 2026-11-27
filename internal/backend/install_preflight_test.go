@@ -350,13 +350,7 @@ func TestInstallerPreflightFindsExternalProcessesAndStoppingController(t *testin
 	if err := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		t.Fatal(err)
 	}
-	command := f.installer.command
-	f.installer.command = func(ctx context.Context, args []string) ([]byte, error) {
-		if args[0] == "ps" {
-			return []byte("98123 " + filepath.Join(f.installer.root, ".venv/bin/python") + " " + filepath.Join(f.installer.root, "agent_heavy.py") + " scheduler"), nil
-		}
-		return command(ctx, args)
-	}
+	f.host.processes = []installProcess{{PID: 98123, Command: filepath.Join(f.installer.root, ".venv/bin/python") + " " + filepath.Join(f.installer.root, "agent_heavy.py") + " scheduler"}}
 	// Managed planning refuses this state outright; the review names what remains.
 	ids := preflightIDs(f.installer.preflightLegacy(context.Background(), installPreflightReport{SchemaVersion: 1, Issues: []installPreflightIssue{}}))
 	if !ids["controller-stopping"] || !ids["legacy-processes"] {
