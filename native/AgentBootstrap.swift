@@ -931,7 +931,7 @@ struct QueueBootstrapView: View {
     @State private var pending: QueueBootstrapPendingAction?
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Label(model.allowsInstallation ? "Set up Agent Queue" : "Agent Queue", systemImage: QueueBrand.symbolName).font(.title2.bold())
+            Label { Text(model.allowsInstallation ? "Set up Agent Queue" : "Agent Queue") } icon: { Image(nsImage: QueueBrand.image(height: 24)).renderingMode(.template) }.font(.title2.bold())
             Text(model.allowsInstallation ? "Existing jobs, history and credentials are preserved."
                  : "Setup is disabled for this launch.")
                 .font(.callout).foregroundStyle(.secondary)

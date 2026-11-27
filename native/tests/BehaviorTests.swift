@@ -338,6 +338,19 @@ struct BehaviorTests {
         let presentation = QueueStatusPresentation(snapshot: snapshot, error: nil)
         try check(presentation.title == "2 · 3" && presentation.accessibilityLabel == "Agent Queue, 2 running, 3 waiting",
                   "Status item preserves running and waiting counts and accessibility")
+        func mark(_ status: String, running: Int, drainUntil: String? = nil, error: String? = nil) -> QueueStatusPresentation {
+            QueueStatusPresentation(snapshot: QueueSnapshot(updatedAt: "fixture", queue: QueueSummary(
+                status: status, limit: 1, running: running, waiting: 3, legacyOccupied: false, drainUntil: drainUntil), jobs: []), error: error)
+        }
+        try check(presentation.mark == .running && mark("running", running: 0).mark == .idle
+            && mark("running", running: 2, drainUntil: "2026-11-27T12:00:00Z").mark == .draining
+            && mark("paused", running: 2, drainUntil: "2026-11-27T12:00:00Z").mark == .paused
+            && mark("paused", running: 2, error: "Fixture error").mark == .attention,
+                  "Status mark follows running, idle, draining, paused and unavailable, in that precedence")
+        try check(mark("paused", running: 2).title == "2 · 3"
+            && mark("paused", running: 2).accessibilityLabel == "Agent Queue, paused, 2 running, 3 waiting"
+            && mark("running", running: 2, drainUntil: "2026-11-27T12:00:00Z").accessibilityLabel == "Agent Queue, draining, 2 running, 3 waiting",
+                  "Paused and draining keep the counts and say so")
         try check(QueueStatusPresentation(snapshot: snapshot, error: "Fixture error").title == "!"
             && QueueStatusPresentation(snapshot: nil, error: nil).title.isEmpty,
                   "Status item preserves the error and idle badge states")
@@ -354,6 +367,11 @@ func checkLaneStatusDecoding(_ check: (Bool, String) throws -> Void) throws {
     try check(variants["empty"]?.jobs.isEmpty == true && variants["empty"]?.lanes?.map(\.name) == ["default"] &&
               variants["leaseStates"]?.jobs.contains { $0.position == 1 } == true,
               "Every generated status variant decodes")
+    let marks = variants.mapValues { QueueStatusPresentation(snapshot: $0, error: nil) }
+    try check(marks["draining"]?.mark == .draining && marks["invalidDrainFile"]?.mark == .attention
+        && marks["invalidDrainFile"]?.accessibilityLabel == "Agent Queue, drain needs attention, 0 running, 0 waiting"
+        && marks["pausedWithPublishedLanes"]?.mark == .paused && marks["empty"]?.mark == .idle,
+              "The status mark reads the producer's drain and pause fields")
     guard let lease = snapshot.jobs.first(where: \.isLease) else {
         throw ClientError.message("Generated status has no lease")
     }
