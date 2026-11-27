@@ -167,12 +167,42 @@ struct BehaviorTests {
         try check(QueueAction.scheduling(.adaptive).isAllowed(in: activeQueue), "Scheduling accepts a different mode")
         try check(!QueueAction.scheduling(.fixed).isAllowed(in: activeQueue), "Scheduling refuses the current mode")
         try check(!QueueAction.scheduling(.adaptive).isAllowed(in: pausedQueue), "Scheduling needs a reported scheduler")
+        func drained(until: String? = nil, error: String? = nil) -> QueueSnapshot {
+            QueueSnapshot(updatedAt: original.updatedAt, queue: QueueSummary(status: "running", limit: 2, running: 0, waiting: 1,
+                legacyOccupied: false, drainUntil: until, drainError: error), jobs: [movable])
+        }
+        let drainingQueue = drained(until: "2099-01-01T00:00:00Z")
+        let untrustedQueue = drained(error: "Invalid drain file")
+        for minutes in QueueAction.drainMinutes {
+            try check(QueueAction.drain(minutes: minutes).isAllowed(in: activeQueue), "Drain for \(minutes) minutes is offered")
+        }
+        try check(QueueAction.drain(minutes: 60).isAllowed(in: drainingQueue), "A new drain replaces the end time of an active one")
+        try check(!QueueAction.drain(minutes: 45).isAllowed(in: activeQueue), "Drain refuses a duration outside its list")
+        try check(!QueueAction.drain(minutes: 60).isAllowed(in: nil), "Drain is refused without a snapshot")
+        try check(QueueAction.undrain.isAllowed(in: drainingQueue), "Stop draining is allowed while draining")
+        try check(QueueAction.undrain.isAllowed(in: untrustedQueue), "Undrain removes a drain file the daemon cannot trust")
+        try check(!QueueAction.undrain.isAllowed(in: activeQueue) && !QueueAction.undrain.isAllowed(in: nil), "Undrain is refused without a drain")
+        try check(QueueAction.drainMinutes.map(QueueAction.drainLabel) == ["30 minutes", "1 hour", "2 hours", "4 hours"], "Drain durations read naturally")
+        // One in the morning, so an hour later is the same day and 23 hours later is the next.
+        let morning = Calendar.current.startOfDay(for: Date(timeIntervalSince1970: 1_800_000_000)).addingTimeInterval(3600)
+        for hours in [1.0, 23.0, 72.0] {
+            let until = morning.addingTimeInterval(hours * 3600)
+            let time = until.formatted(date: .omitted, time: .shortened)
+            let end = [1.0: time, 23.0: "tomorrow \(time)"][hours] ?? until.formatted(date: .abbreviated, time: .shortened)
+            try check(drainBanner(drained(until: ISO8601DateFormatter().string(from: until)).queue, now: morning)
+                      == "Draining until \(end). New jobs wait; queued and running jobs continue.",
+                      "The drain banner shows when intake reopens, \(hours) hours ahead")
+        }
+        try check(drainBanner(untrustedQueue.queue) == "Invalid drain file", "An untrusted drain file shows its problem")
         let sent: [(QueueAction, [String], String, Bool)] = [
             (.next(movable), ["next", "7"], "Job #7 will run next.", false),
             (.last(movable), ["last", "7"], "Job #7 moved to the end.", false),
             (.start(movable), ["start", "7"], "Job #7 requested to start outside the parallel limit.", true),
             (.cancel(movable), ["cancel", "7"], "Cancellation requested for job #7.", true),
             (.resume, ["resume"], "Queue resumed.", false),
+            (.drain(minutes: 30), ["drain", "--for", "30m"], "Draining for 30 minutes. New jobs wait; queued and running jobs continue.", false),
+            (.drain(minutes: 120), ["drain", "--for", "120m"], "Draining for 2 hours. New jobs wait; queued and running jobs continue.", false),
+            (.undrain, ["undrain", "--keep-paused"], "Draining stopped. New jobs are accepted.", false),
             (.limit(3), ["limit", "3"], "Parallel job limit changed to 3.", false),
             (.scheduling(.shadow), ["scheduling", "shadow"], "Scheduling changed to Learn only.", false)]
         for (action, arguments, notice, confirms) in sent {
