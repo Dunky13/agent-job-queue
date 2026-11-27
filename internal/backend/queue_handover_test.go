@@ -85,15 +85,48 @@ func handoverFileClient(t *testing.T, f *daemonFixture, output string, args ...s
 
 func TestRealDaemonLiveHandoverRetainsWorkerCallerAndQueuedJobs(t *testing.T) {
 	f := daemonAcceptance(t)
-	started, one, two, release := filepath.Join(f.root, "started"), filepath.Join(f.root, "one"), filepath.Join(f.root, "two"), filepath.Join(f.root, "release")
+	started, one, two, three, release := filepath.Join(f.root, "started"), filepath.Join(f.root, "one"), filepath.Join(f.root, "two"), filepath.Join(f.root, "three"), filepath.Join(f.root, "release")
 	attempts, output := filepath.Join(f.root, "attempts"), filepath.Join(f.root, "caller-output")
 	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0600) })
-	client := handoverFileClient(t, f, output, "/bin/sh", "-c", `printf attempt >> "$1"; touch "$2"; while [ ! -f "$3" ]; do sleep .04; done; printf 'outage-one\n'; while [ ! -f "$4" ]; do sleep .04; done; printf 'outage-two\n'; while [ ! -f "$5" ]; do sleep .04; done; printf 'finished\n'; exit 23`, "fixture", attempts, started, one, two, release)
+	client := handoverFileClient(t, f, output, "/bin/sh", "-c", `printf attempt >> "$1"; touch "$2"; while [ ! -f "$3" ]; do sleep .04; done; printf 'outage-one\n'; while [ ! -f "$4" ]; do sleep .04; done; printf 'outage-two\n'; while [ ! -f "$5" ]; do sleep .04; done; printf 'outage-three\n'; while [ ! -f "$6" ]; do sleep .04; done; printf 'finished\n'; exit 23`, "fixture", attempts, started, one, two, three, release)
 	fixtureUntil(t, 8*time.Second, func() bool { _, err := os.Stat(started); return err == nil })
 	queued := f.launch("/bin/sh", "-c", `printf new-runtime > "$1"`, "fixture", filepath.Join(f.root, "queued-ran"))
 	f.waitJobs(2)
 	value := prepareQueueHandover(t, f, handoverTarget(t))
 	commitQueueHandover(t, f, value)
+	// The queued job has no worker, so the test writes its log. Output a caller
+	// prints from after the daemon exited proves it has finished every read of the
+	// custody receipt that it started before that point.
+	queuedFollows := func(text string) {
+		t.Helper()
+		log, err := os.OpenFile(f.gate.LogPath(1), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err == nil {
+			_, err = log.WriteString(text + "\n")
+			err = errors.Join(err, log.Close())
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixtureUntil(t, 8*time.Second, func() bool { return strings.Contains(queued.out.String(), text) })
+	}
+	// Two command/output barriers force the original caller through at least
+	// one failed socket read while the old worker continues, without a sleep.
+	activeFollows := func(file, text string) {
+		t.Helper()
+		if err := os.WriteFile(file, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		fixtureUntil(t, 8*time.Second, func() bool {
+			raw, err := os.ReadFile(output)
+			return err == nil && strings.Contains(string(raw), text)
+		})
+	}
+	activeFollows(one, "outage-one")
+	queuedFollows("queued-outage-one")
+	// Released custody survives arbitrary operating-system approval delays;
+	// only a still-prepared handover has an expiring dispatch-freeze lease.
+	// No product code edits a released receipt, so the test backdates it only
+	// after both callers are past any earlier view they would compare it with.
 	retained, err := readQueueHandoverReceipt(f.gate)
 	if err != nil {
 		t.Fatal(err)
@@ -102,19 +135,12 @@ func TestRealDaemonLiveHandoverRetainsWorkerCallerAndQueuedJobs(t *testing.T) {
 	if err := writeQueueHandoverReceipt(f.gate, retained); err != nil {
 		t.Fatal(err)
 	}
-	// Released custody survives arbitrary operating-system approval delays;
-	// only a still-prepared handover has an expiring dispatch-freeze lease.
-	// Two command/output barriers force the original caller through at least
-	// one failed socket read while the old worker continues, without a sleep.
-	for _, step := range []struct{ file, text string }{{one, "outage-one"}, {two, "outage-two"}} {
-		if err := os.WriteFile(step.file, nil, 0600); err != nil {
-			t.Fatal(err)
-		}
-		fixtureUntil(t, 8*time.Second, func() bool {
-			raw, err := os.ReadFile(output)
-			return err == nil && strings.Contains(string(raw), step.text)
-		})
-	}
+	// A read in flight at one barrier may have started before the rewrite, so a
+	// second barrier per caller proves a complete read of the expired receipt.
+	activeFollows(two, "outage-two")
+	queuedFollows("queued-outage-two")
+	activeFollows(three, "outage-three")
+	queuedFollows("queued-outage-three")
 	if _, err := os.Stat(filepath.Join(f.root, "queued-ran")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("queued work ran without a daemon", err)
 	}
@@ -138,7 +164,7 @@ func TestRealDaemonLiveHandoverRetainsWorkerCallerAndQueuedJobs(t *testing.T) {
 		t.Fatal("active command was replayed", string(raw), err)
 	}
 	caller, err := os.ReadFile(output)
-	if err != nil || string(caller) != "outage-one\noutage-two\nfinished\n" {
+	if err != nil || string(caller) != "outage-one\noutage-two\noutage-three\nfinished\n" {
 		t.Fatal("caller output was lost", string(caller), err)
 	}
 	state, err := f.gate.Snapshot()
@@ -450,6 +476,35 @@ func releasedQueueFixture(t *testing.T) (*Gate, *queueStore, *queueHandoverRecei
 		t.Fatal(err)
 	}
 	return g, store, receipt
+}
+
+// The daemon replaces the receipt by rename while followers read it. A reader
+// that opened the previous receipt holds a complete file with no links left.
+func TestQueueHandoverReceiptReadSurvivesAtomicReplacement(t *testing.T) {
+	g, _, receipt := releasedQueueFixture(t)
+	written := make(chan error, 1)
+	go func() {
+		var err error
+		for i := 0; i < 300 && err == nil; i++ {
+			err = writeQueueHandoverReceipt(g, receipt)
+		}
+		written <- err
+	}()
+	for {
+		select {
+		case err := <-written:
+			if err != nil {
+				t.Fatal("receipt replacement failed", err)
+			}
+			return
+		default:
+		}
+		if _, err := readQueueHandoverReceipt(g); err != nil {
+			t.Error("reader refused a receipt that was being replaced", err)
+			<-written
+			return
+		}
+	}
 }
 
 func TestQueueHandoverFollowerObservesReleaseBeforeDaemonExit(t *testing.T) {
