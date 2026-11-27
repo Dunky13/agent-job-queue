@@ -32,7 +32,7 @@ The updater exists only in a published build. These builds never check or instal
 
 The window says which applies and links to the releases page. A tracked build also refuses checks and installs while the incomplete-installation marker (`install-in-progress.json`) exists. Open Agent Queue from Applications to finish setup first.
 
-Installations older than the first Sparkle build cannot update in place. They need one last manual download from the release page.
+Installations older than the first Sparkle build cannot update in place. Their own download announces the new build but then fails with "Update archive contains unsafe paths or entries": it accepts no symbolic links, and the signed `Sparkle.framework` needs them. Install the DMG from the homepage or the release page once instead: quit Agent Queue, drag the app from the DMG into Applications, choose Replace and open it. Sparkle updates it from then on.
 
 ## Version identity
 
