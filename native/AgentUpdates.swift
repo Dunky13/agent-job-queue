@@ -148,7 +148,7 @@ struct QueueUpdateDrain: Sendable {
 
     /// The recorded drain while it can still be live. A missing, unreadable, foreign or lapsed marker is none.
     var record: QueueUpdateDrainRecord? {
-        guard let record = Self.read(marker), let expiry = Self.date(record.drainUntil), expiry > now() else { return nil }
+        guard let record = Self.read(marker), let expiry = parseDate(record.drainUntil), expiry > now() else { return nil }
         return record
     }
 
@@ -190,13 +190,6 @@ struct QueueUpdateDrain: Sendable {
     private func probe() async throws -> (drainUntil: String?, status: String) {
         let queue = try JSONDecoder().decode(Probe.self, from: try await command(.status)).queue
         return (queue.drainUntil, queue.status)
-    }
-
-    private static func date(_ text: String) -> Date? {
-        let plain = ISO8601DateFormatter()
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return plain.date(from: text) ?? fractional.date(from: text)
     }
 
     /// The marker is the account's own regular file, readable by nobody else, inside the account's own directory.
