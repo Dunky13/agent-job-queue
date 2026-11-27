@@ -26,6 +26,13 @@ const (
 // errQueueDraining is the daemon's refusal of new work while intake is closed.
 var errQueueDraining = errors.New("Queue is draining; no new work is accepted")
 
+// errQueuePaused refuses a submission to a paused queue. A default-lane caller
+// then runs its command outside the queue; a lane caller fails with it.
+var errQueuePaused = errors.New("Dedicated default queue must be Running; no command was submitted")
+
+// pausedNotice is said when a paused queue sends a command outside the queue.
+const pausedNotice = "the queue is paused; running this command outside the queue"
+
 // drainNoticePeriod spaces the progress notices of a waiting caller; tests shorten it.
 var drainNoticePeriod = 15 * time.Second
 
@@ -93,7 +100,7 @@ func applyDrainPolicy(g *Gate, policy string, argv []string, lane string, until 
 		fmt.Fprintf(os.Stderr, "agent-heavy: queue draining until %s; no job was created (--on-drain fail)\n", drainClock(until))
 		return drainExitFail, true, nil
 	case drainDirect:
-		code, err = runDirect(argv, lane, until, signals)
+		code, err = runDirect(argv, lane, fmt.Sprintf("queue draining until %s; running this command outside the queue (--on-drain direct)", drainClock(until)), signals)
 		return code, true, err
 	}
 	return waitForDrain(g, until, signals)
@@ -128,7 +135,7 @@ func waitForDrain(g *Gate, until time.Time, signals <-chan os.Signal) (int, bool
 // its own session and process group, which receives every forwarded signal, so
 // descendants stop with it and a terminal Ctrl-C arrives once. Having no
 // controlling terminal, it cannot be stopped by a background tty read or write.
-func runDirect(argv []string, lane string, until time.Time, signals <-chan os.Signal) (int, error) {
+func runDirect(argv []string, lane, notice string, signals <-chan os.Signal) (int, error) {
 	if lane != "" {
 		fmt.Fprintf(os.Stderr, "agent-heavy: --on-drain direct cannot use lane %q because lanes protect exclusive resources; no command was run\n", lane)
 		return laneExitUsage, nil
@@ -138,7 +145,7 @@ func runDirect(argv []string, lane string, until time.Time, signals <-chan os.Si
 		return 125, err
 	}
 	environment := queueCommandEnvironment(forwardedEnvironment(), token())
-	fmt.Fprintf(os.Stderr, "agent-heavy: queue draining until %s; running this command outside the queue (--on-drain direct)\n", drainClock(until))
+	fmt.Fprintln(os.Stderr, "agent-heavy:", notice)
 	// SIGQUIT is forwarded for this path only; elsewhere it keeps Go's default.
 	quits := make(chan os.Signal, 2)
 	signal.Notify(quits, syscall.SIGQUIT)
@@ -359,7 +366,7 @@ func waitDrained(g *Gate) (int, error) {
 				message += "; held " + strings.Join(held, ", ") + " blocks it"
 			}
 			if obj(obj(snapshot["groups"])["default"])["status"] == "Paused" {
-				message += "; the queue is paused, so queued jobs will not start until agent-heavy resume or agent-heavy undrain"
+				message += "; the queue is paused, so queued lane jobs and jobs with no caller attached will not start until agent-heavy resume or agent-heavy undrain"
 			}
 			fmt.Fprintln(os.Stderr, message)
 			notice = time.Now()

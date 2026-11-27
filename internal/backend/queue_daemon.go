@@ -131,6 +131,8 @@ func (g *Gate) QueueControl(operation string, payload Object) (Object, error) {
 			return nil, errQueueHandoverBusy
 		case "queue-draining":
 			return nil, queueCodedError(errQueueDraining, response.Error)
+		case "queue-paused":
+			return nil, queueCodedError(errQueuePaused, response.Error)
 		case "lane-full":
 			return nil, queueCodedError(errQueueLaneFull, response.Error)
 		case "lane-unknown":
@@ -211,6 +213,8 @@ func queueErrorCode(err error) string {
 		return "handover-busy"
 	case errors.Is(err, errQueueDraining):
 		return "queue-draining"
+	case errors.Is(err, errQueuePaused):
+		return "queue-paused"
 	case errors.Is(err, errQueueLaneFull):
 		return "lane-full"
 	case errors.Is(err, errQueueUnknownLane):
@@ -570,6 +574,9 @@ func (d *queueDaemon) controlOnce(op string, p Object) (Object, error) {
 	if op == "cancel-queued" {
 		return d.cancelQueued()
 	}
+	if op == "withdraw" {
+		return d.withdraw(p)
+	}
 	id, ok := integer(p["id"])
 	if !ok || id < 0 {
 		return nil, errors.New("Invalid queue job ID")
@@ -730,6 +737,41 @@ func (d *queueDaemon) cancelQueued() (Object, error) {
 	}
 	return Object{"cancelled": cancelled}, nil
 }
+
+// withdraw ends a default-lane job that has not started, for its own caller to
+// run the command outside a paused queue. Under the daemon lock nothing can
+// claim the job in between; a job that already started is refused, untouched.
+func (d *queueDaemon) withdraw(p Object) (Object, error) {
+	id, ok := integer(p["id"])
+	if !ok || id < 0 {
+		return nil, errors.New("Invalid queue job ID")
+	}
+	settings, e := d.store.settings()
+	if e != nil {
+		return nil, e
+	}
+	if settings["status"] != "Paused" {
+		return nil, errors.New("Only a paused queue lets a job be withdrawn")
+	}
+	j, e := d.store.job(id)
+	if errors.Is(e, sql.ErrNoRows) {
+		return nil, errors.New("Queue job does not exist")
+	}
+	if e != nil {
+		return nil, e
+	}
+	if j.token != text(p["token"]) || taskIsLease(j.task) || taskLane(j.task) != defaultLaneName || j.phase != "queued" {
+		return nil, errors.New("Only a queued default-lane job can be withdrawn by its caller")
+	}
+	if e = d.markCancelled(j); e != nil {
+		return nil, e
+	}
+	if e = d.finish(j, 130); e != nil {
+		return nil, e
+	}
+	return Object{"withdrawn": id}, nil
+}
+
 func (d *queueDaemon) submit(p Object) (Object, error) {
 	return d.submitLane(p, defaultLaneName)
 }
@@ -758,7 +800,7 @@ func (d *queueDaemon) submitLane(p Object, lane string) (Object, error) {
 		return nil, e
 	}
 	if settings["status"] != "Running" {
-		return nil, errors.New("Dedicated default queue must be Running; no command was submitted")
+		return nil, errQueuePaused
 	}
 	path, _ := d.g.PayloadPath(value)
 	payload, e := ReadJobPayload(path)

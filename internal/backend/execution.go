@@ -125,7 +125,7 @@ func waitCleanupWithToken(g *Gate, id int, expectedToken string, signals <-chan 
 	}
 }
 func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
-	return followWithToken(g, id, signals, "")
+	return followWithToken(g, id, signals, "", nil)
 }
 
 // followWithToken is the only place that rides out a queue outage. One outage
@@ -136,8 +136,9 @@ func Follow(g *Gate, id int, signals <-chan os.Signal) (int, error) {
 // starts when the first timed-out call returns, and calls already in flight (the
 // read, the cancellation's read and mutation, and a cleanup probe, up to 15
 // seconds each) finish after it passes, so a hung daemon ends the run in under
-// three minutes.
-func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken string) (int, error) {
+// three minutes. A caller that passes its own argv withdraws its queued job
+// while the queue is paused and runs the command outside the queue instead.
+func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken string, argv []string) (int, error) {
 	offset := int64(0)
 	notice := time.Now()
 	path := g.LogPath(id)
@@ -270,7 +271,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		if err != nil {
 			return 125, err
 		}
-		task, err := g.Task(id)
+		task, group, err := g.taskWithQueue(id)
 		rpcAvailable := err == nil
 		if err != nil && errors.Is(err, errQueueTransportUnavailable) {
 			retained, allowed, handoverError := queueHandoverFollowTask(g, id, expectedToken)
@@ -345,6 +346,19 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			}
 		}
 		recovered := rpcAvailable && outage.recover()
+		if name == "Queued" && argv != nil && pendingSignal == nil && rpcAvailable && group["status"] == "Paused" {
+			_, err := g.QueueControl("withdraw", Object{"id": id, "token": expectedToken})
+			if err == nil {
+				var unconfirmed *queueCleanupUnconfirmed
+				if err = waitCleanupWithToken(g, id, expectedToken, signals); err != nil && !errors.As(err, &unconfirmed) {
+					return 125, err
+				} else if err != nil {
+					fmt.Fprintln(os.Stderr, "agent-heavy:", err)
+				}
+				return runDirect(argv, "", fmt.Sprintf("the queue is paused; job %d was withdrawn, running this command outside the queue", id), signals)
+			}
+			// Refused (the job started or the queue resumed) or lost: keep waiting.
+		}
 		if name == "Missing" {
 			cancelled, err := ReadPrivate(filepath.Join(g.Cancelled, strconv.Itoa(id)+".json"))
 			if err != nil {
@@ -645,6 +659,9 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 		}
 	}
 	snapshot, code, err := submissionPrecheck(g, lane)
+	if errors.Is(err, errQueuePaused) && lane == "" {
+		return runDirect(argv, "", pausedNotice, signals)
+	}
 	if code != 0 || err != nil {
 		return code, err
 	}
@@ -795,7 +812,9 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 			}
 		}
 		// The queue may have changed while we waited: check it again before submitting.
-		if snapshot, code, err = submissionPrecheck(g, lane); code != 0 || err != nil {
+		if snapshot, code, err = submissionPrecheck(g, lane); errors.Is(err, errQueuePaused) && lane == "" {
+			return runDirect(argv, "", pausedNotice, signals)
+		} else if code != 0 || err != nil {
 			return code, err
 		}
 	}
@@ -811,6 +830,11 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 			fmt.Fprintln(os.Stderr, "agent-heavy:", unknownLaneError(snapshot, lane))
 			return laneExitUsage, nil
 		}
+		// Paused after the check above: the daemon refused before recording the
+		// token, so no job exists and the files are discarded on return.
+		if errors.Is(err, errQueuePaused) && lane == "" && !submitted {
+			return runDirect(argv, "", pausedNotice, signals)
+		}
 		return 125, unknown(err)
 	}
 	var acknowledged bool
@@ -822,12 +846,16 @@ func RunInLaneOnDrain(g *Gate, argv []string, label, lane, onDrain string) (code
 	}
 	unlock()
 	fmt.Fprintf(os.Stderr, "agent-heavy: job %d queued\n", id)
-	return followWithToken(g, id, signals, jobToken)
+	var own []string
+	if lane == "" {
+		own = argv
+	}
+	return followWithToken(g, id, signals, jobToken, own)
 }
 
 // queueCodedRefusal is a refusal the daemon codes so that callers can branch on it.
 func queueCodedRefusal(err error) bool {
-	return errors.Is(err, errQueueHandoverBusy) || errors.Is(err, errQueueUnknownLane) || errors.Is(err, errQueueDraining)
+	return errors.Is(err, errQueueHandoverBusy) || errors.Is(err, errQueueUnknownLane) || errors.Is(err, errQueueDraining) || errors.Is(err, errQueuePaused)
 }
 
 // queueDefiniteAnswer is any error the daemon itself returned, as opposed to a
@@ -899,7 +927,7 @@ func submissionPrecheck(g *Gate, lane string) (Object, int, error) {
 		return nil, 125, err
 	}
 	if group["status"] != "Running" {
-		return nil, 125, errors.New("Dedicated default queue must be Running; no command was submitted")
+		return nil, 125, errQueuePaused
 	}
 	if lane != "" {
 		// An older daemon ignores unknown submission fields; refuse before it
