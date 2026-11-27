@@ -74,7 +74,7 @@ func TestMacOSResumeRetainsSelfContainedAppAndDiskImageLayout(t *testing.T) {
 			t.Fatalf("resumed release omitted bundled helper %s: %s", name, record)
 		}
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
+	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications|.DS_Store\n") {
 		t.Fatalf("resumed release lost the drag-and-drop layout: %s", record)
 	}
 }

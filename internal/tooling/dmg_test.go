@@ -9,6 +9,9 @@ import (
 	"testing"
 )
 
+// The mount stubs place the committed Finder layout where a built image carries it.
+var finderLayout, _ = filepath.Abs("../../packaging/dmg/DS_Store")
+
 func TestDiskImageVerificationCleansUpWithoutDiscardingBusyMount(t *testing.T) {
 	script, err := filepath.Abs("../../scripts/test-dmg.sh")
 	if err != nil {
@@ -42,6 +45,7 @@ attach)
     chmod 700 "$target"
   done
   ln -s /Applications "$1/Applications"
+  cp "$DMG_TEST_FINDER_LAYOUT" "$1/.DS_Store"
   exit "$DMG_TEST_ATTACH";;
 detach) exit "$DMG_TEST_DETACH";;
 *) exit 99;;
@@ -49,7 +53,7 @@ esac
 `)
 			testTool(t, root, "go", `exit "$DMG_TEST_VERIFY"`)
 			cmd := exec.Command("/bin/bash", script, "fixture.dmg")
-			cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"),
+			cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"), "DMG_TEST_FINDER_LAYOUT="+finderLayout,
 				"DMG_TEST_RECORD="+record, "DMG_TEST_ATTACH="+test.attach,
 				"DMG_TEST_VERIFY="+test.verify, "DMG_TEST_DETACH="+test.detach)
 			output, runErr := cmd.CombinedOutput()
@@ -102,6 +106,8 @@ func TestDiskImageVerificationSelectsOnlyCompleteDistributionLayouts(t *testing.
 		"extra file",
 		"missing helper",
 		"non executable helper",
+		"missing finder layout",
+		"changed finder layout",
 	} {
 		t.Run(layout, func(t *testing.T) {
 			root := t.TempDir()
@@ -139,6 +145,7 @@ attach)
     'link directory') mkdir "$mountpoint/Applications";;
     *) ln -s /Applications "$mountpoint/Applications";;
   esac
+  cp "$DMG_TEST_FINDER_LAYOUT" "$mountpoint/.DS_Store"
   case "$DMG_TEST_LAYOUT" in
     'symlink app') mv "$app" "$mountpoint/app-target"; ln -s app-target "$app";;
     'dangling installer') ln -s missing "$mountpoint/Agent Job Queue Installer.app";;
@@ -146,7 +153,9 @@ attach)
     'hidden app') mkdir "$mountpoint/.Other.app";;
     'uppercase app') mkdir "$mountpoint/Other.APP";;
     'extra file') printf 'extra' > "$mountpoint/README.txt";;
-    'volume metadata') mkdir "$mountpoint/.fseventsd"; printf 'x' > "$mountpoint/.DS_Store";;
+    'volume metadata') mkdir "$mountpoint/.fseventsd" "$mountpoint/.Trashes";;
+    'missing finder layout') rm "$mountpoint/.DS_Store";;
+    'changed finder layout') printf 'x' >> "$mountpoint/.DS_Store";;
     'missing helper') rm "$app/Contents/MacOS/agent-remote";;
     'non executable helper') chmod 600 "$app/Contents/MacOS/agent-heavy";;
   esac
@@ -160,7 +169,7 @@ for argument in "$@"; do printf '|%s' "$argument" >> "$DMG_TEST_EVENTS"; done
 printf '\n' >> "$DMG_TEST_EVENTS"
 `)
 			cmd := exec.Command("/bin/bash", script, "fixture.dmg")
-			cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"), "DMG_TEST_EVENTS="+events, "DMG_TEST_RECORD="+record, "DMG_TEST_LAYOUT="+layout)
+			cmd.Env = append(os.Environ(), "PATH="+root+string(os.PathListSeparator)+os.Getenv("PATH"), "DMG_TEST_EVENTS="+events, "DMG_TEST_RECORD="+record, "DMG_TEST_LAYOUT="+layout, "DMG_TEST_FINDER_LAYOUT="+finderLayout)
 			output, runErr := cmd.CombinedOutput()
 			mount, err := os.ReadFile(record)
 			if err != nil {

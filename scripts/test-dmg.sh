@@ -37,6 +37,10 @@ if [[ ! -L $applications ]] || ! target=$(readlink -n "$applications" && printf 
   printf 'Drag disk image requires Applications -> /Applications.\n' >&2
   exit 1
 fi
+if ! cmp -s "$mountpoint/.DS_Store" "$root/packaging/dmg/DS_Store"; then
+  printf 'Disk image lacks the committed Finder layout.\n' >&2
+  exit 1
+fi
 # Nothing but the app and the link may be offered to the user. Volume
 # bookkeeping that macOS adds on mount is not part of the image contents.
 shopt -s nullglob dotglob

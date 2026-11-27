@@ -76,7 +76,12 @@ func signingTestEnvironment(extra ...string) []string {
 		}
 		environment = append(environment, entry)
 	}
-	return append(environment, extra...)
+	// The hdiutil stub checks that the image source carries the committed Finder layout.
+	layout, err := filepath.Abs("../../packaging/dmg/DS_Store")
+	if err != nil {
+		panic(err)
+	}
+	return append(append(environment, "SIGNING_TEST_LAYOUT="+layout), extra...)
 }
 
 func TestMacOSSigningRejectsIncompleteConfigurationBeforeBuild(t *testing.T) {
@@ -244,7 +249,7 @@ func TestMacOSSigningSignsBundledHelpersBeforeApp(t *testing.T) {
 			}
 		}
 	}
-	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications\n") {
+	if !strings.Contains(record, "disk-image-layout|Agent Queue.app|Applications->/Applications|.DS_Store\n") {
 		t.Fatalf("disk image did not contain the app and the Applications link: %s", record)
 	}
 	assertNotarySubmissionNames(t, record, "1.2.3")
@@ -690,8 +695,9 @@ case "$tool" in
       done
       [[ -d "$image_source/Agent Queue.app" && -L "$image_source/Applications" &&
         $(readlink "$image_source/Applications") == /Applications ]] || exit 91
-      [[ $(find "$image_source" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') == 2 ]] || exit 91
-      printf 'disk-image-layout|Agent Queue.app|Applications->/Applications\n' >> "$SIGNING_TEST_EVENTS"
+      cmp -s "$image_source/.DS_Store" "$SIGNING_TEST_LAYOUT" || exit 91
+      [[ $(find "$image_source" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') == 3 ]] || exit 91
+      printf 'disk-image-layout|Agent Queue.app|Applications->/Applications|.DS_Store\n' >> "$SIGNING_TEST_EVENTS"
       printf 'disk image' > "$last"
     fi
     ;;

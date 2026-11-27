@@ -483,13 +483,15 @@ macos_sign_app_helpers() {
 }
 
 # Finder installs by dragging the app onto the Applications link. The app owns
-# setup on first launch; nothing on the image runs code or copies files.
+# setup on first launch; nothing on the image runs code or copies files. The
+# committed Finder layout places the app left of the link in a plain window.
 macos_disk_image_source() {
   local app=$1 image=$2
   [[ ! -e $image && ! -L $image ]] || { macos_signing_error 'The disk image source must be a fresh directory.'; return 1; }
   mkdir "$image" || return
   ditto "$app" "$image/Agent Queue.app" || return
   ln -s /Applications "$image/Applications" || return
+  cp "${BASH_SOURCE[0]%/*}/../packaging/dmg/DS_Store" "$image/.DS_Store" || return
   MACOS_DISK_IMAGE_SOURCE=$image
 }
 
