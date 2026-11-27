@@ -300,14 +300,12 @@ func (install *installer) runRemote(ctx context.Context, action string) error {
 	if err == nil {
 		return nil
 	}
-	// A failure is one JSON object on the combined output; other lines may surround it.
+	// A failure is one {"error": text} object on the combined output; other lines may surround it.
 	for _, line := range strings.Split(string(output), "\n") {
-		var failure struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal([]byte(line), &failure) == nil && failure.Error != "" {
+		failure, decodeErr := decodeObject([]byte(line))
+		if reason, ok := failure["error"].(string); decodeErr == nil && len(failure) == 1 && ok && reason != "" {
 			// One line only: the app reads setup state markers from this output.
-			return fmt.Errorf("%w: %s", err, DisplayText(failure.Error, 500))
+			return fmt.Errorf("%w: %s", err, DisplayText(reason, 500))
 		}
 	}
 	return err

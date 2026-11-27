@@ -45,12 +45,7 @@ func TestInstallerTestModeControllerNeverRunsAgentQueue(t *testing.T) {
 	for _, action := range []string{"disable", "migrate"} {
 		t.Run(action, func(t *testing.T) {
 			c := fixtureManagedController(t)
-			record := filepath.Join(c.p.home, "service-management.argv")
-			script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$HOME/service-management.argv\"\n" +
-				"printf '{\"schemaVersion\":1,\"service\":\"remote\",\"status\":\"notRegistered\"}\\n'\n"
-			if err := os.WriteFile(filepath.Join(c.p.managedApp, "Contents/MacOS/AgentQueue"), []byte(script), 0700); err != nil {
-				t.Fatal(err)
-			}
+			record := recordingAgentQueue(t, c)
 			enterInstallerTestMode(t, c)
 			code, output := runMainOutput(t, action)
 			if raw, err := os.ReadFile(record); !os.IsNotExist(err) {
@@ -68,12 +63,15 @@ func TestInstallerTestModeControllerNeverRunsAgentQueue(t *testing.T) {
 
 // The recorded supervisor and service child are processes this test owns, so a
 // missing guard signals only them. runMain builds its own controller, which
-// leaves no place for fake signal functions.
+// leaves no place for fake signal or command functions, so the managed app's
+// recording AgentQueue keeps a missing guard on the managed route and away from
+// launchctl.
 func TestInstallerTestModeLeavesSettingsAndProcesses(t *testing.T) {
 	token := strings.Repeat("a", 32)
 	for _, arguments := range [][]string{{"configure"}, {"enable"}, {"disable"}, {"migrate"}, {"serve"}, {"child", "api", token}} {
 		t.Run(arguments[0], func(t *testing.T) {
-			c := fixtureController(t)
+			c := fixtureManagedController(t)
+			serviceManagement := recordingAgentQueue(t, c)
 			enterInstallerTestMode(t, c)
 			if err := c.p.prepare(); err != nil {
 				t.Fatal(err)
@@ -126,6 +124,9 @@ func TestInstallerTestModeLeavesSettingsAndProcesses(t *testing.T) {
 			}
 			if after := homeContents(t, c.p.home); !maps.Equal(before, after) {
 				t.Errorf("installer test mode changed the home:\n%v\n%v", before, after)
+			}
+			if raw, err := os.ReadFile(serviceManagement); !os.IsNotExist(err) {
+				t.Errorf("installer test mode reached Service Management: %v: %s", err, raw)
 			}
 		})
 	}
@@ -202,8 +203,20 @@ func enterInstallerTestMode(t *testing.T, c *controller) {
 	}
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MODE", "1")
 	p, err := newPaths()
-	if err != nil || p.testing || p.managedApp != app {
-		t.Fatal("fixture does not resolve like the installer's helper", err, p.testing, p.managedApp)
+	if err != nil || p.testing || !p.installTesting || p.managedApp != app {
+		t.Fatal("fixture does not resolve like the installer's helper", err, p.testing, p.installTesting, p.managedApp)
 	}
 	c.p = p
+}
+
+// recordingAgentQueue makes the managed app's AgentQueue only log its arguments
+// and report no registration, and returns the log's path.
+func recordingAgentQueue(t *testing.T, c *controller) string {
+	t.Helper()
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$HOME/service-management.argv\"\n" +
+		"printf '{\"schemaVersion\":1,\"service\":\"remote\",\"status\":\"notRegistered\"}\\n'\n"
+	if err := os.WriteFile(filepath.Join(c.p.managedApp, "Contents/MacOS/AgentQueue"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(c.p.home, "service-management.argv")
 }

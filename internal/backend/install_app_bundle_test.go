@@ -23,7 +23,7 @@ func TestInstallerAppBundleCLIValidatesBundleBeforeSetup(t *testing.T) {
 	t.Setenv("AGENT_QUEUE_INSTALL_TEST_MANAGED", "")
 	// A recognized mode with a missing bundle is an installation error, not usage.
 	code, message := installMainOutput(t, []string{"--app-bundle", f.installer.app})
-	if code != 1 || strings.Contains(message, installTestLayoutRequired) || !strings.Contains(message, "Agent Queue setup: ") {
+	if code != 1 || strings.Contains(message, installTestLayoutRequired) || !strings.Contains(message, "Agent Queue setup: ") || !strings.Contains(message, f.installer.app) {
 		t.Fatalf("app-bundle mode did not reach bundle validation: exit %d: %s", code, message)
 	}
 	if _, err := os.Stat(filepath.Join(f.installer.home, ".local/share/agent-heavy/install-in-progress.json")); !os.IsNotExist(err) {

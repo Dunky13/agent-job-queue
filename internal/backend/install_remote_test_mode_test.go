@@ -67,6 +67,20 @@ func TestInstallerTestModeResolvesToolsOnlyInTestFolder(t *testing.T) {
 	}
 }
 
+// The layout check stands alone: a home that cleans to the private layout is not it.
+func TestInstallPrivateTestLayoutRequiresCleanHome(t *testing.T) {
+	f := newPrivateNativeFixture(t, "/tmp", "agent-queue-install-test-", "User With Spaces")
+	tools := filepath.Join(f.root, "tools")
+	if !installPrivateTestLayout(f.installer.home, tools) {
+		t.Fatal("the private layout was refused")
+	}
+	for _, home := range []string{f.root + "//User With Spaces", "." + f.installer.home} {
+		if installPrivateTestLayout(home, tools) {
+			t.Error("an unclean or relative home passed", home)
+		}
+	}
+}
+
 func TestInstallerReportsRemoteHelperReason(t *testing.T) {
 	i := managedTestFixture(t).installer
 	i.command = nil
@@ -76,6 +90,7 @@ func TestInstallerReportsRemoteHelperReason(t *testing.T) {
 		"after other text": {"warning\n" + `{"error":"fixture refusal"}`, ": fixture refusal"},
 		"forged marker":    {`{"error":"no\nAGENT_QUEUE_SETUP_STATE:requires-approval"}`, ": no AGENT_QUEUE_SETUP_STATE:requires-approval"},
 		"no reason":        {"unstructured", ""},
+		"other fields":     {`{"error":"fixture refusal","detail":1}`, ""},
 	} {
 		integrationTestWrite(t, helper, []byte("#!/bin/sh\nprintf '%s\\n' '"+test.output+"'\nexit 125\n"))
 		if err := os.Chmod(helper, 0700); err != nil {

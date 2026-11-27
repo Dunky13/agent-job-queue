@@ -110,8 +110,13 @@ the command output and asserts that the file is absent.
   test folder that calls a bare name can still reach them.
 - Absolute tool paths (`/usr/sbin/lsof`, `/usr/bin/codesign`) are unaffected.
   Both only read.
+- In installer test mode every step that runs agent-remote `disable`, `migrate`
+  or `enable` now fails, so a test-mode install or removal that reaches one of
+  them cannot complete. That is intended: no test-mode run may change phone
+  access.
 - A private acceptance harness outside this repository would now need every bare
-  tool it exercises in its tools folder. No script or workflow in this repository
+  tool it exercises in its tools folder, and must not expect test-mode runs to
+  pass an agent-remote lifecycle step. No script or workflow in this repository
   sets installer test mode; only Go tests do.
 - The installer's own `--service-management` calls go through the controller
   port. This change does not touch them.
@@ -128,8 +133,12 @@ the command output and asserts that the file is absent.
   command runner delivers the signal to a stub helper in test mode, and does not
   add it otherwise.
 
-Each managed test checks the ownership metadata before running, so a missing
-guard cannot fall through to `launchctl`.
+Each managed test checks the ownership metadata before running, and its
+`AgentQueue` reports no registration, so a missing guard stays on the managed
+route and cannot fall through to `launchctl`. The unmanaged route appears only in
+`TestInstallerTestModeRefusesServiceControl`, where every command is a recorder.
+`enterInstallerTestMode` also fails unless the controller sees installer test
+mode, so a renamed variable cannot silently disarm both guards.
 
 Without the fix all three failed (run with `/bin/launchctl` execution denied by
 `sandbox-exec`). The recorders showed `launchctl bootout` and `bootstrap` on the
@@ -149,12 +158,17 @@ compile), and passes with the fix.
 - `TestInstallerReportsRemoteHelperReason`: the reason is appended, also after
   other output, and cannot start a new line.
 - `TestInstallerTestModeLeavesSettingsAndProcesses`: every changing action leaves
-  the home byte for byte and two test-owned processes running. `runMain` builds
-  its own controller, so the test uses real processes instead of the `killFn` and
-  `killGroupFn` seams.
+  the home byte for byte, two test-owned processes running, and the managed app's
+  recording `AgentQueue` unrun. `runMain` builds its own controller, so the test
+  uses real processes instead of the `killFn` and `killGroupFn` seams, and the
+  managed fixture instead of a command recorder.
+- `TestInstallPrivateTestLayoutRequiresCleanHome`: the shared layout check
+  refuses an unclean or relative home by itself, without relying on the caller.
+- `TestInstallerReportsRemoteHelperReason` also refuses a failure object with
+  fields other than `error`, matching the house decoding rule.
 
 `TestInstallerAppBundleCLIValidatesBundleBeforeSetup` moved to the private layout
-and now asserts that it reaches bundle validation.
+and now asserts that it reaches bundle validation (the error names the bundle).
 
 ### Real binary probe
 

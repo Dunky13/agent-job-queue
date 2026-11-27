@@ -74,6 +74,9 @@ func (adapter installPrivateController) tool() (string, error) {
 // root. Installer test mode starts only there, so a real home is never its target.
 func installPrivateTestLayout(home, tools string) bool {
 	root := filepath.Dir(home)
+	if home != filepath.Clean(home) || !filepath.IsAbs(home) {
+		return false
+	}
 	// A list separator in root would split the tools folder out of the test PATH.
 	if filepath.Base(home) != "User With Spaces" || !strings.HasPrefix(filepath.Base(root), "agent-queue-install-test-") || strings.ContainsRune(root, os.PathListSeparator) || tools != filepath.Join(root, "tools") {
 		return false
