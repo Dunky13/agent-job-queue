@@ -303,33 +303,52 @@ func (install *installer) managedDrain(ctx context.Context, p *managedPlan) erro
 // run, not the file there now, so a moved or replaced bundle does not change it.
 // Anything else, including no evidence, leaves the holder unowned, and the error
 // says which evidence was missing.
+//
+// A child that a helper forks shares the lock descriptor until it execs, so a
+// listing can name a process that holds nothing by the time it is read. A holder
+// that fails the check is therefore listed again: only one that is gone from a
+// successful second listing is disregarded, and it never counts as a holder.
 func (install *installer) managedHeldByApp(ctx context.Context, app, lock, helper string) error {
 	holders, listErr := install.hostQueries().LockHolders(ctx, lock)
+	owned := 0
 	for _, pid := range holders {
-		executable, err := installProcessExecutable(pid)
-		if err != nil {
-			return fmt.Errorf("holder %d cannot be read: %w", pid, err)
-		} else if executable != filepath.Join(app, "Contents/MacOS", helper) {
-			return fmt.Errorf("holder %d runs %s", pid, executable)
+		refusal := installAppOwnsHolder(app, helper, pid)
+		if refusal == nil {
+			owned++
+			continue
 		}
-		parent, err := installProcessParent(pid)
-		if err != nil {
-			return fmt.Errorf("holder %d has no readable parent: %w", pid, err)
-		} else if parent <= 1 {
-			return fmt.Errorf("holder %d has parent %d", pid, parent)
-		}
-		executable, err = installProcessExecutable(parent)
-		if err != nil {
-			return fmt.Errorf("parent %d of holder %d cannot be read: %w", parent, pid, err)
-		} else if executable != filepath.Join(app, "Contents/MacOS/AgentQueue") {
-			return fmt.Errorf("parent %d of holder %d runs %s", parent, pid, executable)
+		current, err := install.hostQueries().LockHolders(ctx, lock)
+		if err != nil || slices.Contains(current, pid) {
+			return refusal
 		}
 	}
 	if listErr != nil {
 		return listErr
 	}
-	if len(holders) == 0 {
+	if owned == 0 {
 		return errors.New("no holder found")
+	}
+	return nil
+}
+
+func installAppOwnsHolder(app, helper string, pid int) error {
+	executable, err := installProcessExecutable(pid)
+	if err != nil {
+		return fmt.Errorf("holder %d cannot be read: %w", pid, err)
+	} else if executable != filepath.Join(app, "Contents/MacOS", helper) {
+		return fmt.Errorf("holder %d runs %s", pid, executable)
+	}
+	parent, err := installProcessParent(pid)
+	if err != nil {
+		return fmt.Errorf("holder %d has no readable parent: %w", pid, err)
+	} else if parent <= 1 {
+		return fmt.Errorf("holder %d has parent %d", pid, parent)
+	}
+	executable, err = installProcessExecutable(parent)
+	if err != nil {
+		return fmt.Errorf("parent %d of holder %d cannot be read: %w", parent, pid, err)
+	} else if executable != filepath.Join(app, "Contents/MacOS/AgentQueue") {
+		return fmt.Errorf("parent %d of holder %d runs %s", parent, pid, executable)
 	}
 	return nil
 }

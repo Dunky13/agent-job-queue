@@ -315,6 +315,66 @@ func TestManagedRemovalOfRunningAppRefusesActiveJobs(t *testing.T) {
 	}
 }
 
+// A helper's forked child holds the lifetime lock until it execs, so a listing
+// can name a process that is gone when it is read.
+func TestManagedHeldByAppDisregardsOnlyAHolderThatLeftTheListing(t *testing.T) {
+	a := runningAppFixture(t, true)
+	i := a.installer
+	gone := exec.Command("/usr/bin/true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	dead := gone.Process.Pid
+	listing := a.host.holders
+	lock := filepath.Join(i.state, "resource-controller.lock")
+	failure := errors.New("lsof failed")
+	for name, test := range map[string]struct {
+		holders func(call int, owned []int) ([]int, error)
+		want    string
+	}{
+		"transient beside the helper": {holders: func(call int, owned []int) ([]int, error) {
+			if call == 1 {
+				return append([]int{dead}, owned...), nil
+			}
+			return owned, nil
+		}},
+		"still listed": {holders: func(_ int, owned []int) ([]int, error) {
+			return append([]int{dead}, owned...), nil
+		}, want: "cannot be read"},
+		"second listing fails": {holders: func(call int, owned []int) ([]int, error) {
+			if call == 1 {
+				return append([]int{dead}, owned...), nil
+			}
+			return nil, failure
+		}, want: "cannot be read"},
+		"only a transient": {holders: func(call int, owned []int) ([]int, error) {
+			if call == 1 {
+				return []int{dead}, nil
+			}
+			return owned, nil
+		}, want: "no holder found"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			a.host.holders = func(ctx context.Context, path string) ([]int, error) {
+				// The real helper alone: its own short-lived children are
+				// the subject here, so each case states them itself.
+				holders, err := listing(ctx, path)
+				if err != nil {
+					return holders, err
+				}
+				owned := slices.DeleteFunc(holders, func(pid int) bool { return installAppOwnsHolder(i.app, "agent-heavy", pid) != nil })
+				calls++
+				return test.holders(calls, owned)
+			}
+			err := i.managedHeldByApp(removalContext(t), i.app, lock, "agent-heavy")
+			if test.want == "" && err != nil || test.want != "" && (err == nil || !strings.Contains(err.Error(), test.want)) {
+				t.Fatalf("held by app: %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestManagedRemovalRefusesWhenDrainCannotBeVerified(t *testing.T) {
 	a := runningAppFixture(t, true)
 	i := a.installer
