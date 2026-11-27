@@ -83,7 +83,7 @@ func TestInstallAppController(t *testing.T) {
 	}}
 	controller, ctx := install.appController(), context.Background()
 
-	previous := "/Users/someone/Applications/Previous.app"
+	previous := "/Volumes/Archive/Previous.app"
 	for _, operation := range [][]string{{install.app, "status", "queue"}, {previous, "register", "login"}, {install.app, "unregister", "remote"}} {
 		if output, err := controller.ServiceManagement(ctx, operation[0], operation[1], operation[2]); err != nil || string(output) != "answer" {
 			t.Fatalf("service management: %q %v", output, err)
