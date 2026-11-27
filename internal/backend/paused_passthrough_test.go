@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestWithdrawEndsOnlyItsCallersWaitingDefaultJobOfAPausedQueue(t *testing.T) {
@@ -91,5 +93,45 @@ func TestFollowRunsTheCommandWhenTheWithdrawReplyIsLost(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "job 7 was withdrawn, running this command outside the queue") {
 		t.Fatalf("stderr: %q", stderr)
+	}
+}
+
+// A withdraw that committed while the daemon then stays away is read from the
+// queue store: the caller runs the command, or reports an interrupt that came first.
+func TestFollowRunsAWithdrawnCommandReadFromTheStore(t *testing.T) {
+	for _, interrupted := range []bool{false, true} {
+		t.Run(fmt.Sprint("interrupted=", interrupted), func(t *testing.T) {
+			fastOutage(t, 25*time.Millisecond)
+			g := testGate(t)
+			writeJobLog(t, g, 7, "")
+			value := token()
+			store, err := openQueueStore(g.State, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := queueJSON(Object{"token": value, "withdrawn": true, "cancelled": true, "status": Object{"Done": Object{"result": Object{"Failed": 130}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = store.db.Exec("INSERT INTO queue_jobs(id,token,task,phase,outcome) VALUES(7,?,?,'outcome',130)", value, data); err != nil {
+				t.Fatal(err)
+			}
+			store.close()
+			g.queueControl = func(string, Object) (Object, error) { return nil, transportTimeout(t) }
+			signals := make(chan os.Signal, 1)
+			want := 9
+			if interrupted {
+				signals <- syscall.SIGTERM
+				want = 128 + int(syscall.SIGTERM)
+			}
+			root := t.TempDir()
+			read := captureStreams(t)
+			code, err := followWithToken(g, 7, signals, value, []string{"/bin/sh", "-c", `echo ran >> "$1/count"; exit 9`, "fixture", root})
+			_, stderr := read()
+			_, statErr := os.Stat(filepath.Join(root, "count"))
+			if code != want || err != nil || interrupted != os.IsNotExist(statErr) {
+				t.Fatalf("code=%d err=%v ran=%v stderr=%q", code, err, statErr == nil, stderr)
+			}
+		})
 	}
 }

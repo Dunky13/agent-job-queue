@@ -144,6 +144,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 	path := g.LogPath(id)
 	var pendingSignal os.Signal
 	pauseShown, pauseCheckLost := false, false
+	withdrawNoted := false // a failed withdraw was reported, once per run
 	outage := newQueueOutage(id, os.Stderr)
 	// cancelSentAt is the first cancel the daemon acknowledged in this run. After
 	// one, a held interrupt reports the interrupt status as it always has, so a
@@ -172,12 +173,31 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		fmt.Fprintf(os.Stderr, "agent-heavy: %v; the job's own exit status is %d\n", err, code)
 		return nil
 	}
+	// runWithdrawn runs the command of a job this caller withdrew from a paused
+	// queue, unless an interrupt (sig, or one not read yet) ended the wait first.
+	runWithdrawn := func(sig os.Signal) (int, error) {
+		if sig == nil {
+			select {
+			case sig = <-signals:
+			default:
+			}
+		}
+		if sig != nil {
+			return signalExit(sig), nil
+		}
+		return runDirect(argv, "", fmt.Sprintf("the queue is paused; job %d was withdrawn, running this command outside the queue", id), signals)
+	}
 	// stored reports a job whose result the queue store already holds, which a
-	// caller that cannot reach the daemon must not lose.
-	stored := func() (int, error, bool) {
-		code, ok := queueStoredOutcome(g, id, expectedToken)
+	// caller that cannot reach the daemon must not lose. sig is the interrupt
+	// that ends the wait, if any.
+	stored := func(sig os.Signal) (int, error, bool) {
+		code, withdrawn, ok := queueStoredOutcome(g, id, expectedToken)
 		if !ok {
 			return 0, nil, false
+		}
+		if withdrawn && argv != nil {
+			code, err := runWithdrawn(sig)
+			return code, err, true
 		}
 		if _, err := Drain(path, offset); err != nil {
 			return 125, err, true
@@ -190,7 +210,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 	// anything. A result the store already holds is reported instead of the
 	// interrupt; otherwise the job is left as it is.
 	detach := func(sig os.Signal) (int, error) {
-		if code, err, ok := stored(); ok {
+		if code, err, ok := stored(sig); ok {
 			return code, err
 		}
 		announceDetach(id, cancelTried)
@@ -199,7 +219,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 	// end reports an outage that cannot be waited out. The store may still prove
 	// the job finished; otherwise the job may still be running.
 	end := func(prefix string, cause error) (int, error) {
-		if code, err, ok := stored(); ok {
+		if code, err, ok := stored(pendingSignal); ok {
 			return code, err
 		}
 		message := fmt.Sprintf("%s; job %d may still be running; inspect it with: agent-heavy logs %d", prefix, id, id)
@@ -309,10 +329,7 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 			} else if err != nil {
 				return 125, err
 			}
-			if pendingSignal != nil {
-				return signalExit(pendingSignal), nil
-			}
-			return runDirect(argv, "", fmt.Sprintf("the queue is paused; job %d was withdrawn, running this command outside the queue", id), signals)
+			return runWithdrawn(pendingSignal)
 		}
 		if name == "Done" {
 			if rpcAvailable {
@@ -361,8 +378,13 @@ func followWithToken(g *Gate, id int, signals <-chan os.Signal, expectedToken st
 		// The job reads as withdrawn on the next pass, even when this reply is
 		// lost; a refusal (the job started or the queue resumed) keeps waiting.
 		if (name == "Queued" || name == "Stashed") && argv != nil && pendingSignal == nil && rpcAvailable && group["status"] == "Paused" {
-			if _, err := g.QueueControl("withdraw", Object{"id": id, "token": expectedToken}); err == nil {
+			_, err := g.QueueControl("withdraw", Object{"id": id, "token": expectedToken})
+			if err == nil {
 				continue
+			}
+			if !withdrawNoted {
+				withdrawNoted = true
+				fmt.Fprintf(os.Stderr, "agent-heavy: the queue is paused; job %d could not be withdrawn yet (%v), still waiting\n", id, err)
 			}
 		}
 		if name == "Missing" {
