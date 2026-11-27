@@ -222,6 +222,9 @@ func (install *installer) commandEnvironment(args []string) []string {
 		}
 		environment["HOME"] = install.home
 	}
+	if managedRemote && install.testing {
+		environment["AGENT_QUEUE_INSTALL_TEST_MODE"] = "1" // agent-remote then refuses real service control.
+	}
 	replacement := len(args) == 3 && args[1] == "--prepare-app-replacement" && args[2] == install.app && args[0] == filepath.Join(install.app, "Contents/MacOS/AgentQueue")
 	if replacement || slices.Equal(args, []string{filepath.Join(install.root, "bin/agent-heavy"), "status", "--json"}) || slices.Equal(args, []string{filepath.Join(install.app, "Contents/MacOS/agent-heavy"), "status", "--json"}) || len(args) > 1 && args[0] == filepath.Join(install.app, "Contents/MacOS/AgentQueue") && args[1] == "--service-management" {
 		// Installation always targets this user's installed state. An ambient
